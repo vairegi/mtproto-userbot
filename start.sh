@@ -21,27 +21,24 @@
 # main command is running. If every process were backgrounded the script would
 # reach the end, exit 0, and the platform would shut the container down.
 #
-# Each background process is auto-restarted if it dies (PM2's `autorestart`),
-# with a short delay so a crash-loop cannot spin the CPU. If the FOREGROUND
-# process dies, the whole container exits and the platform restarts it — which
-# is exactly the behaviour you want.
+# CRASH vs CLEAN-EXIT ACCOUNTING (2026-07-29 fix)
+# -----------------------------------------------
+# The previous version of this script counted EVERY exit — including clean
+# `code=0` cycle completions — toward a 50-restart ceiling. On Render, relay.py
+# finishes its polling cycle in 10-30 seconds and exits cleanly; that is normal
+# and healthy, not a crash. After ~50 clean cycles (about 15 minutes) the
+# supervisor would give up and the bot would go silent.
 #
-# IMPORTANT NOTE ABOUT relay.py AND userbot.py
-# --------------------------------------------
-# In this project relay.py and userbot.py are LIBRARY modules, not standalone
-# services: worker.py imports `process_job` from relay.py and `build_client`
-# from userbot.py. Running them as separate processes was requested, so this
-# script does exactly that, but it handles them intelligently:
-#
-#   - If a module has no independent main loop it exits immediately. Rather
-#     than restarting it forever in a pointless loop, the script detects that
-#     and reports it once in the logs.
-#   - Because userbot.py must hold the container open in the foreground, the
-#     script keeps a supervisor loop alive there regardless, so your container
-#     never exits by surprise.
-#
-# The actual gallery-processing work happens inside worker.py (which drives
-# relay.py + userbot.py internally), so the pipeline is fully functional.
+# The rules are now:
+#   * code == 0                 -> ALWAYS treated as a clean exit. Never
+#                                  counted toward the crash limit. Restarted
+#                                  immediately (short delay).
+#   * code != 0                 -> counted as a crash.
+#   * A process that ran for >= 60 seconds before a non-zero exit RESETS the
+#     crash counter to 0. That way a genuine crash-loop (rapid failures) still
+#     trips the safety limit, but a bot that has been healthy for a while
+#     never uses up its restart budget.
+#   * The safety ceiling is only for BACK-TO-BACK rapid crashes.
 #
 # USAGE
 #   bash start.sh
@@ -66,8 +63,7 @@ if [ -z "${PY}" ]; then
   exit 1
 fi
 
-# Hugging Face Spaces sets HOME=/home/user but some images restrict writes.
-# Fall back to /tmp for logs if our own folder is not writable.
+# Prefer app-local logs; fall back to /tmp if the filesystem is read-only.
 LOG_DIR="${APP_DIR}/logs"
 if ! mkdir -p "${LOG_DIR}" 2>/dev/null || [ ! -w "${LOG_DIR}" ]; then
   LOG_DIR="/tmp/logs"
@@ -102,8 +98,8 @@ if [ -n "${MISSING}" ]; then
   log "FATAL: missing required environment variable(s):${MISSING}"
   log ""
   log "Add them in your hosting platform's Secrets/Variables panel:"
-  log "  Hugging Face Spaces -> Settings -> Variables and secrets"
   log "  Render              -> Environment -> Environment Variables"
+  log "  Hugging Face Spaces -> Settings -> Variables and secrets"
   log ""
   log "Required: API_ID, API_HASH, BOT_TOKEN, MONGO_URI, STRING_SESSION,"
   log "          ADMIN_USER_ID, BOT1_USERNAME, BOT2_USERNAME, DATABASE_CHANNEL_ID"
@@ -111,8 +107,6 @@ if [ -n "${MISSING}" ]; then
 fi
 log "env check: all required variables are present"
 
-# Verify MongoDB is reachable before starting anything. Catching a bad
-# MONGO_URI here gives one clear error instead of four crashing processes.
 log "checking MongoDB connection..."
 if ${PY} -c "
 import sys
@@ -156,47 +150,90 @@ shutdown() {
 }
 trap shutdown SIGTERM SIGINT
 
+# ---------------------------------------------------------------------------
 # supervise <script> <label>
-# Runs a script in a restart loop, in the background. Mirrors PM2's
-# autorestart + restart_delay + min_uptime behaviour.
+# ---------------------------------------------------------------------------
+# Runs a script in a restart loop, in the background.
+#
+# Restart accounting (fixed 2026-07-29):
+#   * A "crash" == the process exited with a NON-ZERO status.
+#   * A "clean exit" (status 0) is treated as one completed cycle: restart
+#     immediately, do NOT touch the crash counter, do NOT count toward the
+#     50-restart safety ceiling.
+#   * The crash counter resets to 0 the moment the process runs for
+#     HEALTHY_UPTIME_SEC (60s) or longer, so a bot that has been healthy for
+#     a while always has a fresh restart budget.
+#   * The 50-crash ceiling only trips on RAPID BACK-TO-BACK crashes, which is
+#     what the ceiling is actually there to protect against (a hot restart
+#     loop that would burn CPU forever).
 supervise() {
   script="$1"
   label="$2"
+
+  # Tunables
+  local MAX_CONSECUTIVE_CRASHES=50   # only rapid-fire crashes count
+  local HEALTHY_UPTIME_SEC=60        # >= this uptime clears the crash streak
+  local CLEAN_EXIT_DELAY=2           # short pause between healthy work cycles
+  local FAST_CRASH_DELAY=15          # back off harder on instant crashes
+  local NORMAL_CRASH_DELAY=5         # standard crash-restart delay
+
   (
-    restarts=0
-    max_restarts=50
+    consecutive_crashes=0
+    total_starts=0
+    total_clean_exits=0
+    total_crashes=0
+
     while :; do
       start_time=$(date +%s)
-      log "[${label}] starting"
+      total_starts=$(( total_starts + 1 ))
+      log "[${label}] starting (start #${total_starts})"
       ${PY} -u "${script}"
       code=$?
       end_time=$(date +%s)
       uptime=$(( end_time - start_time ))
 
-      if [ ${code} -eq 0 ] && [ ${uptime} -lt 5 ]; then
-        # Exited cleanly and instantly => it is an imported library module
-        # with no main loop of its own (true for relay.py / userbot.py here).
-        # Restarting it forever would just spam the logs, so stop.
-        log "[${label}] exited immediately with code 0 — this module has no"
-        log "[${label}] standalone loop (it is imported by worker.py). Not restarting."
-        break
+      # ---- CLEAN EXIT (code 0) --------------------------------------------
+      # Always treat as a healthy cycle completion, regardless of uptime.
+      # Do NOT count toward the crash ceiling. Reset the streak so any prior
+      # crash counter is cleared.
+      if [ ${code} -eq 0 ]; then
+        total_clean_exits=$(( total_clean_exits + 1 ))
+        consecutive_crashes=0
+        log "[${label}] clean exit (code=0) after ${uptime}s — cycle #${total_clean_exits} complete; restarting in ${CLEAN_EXIT_DELAY}s"
+        sleep ${CLEAN_EXIT_DELAY}
+        continue
       fi
 
-      restarts=$(( restarts + 1 ))
-      if [ ${restarts} -ge ${max_restarts} ]; then
-        log "[${label}] hit ${max_restarts} restarts — giving up"
-        break
-      fi
+      # ---- CRASH (non-zero) ----------------------------------------------
+      total_crashes=$(( total_crashes + 1 ))
 
-      # Back off harder on instant crashes to avoid a hot restart loop.
-      if [ ${uptime} -lt 10 ]; then
-        delay=15
+      # A crash that came AFTER a long healthy uptime clears the streak: the
+      # process was fine for a while, it just hit one bad event. Count this
+      # crash as #1 of a fresh streak, not #N of the previous one.
+      if [ ${uptime} -ge ${HEALTHY_UPTIME_SEC} ]; then
+        consecutive_crashes=1
+        log "[${label}] crashed (code=${code}) after ${uptime}s of healthy uptime — resetting crash streak"
       else
-        delay=5
+        consecutive_crashes=$(( consecutive_crashes + 1 ))
       fi
-      log "[${label}] exited code=${code} after ${uptime}s — restarting in ${delay}s (restart ${restarts}/${max_restarts})"
+
+      if [ ${consecutive_crashes} -ge ${MAX_CONSECUTIVE_CRASHES} ]; then
+        log "[${label}] ${MAX_CONSECUTIVE_CRASHES} back-to-back rapid crashes — giving up to avoid a hot restart loop"
+        log "[${label}] totals: ${total_starts} starts, ${total_clean_exits} clean cycles, ${total_crashes} crashes"
+        break
+      fi
+
+      # Back off harder on instant crashes so we never spin the CPU.
+      if [ ${uptime} -lt 10 ]; then
+        delay=${FAST_CRASH_DELAY}
+      else
+        delay=${NORMAL_CRASH_DELAY}
+      fi
+      log "[${label}] crashed code=${code} after ${uptime}s — restarting in ${delay}s (consecutive rapid crashes: ${consecutive_crashes}/${MAX_CONSECUTIVE_CRASHES})"
       sleep ${delay}
     done
+
+    log "[${label}] supervisor exiting after ${total_starts} total starts (${total_clean_exits} clean, ${total_crashes} crashed)"
   ) &
   pid=$!
   PIDS="${PIDS} ${pid}"
@@ -224,9 +261,7 @@ sleep 1
 # ---------------------------------------------------------------------------
 # This is what holds the container open. userbot.py in this project is a client
 # factory (no main loop), so we run it once to validate the session, then keep
-# a lightweight supervisor loop in the foreground. That loop also acts as a
-# watchdog: if every background supervisor dies, we exit non-zero so the
-# hosting platform restarts the whole container.
+# a lightweight supervisor loop in the foreground.
 log "------------------------------------------------------------"
 log "starting userbot.py in the foreground"
 log "------------------------------------------------------------"
