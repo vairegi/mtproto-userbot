@@ -1,0 +1,39 @@
+# Pinned dependency lockfile for the relay pipeline.
+# ALL versions use == on purpose — see Section 4a of the brief.
+# Rebuild venv only when you deliberately want to upgrade something.
+
+# Telegram userbot client
+Telethon==1.36.0
+
+# Admin bot (separate process, uses the Bot API)
+python-telegram-bot==21.6
+
+# Env loading
+python-dotenv==1.0.1
+
+# HTTP client for the source-site fallback API + hf_scraper.py
+httpx==0.27.2
+
+# HTML parsing for hf_scraper.py (direct hentaifox.com scraper)
+beautifulsoup4==4.12.3
+
+# Timezone handling (stdlib zoneinfo + tzdata fallback for Ubuntu minimal)
+tzdata==2024.2
+
+# ---------------------------------------------------------------------------
+# MongoDB — replaces the old local SQLite queue.db file.
+#
+# Version note (verified by actually installing these together):
+#   motor 3.6.0 requires pymongo>=4.9,<4.10 — so pymongo MUST be 4.9.x here.
+#   Using pymongo 4.10+ with motor 3.6.0 makes pip fail with
+#   "ResolutionImpossible", which would break the build on Hugging Face.
+#
+# The `[srv]` extra is what enables "mongodb+srv://" connection strings, which
+# is the format MongoDB Atlas gives you. From pymongo 4.9 onward, the required
+# dnspython package became a normal dependency, so the extra is a harmless
+# no-op (pip may print "does not provide the extra 'srv'" — safe to ignore).
+# dnspython is pinned explicitly below so mongodb+srv:// always resolves.
+# ---------------------------------------------------------------------------
+pymongo[srv]==4.9.2
+dnspython==2.7.0
+motor==3.6.0
