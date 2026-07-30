@@ -196,7 +196,9 @@ def load_settings() -> Settings:
         bot1_username=_req("BOT1_USERNAME").lstrip("@"),
         bot2_username=_req("BOT2_USERNAME").lstrip("@"),
         database_channel_id=_int_req("DATABASE_CHANNEL_ID", "CHANNEL_ID"),
-        doujinshibot_username=(_opt("DOUJINSHIBOT_USERNAME", default="Doujinshibot") or "").lstrip("@"),
+        # Correct spelling is Doug-in-shibot (with a 'g'), NOT Dou-jin-shibot.
+        # The 'j' variant is a different bot; sending /mpost there does nothing.
+        doujinshibot_username=(_opt("DOUJINSHIBOT_USERNAME", default="Douginshibot") or "").lstrip("@"),
         # NEW — MongoDB
         mongo_uri=_req("MONGO_URI", "MONGODB_URI"),
         mongo_db_name=_opt("MONGO_DB_NAME", default="relaybot") or "relaybot",
