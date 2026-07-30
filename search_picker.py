@@ -403,52 +403,85 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 # Also grey it out — it's already in the main channel.
                 sess.queued.add(h.gallery_id)
 
-        # Build a reply summary
-        reply_lines = [f"✅ /search → queue for \"{sess.query}\":"]
-        reply_lines.append(f"  {len(result.queued)} queued")
+        # ------------------------------------------------------------------
+        # Build the reply and (when there are queued items) hand it off to
+        # the progress tracker so it LIVE-EDITS this same message. Prior
+        # versions sent a separate confirm reply AND then let the tracker
+        # post its own progress message — users saw two nearly-identical
+        # messages back-to-back. Now everything goes into one consolidated
+        # message: fixed header, live progress lines, fixed token line, and
+        # the channel footer (rendered by progress_tracker).
+        # ------------------------------------------------------------------
+
+        # Header lines — the static summary that stays visible above the
+        # live progress list.
+        header_lines = [f"✅ /search → queue for \"{sess.query}\":"]
+        header_lines.append(f"  {len(result.queued)} queued")
         if result.skipped_already_done:
-            reply_lines.append(
+            header_lines.append(
                 f"  {len(result.skipped_already_done)} skipped — already uploaded to channel:"
             )
             for u in result.skipped_already_done[:10]:
-                reply_lines.append(f"    • {u}")
+                header_lines.append(f"    • {u}")
         if result.skipped_already_pending:
-            reply_lines.append(
+            header_lines.append(
                 f"  {len(result.skipped_already_pending)} skipped — already in queue:"
             )
             for u in result.skipped_already_pending[:10]:
-                reply_lines.append(f"    • {u}")
+                header_lines.append(f"    • {u}")
+        if result.rejected:
+            header_lines.append(f"  {len(result.rejected)} rejected:")
+            for line, why in result.rejected[:10]:
+                header_lines.append(f"    • {line} — {why}")
+        header_text = "\n".join(header_lines)
+
+        # Token line — shown to non-admins only, placed between the progress
+        # list and the channel footer inside the consolidated message.
+        token_line = ""
         if not is_admin_user:
             conn0 = db.connect()
             try:
                 tok_now = db.get_user_tokens(conn0, user_id, uname or None)
             finally:
                 conn0.close()
-            reply_lines.append("")
-            if tok_now['remaining'] <= 3:
-                reply_lines.append(
+            if tok_now["remaining"] <= 3:
+                token_line = (
                     f"⚠️ You have {tok_now['remaining']}/{tok_now['daily_cap']} tokens left today."
                 )
             else:
-                reply_lines.append(
-                    f"  Tokens: {tok_now['remaining']}/{tok_now['daily_cap']} remaining today."
+                token_line = (
+                    f"🎟 Tokens: {tok_now['remaining']}/{tok_now['daily_cap']} remaining today."
                 )
 
-
-        # Channel footer — shown to EVERYONE (admins and normal users) so
-        # anyone who ran /search knows where the finished posts land.
-        reply_lines.append("📢 Channel: https://t.me/+M6yURQt1-TY1YTZl")
-
-        await q.message.reply_text("\n".join(reply_lines)[:4000])
-
-
         if result.queued:
+            # Send the confirm reply as the SEED for the progress message,
+            # then hand its message_id to the tracker so subsequent edits
+            # land on the same bubble. The tracker's footer already contains
+            # the posting-channel + daily-updates URLs, so we don't append
+            # them here.
+            reply_msg = await q.message.reply_text(header_text[:4000])
             try:
                 await progress_tracker.start_batch_tracking(
-                    ctx.application, q.message.chat_id, result.queued
+                    ctx.application, q.message.chat_id, result.queued,
+                    header=header_text,
+                    token_line=token_line,
+                    existing_message_id=reply_msg.message_id,
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("progress tracker failed to start for /search batch: %s", e)
+        else:
+            # Nothing queued (everything was skipped/rejected). Send a
+            # one-shot reply that still shows the token line + channel
+            # footer, since there will be no live progress message to carry
+            # them.
+            single_lines = [header_text]
+            if token_line:
+                single_lines.append("")
+                single_lines.append(token_line)
+            single_lines.append("")
+            single_lines.append("📢 Posting in this Channel: https://t.me/+M6yURQt1-TY1YTZl")
+            single_lines.append("📣 Daily Updates Here — https://t.me/+uyNxVAVPdUBlOWU9")
+            await q.message.reply_text("\n".join(single_lines)[:4000])
 
         await _refresh_message(q, ctx, sess)
         await q.answer("Queued.")
