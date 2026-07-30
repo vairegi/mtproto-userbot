@@ -418,12 +418,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
             for u in result.skipped_already_pending[:10]:
                 reply_lines.append(f"    • {u}")
-        if result.rejected:
-            reply_lines.append(f"  {len(result.rejected)} rejected:")
-            for line, why in result.rejected[:10]:
-                reply_lines.append(f"    • {line} — {why}")
-
-        if not is_admin_user:
+                if not is_admin_user:
             conn0 = db.connect()
             try:
                 tok_now = db.get_user_tokens(conn0, user_id, uname or None)
@@ -439,7 +434,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     f"🎟 Tokens: {tok_now['remaining']}/{tok_now['daily_cap']} remaining today."
                 )
 
+        # Channel footer — shown to EVERYONE (admins and normal users) so
+        # anyone who ran /search knows where the finished posts land.
+        reply_lines.append("📢 Channel: https://t.me/+M6yURQt1-TY1YTZl")
+
         await q.message.reply_text("\n".join(reply_lines)[:4000])
+
 
         if result.queued:
             try:
