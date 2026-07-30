@@ -49,10 +49,17 @@ _POLL_INTERVAL_SEC = 2.0
 _AUTO_DELETE_DELAY_SEC = 30
 _TRACKER_KEY = "_progress_tracker_task"
 
-# Footer line appended to every progress message so users know where the
+# Footer lines appended to every progress message so users know where the
 # posted doujinshi actually end up. Change here to update all future batches.
+#
+# Two-part footer:
+#   line 1 = the main posting channel (where finished PDFs land)
+#   line 2 = the daily-updates channel (announcements / summaries)
+_POSTING_CHANNEL_URL = "https://t.me/+M6yURQt1-TY1YTZl"
+_DAILY_UPDATES_URL   = "https://t.me/+uyNxVAVPdUBlOWU9"
 _CHANNEL_FOOTER = (
-    "📢 All doujinshi posted here → https://t.me/+uyNxVAVPdUBlOWU9"
+    f"📢 Posting in this Channel: {_POSTING_CHANNEL_URL}\n"
+    f"📣 Daily Updates Here — {_DAILY_UPDATES_URL}"
 )
 # Safety net: if a batch is somehow never marked terminal (a bug we haven't
 # hit yet, or a job silently vanishing), stop hammering editMessageText and
@@ -91,11 +98,31 @@ def _short(title: str, limit: int = 48) -> str:
     return t[: limit - 1] + "…"
 
 
-def _render_batch_text(job_ids: List[int], rows_by_id: Dict[int, dict]) -> Tuple[str, bool]:
-    """Build the message body for one batch. Returns (text, all_terminal)."""
+def _render_batch_text(
+    job_ids: List[int],
+    rows_by_id: Dict[int, dict],
+    header: str = "",
+    token_line: str = "",
+) -> Tuple[str, bool]:
+    """Build the message body for one batch. Returns (text, all_terminal).
+
+    `header`     : optional lines prepended above the progress list. Used by
+                    /search Confirm to place its "queue for X: N queued" summary
+                    (plus any "skipped" details) at the very top of the ONE
+                    consolidated message.
+    `token_line` : optional line placed BETWEEN the progress list and the
+                    channel footer. Used by /search Confirm so a normal user
+                    still sees "🎟 Tokens: N/M remaining today." without it
+                    scrolling off the top when items advance.
+    """
     total = len(job_ids)
     done_terminal = 0
-    lines = [f"📊 Progress — {total} item{'s' if total != 1 else ''}"]
+    lines: List[str] = []
+    if header:
+        # Preserve internal newlines in the caller-supplied header exactly.
+        lines.append(header.rstrip())
+        lines.append("")
+    lines.append(f"📊 Progress — {total} item{'s' if total != 1 else ''}")
     lines.append("")
     for jid in job_ids:
         row = rows_by_id.get(jid)
@@ -121,6 +148,9 @@ def _render_batch_text(job_ids: List[int], rows_by_id: Dict[int, dict]) -> Tuple
         lines.append(f"Finished: ✅ {n_done}  ⚠️ {n_partial}  ❌ {n_failed}")
     else:
         lines.append(f"{done_terminal}/{total} finished so far…")
+    if token_line:
+        lines.append("")
+        lines.append(token_line)
     # Always-visible destination footer so users know where the actual posts
     # land. Only appended if it fits within the 4000-char cap.
     footer = "\n\n" + _CHANNEL_FOOTER
@@ -130,16 +160,50 @@ def _render_batch_text(job_ids: List[int], rows_by_id: Dict[int, dict]) -> Tuple
     return body[:4000], all_terminal
 
 
+# Per-batch header/token overrides supplied by callers who want the progress
+# message to include their own preamble (e.g. /search Confirm's summary). We
+# keep them in a process-local dict rather than adding two more DB columns
+# because they are purely presentational and live-forgotten when the batch
+# ends. Cleared automatically once the batch is deleted.
+_BATCH_EXTRAS: Dict[str, Dict[str, str]] = {}
+
+
 async def start_batch_tracking(
-    app: Application, chat_id: int, job_id_url_pairs: List[Tuple[int, str]]
+    app: Application,
+    chat_id: int,
+    job_id_url_pairs: List[Tuple[int, str]],
+    *,
+    header: str = "",
+    token_line: str = "",
+    existing_message_id: int | None = None,
 ) -> None:
     """Create a progress batch + initial message, and make sure the background
     polling loop is running. Call this right after enqueuing jobs (from
-    cmd_fetch, the /search Confirm handler, or the auto-fetch handler)."""
+    cmd_fetch, the /search Confirm handler, or the auto-fetch handler).
+
+    NEW keyword arguments (all optional, backwards-compatible):
+
+    `header`               — static preamble rendered above the progress list.
+                             /search Confirm passes its summary here so the
+                             confirm-reply and the live progress become ONE
+                             message instead of two.
+    `token_line`           — static line rendered between the progress list
+                             and the channel footer (used for the token count).
+    `existing_message_id`  — if the caller has already sent a message the
+                             tracker should EDIT in place, pass its id here
+                             (skip the extra send_message). This is what turns
+                             the /search reply itself into the progress
+                             message.
+    """
     if not job_id_url_pairs:
         return
     job_ids = [jid for jid, _u in job_id_url_pairs]
     batch_id = uuid.uuid4().hex[:12]
+
+    # Remember the caller's presentational extras for this batch. The poll
+    # loop reads them on every render.
+    if header or token_line:
+        _BATCH_EXTRAS[batch_id] = {"header": header, "token_line": token_line}
 
     conn = db.connect()
     try:
@@ -151,17 +215,33 @@ async def start_batch_tracking(
         conn.close()
 
     rows_by_id = {r["job_id"]: r for r in rows}
-    text, _ = _render_batch_text(job_ids, rows_by_id)
+    text, _ = _render_batch_text(
+        job_ids, rows_by_id, header=header, token_line=token_line
+    )
 
-    try:
-        msg = await app.bot.send_message(chat_id=chat_id, text=text)
-    except TelegramError as e:
-        log.warning("failed to send initial progress message: %s", e)
-        return
+    message_id: int | None = existing_message_id
+    if message_id is None:
+        try:
+            msg = await app.bot.send_message(chat_id=chat_id, text=text)
+            message_id = msg.message_id
+        except TelegramError as e:
+            log.warning("failed to send initial progress message: %s", e)
+            _BATCH_EXTRAS.pop(batch_id, None)
+            return
+    else:
+        # Caller already sent the message (e.g. /search Confirm's reply). Edit
+        # it in place so it becomes the live progress message. Any failure
+        # here is non-fatal — the tracker will keep trying on its next poll.
+        try:
+            await app.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text
+            )
+        except TelegramError as e:
+            log.debug("initial edit_message_text failed (non-fatal): %s", e)
 
     conn = db.connect()
     try:
-        db.set_progress_batch_message(conn, batch_id, msg.message_id)
+        db.set_progress_batch_message(conn, batch_id, int(message_id))
     finally:
         conn.close()
 
@@ -192,7 +272,13 @@ async def _poll_loop(app: Application) -> None:
 
                     rows = db.get_progress_for_jobs(conn, job_ids)
                     rows_by_id = {r["job_id"]: r for r in rows}
-                    text, all_terminal = _render_batch_text(job_ids, rows_by_id)
+                    extras = _BATCH_EXTRAS.get(batch_id, {})
+                    header_extra = extras.get("header", "")
+                    token_extra = extras.get("token_line", "")
+                    text, all_terminal = _render_batch_text(
+                        job_ids, rows_by_id,
+                        header=header_extra, token_line=token_extra,
+                    )
 
                     # Safety net: force-close batches stuck open way too long
                     # (e.g. a job crashed before ever writing a terminal phase).
@@ -210,7 +296,10 @@ async def _poll_loop(app: Application) -> None:
                                 )
                         rows = db.get_progress_for_jobs(conn, job_ids)
                         rows_by_id = {r["job_id"]: r for r in rows}
-                        text, all_terminal = _render_batch_text(job_ids, rows_by_id)
+                        text, all_terminal = _render_batch_text(
+                            job_ids, rows_by_id,
+                            header=header_extra, token_line=token_extra,
+                        )
 
                     if last_sent_text.get(batch_id) != text:
                         try:
@@ -242,6 +331,7 @@ async def _poll_loop(app: Application) -> None:
                             db.delete_progress_batch(conn, batch_id)
                             pending_deletes.pop(batch_id, None)
                             last_sent_text.pop(batch_id, None)
+                            _BATCH_EXTRAS.pop(batch_id, None)
                     else:
                         pending_deletes.pop(batch_id, None)
             finally:
