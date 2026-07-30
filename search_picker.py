@@ -418,21 +418,22 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
             for u in result.skipped_already_pending[:10]:
                 reply_lines.append(f"    • {u}")
-                if not is_admin_user:
+        if not is_admin_user:
             conn0 = db.connect()
             try:
                 tok_now = db.get_user_tokens(conn0, user_id, uname or None)
             finally:
                 conn0.close()
             reply_lines.append("")
-            if tok_now["remaining"] <= 3:
+            if tok_now['remaining'] <= 3:
                 reply_lines.append(
                     f"⚠️ You have {tok_now['remaining']}/{tok_now['daily_cap']} tokens left today."
                 )
             else:
                 reply_lines.append(
-                    f"🎟 Tokens: {tok_now['remaining']}/{tok_now['daily_cap']} remaining today."
+                    f"  Tokens: {tok_now['remaining']}/{tok_now['daily_cap']} remaining today."
                 )
+
 
         # Channel footer — shown to EVERYONE (admins and normal users) so
         # anyone who ran /search knows where the finished posts land.
