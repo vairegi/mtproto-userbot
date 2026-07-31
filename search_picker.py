@@ -211,17 +211,32 @@ async def start_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: st
 
     hits = await _load_page(sess, 1)
     if not hits:
-        # Detect: was it a hard failure (network) or empty results?
+        # Distinguish "search unavailable" (scraper returned None) vs
+        # "no results" (scraper returned an empty page).
         if sess.total_results == 0 and not sess.pages_cache.get(1):
-            # Distinguish "search unavailable" vs "no results"
+            # Second probe: gives cloudscraper a chance to rebuild its
+            # solved-challenge cookie if the first request happened to hit
+            # a rotated Cloudflare challenge.
             probe = await hf_scraper.search(sess.query, page=1)
             if probe is None:
-                await msg.reply_text("Search unavailable, try again later.")
+                await msg.reply_text(
+                    "🔎 Search is temporarily unavailable.\n"
+                    "The source website (hentaifox.com) is blocking our "
+                    "server right now — usually a Cloudflare challenge "
+                    "rotation. Please try again in about a minute.\n\n"
+                    "If this keeps happening for more than 10 minutes, "
+                    "ping the admin."
+                )
                 _sessions(ctx).pop(sess.session_id, None)
                 return
-        await msg.reply_text(f'No results for "{sess.query}".')
+            # Probe succeeded but returned an empty page — truly no results.
+        await msg.reply_text(
+            f'🔎 No results found for "{sess.query}".\n'
+            f'Try a different keyword or fewer words.'
+        )
         _sessions(ctx).pop(sess.session_id, None)
         return
+
 
     text = _build_header(sess) + "\n\n" + _build_body(hits, sess)
     keyboard = _build_keyboard(sess, hits)
