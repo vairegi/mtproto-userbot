@@ -11,7 +11,8 @@ python-telegram-bot==21.6
 # Env loading
 python-dotenv==1.0.1
 
-# HTTP client for the source-site fallback API + hf_scraper.py
+# HTTP client for the source-site fallback API
+# (hf_scraper.py no longer uses httpx — see cloudscraper block below.)
 httpx==0.27.2
 
 # HTML parsing for hf_scraper.py (direct hentaifox.com scraper)
@@ -19,6 +20,22 @@ beautifulsoup4==4.12.3
 
 # Timezone handling (stdlib zoneinfo + tzdata fallback for Ubuntu minimal)
 tzdata==2024.2
+
+# ---------------------------------------------------------------------------
+# Cloudflare bypass for hf_scraper.py (added 2026-07 after Render 403s).
+#
+# hentaifox.com sits behind Cloudflare with an active JS challenge on every
+# request. Datacenter IPs (Render, Fly.io, HF Spaces) get an immediate HTTP
+# 403 with `cf-mitigated: challenge` when hit by plain httpx / requests /
+# even curl_cffi with TLS impersonation — we proved this during debugging.
+#
+# cloudscraper actually runs the JS challenge and stores the resulting
+# cf_clearance cookie so subsequent requests pass through. Version 1.2.71
+# is the current stable release on PyPI (the "3.0.0" tag on GitHub was never
+# published there — pip install would fail). Verified working against
+# hentaifox.com from a datacenter IP.
+# ---------------------------------------------------------------------------
+cloudscraper==1.2.71
 
 # ---------------------------------------------------------------------------
 # MongoDB — replaces the old local SQLite queue.db file.
