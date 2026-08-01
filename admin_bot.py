@@ -1207,11 +1207,13 @@ async def cmd_autostatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 def build_app() -> Application:
-    # Ensure DB exists (admin bot may boot before worker on first ever run)
+    # Ensure DB exists
     db.init_db()
-    _ensure_auto_queue_running(app)
 
     app = ApplicationBuilder().token(settings.admin_bot_token).post_init(_on_startup).build()
+
+    _ensure_auto_queue_running(app)  # 👈 FIXED! 'app' banne ke BAAD call kiya
+
     # Regular-admin commands
     app.add_handler(CommandHandler("fetch", cmd_fetch))
     app.add_handler(CommandHandler("search", cmd_search))
