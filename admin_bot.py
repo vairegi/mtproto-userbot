@@ -837,6 +837,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("  /autoon          enable daily random-gallery auto-queue")
         lines.append("  /autooff         disable auto-queue")
         lines.append("  /autotime HH:MM  set daily queue time (IST, 24-hour)")
+        lines.append("  /autocooldown N  set minutes between auto-posts (default 30)")
+
         lines.append("  /autostatus      show auto-queue configuration")
     if is_super:
         lines.append("")
@@ -1205,6 +1207,43 @@ async def cmd_autooff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @only_admin
+async def cmd_autocooldown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the cooldown (in minutes) between consecutive auto-posts.
+    Usage: /autocooldown N   (N >= 1, default 30)
+    """
+    msg = update.effective_message
+    args = msg.text.split(maxsplit=1) if msg and msg.text else []
+    conn = db.connect()
+    try:
+        current = _auto_queue_get_cooldown_min(conn)
+    finally:
+        conn.close()
+
+    if len(args) < 2:
+        await msg.reply_text(
+            f"Usage: /autocooldown N   (N minutes, >= 1)\n"
+            f"Current cooldown: {current} min\n\n"
+            f"After each auto-post, the scheduler waits this long before it\n"
+            f"can queue another one, even if the queue is already empty."
+        )
+        return
+    try:
+        minutes = int(args[1].strip())
+        if minutes < 1:
+            raise ValueError
+    except ValueError:
+        await msg.reply_text("Cooldown must be a whole number of minutes, >= 1.")
+        return
+
+    conn = db.connect()
+    try:
+        _auto_queue_set_cooldown_min(conn, minutes)
+    finally:
+        conn.close()
+    await msg.reply_text(f"✅ Auto-queue cooldown set to {minutes} min.")
+
+
+@only_admin
 async def cmd_autotime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Set the daily auto-queue time. Usage: /autotime HH:MM (24-hour, IST)."""
     msg = update.effective_message
@@ -1248,17 +1287,48 @@ async def cmd_autostatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     try:
         enabled = _auto_queue_get_enabled(conn)
         time_str = _auto_queue_get_time_str(conn)
-        last_run = _auto_queue_last_run_date(conn) or "(never)"
+        cooldown_min = _auto_queue_get_cooldown_min(conn)
+        last_run_iso = _auto_queue_last_run_iso(conn)
+        counts = db.counts_by_status(conn)
     finally:
         conn.close()
-    now_ist = datetime.now(_IST_TZ).strftime("%Y-%m-%d %H:%M IST")
-    await update.effective_message.reply_text(
-        "🤖 Auto-queue status\n"
-        f"  Enabled       : {'✅ yes' if enabled else '⏹️ no'}\n"
-        f"  Daily time    : {time_str} IST\n"
-        f"  Last ran      : {last_run}\n"
-        f"  Now (IST)     : {now_ist}"
-    )
+
+    now_ist = datetime.now(_IST_TZ)
+    now_str = now_ist.strftime("%Y-%m-%d %H:%M IST")
+    active = int(counts.get("pending", 0)) + int(counts.get("processing", 0))
+
+    if last_run_iso:
+        try:
+            last_dt = datetime.fromisoformat(last_run_iso)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=_IST_TZ)
+            last_run_display = last_dt.strftime("%Y-%m-%d %H:%M IST")
+            mins_since = (now_ist - last_dt).total_seconds() / 60.0
+            mins_until = max(0, cooldown_min - mins_since)
+            cooldown_line = (
+                f"  Next eligible : {int(mins_until)} min from now"
+                if mins_until > 0 else
+                f"  Next eligible : cooldown clear (queue must also be empty)"
+            )
+        except ValueError:
+            last_run_display = "(invalid)"
+            cooldown_line = ""
+    else:
+        last_run_display = "(never)"
+        cooldown_line = f"  Next eligible : cooldown clear (queue must also be empty)"
+
+    lines = [
+        "🤖 Auto-queue status",
+        f"  Enabled       : {'✅ yes' if enabled else '⏹️ no'}",
+        f"  Start time    : {time_str} IST (fires only on/after this)",
+        f"  Cooldown      : {cooldown_min} min between auto-posts",
+        f"  Last ran      : {last_run_display}",
+        cooldown_line,
+        f"  Queue now     : {active} active job(s)",
+        f"  Now (IST)     : {now_str}",
+    ]
+    await update.effective_message.reply_text("\n".join(l for l in lines if l))
+
 
 def build_app() -> Application:
     # Ensure DB exists
@@ -1303,7 +1373,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("autoon", cmd_autoon))
     app.add_handler(CommandHandler("autooff", cmd_autooff))
     app.add_handler(CommandHandler("autotime", cmd_autotime))
+    app.add_handler(CommandHandler("autocooldown", cmd_autocooldown))
     app.add_handler(CommandHandler("autostatus", cmd_autostatus))
+
 
     # Absorb everything else silently (Yeh ALWAYS bilkul LAST mein hona chahiye)
     app.add_handler(MessageHandler(filters.ALL, swallow))
