@@ -835,6 +835,102 @@ async def _on_startup(app: Application) -> None:
     # Resume tracking any progress batches left over from before a restart.
     progress_tracker.ensure_tracker_running(app)
 
+# ---------------------------------------------------------------------------
+# /diag — admin-only diagnostic probe (added 2026-08-01)
+#
+# Runs three tests from inside the bot process (i.e. from Render's actual
+# outbound IP) and DMs the result back to the caller. Used to diagnose
+# whether hentaifox.com is still returning HTTP 403 to this container, or
+# whether Cloudflare has stopped blocking us and we can drop the whole
+# bypass stack.
+# ---------------------------------------------------------------------------
+@only_admin
+async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Probe hentaifox.com three ways and report status back to the admin."""
+    msg = update.effective_message
+    if not msg:
+        return
+    await msg.reply_text("🔎 Running diagnostics… this takes ~15 seconds.")
+
+    lines: list[str] = ["🧪 hentaifox.com diagnostics", ""]
+
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # -------- Test 1: plain httpx GET, HEAD-style read of key headers --------
+    lines.append("① plain httpx GET https://hentaifox.com/search/?q=sister")
+    try:
+        import httpx  # local import so a missing httpx never breaks the bot
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as c:
+            r = await c.get("https://hentaifox.com/search/?q=sister", headers=headers)
+        cf_mitigated = r.headers.get("cf-mitigated", "(none)")
+        server = r.headers.get("server", "(none)")
+        lines.append(f"   status  : HTTP {r.status_code}")
+        lines.append(f"   server  : {server}")
+        lines.append(f"   cf-mit. : {cf_mitigated}")
+        lines.append(f"   length  : {len(r.text)} bytes")
+        # Real search page contains 20 gallery links; a challenge page has 0.
+        gallery_links = len(re.findall(r"/gallery/\d+", r.text))
+        lines.append(f"   /gallery/N links found: {gallery_links}")
+        looks_real = gallery_links >= 10 and r.status_code == 200
+        lines.append(f"   verdict : {'✅ REAL PAGE' if looks_real else '❌ blocked / decoy'}")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"   ERROR: {e!s}")
+    lines.append("")
+
+    # -------- Test 2: raw homepage GET to check baseline reachability --------
+    lines.append("② plain httpx GET https://hentaifox.com/  (homepage)")
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as c:
+            r = await c.get("https://hentaifox.com/", headers=headers)
+        cf_mitigated = r.headers.get("cf-mitigated", "(none)")
+        lines.append(f"   status  : HTTP {r.status_code}")
+        lines.append(f"   cf-mit. : {cf_mitigated}")
+        lines.append(f"   length  : {len(r.text)} bytes")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"   ERROR: {e!s}")
+    lines.append("")
+
+    # -------- Test 3: your actual hf_scraper.search() code path --------------
+    lines.append("③ hf_scraper.search('sister', page=1)")
+    try:
+        result = await hf_scraper.search("sister", page=1)
+        if result is None:
+            lines.append("   verdict : ❌ returned None (scraper failed)")
+        else:
+            lines.append(f"   total_results : {result.total_results}")
+            lines.append(f"   hits returned : {len(result.hits)}")
+            if result.hits:
+                first = result.hits[0]
+                lines.append(f"   first title   : {first.title[:60]!r}")
+                lines.append(f"   first url     : {first.url}")
+                lines.append("   verdict : ✅ WORKING")
+            else:
+                lines.append("   verdict : ⚠️ empty results (parse issue?)")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"   ERROR: {e!s}")
+    lines.append("")
+
+    # -------- Metadata --------
+    import platform, sys
+    lines.append("─── environment ───")
+    lines.append(f"python  : {sys.version.split()[0]}")
+    lines.append(f"platform: {platform.system()} {platform.machine()}")
+    flare = (os.getenv("FLARESOLVERR_URL") or "").strip()
+    lines.append(f"FLARESOLVERR_URL set: {'yes' if flare else 'no'}")
+
+    report = "\n".join(lines)
+    # Telegram messages cap at 4096 chars; ours will be ~1200. Send as code
+    # block for readable monospace.
+    await msg.reply_text(f"```\n{report}\n```", parse_mode="Markdown")
 
 def build_app() -> Application:
     # Ensure DB exists (admin bot may boot before worker on first ever run)
@@ -854,6 +950,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("help", cmd_help))
     # Super-admin commands
+    app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("addsuperadmin", cmd_addsuperadmin))
