@@ -1022,7 +1022,7 @@ async def _pick_random_english_gallery() -> Optional[str]:
     return None
 
 
-aasync def _auto_queue_tick(app) -> None:
+async def _auto_queue_tick(app) -> None:
     """One iteration of the daily scheduler. Returns True if work was done."""
     now_ist = datetime.now(_IST_TZ)
     today = now_ist.date().isoformat()
