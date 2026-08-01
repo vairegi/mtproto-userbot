@@ -1,157 +1,148 @@
 """
-hf_scraper.py — Direct scraper for hentaifox.com, used by:
-  - /search <keyword>  (Admin Bot inline results)
-  - relay.py fallback metadata (when SOURCE_API_BASE/KEY are not configured
-    and Bot 1's cover post is not detected in time)
+hf_scraper.py — Direct scraper for nhentai.net (formerly hentaifox.com).
 
-WHY THIS FILE CHANGED (2026-07 fix for HTTP 403 on Render)
-----------------------------------------------------------
-hentaifox.com sits behind Cloudflare with an active JavaScript / Turnstile
-challenge (proven by the response headers we received during debugging:
-`cf-mitigated: challenge`, `server: cloudflare`, and a `chlray` server-timing
-value on EVERY request). From a datacenter IP (Render, Fly, HF Spaces, etc.)
-a plain `httpx` GET is immediately answered with HTTP 403 — no gallery HTML
-is ever returned, so the admin bot correctly said "Search unavailable".
+WHY THIS MODULE CHANGED SOURCE (2026-08-01 — nhentai switch)
+------------------------------------------------------------
+hentaifox.com sits behind Cloudflare Turnstile and hard-blocks Render's
+datacenter IP range. We verified inside the Render container itself:
+    HTTP 403 · server: cloudflare · cf-mitigated: challenge · 0 galleries
 
-We proved during a live probe that:
-  * `httpx` + realistic browser headers          -> 403 (still challenged)
-  * `curl_cffi` with chrome124 TLS impersonation -> 403 (still challenged)
-  * `cloudscraper` (solves the JS challenge)     -> 200, real search results
+nhentai.net returns HTTP 200 to a plain httpx GET from the same IP and,
+better still, exposes a clean JSON API that its own SvelteKit frontend
+uses. Two endpoints do the whole job:
 
-So this rewrite uses `cloudscraper`. Cloudscraper is a small wrapper around
-`requests` that runs Cloudflare's JS challenge with a JS engine and stores
-the resulting `cf_clearance` cookie, letting subsequent requests pass through.
-The old sync-only `requests` API is wrapped with `asyncio.run_in_executor`
-so the rest of the async project (search_picker.py / relay.py) keeps working
-without any change to its call sites.
+    GET /api/v2/search?query=<q>&sort=date&page=<n>
+        → list of galleries with english_title / japanese_title, num_pages,
+          media_id, and a thumbnail path.
 
-KEY DESIGN DECISIONS
---------------------
-1. ONE process-wide scraper instance is kept alive so the solved-challenge
-   cookies are reused. Solving the JS challenge is expensive (~2-5s); reusing
-   the session brings /search back down to ~200-400ms per page.
+    GET /api/v2/galleries/<id>?include=related,suggestions,comments
+        → full detail incl. title.pretty (clean, no artist/language brackets),
+          resolved tags with names+types, cover path.
 
-2. The scraper is REBUILT automatically if a request comes back 403 again
-   (Cloudflare rotates challenges every 30-60 min). The rebuild is
-   thread-safe: two concurrent /search commands will not race to rebuild.
+Because nhentai and hentaifox use different numeric ID spaces, gallery
+URLs handed to Bot 1 (@postedstuffbot) and Bot 2 (@Gallery_DLBot) are now
+in the form:
+        https://nhentai.net/g/<id>/
+Both bots accept this format (confirmed by user).
 
-3. Every request carries a full modern-Chrome header set including
-   Sec-CH-UA client hints and a Referer, so Cloudflare's fingerprint check
-   sees "consistent Chrome tab" rather than "headless Python".
+TITLE STRATEGY (as requested)
+-----------------------------
+Two-stage titles:
 
-4. Retry-with-backoff: on transient 403/5xx we retry up to 3 times with a
-   jittered delay, rebuilding the scraper between attempts.
+  1. SEARCH RESULTS (the picker with rows on each page):
+     Use `english_title` if present, else `japanese_title`. Fast — one API
+     call returns all rows. Users see the picker in ~300 ms.
 
-5. Nothing here raises to the caller. On terminal failure we return `None`
-   so search_picker.py can show its clean "Search unavailable" message.
+  2. CONFIRMED / QUEUED ITEMS (progress messages, batch labels):
+     After the user hits Confirm, `fetch_gallery_meta()` is called for
+     each selected gallery. That endpoint returns the clean `pretty` title
+     which is what shows up in the progress tracker + final "posted" line.
+
+     This keeps /search snappy while giving humans a clean title in the
+     places they actually read.
+
+CACHING & DEDUP
+---------------
+  * response cache — 90 s for search JSON, 30 min for gallery detail JSON
+  * in-flight dedup — two callers asking for the same URL simultaneously
+    share ONE upstream request
+  * cache is bounded (128 entries max) with an LRU-ish trim
+
+PUBLIC API (unchanged from previous version)
+-------------------------------------------
+Everything downstream (search_picker.py, relay.py, worker.py, admin_bot.py)
+keeps working without edits:
+
+    async search(query, page=1) -> Optional[SearchPage]
+    async fetch_gallery_meta(url_or_id) -> Optional[GalleryMeta]
+    async health_check() -> bool
+    route_status() -> dict            (used by /diag)
+
+NO env vars required. No proxies. No third-party services.
 """
 from __future__ import annotations
 
 import asyncio
-import random
+import json
 import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from bs4 import BeautifulSoup
-
-# cloudscraper is imported lazily so this file is still importable in
-# environments that haven't installed it yet (e.g. running -m py_compile).
-try:
-    import cloudscraper  # type: ignore
-    _CLOUDSCRAPER_IMPORT_ERROR: Optional[str] = None
-except Exception as _e:  # noqa: BLE001
-    cloudscraper = None  # type: ignore[assignment]
-    _CLOUDSCRAPER_IMPORT_ERROR = str(_e)
+import httpx
 
 from logging_setup import setup_logging
 
 log = setup_logging("hf_scraper")
 
-BASE_URL = "https://hentaifox.com"
+# ---------------------------------------------------------------------------
+# Site constants
+# ---------------------------------------------------------------------------
+BASE_URL = "https://nhentai.net"
+API_URL = f"{BASE_URL}/api/v2"
 
-# One realistic modern Chrome header block. `cloudscraper` will merge these
-# with its own generated Cookie / User-Agent for the challenge phase, and
-# reuse the resulting session on every subsequent call.
-_BROWSER_HEADERS = {
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8,"
-        "application/signed-exchange;v=b3;q=0.7"
+# nhentai's own frontend uses this exact User-Agent flavour + Accept header;
+# copying it keeps our profile identical to what their WAF already whitelists.
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     ),
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
+    # No 'br' — we don't ship the brotli package, so gzip/deflate is the
+    # safe, universal choice. nhentai serves fine over gzip.
+    "Accept-Encoding": "gzip, deflate",
+    "Referer": f"{BASE_URL}/",
 }
 
-_TIMEOUT = 25.0                # cloudscraper needs more headroom than httpx
-_MAX_RETRIES = 3
-_CHALLENGE_TTL_SEC = 25 * 60   # rebuild the session at least this often
-
-# ------------------------------------------------------------------
-# Shared scraper instance (thread-safe, lazily created and refreshed)
-# ------------------------------------------------------------------
-_scraper = None                # type: ignore[var-annotated]
-_scraper_created_at: float = 0.0
-_scraper_lock = threading.Lock()
+_TIMEOUT = 20.0
+_SEARCH_CACHE_TTL_SEC = 90
+_GALLERY_CACHE_TTL_SEC = 30 * 60
+_CACHE_MAX_ENTRIES = 128
 
 
-def _build_scraper():
-    """Create a fresh cloudscraper session that solves Cloudflare's challenge."""
-    if cloudscraper is None:
-        raise RuntimeError(
-            f"cloudscraper is not installed ({_CLOUDSCRAPER_IMPORT_ERROR}). "
-            f"Add `cloudscraper==1.2.71` to requirements.txt and redeploy."
-        )
-    s = cloudscraper.create_scraper(
-        # Emulate desktop Chrome on Windows — matches the header set above.
-        browser={"browser": "chrome", "platform": "windows", "mobile": False},
-        # Slightly longer challenge delay: safer on slow datacenter CPUs.
-        delay=6,
-    )
-    s.headers.update(_BROWSER_HEADERS)
-    return s
+# ---------------------------------------------------------------------------
+# Response cache + in-flight dedup
+# ---------------------------------------------------------------------------
+_cache: Dict[str, Tuple[float, Any]] = {}     # key -> (expires_at, value)
+_cache_lock = threading.Lock()
+_inflight: Dict[str, "asyncio.Future[Optional[Any]]"] = {}
+_inflight_lock = threading.Lock()
 
 
-def _get_scraper(force_refresh: bool = False):
-    """Return the shared scraper, rebuilding it when stale or when forced."""
-    global _scraper, _scraper_created_at
-    now = time.time()
-    with _scraper_lock:
-        stale = (now - _scraper_created_at) > _CHALLENGE_TTL_SEC
-        if _scraper is None or force_refresh or stale:
-            if _scraper is not None:
-                log.info(
-                    "rebuilding cloudscraper session (force=%s stale=%s)",
-                    force_refresh, stale,
-                )
-            _scraper = _build_scraper()
-            _scraper_created_at = now
-        return _scraper
+def _cache_get(key: str) -> Optional[Any]:
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry is None:
+            return None
+        expires_at, value = entry
+        if time.time() > expires_at:
+            _cache.pop(key, None)
+            return None
+        return value
 
 
-# ------------------------------------------------------------------
-# Data models (unchanged — callers keep working)
-# ------------------------------------------------------------------
+def _cache_put(key: str, value: Any, ttl_sec: int) -> None:
+    with _cache_lock:
+        if len(_cache) >= _CACHE_MAX_ENTRIES:
+            # LRU-ish trim: drop the oldest quarter by expiry.
+            for k in sorted(_cache, key=lambda k: _cache[k][0])[: _CACHE_MAX_ENTRIES // 4]:
+                _cache.pop(k, None)
+        _cache[key] = (time.time() + ttl_sec, value)
 
+
+# ---------------------------------------------------------------------------
+# Data models — public API surface (unchanged shape, drop-in compatible)
+# ---------------------------------------------------------------------------
 @dataclass
 class SearchHit:
     gallery_id: str
     title: str
     url: str
     thumb_url: Optional[str] = None
-    category: Optional[str] = None
+    category: Optional[str] = None    # kept in dataclass for compat; not set from search
 
 
 @dataclass
@@ -172,190 +163,300 @@ class GalleryMeta:
     gallery_id: Optional[str] = None
 
 
-# ------------------------------------------------------------------
-# Blocking HTTP fetch (runs inside the executor)
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# HTTP layer — one shared AsyncClient, plain httpx GETs to nhentai
+# ---------------------------------------------------------------------------
+_client_lock = threading.Lock()
+_client: Optional[httpx.AsyncClient] = None
 
-def _fetch_sync(url: str, params: Optional[dict] = None,
-                referer: Optional[str] = None) -> Optional[str]:
-    """Blocking GET via cloudscraper, with retry + session refresh on 403."""
-    headers = dict(_BROWSER_HEADERS)
-    if referer:
-        headers["Referer"] = referer
-        headers["Sec-Fetch-Site"] = "same-origin"
 
-    last_status: Optional[int] = None
-    for attempt in range(1, _MAX_RETRIES + 1):
+async def _get_client() -> httpx.AsyncClient:
+    """Return the shared AsyncClient, creating on first use."""
+    global _client
+    if _client is None:
+        with _client_lock:
+            if _client is None:
+                _client = httpx.AsyncClient(
+                    timeout=_TIMEOUT,
+                    follow_redirects=True,
+                    headers=_HEADERS,
+                    http2=False,   # nhentai serves fine over http/1.1
+                )
+    return _client
+
+
+async def _http_get_json(path: str, params: Optional[dict] = None) -> Optional[dict]:
+    """
+    GET a nhentai JSON endpoint and return its parsed body, or None on failure.
+    Never raises upward — callers get None and can surface a clean UX error.
+    """
+    url = f"{API_URL}{path}"
+    try:
+        client = await _get_client()
+        r = await client.get(url, params=params)
+        if r.status_code != 200:
+            log.warning("nhentai HTTP %s for %s params=%s", r.status_code, path, params)
+            return None
         try:
-            scraper = _get_scraper(force_refresh=(attempt > 1))
-            r = scraper.get(url, params=params, headers=headers,
-                            timeout=_TIMEOUT, allow_redirects=True)
-            last_status = r.status_code
-            if r.status_code == 200 and r.text:
-                return r.text
-            if r.status_code == 404:
-                # Real "not found" — do not retry, do not warn.
-                return None
-            log.warning(
-                "hf_scraper HTTP %s for %s (attempt %d/%d)",
-                r.status_code, url, attempt, _MAX_RETRIES,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning(
-                "hf_scraper request error (attempt %d/%d): %s",
-                attempt, _MAX_RETRIES, e,
-            )
+            return r.json()
+        except json.JSONDecodeError as e:
+            log.warning("nhentai returned non-JSON (%s) for %s: %s",
+                        e, path, r.text[:120])
+            return None
+    except Exception as e:  # noqa: BLE001
+        log.warning("nhentai request failed for %s: %s", path, e)
+        return None
 
-        # Backoff before the next attempt (jittered exponential).
-        if attempt < _MAX_RETRIES:
-            sleep_s = (2 ** (attempt - 1)) + random.uniform(0.5, 1.5)
-            time.sleep(sleep_s)
 
-    log.warning("hf_scraper giving up on %s after %d attempts (last=%s)",
-                url, _MAX_RETRIES, last_status)
+async def _fetch_json_cached(cache_key: str, path: str,
+                             params: Optional[dict], ttl_sec: int) -> Optional[dict]:
+    """
+    JSON fetch with:
+      - response cache (ttl_sec)
+      - in-flight dedup (two concurrent identical requests share one call)
+    """
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    loop = asyncio.get_running_loop()
+    with _inflight_lock:
+        existing = _inflight.get(cache_key)
+        if existing is not None:
+            future = existing
+            owner = False
+        else:
+            future = loop.create_future()
+            _inflight[cache_key] = future
+            owner = True
+
+    if not owner:
+        try:
+            return await future
+        except Exception:  # noqa: BLE001
+            return None
+
+    try:
+        data = await _http_get_json(path, params)
+        if data is not None:
+            _cache_put(cache_key, data, ttl_sec)
+        future.set_result(data)
+        return data
+    except Exception as e:  # noqa: BLE001
+        future.set_exception(e)
+        return None
+    finally:
+        with _inflight_lock:
+            _inflight.pop(cache_key, None)
+
+
+# ---------------------------------------------------------------------------
+# Field helpers
+# ---------------------------------------------------------------------------
+def _pick_search_title(item: dict) -> str:
+    """
+    Title strategy for SEARCH ROWS:  english_title  ->  japanese_title  ->  id.
+    Users tend to type queries in English, so english_title is the right first
+    choice; Japanese is a good fallback for JP-only titles; ID is a last-resort
+    marker so a row is never blank.
+    """
+    en = (item.get("english_title") or "").strip()
+    if en:
+        return en
+    jp = (item.get("japanese_title") or "").strip()
+    if jp:
+        return jp
+    return f"Gallery {item.get('id', '?')}"
+
+
+def _pretty_title_from_detail(detail: dict) -> str:
+    """
+    Title strategy for CONFIRMED ITEMS: prefer `pretty` (clean, no brackets),
+    then english, then japanese. This is what shows up in the progress tracker
+    and the final "posted" line.
+    """
+    t = detail.get("title") or {}
+    for k in ("pretty", "english", "japanese"):
+        v = (t.get(k) or "").strip()
+        if v:
+            return v
+    return f"Gallery {detail.get('id', '?')}"
+
+
+def _thumb_url(item_or_detail: dict) -> Optional[str]:
+    """Best-effort thumbnail URL for a search-result row."""
+    thumb = (item_or_detail.get("thumbnail") or "").strip()
+    if thumb:
+        # nhentai returns a bare path like "galleries/4085333/thumb.jpg.webp".
+        # Their CDN host is t3/t4.nhentai.net; the site's own frontend uses t3.
+        return f"https://t3.nhentai.net/{thumb}"
     return None
 
 
-async def _get(url: str, params: Optional[dict] = None,
-               referer: Optional[str] = None) -> Optional[str]:
-    """Async facade so the rest of the codebase can `await` us as before."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _fetch_sync, url, params, referer)
+def _cover_url_from_detail(detail: dict) -> Optional[str]:
+    cover = detail.get("cover") or {}
+    path = (cover.get("path") or "").strip()
+    if path:
+        return f"https://t3.nhentai.net/{path}"
+    # Some detail responses only have `thumbnail`.
+    return _thumb_url(detail)
 
 
-# ------------------------------------------------------------------
-# HTML parsing (unchanged from the original — only fetch layer changed)
-# ------------------------------------------------------------------
-
-def _parse_search_html(html: str, query: str, page: int) -> SearchPage:
-    soup = BeautifulSoup(html, "html.parser")
-    hits: List[SearchHit] = []
-
-    header = soup.select_one("h1.tag_info")
-    total = 0
-    if header:
-        m = re.search(r"([\d,]+)\s*results", header.get_text(" ", strip=True))
-        if m:
-            try:
-                total = int(m.group(1).replace(",", ""))
-            except ValueError:
-                total = 0
-
-    for thumb in soup.select("div.thumb"):
-        a = thumb.select_one("div.inner_thumb a[href*='/gallery/']") or thumb.select_one(
-            "a[href*='/gallery/']"
-        )
-        if not a:
+def _tag_names_from_detail(detail: dict) -> List[str]:
+    """Extract useful tag names. Keeps the fields /mpost traditionally used."""
+    out: List[str] = []
+    for t in detail.get("tags") or []:
+        if not isinstance(t, dict):
             continue
-        href = a.get("href") or ""
-        m = re.search(r"/gallery/(\d+)/?", href)
-        if not m:
+        ttype = (t.get("type") or "").strip().lower()
+        name = (t.get("name") or "").strip()
+        if not name:
             continue
-        gid = m.group(1)
-        title_el = thumb.select_one("h2.g_title a")
-        title = title_el.get_text(strip=True) if title_el else f"Gallery {gid}"
-        img = thumb.select_one("img")
-        thumb_url = None
-        if img is not None:
-            thumb_url = img.get("data-src") or img.get("src")
-            if thumb_url and thumb_url.startswith("data:"):
-                thumb_url = img.get("data-src")
-        cat_el = thumb.select_one("h3.g_cat a")
-        category = cat_el.get_text(strip=True) if cat_el else None
-        hits.append(
-            SearchHit(
-                gallery_id=gid,
-                title=title,
-                url=f"{BASE_URL}/gallery/{gid}/",
-                thumb_url=thumb_url,
-                category=category,
-            )
-        )
-
-    # "not_found" block appears on hentaifox 404 pages (e.g. page number too high)
-    not_found = soup.select_one("div.galleries_overview.not_found")
-    has_next = not not_found and len(hits) > 0
-
-    return SearchPage(query=query, page=page, total_results=total, hits=hits, has_next=has_next)
+        if ttype in ("tag", "artist", "parody", "character", "group"):
+            out.append(name)
+    return out
 
 
+# ---------------------------------------------------------------------------
+# Public API — search()
+# ---------------------------------------------------------------------------
 async def search(query: str, page: int = 1) -> Optional[SearchPage]:
-    """Scrape https://hentaifox.com/search/?q=<query>&page=<page>.
+    """
+    Scrape https://nhentai.net/api/v2/search?query=<query>&sort=date&page=<page>.
+
     Returns None on network/parse failure (caller should show
-    'search unavailable, try again' rather than crash)."""
-    query = (query or "").strip()
-    if not query:
+    "search unavailable" rather than crash). Returns an empty-hit page when
+    the query has no results, so the caller can distinguish "unavailable"
+    from "genuinely empty".
+    """
+    q = (query or "").strip()
+    if not q:
         return None
-    params = {"q": query}
-    if page and page > 1:
-        params["page"] = page
-    html = await _get(f"{BASE_URL}/search/", params=params, referer=f"{BASE_URL}/")
-    if html is None:
+
+    params: Dict[str, Any] = {"query": q, "sort": "date", "page": int(page or 1)}
+    cache_key = f"search:{q}:p{page}"
+
+    data = await _fetch_json_cached(cache_key, "/search", params, _SEARCH_CACHE_TTL_SEC)
+    if data is None:
         return None
+
     try:
-        return _parse_search_html(html, query, page)
+        results = data.get("result") or []
+        num_pages = int(data.get("num_pages") or 1)
+        per_page = int(data.get("per_page") or len(results) or 25)
+        total = int(data.get("total") or (num_pages * per_page))
+
+        hits: List[SearchHit] = []
+        for item in results:
+            gid = item.get("id")
+            if gid is None:
+                continue
+            gid_str = str(gid)
+            hits.append(
+                SearchHit(
+                    gallery_id=gid_str,
+                    title=_pick_search_title(item),
+                    url=f"{BASE_URL}/g/{gid_str}/",
+                    thumb_url=_thumb_url(item),
+                    category=None,
+                )
+            )
+
+        return SearchPage(
+            query=q,
+            page=int(page or 1),
+            total_results=total,
+            hits=hits,
+            has_next=(int(page or 1) < num_pages),
+        )
     except Exception as e:  # noqa: BLE001
-        log.warning("hf_scraper: failed to parse search page: %s", e)
+        log.warning("nhentai: failed to normalise search response: %s", e)
         return None
 
 
-def _parse_gallery_html(html: str, gallery_id: Optional[str] = None) -> Optional[GalleryMeta]:
-    soup = BeautifulSoup(html, "html.parser")
-    title_el = soup.select_one("div.info h1") or soup.select_one("h1")
-    if not title_el:
-        return None
-    title = title_el.get_text(strip=True)
-
-    tags: List[str] = []
-    for li in soup.select("ul.tags li a.tag_btn"):
-        t = li.get_text(strip=True)
-        t = re.sub(r"\s*\d+\s*$", "", t).strip()  # drop trailing badge count
-        if t:
-            tags.append(t)
-
-    cover_el = soup.select_one("div.cover img")
-    cover_url = cover_el.get("src") if cover_el else None
-
-    pages = None
-    pages_el = soup.select_one("span.i_text.pages")
-    if pages_el:
-        m = re.search(r"Pages:\s*(\d+)", pages_el.get_text(" ", strip=True))
-        if m:
-            pages = int(m.group(1))
-
-    gid_input = soup.select_one("input#gallery_id")
-    gid = gid_input.get("value") if gid_input else gallery_id
-
-    return GalleryMeta(title=title, tags=tags, cover_url=cover_url, pages=pages, gallery_id=gid)
+# ---------------------------------------------------------------------------
+# Public API — fetch_gallery_meta()
+# ---------------------------------------------------------------------------
+_GALLERY_ID_RE = re.compile(r"/g/(\d+)")
 
 
-async def fetch_gallery_meta(gallery_url_or_id: str) -> Optional[GalleryMeta]:
-    """Fetch + parse a gallery page directly by URL or numeric ID."""
-    s = (gallery_url_or_id or "").strip()
+def _extract_gallery_id(url_or_id: str) -> Optional[str]:
+    """
+    Accept:
+      - a bare numeric id             ("668505")
+      - a full nhentai gallery URL    ("https://nhentai.net/g/668505/")
+      - a legacy hentaifox URL        (best-effort ID extraction)
+    """
+    s = (url_or_id or "").strip()
     if not s:
         return None
     if s.isdigit():
-        url = f"{BASE_URL}/gallery/{s}/"
-        gid = s
-    else:
-        m = re.search(r"/gallery/(\d+)", s)
-        gid = m.group(1) if m else None
-        url = s if s.startswith("http") else f"{BASE_URL}/gallery/{s}/"
-    html = await _get(url, referer=f"{BASE_URL}/")
-    if html is None:
+        return s
+    m = _GALLERY_ID_RE.search(s)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"/gallery/(\d+)", s)  # legacy hentaifox form
+    if m2:
+        return m2.group(1)
+    return None
+
+
+async def fetch_gallery_meta(gallery_url_or_id: str) -> Optional[GalleryMeta]:
+    """
+    Fetch and normalise a nhentai gallery's metadata.
+
+    Uses the /api/v2/galleries/<id> endpoint. Returns the *pretty* title
+    (clean, no artist/language brackets) for use in progress messages and
+    the final "posted" line.
+    """
+    gid = _extract_gallery_id(gallery_url_or_id)
+    if not gid:
         return None
+
+    cache_key = f"gallery:{gid}"
+    data = await _fetch_json_cached(
+        cache_key,
+        f"/galleries/{gid}",
+        {"include": "related,suggestions,comments"},
+        _GALLERY_CACHE_TTL_SEC,
+    )
+    if data is None:
+        return None
+
     try:
-        return _parse_gallery_html(html, gallery_id=gid)
+        return GalleryMeta(
+            title=_pretty_title_from_detail(data),
+            tags=_tag_names_from_detail(data),
+            cover_url=_cover_url_from_detail(data),
+            pages=int(data["num_pages"]) if data.get("num_pages") is not None else None,
+            gallery_id=str(data.get("id") or gid),
+        )
     except Exception as e:  # noqa: BLE001
-        log.warning("hf_scraper: failed to parse gallery page: %s", e)
+        log.warning("nhentai: failed to normalise gallery %s: %s", gid, e)
         return None
 
 
-# ------------------------------------------------------------------
-# Health probe — used by startup_check.py or ad-hoc /diag commands.
-# ------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# Public API — health_check() + route_status()
+# ---------------------------------------------------------------------------
 async def health_check() -> bool:
-    """Return True iff hentaifox.com is currently reachable and readable."""
-    html = await _get(f"{BASE_URL}/", referer=None)
-    return bool(html and "hentaifox" in html.lower())
+    """
+    True iff we can currently hit nhentai's search endpoint and get a JSON
+    body back. Used by /diag and startup_check.py.
+    """
+    data = await _http_get_json("/search", {"query": "test", "sort": "date", "page": 1})
+    return bool(data and isinstance(data.get("result"), list))
+
+
+def route_status() -> Dict[str, Any]:
+    """Report the scraper's configuration, used by the /diag command."""
+    return {
+        "source": "nhentai.net",
+        "endpoint": API_URL,
+        "cache_entries": len(_cache),
+        "inflight": len(_inflight),
+        # Kept for compatibility with the earlier /diag layout that reported
+        # proxy/scrapeapi configuration. Both False → no bypass service needed.
+        "webshare": False,
+        "scraperapi": False,
+    }
