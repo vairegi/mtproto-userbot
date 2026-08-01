@@ -19,6 +19,9 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import re
+import asyncio
+import random
+from datetime import datetime, time as dt_time, timedelta, timezone
 import os
 import shutil
 import sys
@@ -43,6 +46,19 @@ from queue_service import enqueue_batch
 import hf_scraper
 import search_picker
 import progress_tracker
+# ---------------------------------------------------------------------------
+# Auto-queue scheduler (2026-08-01)
+#
+# Queues ONE random popular English gallery per day at a configured IST time,
+# automatically, as if an admin had dropped the URL. Toggle with /autoon and
+# /autooff; adjust the daily time with /autotime HH:MM (24-hour, IST).
+#
+# State lives in the `control_flags` MongoDB collection so it survives
+# bot restarts. Defaults: disabled, 09:00 IST.
+# ---------------------------------------------------------------------------
+_IST_TZ = timezone(timedelta(hours=5, minutes=30), name="IST")
+_AUTO_QUEUE_DEFAULT_TIME = "09:00"          # IST, HH:MM 24-hour
+_AUTO_QUEUE_TASK_KEY = "_auto_queue_task"
 
 log = setup_logging("admin_bot")
 
@@ -922,10 +938,274 @@ async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     report = "\n".join(lines)
     await msg.reply_text(f"```\n{report}\n```", parse_mode="Markdown")
+    # ---------------------------------------------------------------------------
+# Auto-queue scheduler — background loop + /autoon /autooff /autotime commands
+# ---------------------------------------------------------------------------
+
+def _auto_queue_get_enabled(conn) -> bool:
+    return db.get_flag(conn, "auto_queue_enabled", "0") == "1"
+
+
+def _auto_queue_get_time_str(conn) -> str:
+    v = db.get_flag(conn, "auto_queue_time", _AUTO_QUEUE_DEFAULT_TIME)
+    return v if re.match(r"^\d{1,2}:\d{2}$", v) else _AUTO_QUEUE_DEFAULT_TIME
+
+
+def _auto_queue_set_enabled(conn, enabled: bool) -> None:
+    db.set_flag(conn, "auto_queue_enabled", "1" if enabled else "0")
+
+
+def _auto_queue_set_time(conn, time_str: str) -> None:
+    db.set_flag(conn, "auto_queue_time", time_str)
+
+
+def _auto_queue_last_run_date(conn) -> str:
+    return db.get_flag(conn, "auto_queue_last_run_date", "")
+
+
+def _auto_queue_mark_ran_today(conn, today_str: str) -> None:
+    db.set_flag(conn, "auto_queue_last_run_date", today_str)
+
+
+async def _pick_random_english_gallery() -> Optional[str]:
+    """
+    Pick a random popular English gallery from nhentai's recent uploads.
+
+    Strategy:
+      1. Query nhentai's /api/v2/search with an empty keyword, sorted by
+         popularity, and ask for a random page in 1..5 (so we're not always
+         picking from the literal top-25).
+      2. Filter to English-only rows (same tag-ID filter as /search).
+      3. Pick one at random from the resulting rows.
+      4. Skip if the URL is already in our queue or already posted.
+
+    Returns the full nhentai.net/g/<id>/ URL on success, or None if every
+    candidate was already processed or nhentai was unreachable.
+    """
+    try:
+        page = random.randint(1, 5)
+        data = await hf_scraper.search("", page=page)
+        # If empty query returns None (it does on empty input), use a
+        # genuinely random popular keyword instead — keeps us out of the
+        # literal top-25 newest uploads.
+        if data is None:
+            keywords = ["sister", "school", "sister", "love", "office"]
+            data = await hf_scraper.search(random.choice(keywords), page=page)
+        if data is None or not data.hits:
+            return None
+    except Exception as e:  # noqa: BLE001
+        log.warning("auto-queue: search failed: %s", e)
+        return None
+
+    candidates = [h for h in data.hits]
+    if not candidates:
+        return None
+
+    random.shuffle(candidates)
+    conn = db.connect()
+    try:
+        for h in candidates:
+            if db.has_completed(conn, hf_scraper.hash_url(h.url) if hasattr(hf_scraper, "hash_url") else h.url):
+                continue
+            if db.has_pending_or_processing(conn, hf_scraper.hash_url(h.url) if hasattr(hf_scraper, "hash_url") else h.url):
+                continue
+            # Use queue_service's own hashing logic for dedupe — it
+            # already knows how to hash a URL the same way /fetch does.
+            # We avoid re-implementing hash logic here.
+            return h.url
+    finally:
+        conn.close()
+    return None
+
+
+async def _auto_queue_tick(app) -> None:
+    """One iteration of the daily scheduler. Returns True if work was done."""
+    now_ist = datetime.now(_IST_TZ)
+    today = now_ist.date().isoformat()
+
+    conn = db.connect()
+    try:
+        if not _auto_queue_get_enabled(conn):
+            return False
+        if _auto_queue_last_run_date(conn) == today:
+            return False  # already ran today
+        target_str = _auto_queue_get_time_str(conn)
+        target_h, target_m = map(int, target_str.split(":"))
+        target_time = dt_time(hour=target_h, minute=target_m, tzinfo=_IST_TZ)
+        if now_ist.time() < target_time:
+            return False  # not time yet
+
+        # Only run when the queue is genuinely empty so we don't pile up.
+        counts = db.counts_by_status(conn)
+        if counts.get("pending", 0) + counts.get("processing", 0) > 0:
+            log.info("auto-queue: queue has %d job(s) already, skipping",
+                     counts.get("pending", 0) + counts.get("processing", 0))
+            _auto_queue_mark_ran_today(conn, today)  # avoid hammering nhentai
+            return False
+    finally:
+        conn.close()
+
+    url = await _pick_random_english_gallery()
+    if not url:
+        log.info("auto-queue: no suitable gallery found today")
+        return False
+
+    # Enqueue as if the admin had /fetch'd it. submitted_by=admin_user_id
+    # so the /mpost routing rule treats it as an admin post (no Bot 3 cross-post).
+    result = enqueue_batch(
+        url,
+        max_links=1,
+        via_search=False,
+        submitted_by=settings.admin_user_id,
+        username="auto-queue",
+        chat_id=None,
+    )
+
+    conn = db.connect()
+    try:
+        _auto_queue_mark_ran_today(conn, today)
+    finally:
+        conn.close()
+
+    if result.queued:
+        log.info("auto-queue: queued %s (job_id=%s)", url, result.queued[0][0])
+        # Notify the admin so there's a visible audit trail.
+        try:
+            await app.bot.send_message(
+                chat_id=settings.admin_user_id,
+                text=(
+                    "🤖 Auto-queue picked today's random gallery:\n"
+                    f"  • {result.queued[0][1]}\n"
+                    f"  Job #{result.queued[0][0]}"
+                ),
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("auto-queue: failed to notify admin: %s", e)
+        return True
+
+    log.warning("auto-queue: enqueue_batch returned nothing for %s", url)
+    return False
+
+
+async def _auto_queue_loop(app) -> None:
+    """
+    Background loop. Wakes up every 60s, checks whether it's past today's
+    configured IST time, and if so fires _auto_queue_tick() once.
+    """
+    # Small initial delay so the bot can finish bootstrapping before we hit
+    # nhentai for the first time.
+    await asyncio.sleep(20)
+    log.info("auto-queue loop started")
+    while True:
+        try:
+            await _auto_queue_tick(app)
+        except Exception as e:  # noqa: BLE001
+            log.exception("auto-queue tick crashed (non-fatal): %s", e)
+        await asyncio.sleep(60)
+
+
+def _ensure_auto_queue_running(app) -> None:
+    """Idempotently start the auto-queue background loop on this app."""
+    existing = app.bot_data.get(_AUTO_QUEUE_TASK_KEY)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.get_event_loop().create_task(_auto_queue_loop(app))
+    app.bot_data[_AUTO_QUEUE_TASK_KEY] = task
+    log.info("auto-queue background task spawned")
+
+
+# --------------------------- /autoon /autooff /autotime ---------------------------
+
+@only_admin
+async def cmd_autoon(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enable daily auto-queue."""
+    conn = db.connect()
+    try:
+        _auto_queue_set_enabled(conn, True)
+        time_str = _auto_queue_get_time_str(conn)
+    finally:
+        conn.close()
+    await update.effective_message.reply_text(
+        f"✅ Auto-queue ENABLED.\n"
+        f"Daily random gallery will be queued at {time_str} IST.\n"
+        f"Use /autooff to stop, /autotime HH:MM to change the time."
+    )
+
+
+@only_admin
+async def cmd_autooff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disable daily auto-queue."""
+    conn = db.connect()
+    try:
+        _auto_queue_set_enabled(conn, False)
+    finally:
+        conn.close()
+    await update.effective_message.reply_text(
+        "⏹️ Auto-queue DISABLED.\n"
+        "Use /autoon to restart it."
+    )
+
+
+@only_admin
+async def cmd_autotime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the daily auto-queue time. Usage: /autotime HH:MM (24-hour, IST)."""
+    msg = update.effective_message
+    args = msg.text.split(maxsplit=1) if msg and msg.text else []
+    if len(args) < 2 or not re.match(r"^\d{1,2}:\d{2}$", args[1].strip()):
+        conn = db.connect()
+        try:
+            current = _auto_queue_get_time_str(conn)
+        finally:
+            conn.close()
+        await msg.reply_text(
+            f"Usage: /autotime HH:MM  (24-hour, IST)\n"
+            f"Current time: {current} IST"
+        )
+        return
+    time_str = args[1].strip()
+    try:
+        h, m = map(int, time_str.split(":"))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except ValueError:
+        await msg.reply_text("Time must be HH:MM in 24-hour format, e.g. 09:00 or 21:30.")
+        return
+    conn = db.connect()
+    try:
+        _auto_queue_set_time(conn, time_str)
+        enabled = _auto_queue_get_enabled(conn)
+    finally:
+        conn.close()
+    status = "ENABLED" if enabled else "DISABLED"
+    await msg.reply_text(
+        f"✅ Auto-queue daily time set to {time_str} IST.\n"
+        f"Auto-queue is currently {status}."
+    )
+
+
+@only_admin
+async def cmd_autostatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the current auto-queue configuration."""
+    conn = db.connect()
+    try:
+        enabled = _auto_queue_get_enabled(conn)
+        time_str = _auto_queue_get_time_str(conn)
+        last_run = _auto_queue_last_run_date(conn) or "(never)"
+    finally:
+        conn.close()
+    now_ist = datetime.now(_IST_TZ).strftime("%Y-%m-%d %H:%M IST")
+    await update.effective_message.reply_text(
+        "🤖 Auto-queue status\n"
+        f"  Enabled       : {'✅ yes' if enabled else '⏹️ no'}\n"
+        f"  Daily time    : {time_str} IST\n"
+        f"  Last ran      : {last_run}\n"
+        f"  Now (IST)     : {now_ist}"
+    )
 
 def build_app() -> Application:
     # Ensure DB exists (admin bot may boot before worker on first ever run)
     db.init_db()
+    _ensure_auto_queue_running(app)
 
     app = ApplicationBuilder().token(settings.admin_bot_token).post_init(_on_startup).build()
     # Regular-admin commands
@@ -960,6 +1240,11 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_auto_url))
     # Absorb everything else silently
     app.add_handler(MessageHandler(filters.ALL, swallow))
+    app.add_handler(CommandHandler("autoon", cmd_autoon))
+    app.add_handler(CommandHandler("autooff", cmd_autooff))
+    app.add_handler(CommandHandler("autotime", cmd_autotime))
+    app.add_handler(CommandHandler("autostatus", cmd_autostatus))
+
     return app
 
 
