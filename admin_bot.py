@@ -828,6 +828,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("  /last              full error text of the most recent failed job")
         lines.append("  /health            session, disk, queue depth, last bot pings")
         lines.append("  /alltoken          everyone's daily token usage (sorted)")
+        lines.append("  /autoon          enable daily random-gallery auto-queue")
+        lines.append("  /autooff         disable auto-queue")
+        lines.append("  /autotime HH:MM  set daily queue time (IST, 24-hour)")
+        lines.append("  /autostatus      show auto-queue configuration")
     if is_super:
         lines.append("")
         lines.append("Super-admin only:")
