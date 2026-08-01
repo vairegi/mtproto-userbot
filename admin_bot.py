@@ -1245,11 +1245,14 @@ def build_app() -> Application:
     # Must be registered BEFORE the catch-all swallow.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_auto_url))
     # Absorb everything else silently
-    app.add_handler(MessageHandler(filters.ALL, swallow))
+    # Auto-queue commands
     app.add_handler(CommandHandler("autoon", cmd_autoon))
     app.add_handler(CommandHandler("autooff", cmd_autooff))
     app.add_handler(CommandHandler("autotime", cmd_autotime))
     app.add_handler(CommandHandler("autostatus", cmd_autostatus))
+
+    # Absorb everything else silently (Yeh ALWAYS bilkul LAST mein hona chahiye)
+    app.add_handler(MessageHandler(filters.ALL, swallow))
 
     return app
 
