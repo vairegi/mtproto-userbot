@@ -1022,7 +1022,7 @@ async def _pick_random_english_gallery() -> Optional[str]:
     return None
 
 
-async def _auto_queue_tick(app) -> None:
+aasync def _auto_queue_tick(app) -> None:
     """One iteration of the daily scheduler. Returns True if work was done."""
     now_ist = datetime.now(_IST_TZ)
     today = now_ist.date().isoformat()
@@ -1036,7 +1036,8 @@ async def _auto_queue_tick(app) -> None:
         target_str = _auto_queue_get_time_str(conn)
         target_h, target_m = map(int, target_str.split(":"))
         target_time = dt_time(hour=target_h, minute=target_m, tzinfo=_IST_TZ)
-        if now_ist.time() < target_time:
+        if now_ist.time().replace(tzinfo=None) < target_time.replace(tzinfo=None):
+
             return False  # not time yet
 
         # Only run when the queue is genuinely empty so we don't pile up.
