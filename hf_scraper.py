@@ -442,11 +442,24 @@ async def search(query: str, page: int = 1) -> Optional[SearchPage]:
         per_page = int(data.get("per_page") or len(results) or 25)
         total = int(data.get("total") or (num_pages * per_page))
 
+        # English-only filter: nhentai's language tag IDs are stable —
+        #   12227 = english  (tag name verified from /api/v2/galleries/<id>)
+        # A gallery is "English" iff 12227 is in its tag_ids list.
+        # Users asked to see ONLY English content in the picker, so any row
+        # without that tag ID is dropped here, before building SearchHit.
+        _ENGLISH_TAG_ID = 12227
+
         hits: List[SearchHit] = []
         for item in results:
             gid = item.get("id")
             if gid is None:
                 continue
+
+            # English-only filter
+            tag_ids = item.get("tag_ids") or []
+            if _ENGLISH_TAG_ID not in tag_ids:
+                continue
+
             gid_str = str(gid)
             hits.append(
                 SearchHit(
@@ -457,6 +470,7 @@ async def search(query: str, page: int = 1) -> Optional[SearchPage]:
                     category=None,
                 )
             )
+
 
         return SearchPage(
             query=q,
