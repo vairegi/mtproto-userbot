@@ -212,7 +212,8 @@ def load_settings() -> Settings:
         bot2_pdf_timeout_sec=_int("BOT2_PDF_TIMEOUT_SEC", 60),
         bot2_retry_count=_int("BOT2_RETRY_COUNT", 1),
         batch_max_links=_int("BATCH_MAX_LINKS", 25),
-        auto_fetch_domains=_domains("AUTO_FETCH_DOMAINS", "hentaifox.com"),
+        auto_fetch_domains=_domains("AUTO_FETCH_DOMAINS", "hentaifox.com,nhentai.net"),
+
     )
 
 
