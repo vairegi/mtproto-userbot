@@ -60,6 +60,12 @@ _IST_TZ = timezone(timedelta(hours=5, minutes=30), name="IST")
 _AUTO_QUEUE_DEFAULT_TIME = "09:00"          # IST, HH:MM 24-hour
 _AUTO_QUEUE_TASK_KEY = "_auto_queue_task"
 
+# How long to wait after a successful auto-post before we consider posting
+# another one. Prevents flooding your channel if the queue drains quickly.
+# Override at runtime with /autocooldown N.
+_AUTO_QUEUE_DEFAULT_COOLDOWN_MIN = 1
+
+
 log = setup_logging("admin_bot")
 
 
@@ -970,6 +976,23 @@ def _auto_queue_last_run_date(conn) -> str:
 def _auto_queue_mark_ran_today(conn, today_str: str) -> None:
     db.set_flag(conn, "auto_queue_last_run_date", today_str)
 
+def _auto_queue_get_cooldown_min(conn) -> int:
+    """Minutes to wait after a successful auto-post before firing again."""
+    v = db.get_flag(conn, "auto_queue_cooldown_min", str(_AUTO_QUEUE_DEFAULT_COOLDOWN_MIN))
+    try:
+        return max(1, int(v))
+    except (TypeError, ValueError):
+        return _AUTO_QUEUE_DEFAULT_COOLDOWN_MIN
+
+
+def _auto_queue_set_cooldown_min(conn, minutes: int) -> None:
+    db.set_flag(conn, "auto_queue_cooldown_min", str(max(1, int(minutes))))
+
+
+def _auto_queue_last_run_iso(conn) -> str:
+    """Full ISO timestamp of the last successful auto-post (used by cooldown)."""
+    return db.get_flag(conn, "auto_queue_last_run_iso", "")
+
 
 async def _pick_random_english_gallery() -> Optional[str]:
     """
@@ -1023,40 +1046,64 @@ async def _pick_random_english_gallery() -> Optional[str]:
 
 
 async def _auto_queue_tick(app) -> None:
-    """One iteration of the daily scheduler. Returns True if work was done."""
+    """
+    One iteration of the auto-queue scheduler.
+
+    New rule (2026-08-01): fire whenever ALL of the following are true —
+      * auto-queue is enabled
+      * current IST time-of-day is >= configured start time
+      * the queue is EMPTY (0 pending + 0 processing)
+      * at least `cooldown` minutes have passed since the last auto-post
+    Returns True iff we successfully queued a new gallery.
+
+    The old "once per calendar day" cap is gone; we use a rolling cooldown
+    instead so a busy day can produce multiple posts (as long as the queue
+    keeps draining) and a quiet day still gets its first post.
+    """
     now_ist = datetime.now(_IST_TZ)
-    today = now_ist.date().isoformat()
 
     conn = db.connect()
     try:
         if not _auto_queue_get_enabled(conn):
             return False
-        if _auto_queue_last_run_date(conn) == today:
-            return False  # already ran today
+
+        # Rolling cooldown — replaces the daily-cap check.
+        cooldown_min = _auto_queue_get_cooldown_min(conn)
+        last_run_iso = db.get_flag(conn, "auto_queue_last_run_iso", "")
+        if last_run_iso:
+            try:
+                last_run_dt = datetime.fromisoformat(last_run_iso)
+                if last_run_dt.tzinfo is None:
+                    last_run_dt = last_run_dt.replace(tzinfo=_IST_TZ)
+                minutes_since = (now_ist - last_run_dt).total_seconds() / 60.0
+                if minutes_since < cooldown_min:
+                    return False  # still cooling down
+            except ValueError:
+                pass  # stored string was garbage; treat as "never ran"
+
+        # Time-of-day gate: is it past the configured start time in IST?
         target_str = _auto_queue_get_time_str(conn)
         target_h, target_m = map(int, target_str.split(":"))
-        target_time = dt_time(hour=target_h, minute=target_m, tzinfo=_IST_TZ)
-        if now_ist.time().replace(tzinfo=None) < target_time.replace(tzinfo=None):
+        current_minutes = now_ist.hour * 60 + now_ist.minute
+        target_minutes = target_h * 60 + target_m
+        if current_minutes < target_minutes:
+            return False  # not yet in today's active window
 
-            return False  # not time yet
-
-        # Only run when the queue is genuinely empty so we don't pile up.
+        # Idle gate: only fire when the queue is genuinely empty. If it's not,
+        # we quietly back off — do NOT stamp last_run, so we retry next minute.
         counts = db.counts_by_status(conn)
-        if counts.get("pending", 0) + counts.get("processing", 0) > 0:
-            log.info("auto-queue: queue has %d job(s) already, skipping",
-                     counts.get("pending", 0) + counts.get("processing", 0))
-            _auto_queue_mark_ran_today(conn, today)  # avoid hammering nhentai
+        active = int(counts.get("pending", 0)) + int(counts.get("processing", 0))
+        if active > 0:
             return False
     finally:
         conn.close()
 
+    # ---- All gates passed — attempt to pick and queue a gallery ----
     url = await _pick_random_english_gallery()
     if not url:
-        log.info("auto-queue: no suitable gallery found today")
+        log.info("auto-queue: no suitable English gallery found (all in dedup?)")
         return False
 
-    # Enqueue as if the admin had /fetch'd it. submitted_by=admin_user_id
-    # so the /mpost routing rule treats it as an admin post (no Bot 3 cross-post).
     result = enqueue_batch(
         url,
         max_links=1,
@@ -1066,30 +1113,36 @@ async def _auto_queue_tick(app) -> None:
         chat_id=None,
     )
 
+    if not result.queued:
+        log.warning("auto-queue: enqueue_batch returned nothing for %s", url)
+        return False
+
+    # Only stamp last_run when we ACTUALLY queued something. This is the
+    # critical fix: previously the guard-path stamped even when we skipped,
+    # burning the daily quota. Now the cooldown starts only after real work.
     conn = db.connect()
     try:
-        _auto_queue_mark_ran_today(conn, today)
+        db.set_flag(conn, "auto_queue_last_run_iso", now_ist.isoformat())
+        # Legacy field kept in sync so /autostatus still shows a Last ran date.
+        _auto_queue_mark_ran_today(conn, now_ist.date().isoformat())
     finally:
         conn.close()
 
-    if result.queued:
-        log.info("auto-queue: queued %s (job_id=%s)", url, result.queued[0][0])
-        # Notify the admin so there's a visible audit trail.
-        try:
-            await app.bot.send_message(
-                chat_id=settings.admin_user_id,
-                text=(
-                    "🤖 Auto-queue picked today's random gallery:\n"
-                    f"  • {result.queued[0][1]}\n"
-                    f"  Job #{result.queued[0][0]}"
-                ),
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("auto-queue: failed to notify admin: %s", e)
-        return True
+    log.info("auto-queue: queued %s (job_id=%s)", url, result.queued[0][0])
+    try:
+        await app.bot.send_message(
+            chat_id=settings.admin_user_id,
+            text=(
+                "🤖 Auto-queue picked another gallery:\n"
+                f"  • {result.queued[0][1]}\n"
+                f"  Job #{result.queued[0][0]}\n"
+                f"  Next possible auto-post: in ~{_auto_queue_get_cooldown_min(conn) if False else cooldown_min} min"
+            ),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("auto-queue: failed to notify admin: %s", e)
+    return True
 
-    log.warning("auto-queue: enqueue_batch returned nothing for %s", url)
-    return False
 
 
 async def _auto_queue_loop(app) -> None:
