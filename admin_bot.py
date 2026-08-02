@@ -63,7 +63,10 @@ _AUTO_QUEUE_TASK_KEY = "_auto_queue_task"
 # How long to wait after a successful auto-post before we consider posting
 # another one. Prevents flooding your channel if the queue drains quickly.
 # Override at runtime with /autocooldown N.
+# Override at runtime with /autocooldown N. Set to 0 to disable cooldown
+# entirely (idle-based gating alone controls the pace).
 _AUTO_QUEUE_DEFAULT_COOLDOWN_MIN = 1
+
 
 
 log = setup_logging("admin_bot")
@@ -1051,59 +1054,99 @@ async def _auto_queue_tick(app) -> None:
     """
     One iteration of the auto-queue scheduler.
 
-    New rule (2026-08-01): fire whenever ALL of the following are true —
-      * auto-queue is enabled
-      * current IST time-of-day is >= configured start time
-      * the queue is EMPTY (0 pending + 0 processing)
-      * at least `cooldown` minutes have passed since the last auto-post
-    Returns True iff we successfully queued a new gallery.
+    New rule set (2026-08-02, matches user spec exactly):
+      * enabled?                    -> no  ⇒ skip
+      * past the daily start time?  -> no  ⇒ skip
+      * cooldown expired?           -> no  ⇒ skip
+      * queue currently active?     -> yes ⇒ skip (user is using the bot)
+      * queue idle for >= 15s?      -> no  ⇒ skip
+      * ALL YES                     -> queue one random English gallery
 
-    The old "once per calendar day" cap is gone; we use a rolling cooldown
-    instead so a busy day can produce multiple posts (as long as the queue
-    keeps draining) and a quiet day still gets its first post.
+    The old daily curfew ("fires only at HH:MM once") is gone. Once auto-queue
+    is enabled AND we're past the configured start-of-day time, the scheduler
+    keeps posting one gallery every time the queue drains and stays idle for
+    15 s, up to the cooldown limit. Only /autooff stops it.
+
+    Returns True iff we actually queued a new gallery.
     """
     now_ist = datetime.now(_IST_TZ)
 
     conn = db.connect()
     try:
+        # ---- Gate 1: enabled ----
         if not _auto_queue_get_enabled(conn):
             return False
 
-        # Rolling cooldown — replaces the daily-cap check.
-        cooldown_min = _auto_queue_get_cooldown_min(conn)
-        last_run_iso = db.get_flag(conn, "auto_queue_last_run_iso", "")
-        if last_run_iso:
-            try:
-                last_run_dt = datetime.fromisoformat(last_run_iso)
-                if last_run_dt.tzinfo is None:
-                    last_run_dt = last_run_dt.replace(tzinfo=_IST_TZ)
-                minutes_since = (now_ist - last_run_dt).total_seconds() / 60.0
-                if minutes_since < cooldown_min:
-                    return False  # still cooling down
-            except ValueError:
-                pass  # stored string was garbage; treat as "never ran"
-
-        # Time-of-day gate: is it past the configured start time in IST?
+        # ---- Gate 2: past the daily "start" time-of-day ----
+        # This is a floor, not a curfew: fire on/after HH:MM IST any day.
         target_str = _auto_queue_get_time_str(conn)
-        target_h, target_m = map(int, target_str.split(":"))
-        current_minutes = now_ist.hour * 60 + now_ist.minute
-        target_minutes = target_h * 60 + target_m
-        if current_minutes < target_minutes:
-            return False  # not yet in today's active window
+        try:
+            target_h, target_m = map(int, target_str.split(":"))
+        except (ValueError, TypeError):
+            target_h, target_m = 9, 0
+        if (now_ist.hour, now_ist.minute) < (target_h, target_m):
+            # Still before today's start time. Skip for now, will re-check
+            # in the next tick (5s later).
+            return False
 
-        # Idle gate: only fire when the queue is genuinely empty. If it's not,
-        # we quietly back off — do NOT stamp last_run, so we retry next minute.
+        # ---- Gate 3: cooldown between successive auto-posts ----
+        cooldown_min = _auto_queue_get_cooldown_min(conn)
+        if cooldown_min > 0:
+            last_run_iso = db.get_flag(conn, "auto_queue_last_run_iso", "")
+            if last_run_iso:
+                try:
+                    last_run_dt = datetime.fromisoformat(last_run_iso)
+                    if last_run_dt.tzinfo is None:
+                        last_run_dt = last_run_dt.replace(tzinfo=_IST_TZ)
+                    minutes_since = (now_ist - last_run_dt).total_seconds() / 60.0
+                    if minutes_since < cooldown_min:
+                        return False
+                except ValueError:
+                    pass  # garbage in DB; treat as "never ran"
+
+        # ---- Gate 4: is the queue currently active? ----
+        # If ANY job is pending or processing, someone (user OR previous
+        # auto-post) is being served. Back off; retry next tick.
         counts = db.counts_by_status(conn)
         active = int(counts.get("pending", 0)) + int(counts.get("processing", 0))
         if active > 0:
+            # Something is running — stamp "user activity" so the 15s idle
+            # timer only starts once this job is done.
+            db.set_flag(conn, "auto_queue_last_activity_iso", now_ist.isoformat())
             return False
+
+        # ---- Gate 5: has the queue been idle for at least 15 seconds? ----
+        # "Idle" means: no pending/processing job, AND at least 15s have
+        # passed since the last time something WAS active. This gives real
+        # users a grace window to submit their next selection without the
+        # auto-queue jumping in mid-conversation.
+        last_activity_iso = db.get_flag(conn, "auto_queue_last_activity_iso", "")
+        if last_activity_iso:
+            try:
+                last_act_dt = datetime.fromisoformat(last_activity_iso)
+                if last_act_dt.tzinfo is None:
+                    last_act_dt = last_act_dt.replace(tzinfo=_IST_TZ)
+                seconds_idle = (now_ist - last_act_dt).total_seconds()
+                if seconds_idle < 15:
+                    return False
+            except ValueError:
+                # Corrupt timestamp — pretend queue just went idle now, so
+                # we wait a full 15s before posting.
+                db.set_flag(conn, "auto_queue_last_activity_iso", now_ist.isoformat())
+                return False
+        else:
+            # First-ever run of this loop; stamp a starting point and
+            # give ourselves 15s of grace before firing.
+            db.set_flag(conn, "auto_queue_last_activity_iso", now_ist.isoformat())
+            return False
+
     finally:
         conn.close()
 
-    # ---- All gates passed — attempt to pick and queue a gallery ----
+    # ---- All gates passed — pick and queue a gallery ----
     url = await _pick_random_english_gallery()
     if not url:
-        log.info("auto-queue: no suitable English gallery found (all in dedup?)")
+        log.info("auto-queue: no suitable English gallery found this tick")
         return False
 
     result = enqueue_batch(
@@ -1111,7 +1154,7 @@ async def _auto_queue_tick(app) -> None:
         max_links=1,
         via_search=False,
         submitted_by=settings.admin_user_id,
-        username="auto-queue",
+        username="auto-queue",     # marker so this doesn't count as user activity
         chat_id=None,
     )
 
@@ -1119,13 +1162,14 @@ async def _auto_queue_tick(app) -> None:
         log.warning("auto-queue: enqueue_batch returned nothing for %s", url)
         return False
 
-    # Only stamp last_run when we ACTUALLY queued something. This is the
-    # critical fix: previously the guard-path stamped even when we skipped,
-    # burning the daily quota. Now the cooldown starts only after real work.
+    # Stamp last_run (cooldown clock) AND last_activity (idle clock) atomically.
+    # Idle clock stamping means the queue starts "not idle" and will need to
+    # drain + stay quiet 15s again before the next auto-post — exactly what
+    # the user asked for.
     conn = db.connect()
     try:
         db.set_flag(conn, "auto_queue_last_run_iso", now_ist.isoformat())
-        # Legacy field kept in sync so /autostatus still shows a Last ran date.
+        db.set_flag(conn, "auto_queue_last_activity_iso", now_ist.isoformat())
         _auto_queue_mark_ran_today(conn, now_ist.date().isoformat())
     finally:
         conn.close()
@@ -1137,8 +1181,7 @@ async def _auto_queue_tick(app) -> None:
             text=(
                 "🤖 Auto-queue picked another gallery:\n"
                 f"  • {result.queued[0][1]}\n"
-                f"  Job #{result.queued[0][0]}\n"
-                f"  Next possible auto-post: in ~{_auto_queue_get_cooldown_min(conn) if False else cooldown_min} min"
+                f"  Job #{result.queued[0][0]}"
             ),
         )
     except Exception as e:  # noqa: BLE001
@@ -1149,19 +1192,24 @@ async def _auto_queue_tick(app) -> None:
 
 async def _auto_queue_loop(app) -> None:
     """
-    Background loop. Wakes up every 60s, checks whether it's past today's
-    configured IST time, and if so fires _auto_queue_tick() once.
+    Background loop. Wakes up on a short interval, defers to user activity,
+    and posts a random gallery whenever the queue has been idle long enough.
+
+    Cadence:
+      * check every 5 s (fast poll — matches the 15 s idle window)
+      * if a manual user just used the bot, back off silently
+      * initial 20 s delay so the bot finishes bootstrapping before we
+        hit nhentai on cold start
     """
-    # Small initial delay so the bot can finish bootstrapping before we hit
-    # nhentai for the first time.
     await asyncio.sleep(20)
-    log.info("auto-queue loop started")
+    log.info("auto-queue loop started (idle-based, 5s poll)")
     while True:
         try:
             await _auto_queue_tick(app)
         except Exception as e:  # noqa: BLE001
             log.exception("auto-queue tick crashed (non-fatal): %s", e)
-        await asyncio.sleep(60)
+        await asyncio.sleep(5)
+
 
 
 def _ensure_auto_queue_running(app) -> None:
