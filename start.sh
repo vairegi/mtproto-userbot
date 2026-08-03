@@ -97,10 +97,23 @@ PIDS=""
 # Forward shutdown signals to every child so the container stops cleanly.
 shutdown() {
   log "shutdown signal received — stopping child processes"
+  # Graceful phase — 12 seconds. Telegram closes an idle long-poll in <10s,
+  # so this window lets admin_bot's polling connection actually release its
+  # slot with the Telegram API before we hard-kill. Without this, the next
+  # container instance racing to boot gets Conflict for ~30s.
   for pid in ${PIDS}; do
     kill -TERM "${pid}" 2>/dev/null || true
   done
-  sleep 2
+  # Wait up to 12s for children to exit voluntarily.
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    alive=0
+    for pid in ${PIDS}; do
+      kill -0 "${pid}" 2>/dev/null && alive=$((alive+1))
+    done
+    [ "${alive}" -eq 0 ] && break
+    sleep 1
+  done
+  # Anything still alive → SIGKILL.
   for pid in ${PIDS}; do
     kill -KILL "${pid}" 2>/dev/null || true
   done
@@ -137,8 +150,16 @@ supervise() {
       if [ ${code} -eq 0 ]; then
         total_clean_exits=$(( total_clean_exits + 1 ))
         consecutive_crashes=0
-        log "[${label}] clean exit (code=0) after ${uptime}s — cycle #${total_clean_exits} complete; restarting in ${CLEAN_EXIT_DELAY}s"
-        sleep ${CLEAN_EXIT_DELAY}
+        # admin_bot must wait extra before restart so Telegram's polling
+        # slot from the PREVIOUS process definitely releases. relay.py and
+        # worker.py don't touch getUpdates so they can restart fast.
+        if [ "${label}" = "admin_bot" ]; then
+          delay=8
+        else
+          delay=${CLEAN_EXIT_DELAY}
+        fi
+        log "[${label}] clean exit (code=0) after ${uptime}s — cycle #${total_clean_exits} complete; restarting in ${delay}s"
+        sleep ${delay}
         continue
       fi
 
@@ -161,6 +182,12 @@ supervise() {
         delay=${FAST_CRASH_DELAY}
       else
         delay=${NORMAL_CRASH_DELAY}
+      fi
+      # admin_bot crash → likely Conflict → force extra 15s so Telegram's
+      # server-side polling slot from the crashed instance definitely
+      # expires (empirically ~10-30s) before we reconnect.
+      if [ "${label}" = "admin_bot" ] && [ "${code}" != "0" ]; then
+        delay=$(( delay + 15 ))
       fi
       log "[${label}] crashed code=${code} after ${uptime}s — restarting in ${delay}s (consecutive rapid crashes: ${consecutive_crashes}/${MAX_CONSECUTIVE_CRASHES})"
       sleep ${delay}
