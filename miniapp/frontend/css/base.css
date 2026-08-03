@@ -1,0 +1,85 @@
+/*
+  ============================================================================
+  base.css — Reset + typography + layout primitives
+  ============================================================================
+  No component styles here. Only the foundational rules that ALL components
+  inherit from. Keep this small — every rule here affects every element.
+  ============================================================================
+*/
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; overscroll-behavior-y: none; }
+
+html {
+  background: var(--du-bg-0);
+  color: var(--du-ink-hi);
+  font-family: var(--du-font-body);
+  font-size: var(--du-fs-md);
+  line-height: var(--du-lh-normal);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-size-adjust: 100%;
+}
+
+body {
+  min-height: 100vh;
+  min-height: 100dvh;
+  background:
+    radial-gradient(1200px 600px at 20% -10%, rgba(122,92,255,0.15), transparent 60%),
+    radial-gradient(900px 500px at 100% 110%, rgba(79,209,197,0.10), transparent 60%),
+    var(--du-bg-0);
+}
+
+button, input, textarea, select {
+  font: inherit; color: inherit;
+  background: transparent; border: 0; outline: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button { cursor: pointer; }
+img { display: block; max-width: 100%; height: auto; }
+a { color: var(--du-accent); text-decoration: none; }
+
+/* App shell layout */
+#app {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+.app-header {
+  position: sticky; top: 0; z-index: var(--du-z-header);
+  height: calc(var(--du-header-h) + var(--du-safe-top));
+  padding-top: var(--du-safe-top);
+  background: var(--tg-header-bg);
+  border-bottom: 1px solid var(--du-border);
+  display: flex; align-items: center;
+  padding-inline: var(--du-space-4);
+  gap: var(--du-space-3);
+}
+
+.app-main {
+  padding: var(--du-space-4);
+  padding-bottom: calc(var(--du-tabbar-h) + var(--du-safe-bot) + var(--du-space-4));
+}
+
+.app-tabbar {
+  position: fixed; left: 0; right: 0; bottom: 0;
+  z-index: var(--du-z-tabbar);
+  height: calc(var(--du-tabbar-h) + var(--du-safe-bot));
+  padding-bottom: var(--du-safe-bot);
+  background: var(--tg-header-bg);
+  border-top: 1px solid var(--du-border);
+  display: flex; align-items: stretch;
+}
+
+/* Utilities — sparingly. Prefer semantic component classes. */
+.u-hide      { display: none !important; }
+.u-flex      { display: flex; }
+.u-center    { display: flex; align-items: center; justify-content: center; }
+.u-gap-2     { gap: var(--du-space-2); }
+.u-gap-3     { gap: var(--du-space-3); }
+.u-gap-4     { gap: var(--du-space-4); }
+.u-grow      { flex: 1 1 auto; min-width: 0; }
+.u-truncate  { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

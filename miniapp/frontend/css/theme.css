@@ -1,0 +1,142 @@
+/*
+  ============================================================================
+  theme.css — Design Tokens
+  ============================================================================
+
+  Every visual choice in the app lives here. Change a variable, restyle the
+  whole thing. NO component file should hardcode a color or size — always
+  reference these variables.
+
+  Two theme layers:
+    1. --tg-*  values come from Telegram (WebApp.themeParams). Set by JS at
+       boot in core/telegram.js. They auto-follow the user's Telegram theme.
+    2. --du-* are OUR app's tokens. They default to a purple/cyan cosmic
+       palette (matches the "Gateway" reference screenshot) but override
+       gracefully from Telegram tokens when available.
+
+  To restyle: edit ONLY the :root block below.
+  To add a new token: add it here, use it everywhere via var().
+  ============================================================================
+*/
+
+:root {
+  /* ---- Telegram theme fallbacks (JS overrides these at boot) ---- */
+  --tg-bg:               #0f0b1a;
+  --tg-text:             #ffffff;
+  --tg-hint:             #8a8a9e;
+  --tg-link:             #7a5cff;
+  --tg-button:           #7a5cff;
+  --tg-button-text:      #ffffff;
+  --tg-secondary-bg:     #17122a;
+  --tg-header-bg:        #1a1030;
+  --tg-accent-text:      #7a5cff;
+  --tg-section-bg:       #17122a;
+  --tg-section-header:   #a89bff;
+  --tg-subtitle:         #8a8a9e;
+  --tg-destructive:      #ff4d6d;
+
+  /* ---- App-level tokens (Doujinshi Universe brand) ---- */
+
+  /* Surfaces — layered from lowest (page bg) to highest (modals) */
+  --du-bg-0:             var(--tg-bg);          /* page background */
+  --du-bg-1:             var(--tg-secondary-bg); /* cards, sections */
+  --du-bg-2:             #1f1740;               /* elevated cards */
+  --du-bg-3:             #2a1f55;               /* modals, sheets */
+
+  /* Ink — text hierarchy */
+  --du-ink-hi:           var(--tg-text);         /* primary text */
+  --du-ink-mid:          #cbc4e6;                /* secondary text */
+  --du-ink-lo:           var(--tg-hint);         /* tertiary/hint */
+  --du-ink-inv:          #0f0b1a;                /* text on accent bg */
+
+  /* Accents */
+  --du-accent:           #7a5cff;                /* primary purple */
+  --du-accent-2:         #4fd1c5;                /* cyan for "secure/online" */
+  --du-accent-3:         #ff4dcf;                /* magenta highlight */
+  --du-danger:           var(--tg-destructive);
+  --du-warn:             #ffb84d;
+  --du-success:          #4fd1c5;
+
+  /* Borders + dividers */
+  --du-border:           rgba(255, 255, 255, 0.08);
+  --du-border-strong:    rgba(255, 255, 255, 0.16);
+  --du-divider:          rgba(255, 255, 255, 0.05);
+
+  /* Radii — one place to change corner roundness across the app */
+  --du-radius-sm:        8px;
+  --du-radius-md:        12px;
+  --du-radius-lg:        18px;
+  --du-radius-xl:        24px;
+  --du-radius-pill:      999px;
+
+  /* Spacing scale — 4px base grid */
+  --du-space-1:          4px;
+  --du-space-2:          8px;
+  --du-space-3:          12px;
+  --du-space-4:          16px;
+  --du-space-5:          20px;
+  --du-space-6:          24px;
+  --du-space-7:          32px;
+  --du-space-8:          40px;
+
+  /* Typography */
+  --du-font-body:        -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                         "Helvetica Neue", Arial, sans-serif;
+  --du-font-display:     "SF Pro Display", var(--du-font-body);
+  --du-font-mono:        "SF Mono", ui-monospace, "Cascadia Mono", Menlo, monospace;
+
+  --du-fs-xs:            11px;
+  --du-fs-sm:            13px;
+  --du-fs-md:            15px;
+  --du-fs-lg:            17px;
+  --du-fs-xl:            20px;
+  --du-fs-2xl:           26px;
+  --du-fs-3xl:           32px;
+
+  --du-fw-regular:       400;
+  --du-fw-medium:        500;
+  --du-fw-semibold:      600;
+  --du-fw-bold:          700;
+
+  --du-lh-tight:         1.2;
+  --du-lh-normal:        1.5;
+
+  /* Shadows */
+  --du-shadow-sm:        0 1px 2px rgba(0,0,0,0.25);
+  --du-shadow-md:        0 4px 12px rgba(0,0,0,0.35);
+  --du-shadow-lg:        0 12px 32px rgba(0,0,0,0.45);
+  --du-glow-accent:      0 0 24px rgba(122, 92, 255, 0.35);
+  --du-glow-cyan:        0 0 24px rgba(79, 209, 197, 0.30);
+
+  /* Motion */
+  --du-ease:             cubic-bezier(0.2, 0.8, 0.2, 1);
+  --du-dur-fast:         120ms;
+  --du-dur-med:          220ms;
+  --du-dur-slow:         360ms;
+
+  /* Layout */
+  --du-header-h:         56px;
+  --du-tabbar-h:         64px;
+  --du-safe-top:         env(safe-area-inset-top, 0px);
+  --du-safe-bot:         env(safe-area-inset-bottom, 0px);
+
+  /* Z-layers */
+  --du-z-header:         50;
+  --du-z-tabbar:         50;
+  --du-z-sheet:          200;
+  --du-z-toast:          300;
+}
+
+/* Optional light-theme override — JS toggles [data-theme="light"] on <html>. */
+html[data-theme="light"] {
+  --du-bg-0:             #fafafa;
+  --du-bg-1:             #ffffff;
+  --du-bg-2:             #f2eefe;
+  --du-bg-3:             #ffffff;
+  --du-ink-hi:           #1a1030;
+  --du-ink-mid:          #4b3f75;
+  --du-ink-lo:           #7d75a3;
+  --du-border:           rgba(0,0,0,0.08);
+  --du-border-strong:    rgba(0,0,0,0.14);
+  --du-divider:          rgba(0,0,0,0.05);
+}
