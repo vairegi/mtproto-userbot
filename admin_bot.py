@@ -1422,6 +1422,19 @@ def _set_miniapp_visibility(public: bool) -> None:
 def build_app() -> Application:
     # Ensure DB exists
     db.init_db()
+        # Belt-and-braces: if a webhook was ever configured on this bot token
+    # (e.g. by an old deploy), getUpdates will Conflict forever. Nuke it
+    # once at build time — cheap, idempotent, and safe if none is set.
+    try:
+        import httpx as _httpx_boot
+        _httpx_boot.post(
+            f"https://api.telegram.org/bot{settings.admin_bot_token}/deleteWebhook",
+            params={"drop_pending_updates": "true"},
+            timeout=10,
+        )
+        log.info("deleteWebhook called at boot (idempotent)")
+    except Exception as _e:  # noqa: BLE001
+        log.warning("deleteWebhook failed at boot (non-fatal): %s", _e)
 
     app = ApplicationBuilder().token(settings.admin_bot_token).post_init(_on_startup).build()
 
@@ -1477,8 +1490,28 @@ def build_app() -> Application:
 def main() -> int:
     app = build_app()
     log.info("admin bot starting")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+    # ---- Conflict-safety settings -----------------------------------------
+    # drop_pending_updates=True  → discard the update backlog on boot. A
+    #                              previous crashed instance may have left a
+    #                              stale offset that Telegram would resend.
+    # timeout / poll_interval    → long poll for 25s at a time (default 10s).
+    #                              Long-poll lets Telegram forcibly close the
+    #                              PREVIOUS conflicting connection faster.
+    # bootstrap_retries=-1       → infinite retry on transient network errors
+    #                              so we never exit(1) into the restart budget
+    #                              on a hiccup.
+    # allowed_updates            → only the update types we actually handle
+    #                              (unchanged behaviour, less bandwidth).
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False,
+        drop_pending_updates=True,
+        timeout=25,
+        poll_interval=1.0,
+        bootstrap_retries=-1,
+    )
     return 0
+
 
 
 if __name__ == "__main__":
