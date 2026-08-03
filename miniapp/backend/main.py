@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from app.routes import mount_all
 
 log = logging.getLogger("miniapp")
-logging.basicConfig(level=os.environ.get("MINIAPP_LOG_LEVEL", "INFO"))
+logging.basicConfig(level=os.environ.get("MINIAPP_LOG_LEVEL", "INFO").upper())
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
