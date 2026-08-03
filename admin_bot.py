@@ -27,8 +27,9 @@ import shutil
 import sys
 from typing import Awaitable, Callable, Optional
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.constants import ChatAction
+from pymongo import MongoClient
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -1377,7 +1378,47 @@ async def cmd_autostatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     ]
     await update.effective_message.reply_text("\n".join(l for l in lines if l))
 
+MINIAPP_URL = os.environ.get("MINIAPP_URL", "").rstrip("/") + "/"
 
+@only_public
+async def cmd_app(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Give the caller a big 'Open Universe' Web App button."""
+    if not MINIAPP_URL or MINIAPP_URL == "/":
+        await update.effective_message.reply_text(
+            "⚠️ MINIAPP_URL is not configured on the server.")
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🌌 Open Universe", web_app=WebAppInfo(url=MINIAPP_URL))
+    ]])
+    await update.effective_message.reply_text(
+        "Tap to open the Doujinshi Universe browser:",
+        reply_markup=kb,
+    )
+
+@only_admin
+async def cmd_appon(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Flip Mini App to PUBLIC mode."""
+    _set_miniapp_visibility(True)
+    await update.effective_message.reply_text(
+        "✅ Mini App is now PUBLIC (all users can browse & queue).")
+
+@only_admin
+async def cmd_appoff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Flip Mini App to PRIVATE (admin-only) mode."""
+    _set_miniapp_visibility(False)
+    await update.effective_message.reply_text(
+        "🔒 Mini App is now PRIVATE (admin only).")
+
+def _set_miniapp_visibility(public: bool) -> None:
+    """Writes miniapp_settings.public_mode in Mongo."""
+    uri = os.environ["MONGO_URI"]
+    db_name = os.environ.get("MONGO_DB", "relaybot")
+    with MongoClient(uri, serverSelectionTimeoutMS=5000) as c:
+        c[db_name]["miniapp_settings"].update_one(
+            {"_id": "singleton"},
+            {"$set": {"public_mode": bool(public)}},
+            upsert=True,
+        )
 def build_app() -> Application:
     # Ensure DB exists
     db.init_db()
@@ -1423,7 +1464,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("autotime", cmd_autotime))
     app.add_handler(CommandHandler("autocooldown", cmd_autocooldown))
     app.add_handler(CommandHandler("autostatus", cmd_autostatus))
-
+    app.add_handler(CommandHandler("app", cmd_app))
+    app.add_handler(CommandHandler("appon", cmd_appon))
+    app.add_handler(CommandHandler("appoff", cmd_appoff))
 
     # Absorb everything else silently (Yeh ALWAYS bilkul LAST mein hona chahiye)
     app.add_handler(MessageHandler(filters.ALL, swallow))
