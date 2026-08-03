@@ -1,47 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
 # start.sh — single entrypoint that replaces PM2.
-#
-# WHY THIS EXISTS
-# ---------------
-# PM2 is a Node.js process manager. It expects a long-lived server with a
-# writable home directory and the ability to install global npm packages, none
-# of which is guaranteed on free serverless hosting (Hugging Face Spaces,
-# Render, Railway, Fly.io). This script does the same essential job using only
-# bash, which is available everywhere.
-#
-# WHAT IT DOES
-# ------------
-#   * admin_bot.py  -> background
-#   * worker.py     -> background
-#   * relay.py      -> background   (see IMPORTANT note below)
-#   * userbot.py    -> FOREGROUND
-#
-# The foreground process matters: a container stays alive only as long as its
-# main command is running. If every process were backgrounded the script would
-# reach the end, exit 0, and the platform would shut the container down.
-#
-# CRASH vs CLEAN-EXIT ACCOUNTING (2026-07-29 fix)
-# -----------------------------------------------
-# The previous version of this script counted EVERY exit — including clean
-# `code=0` cycle completions — toward a 50-restart ceiling. On Render, relay.py
-# finishes its polling cycle in 10-30 seconds and exits cleanly; that is normal
-# and healthy, not a crash. After ~50 clean cycles (about 15 minutes) the
-# supervisor would give up and the bot would go silent.
-#
-# The rules are now:
-#   * code == 0                 -> ALWAYS treated as a clean exit. Never
-#                                  counted toward the crash limit. Restarted
-#                                  immediately (short delay).
-#   * code != 0                 -> counted as a crash.
-#   * A process that ran for >= 60 seconds before a non-zero exit RESETS the
-#     crash counter to 0. That way a genuine crash-loop (rapid failures) still
-#     trips the safety limit, but a bot that has been healthy for a while
-#     never uses up its restart budget.
-#   * The safety ceiling is only for BACK-TO-BACK rapid crashes.
-#
-# USAGE
-#   bash start.sh
 # =============================================================================
 
 set -uo pipefail
@@ -150,32 +109,15 @@ shutdown() {
 }
 trap shutdown SIGTERM SIGINT
 
-# ---------------------------------------------------------------------------
-# supervise <script> <label>
-# ---------------------------------------------------------------------------
-# Runs a script in a restart loop, in the background.
-#
-# Restart accounting (fixed 2026-07-29):
-#   * A "crash" == the process exited with a NON-ZERO status.
-#   * A "clean exit" (status 0) is treated as one completed cycle: restart
-#     immediately, do NOT touch the crash counter, do NOT count toward the
-#     50-restart safety ceiling.
-#   * The crash counter resets to 0 the moment the process runs for
-#     HEALTHY_UPTIME_SEC (60s) or longer, so a bot that has been healthy for
-#     a while always has a fresh restart budget.
-#   * The 50-crash ceiling only trips on RAPID BACK-TO-BACK crashes, which is
-#     what the ceiling is actually there to protect against (a hot restart
-#     loop that would burn CPU forever).
 supervise() {
   script="$1"
   label="$2"
 
-  # Tunables
-  local MAX_CONSECUTIVE_CRASHES=50   # only rapid-fire crashes count
-  local HEALTHY_UPTIME_SEC=60        # >= this uptime clears the crash streak
-  local CLEAN_EXIT_DELAY=2           # short pause between healthy work cycles
-  local FAST_CRASH_DELAY=15          # back off harder on instant crashes
-  local NORMAL_CRASH_DELAY=5         # standard crash-restart delay
+  local MAX_CONSECUTIVE_CRASHES=50   
+  local HEALTHY_UPTIME_SEC=60        
+  local CLEAN_EXIT_DELAY=2           
+  local FAST_CRASH_DELAY=15          
+  local NORMAL_CRASH_DELAY=5         
 
   (
     consecutive_crashes=0
@@ -192,10 +134,6 @@ supervise() {
       end_time=$(date +%s)
       uptime=$(( end_time - start_time ))
 
-      # ---- CLEAN EXIT (code 0) --------------------------------------------
-      # Always treat as a healthy cycle completion, regardless of uptime.
-      # Do NOT count toward the crash ceiling. Reset the streak so any prior
-      # crash counter is cleared.
       if [ ${code} -eq 0 ]; then
         total_clean_exits=$(( total_clean_exits + 1 ))
         consecutive_crashes=0
@@ -204,12 +142,8 @@ supervise() {
         continue
       fi
 
-      # ---- CRASH (non-zero) ----------------------------------------------
       total_crashes=$(( total_crashes + 1 ))
 
-      # A crash that came AFTER a long healthy uptime clears the streak: the
-      # process was fine for a while, it just hit one bad event. Count this
-      # crash as #1 of a fresh streak, not #N of the previous one.
       if [ ${uptime} -ge ${HEALTHY_UPTIME_SEC} ]; then
         consecutive_crashes=1
         log "[${label}] crashed (code=${code}) after ${uptime}s of healthy uptime — resetting crash streak"
@@ -223,7 +157,6 @@ supervise() {
         break
       fi
 
-      # Back off harder on instant crashes so we never spin the CPU.
       if [ ${uptime} -lt 10 ]; then
         delay=${FAST_CRASH_DELAY}
       else
@@ -241,11 +174,32 @@ supervise() {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Launch the three background processes
+# 3. Launch background processes & Mini App Web Server
 # ---------------------------------------------------------------------------
 log "------------------------------------------------------------"
 log "launching background processes"
 log "------------------------------------------------------------"
+
+# --- Mini App: serves the frontend AND passes Render's port scan ---
+MINIAPP_ROOT="$(cd "$(dirname "$0")" && pwd)/miniapp"
+
+if [ -d "$MINIAPP_ROOT" ]; then
+    log "[start.sh] Booting Mini App backend on port ${PORT:-8000}"
+    (
+        cd "$MINIAPP_ROOT"
+        export PYTHONPATH="$(dirname "$MINIAPP_ROOT"):$MINIAPP_ROOT/backend:${PYTHONPATH:-}"
+        exec uvicorn backend.main:app \
+            --host 0.0.0.0 \
+            --port "${PORT:-8000}" \
+            --log-level "${MINIAPP_LOG_LEVEL:-info}"
+    ) &
+    MINIAPP_PID=$!
+    PIDS="${PIDS} ${MINIAPP_PID}"
+    log "[start.sh] Mini App PID=${MINIAPP_PID} on port ${PORT:-8000}"
+else
+    log "[start.sh] WARN: $MINIAPP_ROOT missing, skipping Mini App startup"
+fi
+# --- End of Mini App block ---
 
 supervise "admin_bot.py" "admin_bot"
 sleep 3                      # let the Admin Bot claim the Telegram polling slot
@@ -259,9 +213,6 @@ sleep 1
 # ---------------------------------------------------------------------------
 # 4. Run userbot.py in the FOREGROUND
 # ---------------------------------------------------------------------------
-# This is what holds the container open. userbot.py in this project is a client
-# factory (no main loop), so we run it once to validate the session, then keep
-# a lightweight supervisor loop in the foreground.
 log "------------------------------------------------------------"
 log "starting userbot.py in the foreground"
 log "------------------------------------------------------------"
@@ -279,7 +230,6 @@ fi
 log "userbot.py validated OK; entering foreground watchdog loop"
 log "the bot is now running — background processes are supervised"
 
-# Foreground watchdog: keeps the container alive and reports health.
 while :; do
   sleep 60
   alive=0
