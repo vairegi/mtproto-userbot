@@ -10,16 +10,29 @@
   To add a new one:
     register("banner", (props) => htmlNode);
   Both without touching any page.
+
+  IMPORTANT — DO NOT put `import "components/*.js"` at the bottom of this
+  file. Component files do `import { register } from "core/components.js"`
+  which creates a circular graph, and their top-level `register(...)` call
+  hits `factories` before this file finishes initializing (TDZ error on
+  Android WebView). Component preloading lives in app.js instead, AFTER
+  components.js has fully evaluated.
 */
 
-const factories = new Map();
+// Lazy singleton so any accidental import cycle can't reference `factories`
+// before it exists. `_factories()` returns the same Map every time.
+let _map = null;
+function _factories() {
+  if (_map === null) _map = new Map();
+  return _map;
+}
 
 export function register(name, factory) {
-  factories.set(name, factory);
+  _factories().set(name, factory);
 }
 
 export function make(name, props = {}) {
-  const f = factories.get(name);
+  const f = _factories().get(name);
   if (!f) throw new Error(`Component "${name}" not registered`);
   return f(props);
 }
@@ -46,11 +59,3 @@ export function h(tag, attrs = {}, ...children) {
   }
   return el;
 }
-
-// Pre-register the built-in components so pages can use them from turn 1.
-// Each import registers itself as a side-effect.
-import "components/card.js";
-import "components/chip.js";
-import "components/sheet.js";
-import "components/toast.js";
-import "components/skeleton.js";
