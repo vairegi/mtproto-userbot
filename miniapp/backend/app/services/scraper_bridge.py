@@ -57,7 +57,6 @@ except Exception as e:  # noqa: BLE001
 
 
 def _run_async(coro):
-    """Run an awaitable to completion from a sync FastAPI handler."""
     try:
         return asyncio.run(coro)
     except RuntimeError:
@@ -80,11 +79,6 @@ _HEADERS = {
     "Referer": "https://nhentai.net/",
 }
 
-# ---------------------------------------------------------------------------
-# Title cleaning — search rows only give the RAW title:
-#   "(C92) [Inariya (Inari)] Kyoudai ... [English] [desudesu]"
-# → "Kyoudai ..."
-# ---------------------------------------------------------------------------
 _LEADING_EVENT = re.compile(r"^\s*\((?:[^()]|\([^()]*\))*\)\s*")
 _LEADING_BRACKET = re.compile(r"^\s*\[(?:[^\[\]]|\[[^\[\]]*\])*\]\s*")
 _TRAILING_BRACKET = re.compile(r"\s*\[([^\[\]]*)\]\s*$")
@@ -104,41 +98,32 @@ def clean_title(raw: str) -> str:
     if not raw:
         return ""
     s = raw.strip()
-    while True:                                   # leading (C92) events
+    while True:
         m = _LEADING_EVENT.match(s)
-        if not m:
-            break
+        if not m: break
         s = s[m.end():]
-    while True:                                   # leading [Artist] credits
+    while True:
         m = _LEADING_BRACKET.match(s)
-        if not m:
-            break
+        if not m: break
         inner = m.group(0).strip()[1:-1].strip().lower()
-        if inner in _KEEP_LEADING:
-            break
+        if inner in _KEEP_LEADING: break
         s = s[m.end():]
-    while True:                                   # trailing [English] etc.
+    while True:
         m = _TRAILING_BRACKET.search(s)
-        if not m:
-            break
+        if not m: break
         inner = m.group(1).strip()
         low = inner.lower()
         is_meta = (low in _DROP_TRAILING
                    or bool(_DROP_TRAILING_RE.search(low))
                    or len(inner) <= 24)
-        if not is_meta:
-            break
+        if not is_meta: break
         candidate = s[: m.start()].rstrip()
-        if not candidate:
-            break
+        if not candidate: break
         s = candidate
     s = s.strip(" -–—|")
     return s or raw.strip()
 
 
-# ---------------------------------------------------------------------------
-# Search-row parsing (grid cards)
-# ---------------------------------------------------------------------------
 def _thumb_from_search_row(row: dict) -> str:
     rel = (row.get("thumbnail") or "").lstrip("/")
     if rel:
@@ -160,7 +145,7 @@ def _row_to_card(row: dict) -> dict:
         "cover":          _thumb_from_search_row(row),
         "pages":          row.get("num_pages"),
         "favorites":      row.get("num_favorites"),
-        "tags":           [],          # search rows carry tag_ids only
+        "tags":           [],
     }
 
 
@@ -174,14 +159,13 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
     query = q.strip() if q and q.strip() else "english"
     params = {"query": query, "sort": real_sort, "page": int(page or 1)}
     try:
-        r = httpx.get(f"{_NH_V2}/search", params=params,
-                      headers=_HEADERS, timeout=15)
+        r = httpx.get(f"{_NH_V2}/search", params=params, headers=_HEADERS, timeout=15)
         r.raise_for_status()
         data = r.json() or {}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.exception("v2 search failed q=%r sort=%r: %s", q, real_sort, e)
         return []
-    out: list[dict] = []
+    out = []
     for row in data.get("result") or []:
         if _ENGLISH_TAG_ID not in (row.get("tag_ids") or []):
             continue
@@ -191,15 +175,11 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Detail parsing (bottom sheet)
-# ---------------------------------------------------------------------------
-_TAG_ORDER = ["parody", "character", "tag", "artist", "group",
-              "language", "category"]
+_TAG_ORDER = ["parody", "character", "tag", "artist", "group", "language", "category"]
 
 
-def _group_tags(tags: list) -> dict:
-    buckets: dict[str, list] = {}
+def _group_tags(tags):
+    buckets = {}
     for t in tags or []:
         if not isinstance(t, dict):
             name = str(t).strip()
@@ -208,11 +188,9 @@ def _group_tags(tags: list) -> dict:
             continue
         ttype = (t.get("type") or "tag").strip().lower()
         name = (t.get("name") or "").strip()
-        if not name:
-            continue
-        buckets.setdefault(ttype, []).append(
-            {"name": name, "count": t.get("count")})
-    ordered: dict[str, list] = {}
+        if not name: continue
+        buckets.setdefault(ttype, []).append({"name": name, "count": t.get("count")})
+    ordered = {}
     for k in _TAG_ORDER:
         if k in buckets:
             ordered[k] = buckets.pop(k)
@@ -220,7 +198,7 @@ def _group_tags(tags: list) -> dict:
     return ordered
 
 
-def _cover_from_detail(d: dict) -> str:
+def _cover_from_detail(d):
     for key in ("cover", "thumbnail"):
         rel = ((d.get(key) or {}).get("path") or "").lstrip("/")
         if rel:
@@ -229,14 +207,14 @@ def _cover_from_detail(d: dict) -> str:
     return f"{_T_CDN}/galleries/{mid}/cover.jpg" if mid else ""
 
 
-def _iso_date(ts) -> str | None:
+def _iso_date(ts):
     try:
         return _dt.datetime.utcfromtimestamp(int(ts)).isoformat() + "Z"
     except (TypeError, ValueError, OSError, OverflowError):
         return None
 
 
-def _detail_to_dict(d: dict) -> dict:
+def _detail_to_dict(d):
     t = d.get("title")
     if isinstance(t, str):
         eng, jpn, pretty = t, "", clean_title(t)
@@ -263,27 +241,21 @@ def _detail_to_dict(d: dict) -> dict:
     }
 
 
-def _direct_nhentai_detail(gallery_id: str) -> dict:
+def _direct_nhentai_detail(gallery_id):
     try:
-        r = httpx.get(
-            f"{_NH_V2}/galleries/{gallery_id}",
-            params={"include": "related,suggestions,comments"},
-            headers=_HEADERS, timeout=15,
-        )
+        r = httpx.get(f"{_NH_V2}/galleries/{gallery_id}",
+                      params={"include": "related,suggestions,comments"},
+                      headers=_HEADERS, timeout=15)
         r.raise_for_status()
         item = r.json() or {}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.exception("v2 detail failed id=%r: %s", gallery_id, e)
         return {}
     return _detail_to_dict(item)
 
 
-# ---------------------------------------------------------------------------
-# hf_scraper dataclass adapters
-# ---------------------------------------------------------------------------
-def _hit_to_dict(hit) -> dict:
-    if hit is None:
-        return {}
+def _hit_to_dict(hit):
+    if hit is None: return {}
     if dataclasses.is_dataclass(hit):
         d = dataclasses.asdict(hit)
     elif isinstance(hit, dict):
@@ -304,9 +276,8 @@ def _hit_to_dict(hit) -> dict:
     }
 
 
-def _meta_to_dict(meta) -> dict:
-    if meta is None:
-        return {}
+def _meta_to_dict(meta):
+    if meta is None: return {}
     if dataclasses.is_dataclass(meta):
         d = dataclasses.asdict(meta)
     elif isinstance(meta, dict):
@@ -331,44 +302,29 @@ def _meta_to_dict(meta) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-def search(q: str, page: int, sort: str, lang: str,
-           include_tags: list[str] | None = None,
-           exclude_tags: list[str] | None = None,
-           pages_min: int | None = None,
-           pages_max: int | None = None,
-           per_page: int = 25) -> list[dict]:
+def search(q, page, sort, lang, include_tags=None, exclude_tags=None,
+           pages_min=None, pages_max=None, per_page=25):
     include_tags = include_tags or []
     exclude_tags = exclude_tags or []
     q_clean = (q or "").strip()
-    rows: list[dict] = []
-
+    rows = []
     if q_clean and HAVE_HF and hasattr(_hf, "search"):
         try:
             page_obj = _run_async(_hf.search(query=q_clean, page=int(page or 1)))
             if page_obj is not None:
                 rows = [_hit_to_dict(h) for h in (getattr(page_obj, "hits", None) or [])]
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log.exception("hf_scraper.search failed q=%r page=%s: %s", q_clean, page, e)
             rows = []
-
     if not rows:
         rows = _direct_nhentai_search(q_clean, int(page or 1), sort or "popular")
-
     rows = _apply_filters(rows, include_tags, exclude_tags, pages_min, pages_max)
     if per_page and per_page > 0:
         rows = rows[:per_page]
     return rows
 
 
-def gallery_detail(gallery_id: str) -> dict:
-    """
-    Direct v2 endpoint first — hf_scraper's GalleryMeta.tags is a flat
-    List[str] with no `type`, so it cannot power the grouped
-    Parodies/Tags/Artists/Groups/Languages/Categories view.
-    """
+def gallery_detail(gallery_id):
     detail = _direct_nhentai_detail(str(gallery_id))
     if detail and detail.get("id"):
         return detail
@@ -379,23 +335,19 @@ def gallery_detail(gallery_id: str) -> dict:
                 d = _meta_to_dict(meta)
                 if d.get("id"):
                     return d
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log.exception("fetch_gallery_meta failed for %s: %s", gallery_id, e)
     return {}
 
 
-def route_status() -> dict:
-    info: dict[str, Any] = {"have_hf": HAVE_HF, "endpoint": _NH_V2}
+def route_status():
+    info = {"have_hf": HAVE_HF, "endpoint": _NH_V2}
     if HAVE_HF and hasattr(_hf, "route_status"):
-        try:
-            info["hf_route_status"] = _hf.route_status()
-        except Exception as e:  # noqa: BLE001
-            info["hf_route_status_error"] = str(e)
+        try: info["hf_route_status"] = _hf.route_status()
+        except Exception as e: info["hf_route_status_error"] = str(e)
     if HAVE_HF and hasattr(_hf, "health_check"):
-        try:
-            info["hf_health_check"] = bool(_run_async(_hf.health_check()))
-        except Exception as e:  # noqa: BLE001
-            info["hf_health_check_error"] = str(e)
+        try: info["hf_health_check"] = bool(_run_async(_hf.health_check()))
+        except Exception as e: info["hf_health_check_error"] = str(e)
     if not HAVE_HF:
         info["source"] = "direct nhentai v2"
     return info
@@ -408,7 +360,7 @@ def _apply_filters(rows, include_tags, exclude_tags, pages_min, pages_max):
             name = (t.get("name") if isinstance(t, dict) else str(t)) or ""
             if name:
                 names.add(name.lower())
-        if names:  # search rows carry no tag names — don't drop them
+        if names:
             if include_tags and not all(t in names for t in include_tags):
                 return False
             if exclude_tags and any(t in names for t in exclude_tags):
