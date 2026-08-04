@@ -2,7 +2,7 @@
   detail-sheet.js — Rich gallery detail sheet
 
   Opens immediately with cover + name (from the grid row), then enriches
-  with /api/gallery/{id} (grouped tags, favorites, upload date, etc).
+  with /api/gallery/{id} (grouped tags, favorites, upload date).
 
   Used by pages/search.js and pages/bookmarks.js. Action buttons come from
   plugins/card-actions.js — to change buttons, edit THAT file, not this one.
@@ -64,7 +64,7 @@ async function enrich(root, g) {
   } catch (_) {
     const l = root.querySelector(".d-loading");
     if (l) l.remove();
-    return;                                     // keep the basic view
+    return;
   }
   if (!d || !d.id) {
     const l = root.querySelector(".d-loading");
@@ -78,16 +78,15 @@ async function enrich(root, g) {
       ? h("img", { class: "d-cover", src: d.cover, alt: d.title })
       : h("div", { class: "d-cover skeleton" }),
 
-    // Pretty title — BOLD only, per spec.
+    // Pretty title — BOLD only.
     h("div", { class: "d-title" }, d.title || `#${d.id}`),
 
-    // Full titles underneath (not bold, smaller).
+    // Full english + japanese titles underneath (smaller, not bold).
     d.title_english
       ? h("div", { class: "d-full-title" }, d.title_english) : null,
     d.title_japanese
       ? h("div", { class: "d-jpn-title" }, d.title_japanese) : null,
 
-    // Meta line: id · pages · favorites · uploaded
     h("div", { class: "d-sub" },
       `#${d.id}`
       + (d.pages ? ` · ${d.pages} pages` : "")
@@ -95,7 +94,6 @@ async function enrich(root, g) {
       + (d.upload_date ? ` · ${fmtDate(d.upload_date)}` : "")),
   );
 
-  // Grouped tag rows, nhentai-style.
   const groups = d.groups || {};
   for (const key of GROUP_ORDER) {
     const arr = groups[key];
