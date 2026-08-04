@@ -24,9 +24,29 @@ from telethon.errors import AuthKeyError, UnauthorizedError
 import db
 from config import settings
 from logging_setup import setup_logging
-from relay import process_job
+import relay as _relay_v1
+import relay_v2 as _relay_v2
 from startup_check import run_checks
 from userbot import build_client
+
+
+def _v2_enabled() -> bool:
+    """V2 relay is the default. Set SELF_COVER_POST_ENABLED=0 to fall back
+    to the legacy V1 (Bot 1) path — see docs/MIGRATION_V2.md §5."""
+    raw = (os.getenv("SELF_COVER_POST_ENABLED", "1") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+async def process_job(*args, **kwargs):
+    """Thin router: pick V1 or V2 orchestrator based on env flag.
+
+    Keeping the name `process_job` here means the rest of worker.py (log
+    lines, tests, imports) is unchanged and the routing decision lives in
+    one place.
+    """
+    if _v2_enabled():
+        return await _relay_v2.process_job(*args, **kwargs)
+    return await _relay_v1.process_job(*args, **kwargs)
 
 log = setup_logging("worker")
 
@@ -172,6 +192,7 @@ async def _run_loop() -> int:
                 client, url, url_hash, job_id=job_id,
                 via_search=via_search, username=username,
                 mpost_enabled=mpost_enabled,
+                submitted_by=submitted_by,
             )
         except (AuthKeyError, UnauthorizedError) as e:
             await _notify_admin(

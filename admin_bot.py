@@ -776,16 +776,61 @@ async def cmd_resettokens(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
 @only_public
 async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """V2: /search has moved to the Mini App.
+
+    The old text-based picker (search_picker.start_search) is no longer
+    the primary search UX. We reply with a friendly redirect + a Web App
+    button so users can hit the same functionality in a much nicer UI.
+
+    The `search_picker` module and its callback handler remain wired up
+    so anyone deep-linking directly into a legacy picker session still
+    works — we only replaced the ENTRY POINT.
+    """
     msg = update.effective_message
-    if not msg or not msg.text:
+    if not msg:
         return
-    parts = msg.text.split(None, 1)
-    query = parts[1].strip() if len(parts) > 1 else ""
-    if not query:
-        await msg.reply_text("Usage: /search <keyword>")
+
+    # Pull the (optional) query so we can pre-fill it in the Mini App.
+    query = ""
+    if msg.text:
+        parts = msg.text.split(None, 1)
+        if len(parts) > 1:
+            query = parts[1].strip()
+
+    # If MINIAPP_URL isn't configured yet, fall back to the legacy picker
+    # so /search never simply breaks on older deploys.
+    if not MINIAPP_URL or MINIAPP_URL == "/":
+        if not query:
+            await msg.reply_text("Usage: /search <keyword>")
+            return
+        await ctx.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        await search_picker.start_search(update, ctx, query)
         return
-    await ctx.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
-    await search_picker.start_search(update, ctx, query)
+
+    # Build the Mini App URL, deep-linking to the query when the user gave one.
+    from urllib.parse import quote
+    target_url = MINIAPP_URL
+    if query:
+        target_url = f"{MINIAPP_URL}#/search?q={quote(query)}"
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🔎 Open in Mini App",
+            web_app=WebAppInfo(url=target_url),
+        )
+    ]])
+
+    body = (
+        "Search has moved to the Mini App ✨\n\n"
+        "You'll get a proper grid with covers, filters, tag chips, "
+        "bookmarks, and one-tap queueing — everything /search used to "
+        "do, only much faster.\n\n"
+        "Tap the button below to open it."
+    )
+    if query:
+        body += f"\n\nYour query “{query}” will be pre-filled."
+
+    await msg.reply_text(body, reply_markup=kb)
 
 
 async def cb_search_picker(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

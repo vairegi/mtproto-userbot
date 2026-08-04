@@ -28,6 +28,12 @@ MIGRATION NOTES (SQLite → MongoDB, VPS → serverless hosting)
 4. `.env` is still loaded if present (handy for local testing) but is no
    longer required — real environment variables take priority, which is
    exactly how hosting platforms inject secrets.
+
+5. `BOT1_USERNAME` IS DEPRECATED (V2 architecture, docs/ARCHITECTURE_V2.md).
+   Bot 1 was removed in favour of an in-house cover poster; the value is
+   still accepted so V2 rollback via `SELF_COVER_POST_ENABLED=0` continues
+   to work, but it is no longer required. A `DeprecationWarning` is logged
+   at startup if the variable is set.
 """
 from __future__ import annotations
 
@@ -193,7 +199,12 @@ def load_settings() -> Settings:
         session_string=_req("STRING_SESSION", "TELEGRAM_SESSION_STRING", "SESSION_STRING"),
         admin_bot_token=_req("BOT_TOKEN", "ADMIN_BOT_TOKEN"),
         admin_user_id=_int_req("ADMIN_USER_ID", "ADMIN_ID", "OWNER_ID"),
-        bot1_username=_req("BOT1_USERNAME").lstrip("@"),
+        # DEPRECATED in V2 (docs/ARCHITECTURE_V2.md §7). Legacy relay.py
+        # still references it, so we accept the value with an empty default
+        # to keep the V1 code path importable when SELF_COVER_POST_ENABLED=0
+        # is used for rollback. A warning is emitted at startup (see
+        # _emit_bot1_deprecation_warning below).
+        bot1_username=(_opt("BOT1_USERNAME") or "").lstrip("@"),
         bot2_username=_req("BOT2_USERNAME").lstrip("@"),
         database_channel_id=_int_req("DATABASE_CHANNEL_ID", "CHANNEL_ID"),
         # Correct spelling is Doug-in-shibot (with a 'g'), NOT Dou-jin-shibot.
@@ -235,3 +246,36 @@ else:
 if settings is not None and settings.mongo_uri:
     os.environ.setdefault("MONGO_URI", settings.mongo_uri)
     os.environ.setdefault("MONGO_DB_NAME", settings.mongo_db_name)
+
+
+# ---------------------------------------------------------------------------
+# V2 deprecation warnings (docs/ARCHITECTURE_V2.md §7)
+# ---------------------------------------------------------------------------
+# BOT1_USERNAME is no longer required. If the operator still has it set on
+# their Render service we emit a one-line warning at import time so it's
+# visible in the startup logs but doesn't break anything.
+#
+# We use logging directly (not warnings.warn) so the message shows up in the
+# platform's log viewer where the operator will actually see it.
+def _emit_bot1_deprecation_warning() -> None:
+    v = os.environ.get("BOT1_USERNAME", "").strip()
+    if not v:
+        return
+    self_cover = (os.environ.get("SELF_COVER_POST_ENABLED", "1") or "1").strip().lower()
+    if self_cover in ("0", "false", "no", "off"):
+        # V2 rollback in effect — the legacy path genuinely needs BOT1.
+        return
+    try:
+        import logging as _logging
+        _logging.getLogger("config").warning(
+            "BOT1_USERNAME=%r is set but V2 no longer uses Bot 1. "
+            "You can remove it from the environment; see "
+            "docs/ARCHITECTURE_V2.md §7 and docs/MIGRATION_V2.md §5. "
+            "To keep the legacy path, also set SELF_COVER_POST_ENABLED=0.",
+            v,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_emit_bot1_deprecation_warning()

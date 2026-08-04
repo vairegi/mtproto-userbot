@@ -202,6 +202,14 @@ class MongoHandle:
     def counters(self):
         return self.db["counters"]
 
+    @property
+    def galleries(self):
+        """V2 dedup + delivery collection (see docs/ARCHITECTURE_V2.md).
+
+        _id = gallery_id (string). Never touched by V1 code paths.
+        """
+        return self.db["galleries"]
+
     def close(self) -> None:
         """No-op: the shared MongoClient stays alive for the process."""
         return None
@@ -250,6 +258,27 @@ def _ensure_indexes(conn: MongoHandle) -> None:
             [("completed_at", ASCENDING)], name="idx_batches_open"
         )
         conn.user_tokens.create_index([("username", ASCENDING)], name="idx_tokens_username")
+        # V2 galleries indexes -------------------------------------------------
+        # _id is already unique (implicit). We index status for admin sweeps,
+        # and started_at (partial: PROCESSING only) for lazy stale-recovery.
+        conn.galleries.create_index(
+            [("status", ASCENDING)], name="idx_galleries_status"
+        )
+        try:
+            conn.galleries.create_index(
+                [("started_at", ASCENDING)],
+                name="idx_galleries_started_processing",
+                partialFilterExpression={"status": "PROCESSING"},
+            )
+        except PyMongoError:
+            # Partial index syntax is Mongo 3.2+; if the cluster refuses it,
+            # fall back to a plain index so the collection still works.
+            conn.galleries.create_index(
+                [("started_at", ASCENDING)], name="idx_galleries_started"
+            )
+        conn.galleries.create_index(
+            [("url_hash", ASCENDING)], name="idx_galleries_url_hash"
+        )
         _indexes_ready = True
     except PyMongoError:
         # Index creation is an optimisation, never a hard requirement.
