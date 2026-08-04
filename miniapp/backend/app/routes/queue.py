@@ -29,7 +29,7 @@ def enqueue(body: EnqueueBody, user: dict = Depends(get_current_user)) -> dict:
     uid = int(user["id"])
 
     # If app is private, block non-admins.
-    if not db.get_public_mode() and uid != int(settings.admin_user_id):
+    if not db.get_public_mode() and not settings.is_admin(uid):  # v0.3
         raise HTTPException(403, "App is currently private (admin only).")
 
     # Rate-limit check + consume (raises 429 if over limit).

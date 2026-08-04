@@ -21,7 +21,7 @@ def me(user: dict = Depends(get_current_user)) -> dict:
     uid = int(user["id"])
     stored = db.upsert_user(user)
     public_mode = db.get_public_mode()
-    is_admin = uid == int(settings.admin_user_id)
+    is_admin = settings.is_admin(uid)  # v0.3: multi-admin aware
     rl = ratelimit.usage_summary(uid)
 
     # Non-admin + private mode = restricted view.

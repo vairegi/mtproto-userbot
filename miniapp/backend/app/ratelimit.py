@@ -30,7 +30,9 @@ _last_hit: dict[int, float] = {}
 
 
 def _is_admin(user_id: int) -> bool:
-    return int(user_id) == int(settings.admin_user_id)
+    # v0.3: multi-admin aware. settings.admin_user_ids is populated from
+    # ADMIN_USER_IDS ("111,222") merged with the legacy ADMIN_USER_ID.
+    return settings.is_admin(user_id)
 
 
 def check_and_consume(user_id: int) -> dict:
