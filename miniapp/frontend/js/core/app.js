@@ -2,16 +2,27 @@
   app.js — Boot sequence
 
   Runs once on page load. Responsibilities:
-    1. Boot Telegram SDK (theme sync, expand)
-    2. Fetch caller identity/permissions from backend
-    3. Render header + tab bar based on page registry
-    4. Load initial page (from URL hash, default "search")
-    5. Wire hash-based routing so back/forward works
+    1. Register built-in components (side-effect imports)
+    2. Boot Telegram SDK (theme sync, expand)
+    3. Fetch caller identity/permissions from backend
+    4. Render header + tab bar based on page registry
+    5. Load initial page (from URL hash, default "search")
+    6. Wire hash-based routing so back/forward works
 
-  If you need to change GLOBAL behavior, edit here.  If you need to add a
-  page, edit registry.js.  If you need to change a component, edit
-  components.js.  If you need to change styling, edit theme.css.
+  Component side-effect imports live HERE (not in core/components.js)
+  because putting them in components.js creates a circular import graph
+  that hits a Temporal Dead Zone error on Android Telegram WebView.
 */
+
+// ---- IMPORTANT: preload built-in components BEFORE anything else --------
+// Each of these files calls register("name", factory) at top level, which
+// mutates the registry in core/components.js. By importing them here,
+// AFTER components.js is fully initialized, we avoid the TDZ crash.
+import "components/card.js";
+import "components/chip.js";
+import "components/sheet.js";
+import "components/toast.js";
+import "components/skeleton.js";
 
 import { bootTelegram, haptic, showBackButton } from "core/telegram.js";
 import { api } from "core/api.js";
@@ -46,6 +57,10 @@ async function boot() {
 
   window.addEventListener("hashchange", () => routeTo(hashPageId()));
   routeTo(hashPageId());
+
+  // Signal to index.html's error-surface script that boot succeeded so it
+  // doesn't overwrite the app with a "still loading" fallback message.
+  if ($main) $main.dataset.booted = "1";
 }
 
 function hashPageId() {
@@ -101,6 +116,9 @@ async function routeTo(id) {
   // Teardown previous page.
   if (currentTeardown) { try { currentTeardown(); } catch (_) {} currentTeardown = null; }
   $main.innerHTML = "";
+  // Boot succeeded once we've rendered anything — tell index.html's
+  // fallback script to stand down.
+  $main.dataset.booted = "1";
 
   // Set title.
   const $title = document.getElementById("hdr-title");
