@@ -15,13 +15,18 @@ Return-shape adapter:
     (a dataclass with title/tags/cover_url/pages/gallery_id).
 
 Fallback tree:
-  1. If the caller provided a non-empty query, prefer hf_scraper.search
-     (respects its cache, filters English-only via tag id 12227).
-  2. If the query is empty (Popular/Recent chips), hf_scraper.search
-     returns None by design — go straight to a direct nhentai call so
-     the default Discover view is populated.
-  3. If EITHER path raises, fall through to the direct nhentai call so
-     the frontend never sees a 500.
+  1. If the caller provided a non-empty query, prefer hf_scraper.search.
+  2. Empty query (Popular / Recent chips) → hf_scraper.search returns
+     None by design, so use the direct nhentai v2 API for the Discover
+     landing view.
+  3. If EITHER path raises, fall through to the direct v2 API so the
+     frontend never sees a 500.
+
+IMPORTANT — endpoint URL:
+  nhentai's OLD API (/api/galleries/search) now returns HTTP 403 with
+  body "Use new API https://nhentai.net/api/v2/docs". The v2 endpoint
+  (/api/v2/search) is what hf_scraper already uses; the direct fallback
+  in THIS file must use it too. Do not revert to /api/galleries/search.
 """
 from __future__ import annotations
 
@@ -30,12 +35,10 @@ import dataclasses
 import logging
 import os
 import sys
-from typing import Any, Optional
+from typing import Any
 
 log = logging.getLogger("miniapp.scraper")
 
-# Add the parent project on sys.path so `import hf_scraper` works when the
-# Mini App is deployed alongside admin_bot.py.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _BOT_ROOT = os.environ.get("MINIAPP_BOT_ROOT")
 _CANDIDATES = [
@@ -49,34 +52,20 @@ for p in _CANDIDATES:
         sys.path.insert(0, p)
 
 try:
-    import hf_scraper as _hf   # noqa: E402
+    import hf_scraper as _hf
     HAVE_HF = True
     log.info("hf_scraper imported successfully")
-except Exception as e:  # noqa: BLE001
+except Exception as e:
     _hf = None
     HAVE_HF = False
     log.warning("hf_scraper not importable — using fallback nhentai client (%s)", e)
 
 
-# ---------------------------------------------------------------------------
-# Async → sync helper
-# ---------------------------------------------------------------------------
 def _run_async(coro):
-    """
-    Run an awaitable to completion from a sync context.
-
-    FastAPI's `def` (sync) endpoints run in a threadpool, so there is no
-    running event loop on this thread. asyncio.run() creates and closes a
-    fresh loop for each call — safe and simple.
-
-    If a running loop is somehow present (async def endpoints, background
-    tasks), we fall back to asyncio.new_event_loop() manually.
-    """
+    """Run an awaitable to completion from a sync FastAPI handler."""
     try:
         return asyncio.run(coro)
     except RuntimeError:
-        # An event loop is already running on this thread. Rare in this
-        # codebase, but handle it defensively.
         loop = asyncio.new_event_loop()
         try:
             return loop.run_until_complete(coro)
@@ -84,19 +73,22 @@ def _run_async(coro):
             loop.close()
 
 
-# ---------------------------------------------------------------------------
-# Direct nhentai fallback (used for empty/popular queries + on error)
-# ---------------------------------------------------------------------------
 import httpx
 
-_NH_API = "https://nhentai.net/api"
-_ENGLISH_TAG_ID = 12227   # matches hf_scraper's filter
+# nhentai v2 API — matches what hf_scraper.py uses (BASE_URL/api/v2).
+_NH_V2 = "https://nhentai.net/api/v2"
+_ENGLISH_TAG_ID = 12227
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+_HEADERS = {
+    "User-Agent": _UA,
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://nhentai.net/",
+}
 
 
 def _thumb_url_from_item(item: dict) -> str:
-    """Build the cover URL from an nhentai search item."""
+    """Build the cover URL from an nhentai v2 search item."""
     media_id = item.get("media_id") or ""
     images = item.get("images") or {}
     cover = images.get("cover") or images.get("thumbnail") or {}
@@ -106,20 +98,30 @@ def _thumb_url_from_item(item: dict) -> str:
 
 
 def _title_from_item(item: dict) -> str:
-    t = item.get("title") or {}
-    return t.get("english") or t.get("pretty") or t.get("japanese") or ""
+    """
+    nhentai's v2 API returns title inconsistently:
+      * mostly:  {"english": "...", "pretty": "...", "japanese": "..."}
+      * sometimes: a plain string
+      * occasionally: missing entirely — fall back to a numeric id label
+    """
+    t = item.get("title")
+    if isinstance(t, dict):
+        return t.get("pretty") or t.get("english") or t.get("japanese") or f"#{item.get('id', '')}"
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+    gid = item.get("id")
+    return f"#{gid}" if gid is not None else ""
 
 
 def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
     """
-    Direct call to nhentai's JSON API. Used when:
-      * caller sent an empty query (hf_scraper won't accept it)
-      * hf_scraper raised an exception
-      * hf_scraper isn't importable in this deployment
+    Direct v2-API call used for empty/popular queries and as a fallback.
+
+    Why we can't hand off to hf_scraper here: hf_scraper.search returns
+    None when query is empty (see line ~430 of hf_scraper.py: `if not q:
+    return None`). The Discover landing view sends q="" so we MUST go
+    direct.
     """
-    # Empty query + Popular chip → use the "popular" sort with a wildcard.
-    # nhentai's own frontend uses the same trick: an empty search with
-    # sort=popular returns the trending page.
     sort_map = {
         "popular":       "popular",
         "popular-week":  "popular-week",
@@ -131,23 +133,20 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
     }
     real_sort = sort_map.get((sort or "").lower(), "popular")
 
-    # nhentai requires SOME query; when the user typed nothing we ask for
-    # "english" which returns huge trending list. That matches the
-    # English-only spirit of the Mini App exactly.
+    # v2 /search requires a non-empty query. When the user typed nothing,
+    # we ask for "english" — that's the same word used by nhentai's own
+    # frontend when the search bar is empty and matches the Mini App's
+    # English-only spirit exactly.
     query = q.strip() if q else "english"
-
     params = {"query": query, "sort": real_sort, "page": int(page or 1)}
+
     try:
-        r = httpx.get(
-            f"{_NH_API}/galleries/search",
-            params=params,
-            headers={"User-Agent": _UA, "Accept": "application/json"},
-            timeout=15,
-        )
+        r = httpx.get(f"{_NH_V2}/search", params=params, headers=_HEADERS, timeout=15)
         r.raise_for_status()
         data = r.json() or {}
     except Exception as e:  # noqa: BLE001
-        log.exception("direct nhentai search failed q=%r sort=%r: %s", q, real_sort, e)
+        log.exception("direct nhentai v2 search failed q=%r sort=%r: %s",
+                      q, real_sort, e)
         return []
 
     out: list[dict] = []
@@ -168,18 +167,19 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
 
 
 def _direct_nhentai_detail(gallery_id: str) -> dict:
+    """Direct v2-API call for one gallery. Only used if hf_scraper fails."""
     try:
+        # v2 galleries endpoint — same one hf_scraper.fetch_gallery_meta hits
         r = httpx.get(
-            f"{_NH_API}/gallery/{gallery_id}",
-            headers={"User-Agent": _UA, "Accept": "application/json"},
-            timeout=15,
+            f"{_NH_V2}/galleries/{gallery_id}",
+            params={"include": "related,suggestions,comments"},
+            headers=_HEADERS, timeout=15,
         )
         r.raise_for_status()
         item = r.json() or {}
     except Exception as e:  # noqa: BLE001
-        log.exception("direct nhentai detail failed id=%r: %s", gallery_id, e)
+        log.exception("direct nhentai v2 detail failed id=%r: %s", gallery_id, e)
         return {}
-
     return {
         "id":    item.get("id"),
         "title": _title_from_item(item),
@@ -190,9 +190,6 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Convert hf_scraper dataclass results → plain dicts for the frontend
-# ---------------------------------------------------------------------------
 def _hit_to_dict(hit) -> dict:
     """Convert a SearchHit dataclass into the frontend's dict shape."""
     if hit is None:
@@ -202,7 +199,6 @@ def _hit_to_dict(hit) -> dict:
     elif isinstance(hit, dict):
         d = hit
     else:
-        # Fallback: pluck common attribute names
         d = {
             "gallery_id": getattr(hit, "gallery_id", None),
             "title":      getattr(hit, "title", None),
@@ -234,7 +230,6 @@ def _meta_to_dict(meta) -> dict:
             "pages":      getattr(meta, "pages", None),
             "tags":       getattr(meta, "tags", None),
         }
-    # hf_scraper's GalleryMeta.tags is List[str]; convert to [{name,type:...}]
     raw_tags = d.get("tags") or []
     tag_dicts = []
     for t in raw_tags:
@@ -252,7 +247,7 @@ def _meta_to_dict(meta) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Public API — called by routes/search.py and routes/gallery.py
+# Public API
 # ---------------------------------------------------------------------------
 def search(q: str, page: int, sort: str, lang: str,
            include_tags: list[str] | None = None,
@@ -260,15 +255,13 @@ def search(q: str, page: int, sort: str, lang: str,
            pages_min: int | None = None,
            pages_max: int | None = None,
            per_page: int = 25) -> list[dict]:
-    """Return a list of normalized gallery dicts."""
     include_tags = include_tags or []
     exclude_tags = exclude_tags or []
     q_clean = (q or "").strip()
 
     rows: list[dict] = []
 
-    # Path A: real query + hf_scraper available → prefer hf_scraper
-    # (uses its cache + English-only filter + dedup).
+    # Path A: real query + hf_scraper available → prefer hf_scraper.
     if q_clean and HAVE_HF and hasattr(_hf, "search"):
         try:
             page_obj = _run_async(_hf.search(query=q_clean, page=int(page or 1)))
@@ -280,22 +273,19 @@ def search(q: str, page: int, sort: str, lang: str,
                           q_clean, page, e)
             rows = []
 
-    # Path B: empty query OR hf_scraper returned nothing → direct nhentai.
-    # This is what powers the Popular / Popular Week / Popular Today chips
-    # on the default Discover view.
+    # Path B: empty query OR hf_scraper returned nothing → direct v2 API.
+    # This is what powers Popular / Popular Week / Popular Today on the
+    # default Discover landing view.
     if not rows:
         rows = _direct_nhentai_search(q_clean, int(page or 1), sort or "popular")
 
-    # Filters + normalize
     rows = _apply_filters(rows, include_tags, exclude_tags, pages_min, pages_max)
-    # Cap to per_page just in case upstream returned more.
     if per_page and per_page > 0:
         rows = rows[:per_page]
     return [_normalize(r) for r in rows]
 
 
 def gallery_detail(gallery_id: str) -> dict:
-    """Return the full detail dict for one gallery."""
     if HAVE_HF and hasattr(_hf, "fetch_gallery_meta"):
         try:
             meta = _run_async(_hf.fetch_gallery_meta(str(gallery_id)))
@@ -306,31 +296,22 @@ def gallery_detail(gallery_id: str) -> dict:
         except Exception as e:  # noqa: BLE001
             log.exception("hf_scraper.fetch_gallery_meta failed for %s: %s",
                           gallery_id, e)
-    # Fallback
     return _direct_nhentai_detail(str(gallery_id))
 
 
 def route_status() -> dict:
-    """Diagnostics for /api/admin/diag."""
-    info: dict[str, Any] = {"have_hf": HAVE_HF}
+    info: dict[str, Any] = {"have_hf": HAVE_HF, "endpoint": _NH_V2}
     if HAVE_HF and hasattr(_hf, "route_status"):
-        try:
-            info["hf_route_status"] = _hf.route_status()
-        except Exception as e:  # noqa: BLE001
-            info["hf_route_status_error"] = str(e)
+        try: info["hf_route_status"] = _hf.route_status()
+        except Exception as e: info["hf_route_status_error"] = str(e)
     if HAVE_HF and hasattr(_hf, "health_check"):
-        try:
-            info["hf_health_check"] = bool(_run_async(_hf.health_check()))
-        except Exception as e:  # noqa: BLE001
-            info["hf_health_check_error"] = str(e)
-    else:
-        info["source"] = "fallback nhentai"
+        try: info["hf_health_check"] = bool(_run_async(_hf.health_check()))
+        except Exception as e: info["hf_health_check_error"] = str(e)
+    if not HAVE_HF:
+        info["source"] = "fallback nhentai v2"
     return info
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def _normalize(row: dict) -> dict:
     if not row:
         return {}
@@ -347,12 +328,9 @@ def _apply_filters(rows, include_tags, exclude_tags, pages_min, pages_max):
     def _pass(r):
         tag_names = set()
         for t in (r.get("tags") or []):
-            if isinstance(t, dict):
-                name = (t.get("name") or "").lower()
-            else:
-                name = str(t).lower()
+            name = (t.get("name") if isinstance(t, dict) else str(t)) or ""
             if name:
-                tag_names.add(name)
+                tag_names.add(name.lower())
         if include_tags and not all(t in tag_names for t in include_tags):
             return False
         if exclude_tags and any(t in tag_names for t in exclude_tags):
