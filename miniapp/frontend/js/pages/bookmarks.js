@@ -2,14 +2,14 @@
   pages/bookmarks.js — User's saved galleries
 
   Reads from /api/bookmarks and renders the same card grid as search.
-  Actions on tap re-use plugins/card-actions.js (so "Queue" still works from
-  the bookmark view without duplicating logic).
+  Uses the shared detail-sheet plugin so tapping a bookmark shows the
+  full nhentai-style detail view.
 */
 
 import { api } from "core/api.js";
 import { make, h } from "core/components.js";
 import { store } from "core/state.js";
-import { cardActions } from "plugins/card-actions.js";
+import { openGalleryDetail } from "plugins/detail-sheet.js";
 
 export async function render(root, { me }) {
   const $grid = h("div", { class: "card-grid" });
@@ -31,9 +31,12 @@ export async function render(root, { me }) {
     }
     for (const g of items) {
       $grid.appendChild(make("card", {
-        id: g.id, title: g.title, cover: g.cover, pages: g.pages,
+        id: g.id,
+        title: g.title,
+        cover: g.cover,
+        pages: g.pages,
         badge: g.pages ? `${g.pages}p` : null,
-        onOpen: () => openDetail(g, me),
+        onOpen: () => openGalleryDetail(g, me),
       }));
     }
   } catch (e) {
@@ -44,21 +47,4 @@ export async function render(root, { me }) {
       h("div", {}, String(e.message || e)),
     ));
   }
-}
-
-function openDetail(g, me) {
-  const actions = cardActions
-    .filter(a => !a.when || a.when({ gallery: g, me }))
-    .map(a => ({
-      label: `${a.icon} ${a.label}`,
-      kind: a.kind || "secondary",
-      onClick: (sheetApi) => a.run({ gallery: g, me, close: sheetApi.close }),
-    }));
-  const body = h("div", { style: { textAlign: "center" } },
-    g.cover ? h("img", { src: g.cover, alt: g.title,
-      style: { width: "60%", maxWidth: "220px", borderRadius: "12px",
-               margin: "0 auto", display: "block" } }) : null,
-    h("div", { style: { marginTop: "12px", fontWeight: "600" } }, g.title || `#${g.id}`),
-  );
-  make("sheet", { title: "Bookmark", body, actions }).open();
 }
