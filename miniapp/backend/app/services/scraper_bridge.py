@@ -6,12 +6,17 @@ scraper module later changes (e.g. we switch source sites again), only this
 file needs updating.
 
 Behaviour:
-  * Tries to import hf_scraper from the parent project.  If unavailable
+  * Tries to import hf_scraper from the parent project. If unavailable
     (dev sandbox without the bot code), falls back to a direct nhentai
     JSON call so the frontend is still testable.
+  * Uses `inspect.signature` to pass only the kwargs hf_scraper.search
+    actually accepts — this makes us resilient to renames like
+    sort → sort_by, query → q, page → pg, etc. without ever crashing
+    with TypeError.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import sys
@@ -41,6 +46,56 @@ except Exception as e:  # noqa: BLE001
     _hf = None
     HAVE_HF = False
     log.warning("hf_scraper not importable — using fallback nhentai client (%s)", e)
+
+
+# --- Signature-safe kwarg passing ---------------------------------------
+# Build a set of parameter names hf_scraper.search actually accepts, so we
+# never pass an unexpected kwarg. Precomputed once at import for speed.
+_HF_SEARCH_PARAMS: set[str] = set()
+if HAVE_HF and hasattr(_hf, "search"):
+    try:
+        sig = inspect.signature(_hf.search)
+        for name, p in sig.parameters.items():
+            # Exclude *args / **kwargs sentinels from the whitelist.
+            if p.kind in (inspect.Parameter.VAR_POSITIONAL,
+                          inspect.Parameter.VAR_KEYWORD):
+                continue
+            _HF_SEARCH_PARAMS.add(name)
+        log.info("hf_scraper.search accepts kwargs: %s", sorted(_HF_SEARCH_PARAMS))
+    except (TypeError, ValueError) as e:
+        log.warning("Could not introspect hf_scraper.search signature: %s", e)
+
+
+def _call_hf_search(**kwargs) -> list[dict]:
+    """
+    Call hf_scraper.search with only the kwargs it actually accepts.
+
+    Maps common name variants so the caller can use one canonical set of
+    parameter names (q, page, sort, per_page, lang) regardless of what
+    hf_scraper's real signature happens to be.
+    """
+    # Canonical name → list of aliases hf_scraper.search might accept.
+    aliases = {
+        "q":        ["q", "query", "search", "keyword", "text"],
+        "page":     ["page", "pg", "p", "page_num"],
+        "sort":     ["sort", "sort_by", "sort_mode", "order", "order_by"],
+        "per_page": ["per_page", "page_size", "limit", "count"],
+        "lang":     ["lang", "language"],
+    }
+    to_pass: dict[str, Any] = {}
+    for canonical, val in kwargs.items():
+        if val is None:
+            continue
+        candidates = aliases.get(canonical, [canonical])
+        for alias in candidates:
+            if alias in _HF_SEARCH_PARAMS:
+                to_pass[alias] = val
+                break
+        # If NO alias matched, we silently drop the arg rather than crash.
+        # The scraper simply won't filter by that dimension.
+
+    return _hf.search(**to_pass) or []
+
 
 # --- Fallback client (only used if hf_scraper import fails) ---------------
 if not HAVE_HF:
@@ -102,17 +157,56 @@ def search(q: str, page: int, sort: str, lang: str,
     include_tags = include_tags or []
     exclude_tags = exclude_tags or []
 
-    # Preferred path: use the bot's own scraper (respects its cache + filters).
+    # Preferred path: the bot's own hf_scraper (respects its cache + filters).
     if HAVE_HF and hasattr(_hf, "search"):
         try:
-            rows = _hf.search(query=q or "", page=page, sort=sort or "popular") or []
+            rows = _call_hf_search(
+                q=q or "",
+                page=page,
+                sort=sort or "popular",
+                per_page=per_page,
+                lang=lang or "english",
+            )
             return [_normalize(r, per_page)
                     for r in _apply_filters(rows, include_tags, exclude_tags,
                                             pages_min, pages_max)]
         except Exception as e:  # noqa: BLE001
-            log.exception("hf_scraper.search failed, falling back: %s", e)
+            log.exception("hf_scraper.search failed, falling back to direct nhentai: %s", e)
 
-    rows = _fallback_search(q or "", page, sort or "popular")
+    # Fallback: direct nhentai call.
+    if HAVE_HF:
+        # hf_scraper imported OK but crashed — we still need a fallback.
+        import httpx
+        _NH_BASE = "https://nhentai.net"
+        params = {"query": q or "english", "page": page}
+        if sort and sort != "popular":
+            params["sort"] = sort
+        try:
+            r = httpx.get(f"{_NH_BASE}/api/galleries/search", params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json() or {}
+            rows = []
+            for item in data.get("result", []):
+                titles = item.get("title", {}) or {}
+                media_id = item.get("media_id")
+                images = item.get("images", {}) or {}
+                cover = images.get("cover") or images.get("thumbnail") or {}
+                ext_map = {"j": "jpg", "p": "png", "g": "gif", "w": "webp"}
+                ext = ext_map.get(cover.get("t", "j"), "jpg")
+                rows.append({
+                    "id": item.get("id") or item.get("media_id"),
+                    "title": titles.get("english") or titles.get("pretty") or titles.get("japanese") or "",
+                    "cover": f"https://t.nhentai.net/galleries/{media_id}/cover.{ext}",
+                    "pages": item.get("num_pages"),
+                    "tags":  [{"name": t.get("name"), "type": t.get("type")}
+                              for t in item.get("tags") or []],
+                })
+        except Exception as e:  # noqa: BLE001
+            log.exception("Direct nhentai fallback also failed: %s", e)
+            return []
+    else:
+        rows = _fallback_search(q or "", page, sort or "popular")
+
     rows = _apply_filters(rows, include_tags, exclude_tags, pages_min, pages_max)
     return [_normalize(r, per_page) for r in rows]
 
@@ -123,16 +217,45 @@ def gallery_detail(gallery_id: str) -> dict:
             return _normalize(_hf.fetch_gallery_meta(gallery_id), None) or {}
         except Exception as e:  # noqa: BLE001
             log.exception("hf_scraper.fetch_gallery_meta failed: %s", e)
-    return _fallback_detail(str(gallery_id))
+    # Direct fallback for detail
+    try:
+        import httpx
+        r = httpx.get(f"https://nhentai.net/api/gallery/{gallery_id}", timeout=15)
+        r.raise_for_status()
+        item = r.json() or {}
+        titles = item.get("title", {}) or {}
+        media_id = item.get("media_id")
+        images = item.get("images", {}) or {}
+        cover = images.get("cover") or images.get("thumbnail") or {}
+        ext_map = {"j": "jpg", "p": "png", "g": "gif", "w": "webp"}
+        ext = ext_map.get(cover.get("t", "j"), "jpg")
+        return {
+            "id": item.get("id"),
+            "title": titles.get("english") or titles.get("pretty") or titles.get("japanese") or "",
+            "cover": f"https://t.nhentai.net/galleries/{media_id}/cover.{ext}",
+            "pages": item.get("num_pages"),
+            "tags":  [{"name": t.get("name"), "type": t.get("type")}
+                      for t in item.get("tags") or []],
+        }
+    except Exception as e:  # noqa: BLE001
+        log.exception("gallery_detail fallback failed: %s", e)
+        return {}
 
 
 def route_status() -> dict:
+    """Diagnostics for /api/admin/diag."""
+    info: dict[str, Any] = {
+        "have_hf": HAVE_HF,
+        "hf_search_params": sorted(_HF_SEARCH_PARAMS) if HAVE_HF else [],
+    }
     if HAVE_HF and hasattr(_hf, "route_status"):
         try:
-            return _hf.route_status()
+            info["hf_route_status"] = _hf.route_status()
         except Exception as e:  # noqa: BLE001
-            return {"error": str(e), "have_hf": True}
-    return {"have_hf": HAVE_HF, "source": "fallback nhentai"}
+            info["hf_route_status_error"] = str(e)
+    if not HAVE_HF:
+        info["source"] = "fallback nhentai"
+    return info
 
 
 # --- Helpers -------------------------------------------------------------
