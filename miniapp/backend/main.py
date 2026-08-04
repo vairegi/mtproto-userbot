@@ -8,11 +8,6 @@ Boots the Mini App backend. Responsibilities:
   * SPA fallback: any non-API GET returns index.html (hash routing safe)
   * Health check at /healthz for Render / UptimeRobot
   * No-cache headers on index.html so the shim upgrade lands immediately
-
-v0.3 security change:
-  CORS is no longer allow_origins=["*"] with allow_methods/headers=["*"].
-  Origins come from MINIAPP_ALLOWED_ORIGINS plus a *.telegram.org regex;
-  methods and headers are narrowed to what the app actually sends.
 """
 from __future__ import annotations
 
@@ -25,7 +20,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app.config import settings
 from app.routes import mount_all
 
 log = logging.getLogger("miniapp")
@@ -35,6 +29,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 INDEX_HTML = FRONTEND_DIR / "index.html"
 
+# Sanity-check at boot — if the frontend folder is missing, LOUD warning in
+# logs. Prevents the "silent blank screen" mystery: you'll see it in Render's
+# log stream immediately after deploy.
 if not FRONTEND_DIR.is_dir():
     log.error(
         "FRONTEND_DIR does not exist: %s — Mini App will 404 on every request.",
@@ -48,36 +45,21 @@ elif not INDEX_HTML.is_file():
 else:
     log.info("Serving frontend from %s", FRONTEND_DIR)
 
-# Loud boot-time warnings for the two config mistakes that matter most.
-if not settings.bot_token and not settings.dev_bypass_enabled:
-    log.error("BOT_TOKEN is empty and dev mode is off — all API calls will 503.")
-if settings.dev_bypass_enabled:
-    log.warning(
-        "DEV AUTH BYPASS IS ACTIVE (MINIAPP_DEV_MODE=1, no BOT_TOKEN). "
-        "Never run this configuration on a public host."
-    )
-if not settings.admin_user_ids:
-    log.warning("No ADMIN_USER_IDS configured — every /api/admin/* call will 403.")
+app = FastAPI(title="Doujinshi Universe Mini App", version="0.2.0")
 
-app = FastAPI(title="Doujinshi Universe Mini App", version="0.3.0")
-
-# ---------------------------------------------------------------------------
-# CORS — Telegram Mini Apps run same-origin, so this only matters for browser
-# testing and any external front-end you deliberately allow.
-# ---------------------------------------------------------------------------
-_cors_kwargs = {
-    "allow_origins": settings.allowed_origins,
-    "allow_origin_regex": r"^https://([a-z0-9-]+\.)*telegram\.org$",
-    "allow_methods": ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    "allow_headers": ["Content-Type", "X-Telegram-Init-Data"],
-    "max_age": 600,
-}
-app.add_middleware(CORSMiddleware, **_cors_kwargs)
-log.info("CORS allow-list: %s (+ *.telegram.org)", settings.allowed_origins or "[]")
+# CORS — Telegram Mini Apps run same-origin; permissive here for local dev.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------------------------------------------------------------------
 # Static assets
 # ---------------------------------------------------------------------------
+# Mounted at /static — matches every `/static/css/...` and `/static/js/...`
+# reference in index.html and the importmap.
 if FRONTEND_DIR.is_dir():
     app.mount(
         "/static",
@@ -107,11 +89,12 @@ def _serve_index() -> Response:
         str(INDEX_HTML),
         media_type="text/html; charset=utf-8",
         headers={
+            # Telegram's WebView aggressively caches HTML. No-cache guarantees
+            # the user sees the latest shell after every deploy — without this
+            # they might keep the old broken importmap-only shell for days.
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
             "Expires": "0",
-            "X-Content-Type-Options": "nosniff",
-            "Referrer-Policy": "same-origin",
         },
     )
 
@@ -124,20 +107,20 @@ def root_index() -> Response:
 @app.get("/healthz", include_in_schema=False)
 def healthz() -> dict:
     """Render + UptimeRobot health check.  Cheap: no DB call."""
-    return {
-        "ok": True,
-        "service": "miniapp",
-        "frontend": FRONTEND_DIR.is_dir(),
-        "auth_configured": bool(settings.bot_token),
-        "admins": len(settings.admin_user_ids),
-    }
+    return {"ok": True, "service": "miniapp", "frontend": FRONTEND_DIR.is_dir()}
 
 
 # ---------------------------------------------------------------------------
 # SPA catch-all — MUST be registered LAST so /api/* and /static/* win.
 # ---------------------------------------------------------------------------
+# The frontend uses hash routing (#search, #bookmarks, ...) so this is
+# mostly future-proofing: any accidental deep-link like /profile or
+# /admin gets the app shell instead of a 404. Anything under /api/* or
+# /static/* is untouched because those routes were registered above and
+# FastAPI matches in registration order.
 @app.get("/{full_path:path}", include_in_schema=False)
 def spa_fallback(full_path: str, request: Request) -> Response:
+    # Don't shadow the API or static routes if someone hits a bad path.
     if full_path.startswith(("api/", "static/", "healthz")):
         return JSONResponse(status_code=404, content={"detail": "Not found"})
     return _serve_index()

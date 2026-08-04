@@ -7,77 +7,62 @@
   whole thing. NO component file should hardcode a color or size — always
   reference these variables.
 
-  IMPORTANT CHANGE (v0.3):
-    Surfaces are NO LONGER derived from Telegram's theme params. Previously
-    --du-bg-0 was `var(--tg-bg)`, and core/telegram.js copied Telegram's
-    bg_color into --tg-bg at boot. On Telegram's LIGHT theme that value is
-    #ffffff, so the entire app turned white and the dark design collapsed.
+  Two theme layers:
+    1. --tg-*  values come from Telegram (WebApp.themeParams). Set by JS at
+       boot in core/telegram.js. They auto-follow the user's Telegram theme.
+    2. --du-* are OUR app's tokens. They default to a purple/cyan cosmic
+       palette (matches the "Gateway" reference screenshot) but override
+       gracefully from Telegram tokens when available.
 
-    Now: surfaces are hard-coded to the deep-violet palette below and are
-    independent of the user's Telegram theme. Only *accent* colors are
-    allowed to borrow from Telegram. Light mode is opt-in from Settings
-    (html[data-theme="light"]).
-
-  Background artwork:
-    --du-bg-image points at /static/img/bg.jpg. Drop the file there and it is
-    picked up automatically; delete the file and the app falls back to the
-    gradient underneath. --du-bg-dim controls the readability scrim (0 = raw
-    artwork, 1 = fully black). --du-bg-blur softens the artwork behind text.
+  To restyle: edit ONLY the :root block below.
+  To add a new token: add it here, use it everywhere via var().
   ============================================================================
 */
 
 :root {
-  /* ---- Telegram theme fallbacks (JS overrides ONLY the accent ones) ---- */
+  /* ---- Telegram theme fallbacks (JS overrides these at boot) ---- */
+  --tg-bg:               #0f0b1a;
   --tg-text:             #ffffff;
   --tg-hint:             #8a8a9e;
-  --tg-link:             #9d7bff;
+  --tg-link:             #7a5cff;
   --tg-button:           #7a5cff;
   --tg-button-text:      #ffffff;
-  --tg-accent-text:      #9d7bff;
+  --tg-secondary-bg:     #17122a;
+  --tg-header-bg:        #1a1030;
+  --tg-accent-text:      #7a5cff;
+  --tg-section-bg:       #17122a;
   --tg-section-header:   #a89bff;
   --tg-subtitle:         #8a8a9e;
   --tg-destructive:      #ff4d6d;
 
-  /* ---- Background artwork layer ---- */
-  --du-bg-image:         url("/static/img/bg.jpg");
-  --du-bg-dim:           0.45;   /* scrim opacity over the artwork */
-  --du-bg-blur:          0px;    /* raise to 6-10px for a softer backdrop */
-
   /* ---- App-level tokens (Doujinshi Universe brand) ---- */
 
-  /* Surfaces — sampled from the artwork; layered lowest -> highest.
-     These are FIXED. Telegram cannot override them. */
-  --du-bg-0:             #0b0614;   /* page background (near-black violet) */
-  --du-bg-1:             #140b26;   /* cards, sections */
-  --du-bg-2:             #1c1036;   /* elevated cards */
-  --du-bg-3:             #241546;   /* modals, sheets */
+  /* Surfaces — layered from lowest (page bg) to highest (modals) */
+  --du-bg-0:             var(--tg-bg);          /* page background */
+  --du-bg-1:             var(--tg-secondary-bg); /* cards, sections */
+  --du-bg-2:             #1f1740;               /* elevated cards */
+  --du-bg-3:             #2a1f55;               /* modals, sheets */
 
-  /* Translucent surfaces — used over the background artwork */
-  --du-glass-1:          rgba(20, 11, 38, 0.62);
-  --du-glass-2:          rgba(28, 16, 54, 0.72);
-  --du-glass-chrome:     rgba(11, 6, 20, 0.78);  /* header + tab bar */
-  --du-blur-chrome:      saturate(140%) blur(18px);
+  /* Ink — text hierarchy */
+  --du-ink-hi:           var(--tg-text);         /* primary text */
+  --du-ink-mid:          #cbc4e6;                /* secondary text */
+  --du-ink-lo:           var(--tg-hint);         /* tertiary/hint */
+  --du-ink-inv:          #0f0b1a;                /* text on accent bg */
 
-  /* Ink — text hierarchy (fixed, always light-on-dark) */
-  --du-ink-hi:           #f4f1ff;
-  --du-ink-mid:          #cbc4e6;
-  --du-ink-lo:           #9a92b8;
-  --du-ink-inv:          #0b0614;
-
-  /* Accents — these MAY follow Telegram */
-  --du-accent:           #7a5cff;
-  --du-accent-2:         #4fd1c5;
-  --du-accent-3:         #ff4dcf;
+  /* Accents */
+  --du-accent:           #7a5cff;                /* primary purple */
+  --du-accent-2:         #4fd1c5;                /* cyan for "secure/online" */
+  --du-accent-3:         #ff4dcf;                /* magenta highlight */
   --du-danger:           var(--tg-destructive);
   --du-warn:             #ffb84d;
   --du-success:          #4fd1c5;
 
   /* Borders + dividers */
-  --du-border:           rgba(255, 255, 255, 0.09);
-  --du-border-strong:    rgba(255, 255, 255, 0.18);
-  --du-divider:          rgba(255, 255, 255, 0.06);
+  --du-border:           rgba(255, 255, 255, 0.08);
+  --du-border-strong:    rgba(255, 255, 255, 0.16);
+  --du-divider:          rgba(255, 255, 255, 0.05);
 
-  /* Radii */
+  /* Radii — one place to change corner roundness across the app */
   --du-radius-sm:        8px;
   --du-radius-md:        12px;
   --du-radius-lg:        18px;
@@ -117,9 +102,9 @@
   --du-lh-normal:        1.5;
 
   /* Shadows */
-  --du-shadow-sm:        0 1px 2px rgba(0,0,0,0.30);
-  --du-shadow-md:        0 4px 12px rgba(0,0,0,0.40);
-  --du-shadow-lg:        0 12px 32px rgba(0,0,0,0.55);
+  --du-shadow-sm:        0 1px 2px rgba(0,0,0,0.25);
+  --du-shadow-md:        0 4px 12px rgba(0,0,0,0.35);
+  --du-shadow-lg:        0 12px 32px rgba(0,0,0,0.45);
   --du-glow-accent:      0 0 24px rgba(122, 92, 255, 0.35);
   --du-glow-cyan:        0 0 24px rgba(79, 209, 197, 0.30);
 
@@ -136,39 +121,22 @@
   --du-safe-bot:         env(safe-area-inset-bottom, 0px);
 
   /* Z-layers */
-  --du-z-bg:             -1;
   --du-z-header:         50;
   --du-z-tabbar:         50;
   --du-z-sheet:          200;
   --du-z-toast:          300;
 }
 
-/* Optional light-theme override — Settings toggles [data-theme="light"]. */
+/* Optional light-theme override — JS toggles [data-theme="light"] on <html>. */
 html[data-theme="light"] {
-  --du-bg-image:         none;
-  --du-bg-dim:           0;
   --du-bg-0:             #fafafa;
   --du-bg-1:             #ffffff;
   --du-bg-2:             #f2eefe;
   --du-bg-3:             #ffffff;
-  --du-glass-1:          rgba(255, 255, 255, 0.72);
-  --du-glass-2:          rgba(255, 255, 255, 0.82);
-  --du-glass-chrome:     rgba(255, 255, 255, 0.86);
   --du-ink-hi:           #1a1030;
   --du-ink-mid:          #4b3f75;
   --du-ink-lo:           #7d75a3;
-  --du-ink-inv:          #ffffff;
   --du-border:           rgba(0,0,0,0.08);
   --du-border-strong:    rgba(0,0,0,0.14);
   --du-divider:          rgba(0,0,0,0.05);
-}
-
-/* Respect users who ask for less motion / cheaper rendering. */
-@media (prefers-reduced-transparency: reduce) {
-  :root {
-    --du-glass-1:        var(--du-bg-1);
-    --du-glass-2:        var(--du-bg-2);
-    --du-glass-chrome:   var(--du-bg-0);
-    --du-blur-chrome:    none;
-  }
 }

@@ -4,15 +4,6 @@
   ============================================================================
   No component styles here. Only the foundational rules that ALL components
   inherit from. Keep this small — every rule here affects every element.
-
-  v0.3 changes:
-    * Fixed, non-scrolling background artwork layer (body::before) reading
-      --du-bg-image, with a --du-bg-dim scrim (body::after) so text stays
-      readable over any image.
-    * Header and tab bar became translucent "glass" with an OPAQUE fallback
-      for WebViews that don't support backdrop-filter (older Android).
-    * Chrome colors no longer read --tg-header-bg, so Telegram's light theme
-      can't punch white bars into the dark UI.
   ============================================================================
 */
 
@@ -31,53 +22,13 @@ html {
 }
 
 body {
-  position: relative;
   min-height: 100vh;
   min-height: 100dvh;
   background:
-    radial-gradient(1200px 600px at 20% -10%, rgba(122,92,255,0.18), transparent 60%),
-    radial-gradient(900px 500px at 100% 110%, rgba(79,209,197,0.08), transparent 60%),
+    radial-gradient(1200px 600px at 20% -10%, rgba(122,92,255,0.15), transparent 60%),
+    radial-gradient(900px 500px at 100% 110%, rgba(79,209,197,0.10), transparent 60%),
     var(--du-bg-0);
 }
-
-/* ---- Background artwork -------------------------------------------------
-   `position: fixed` keeps the image still while content scrolls (Telegram's
-   WebView ignores background-attachment: fixed on iOS, hence a real layer).
-   If /static/img/bg.jpg is missing the layer simply renders nothing and the
-   gradient above shows through — no broken-image icon.
---------------------------------------------------------------------------- */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: var(--du-z-bg);
-  background-image: var(--du-bg-image);
-  background-size: cover;
-  background-position: center center;
-  background-repeat: no-repeat;
-  filter: blur(var(--du-bg-blur));
-  transform: scale(1.04); /* hides blur edge bleed */
-  pointer-events: none;
-}
-
-/* Readability scrim over the artwork. */
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: var(--du-z-bg);
-  background:
-    linear-gradient(
-      to bottom,
-      rgba(11, 6, 20, calc(var(--du-bg-dim) + 0.12)) 0%,
-      rgba(11, 6, 20, var(--du-bg-dim)) 38%,
-      rgba(11, 6, 20, calc(var(--du-bg-dim) + 0.16)) 100%
-    );
-  pointer-events: none;
-}
-
-html[data-theme="light"] body::before,
-html[data-theme="light"] body::after { display: none; }
 
 button, input, textarea, select {
   font: inherit; color: inherit;
@@ -91,8 +42,6 @@ a { color: var(--du-accent); text-decoration: none; }
 
 /* App shell layout */
 #app {
-  position: relative;
-  z-index: 1;
   display: grid;
   grid-template-rows: auto 1fr auto;
   min-height: 100vh;
@@ -103,8 +52,7 @@ a { color: var(--du-accent); text-decoration: none; }
   position: sticky; top: 0; z-index: var(--du-z-header);
   height: calc(var(--du-header-h) + var(--du-safe-top));
   padding-top: var(--du-safe-top);
-  /* Opaque fallback first — replaced below where blur is supported. */
-  background: var(--du-bg-0);
+  background: var(--tg-header-bg);
   border-bottom: 1px solid var(--du-border);
   display: flex; align-items: center;
   padding-inline: var(--du-space-4);
@@ -121,18 +69,9 @@ a { color: var(--du-accent); text-decoration: none; }
   z-index: var(--du-z-tabbar);
   height: calc(var(--du-tabbar-h) + var(--du-safe-bot));
   padding-bottom: var(--du-safe-bot);
-  background: var(--du-bg-0);
+  background: var(--tg-header-bg);
   border-top: 1px solid var(--du-border);
   display: flex; align-items: stretch;
-}
-
-/* Glass chrome only where the WebView can actually blur. Write ONLY the
-   standard property — do not hand-add -webkit-backdrop-filter. */
-@supports (backdrop-filter: blur(1px)) {
-  .app-header, .app-tabbar {
-    background: var(--du-glass-chrome);
-    backdrop-filter: var(--du-blur-chrome);
-  }
 }
 
 /* Utilities — sparingly. Prefer semantic component classes. */

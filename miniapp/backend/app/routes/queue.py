@@ -29,10 +29,48 @@ def enqueue(body: EnqueueBody, user: dict = Depends(get_current_user)) -> dict:
     uid = int(user["id"])
 
     # If app is private, block non-admins.
-    if not db.get_public_mode() and not settings.is_admin(uid):  # v0.3
+    if not db.get_public_mode() and uid != int(settings.admin_user_id):
         raise HTTPException(403, "App is currently private (admin only).")
 
-    # Rate-limit check + consume (raises 429 if over limit).
+    # ---- V2 dedup gate -----------------------------------------------------
+    # Runs BEFORE the rate-limit consume on purpose: tapping "Queue" on a
+    # gallery we already have must not cost the user one of their daily
+    # tokens, and must not create a junk queue row. This is a read-only
+    # peek — relay_v2 remains the single writer of the PROCESSING claim.
+    try:
+        peek = queue_bridge.dedup_peek(body.url)
+    except Exception as e:  # noqa: BLE001
+        # A broken dedup gate must never block queueing.
+        peek = {"verdict": "proceed", "peek_error": str(e)}
+
+    verdict = peek.get("verdict")
+
+    if verdict == "already_completed":
+        return {
+            "ok": True,
+            "deduped": True,
+            "action": "already_completed",
+            "gallery_id": peek.get("gallery_id"),
+            "status": peek.get("status"),
+            "open_link": peek.get("open_link"),
+            "title": peek.get("title"),
+            "message": "Already in the library — opening the existing post.",
+            "usage": ratelimit.usage_summary(uid),
+        }
+
+    if verdict == "already_processing":
+        return {
+            "ok": True,
+            "deduped": True,
+            "action": "already_processing",
+            "gallery_id": peek.get("gallery_id"),
+            "status": peek.get("status"),
+            "title": peek.get("title"),
+            "message": "This one is already downloading — hang tight.",
+            "usage": ratelimit.usage_summary(uid),
+        }
+
+    # ---- Normal path: rate-limit check + consume (raises 429 if over) ------
     rl = ratelimit.check_and_consume(uid)
 
     # Actually enqueue into the bot's shared queue.
@@ -43,7 +81,12 @@ def enqueue(body: EnqueueBody, user: dict = Depends(get_current_user)) -> dict:
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"Enqueue failed: {e}")
 
-    return {"ok": True, "job": r, "usage": rl}
+    out = {"ok": True, "deduped": False, "action": "queued", "job": r, "usage": rl}
+    # Surface a retry-after-failure hint so the UI can say "retrying…".
+    if peek.get("previous_status"):
+        out["previous_status"] = peek["previous_status"]
+        out["previous_reason"] = peek.get("previous_reason") or ""
+    return out
 
 
 @router.get("/status")

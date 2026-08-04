@@ -1,15 +1,20 @@
 /*
   pages/search.js — Discover / Search page
 
-  Grid cards show cover + NAME only (bold). Tap → detail-sheet plugin
-  fetches /api/gallery/{id} and renders the full metadata view.
+  Renders:
+    - smart search bar (uses plugins/search-operators.js)
+    - filter chip row (English is baked in; chips just toggle sort presets)
+    - grid of cards (uses components/card.js via components registry)
+    - infinite scroll on the grid
+    - tap a card → detail sheet whose buttons come from plugins/card-actions.js
 */
 
 import { api } from "core/api.js";
 import { make, h } from "core/components.js";
 import { haptic } from "core/telegram.js";
+import { store } from "core/state.js";
 import { parseSearch } from "plugins/search-operators.js";
-import { openGalleryDetail } from "plugins/detail-sheet.js";
+import { cardActions } from "plugins/card-actions.js";
 
 const PAGE_SIZE = 25;
 
@@ -37,9 +42,11 @@ export async function render(root, { me }) {
 
   root.append($bar, $hint, $chips, $grid, $footer);
 
+  // Initial load with a skeleton grid.
   showSkeleton();
   await load();
 
+  // Infinite scroll — grow when user hits the bottom.
   const io = new IntersectionObserver((entries) => {
     for (const e of entries) {
       if (e.isIntersecting && !state.loading && !state.done) load();
@@ -98,13 +105,59 @@ export async function render(root, { me }) {
 
   function renderCard(g) {
     return make("card", {
-      id: g.id,
-      title: g.title,
-      cover: g.cover,
-      pages: g.pages,
+      id: g.id, title: g.title, cover: g.cover, pages: g.pages,
       badge: g.pages ? `${g.pages}p` : null,
-      onOpen: () => openGalleryDetail(g, me),
+      onOpen: () => openDetail(g),
     });
+  }
+
+  function openDetail(g) {
+    // Fetch V2 dedup status once, in the background, so the sheet re-renders
+    // its primary button as "Open Post" / "Downloading…" / "Queue to Channel".
+    // The sheet appears immediately; the status update follows within one RTT.
+    if (!g.v2_status) {
+      api.get(`/api/gallery/${g.id}/status`)
+        .then(s => { g.v2_status = s || { known: false }; })
+        .catch(() => { g.v2_status = { known: false }; });
+    }
+
+    // Turn cardActions entries into sheet-button descriptors, unwrapping
+    // function-valued label / icon / disabled fields (V2 dynamic actions).
+    const _val = (v, ctx) => (typeof v === "function" ? v(ctx) : v);
+    const actions = cardActions
+      .filter(a => !a.when || a.when({ gallery: g, me }))
+      .map(a => {
+        const ctx = { gallery: g, me };
+        return {
+          label:    `${_val(a.icon, ctx)} ${_val(a.label, ctx)}`,
+          kind:     a.kind || "secondary",
+          block:    false,
+          disabled: _val(a.disabled, ctx) || false,
+          onClick:  (sheetApi) => a.run({ gallery: g, me, close: sheetApi.close }),
+        };
+      });
+
+    const body = h("div", {},
+      g.cover ? h("img", {
+        src: g.cover, alt: g.title,
+        style: { width: "60%", maxWidth: "220px", margin: "0 auto",
+                 display: "block", borderRadius: "12px",
+                 border: "1px solid var(--du-border)" },
+      }) : null,
+      h("div", { style: { textAlign: "center", marginTop: "12px",
+                          fontSize: "15px", fontWeight: "600" } }, g.title || `#${g.id}`),
+      h("div", { style: { textAlign: "center", color: "var(--du-ink-lo)",
+                          fontSize: "13px", marginTop: "4px" } },
+        `#${g.id} · ${g.pages || "?"} pages`),
+      g.tags && g.tags.length
+        ? h("div", { class: "chip-row", style: { justifyContent: "center" } },
+            ...g.tags.slice(0, 8).map(t =>
+              h("span", { class: "chip", "aria-pressed": "false" }, t.name || t)))
+        : null,
+    );
+
+    const sheet = make("sheet", { title: "Gallery", body, actions });
+    sheet.open();
   }
 
   function emptyState() {
@@ -120,18 +173,14 @@ export async function render(root, { me }) {
 
 function buildSearchBar(state, refetch) {
   const input = h("input", {
-    type: "search",
-    enterkeyhint: "search",
+    type: "search", enterkeyhint: "search",
     placeholder: "Search galleries, tags, artists…",
-    autocomplete: "off",
-    autocapitalize: "off",
-    spellcheck: "false",
+    autocomplete: "off", autocapitalize: "off", spellcheck: "false",
   });
   const clear = h("button", { class: "search-clear u-hide", "aria-label": "Clear" }, "✕");
   const bar = h("div", { class: "search-bar" },
     h("span", { class: "search-icon" }, "🔎"),
-    input,
-    clear,
+    input, clear,
   );
   let timer = null;
   input.addEventListener("input", () => {
@@ -142,11 +191,8 @@ function buildSearchBar(state, refetch) {
     timer = setTimeout(() => { haptic("select"); refetch(); }, 350);
   });
   clear.addEventListener("click", () => {
-    input.value = "";
-    state.query = "";
-    state.parsed = parseSearch("");
-    clear.classList.add("u-hide");
-    refetch();
+    input.value = ""; state.query = ""; state.parsed = parseSearch("");
+    clear.classList.add("u-hide"); refetch();
   });
   return bar;
 }

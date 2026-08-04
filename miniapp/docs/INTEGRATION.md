@@ -139,3 +139,98 @@ Everything the Mini App writes is in `miniapp_*`-prefixed Mongo collections. Not
 3. (Optional) drop `miniapp_settings`, `miniapp_users`, `miniapp_usage`, `miniapp_bookmarks` in Atlas
 
 The bot itself is unaffected.
+
+---
+
+# V2 addendum (Bot 1 removed, MongoDB `galleries` dedup gate)
+
+If you are upgrading to V2, read `docs/ARCHITECTURE_V2.md` (repo root) and
+`docs/MIGRATION_V2.md` first. This addendum covers only the mini-app-side
+changes and the operational steps the operator has to take on Render.
+
+## V2-a. New environment variables
+
+Add these to your Render service alongside the existing miniapp vars:
+
+```
+SELF_COVER_POST_ENABLED     = 1     # 0 = fall back to legacy V1 (Bot 1) path
+MINIAPP_STALE_PROCESSING_S  = 900   # 15 minutes — dedup gate lazy-timeout
+```
+
+Deprecated, still tolerated:
+
+```
+BOT1_USERNAME               = <unset>   # V2 logs a warning if set; ignored
+```
+
+Unchanged:
+
+```
+BOT2_USERNAME               = @Gallery_DLBot
+BOT2_PDF_TIMEOUT_SEC        = 480   # 8-minute Bot 2 wait
+```
+
+## V2-b. New backend endpoints & response shapes
+
+Route | Change
+--- | ---
+`POST /api/queue` | Dedup gate runs BEFORE the rate-limit consume. Response can now be `{deduped:true, action:"already_completed", open_link, title, ...}` / `{deduped:true, action:"already_processing", ...}` / `{deduped:false, action:"queued", job, usage}`.
+`GET /api/gallery/{id}` | Response now carries `v2_status: {known, status, open_link, title, ...}` (read-only) so the sheet renders the correct primary button in one round-trip.
+`GET /api/gallery/{id}/status` | **NEW** read-only endpoint returning `{gallery_id, known, status, open_link, title, pages, completed_at, failed_reason}`. Front-end uses it to swap "Queue" ⇄ "Open Post" on cards.
+`GET /api/queue/status` | `recent[]` rows are enriched with `open_link`, `gallery_id`, `error_reason` so the Queue tab can render "Open Post" without extra requests.
+
+## V2-c. New client behaviour
+
+- **Card action swap**: `frontend/js/plugins/card-actions.js` — the primary
+  action now has function-valued `label` / `icon` / `disabled` fields.
+  Detail-sheet consumers (`pages/search.js`, `pages/bookmarks.js`) unwrap
+  them and pre-fetch `/api/gallery/{id}/status` on sheet open. This is
+  invisible to end-users but critical if you add third-party card actions.
+- **Queue tab**: `frontend/js/pages/queue.js` — done / partial rows render
+  an "🔗 Open Post" button that opens the DB channel deep-link via Telegram
+  WebApp's `openLink`. Failed rows show a friendly reason (technical text
+  stays admin-only).
+- **`/search` command** in `admin_bot.py` now redirects to the Mini App
+  with an inline `WebAppInfo` button, pre-filling the query in the URL
+  hash. The legacy `search_picker` module remains wired up so callback
+  handlers for in-flight legacy sessions still work.
+
+## V2-d. One-time migration
+
+After V2 goes live, run once (from the Render shell, or locally with the
+production `MONGO_URI`):
+
+```
+python3 scripts/migrate_v2_recover_stuck.py --dry-run
+python3 scripts/migrate_v2_recover_stuck.py
+```
+
+This tombstones orphaned `PROCESSING` gallery docs (e.g. from a container
+recycle during V2 first deploy) as `FAILED_RECOVERED`, which the dedup
+gate treats as retryable. See the script's docstring for details.
+
+## V2-e. Verification
+
+- Enqueue a brand-new gallery from the Mini App → cover appears in DB
+  channel authored by the userbot session (not Bot 1) → PDF forwarded
+  under it → the card / detail sheet immediately shows "🔗 Open Post".
+- Enqueue the same gallery from a different Telegram account → response
+  is `{deduped:true, action:"already_completed"}` → user is bounced
+  straight to the existing DB channel post. No new post, no token spent.
+- Enqueue during processing from another account → response is
+  `{deduped:true, action:"already_processing"}` → user sees "already
+  downloading — hang tight" toast.
+- Send a link Bot 2 can't handle → cover post is deleted, admin gets a
+  DM with the offending link + Bot 2's raw error text, user sees
+  "source error — please pick another gallery" in their chat.
+- Trigger a stale PROCESSING doc (kill worker mid-flight) and run the
+  migration script → doc becomes FAILED_RECOVERED; next dedup request
+  for that gallery_id proceeds.
+- Open the mini-app Queue tab → COMPLETED rows show "🔗 Open Post".
+
+## V2-f. Rollback
+
+Set `SELF_COVER_POST_ENABLED=0` on Render, redeploy. The router in
+`worker.py` routes back to legacy `relay.process_job` (which still expects
+`BOT1_USERNAME`). The `galleries` collection stays in Mongo but is not
+consulted by the V1 path; it is safe to leave it there or drop it.

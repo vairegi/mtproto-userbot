@@ -2,14 +2,14 @@
   pages/bookmarks.js — User's saved galleries
 
   Reads from /api/bookmarks and renders the same card grid as search.
-  Uses the shared detail-sheet plugin so tapping a bookmark shows the
-  full nhentai-style detail view.
+  Actions on tap re-use plugins/card-actions.js (so "Queue" still works from
+  the bookmark view without duplicating logic).
 */
 
 import { api } from "core/api.js";
 import { make, h } from "core/components.js";
 import { store } from "core/state.js";
-import { openGalleryDetail } from "plugins/detail-sheet.js";
+import { cardActions } from "plugins/card-actions.js";
 
 export async function render(root, { me }) {
   const $grid = h("div", { class: "card-grid" });
@@ -31,12 +31,9 @@ export async function render(root, { me }) {
     }
     for (const g of items) {
       $grid.appendChild(make("card", {
-        id: g.id,
-        title: g.title,
-        cover: g.cover,
-        pages: g.pages,
+        id: g.id, title: g.title, cover: g.cover, pages: g.pages,
         badge: g.pages ? `${g.pages}p` : null,
-        onOpen: () => openGalleryDetail(g, me),
+        onOpen: () => openDetail(g, me),
       }));
     }
   } catch (e) {
@@ -47,4 +44,35 @@ export async function render(root, { me }) {
       h("div", {}, String(e.message || e)),
     ));
   }
+}
+
+function openDetail(g, me) {
+  // Fetch V2 dedup status once, in the background — sheet appears
+  // immediately, primary-button label updates once the RTT lands.
+  if (!g.v2_status) {
+    api.get(`/api/gallery/${g.id}/status`)
+      .then(s => { g.v2_status = s || { known: false }; })
+      .catch(() => { g.v2_status = { known: false }; });
+  }
+
+  // Unwrap function-valued label / icon / disabled from V2 dynamic actions.
+  const _val = (v, ctx) => (typeof v === "function" ? v(ctx) : v);
+  const actions = cardActions
+    .filter(a => !a.when || a.when({ gallery: g, me }))
+    .map(a => {
+      const ctx = { gallery: g, me };
+      return {
+        label:    `${_val(a.icon, ctx)} ${_val(a.label, ctx)}`,
+        kind:     a.kind || "secondary",
+        disabled: _val(a.disabled, ctx) || false,
+        onClick:  (sheetApi) => a.run({ gallery: g, me, close: sheetApi.close }),
+      };
+    });
+  const body = h("div", { style: { textAlign: "center" } },
+    g.cover ? h("img", { src: g.cover, alt: g.title,
+      style: { width: "60%", maxWidth: "220px", borderRadius: "12px",
+               margin: "0 auto", display: "block" } }) : null,
+    h("div", { style: { marginTop: "12px", fontWeight: "600" } }, g.title || `#${g.id}`),
+  );
+  make("sheet", { title: "Bookmark", body, actions }).open();
 }

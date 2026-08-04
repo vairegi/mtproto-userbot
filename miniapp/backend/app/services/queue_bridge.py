@@ -30,6 +30,95 @@ except Exception as e:  # noqa: BLE001
     HAVE_BOT = False
     log.warning("queue_service / db not importable — queue endpoints will 503 (%s)", e)
 
+# V2 dedup gate (docs/ARCHITECTURE_V2.md). Optional: if the parent project
+# predates V2, gallery_state won't import and we silently fall back to the
+# plain enqueue path so the Mini App keeps working.
+try:
+    import gallery_state as _gs
+    HAVE_GS = True
+except Exception as e:  # noqa: BLE001
+    _gs = None
+    HAVE_GS = False
+    log.warning("gallery_state not importable — dedup gate disabled (%s)", e)
+
+
+def gallery_status(url_or_id: str) -> dict:
+    """Look up a gallery's V2 state WITHOUT mutating anything.
+
+    Used by GET /api/gallery/{id}/status so the frontend can render
+    "Open Post" instead of "Queue" for galleries we already have.
+
+    Returns {"known": False} when we've never seen it, otherwise the
+    status plus the deep-link when COMPLETED.
+    """
+    if not (HAVE_BOT and HAVE_GS):
+        return {"known": False, "reason": "dedup gate unavailable"}
+    gid = _gs.extract_gallery_id(url_or_id)
+    if not gid:
+        return {"known": False, "reason": "no gallery_id"}
+    conn = _bot_db.connect()
+    try:
+        doc = _gs.get(conn, gid) or {}
+        if not doc:
+            return {"known": False, "gallery_id": gid}
+        return {
+            "known": True,
+            "gallery_id": gid,
+            "status": doc.get("status"),
+            "open_link": doc.get("open_link"),
+            "title": doc.get("title"),
+            "pages": doc.get("pages"),
+            "completed_at": doc.get("completed_at"),
+            "failed_reason": doc.get("failed_reason") or "",
+        }
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+
+def dedup_peek(url: str) -> dict:
+    """Read-only dedup pre-check used by POST /api/queue.
+
+    Returns one of:
+      {"verdict": "proceed"}                      -> caller should enqueue
+      {"verdict": "already_completed", ...}       -> caller returns the link
+      {"verdict": "already_processing", ...}      -> caller says "in progress"
+
+    IMPORTANT: this does NOT claim a PROCESSING slot. Claiming happens in
+    relay_v2.process_job, which is the single writer. Doing a read-only peek
+    here means a Mini App tap that hits a duplicate never burns a rate-limit
+    token and never creates a junk queue row.
+    """
+    if not (HAVE_BOT and HAVE_GS):
+        return {"verdict": "proceed"}
+    info = gallery_status(url)
+    if not info.get("known"):
+        return {"verdict": "proceed", "gallery_id": info.get("gallery_id")}
+
+    status = (info.get("status") or "").upper()
+    if status in ("COMPLETED", "PARTIAL"):
+        return {
+            "verdict": "already_completed",
+            "gallery_id": info.get("gallery_id"),
+            "status": status,
+            "open_link": info.get("open_link"),
+            "title": info.get("title"),
+        }
+    if status == "PROCESSING":
+        return {
+            "verdict": "already_processing",
+            "gallery_id": info.get("gallery_id"),
+            "status": status,
+            "title": info.get("title"),
+        }
+    # FAILED_* tombstone → a retry is legitimate.
+    return {
+        "verdict": "proceed",
+        "gallery_id": info.get("gallery_id"),
+        "previous_status": status,
+        "previous_reason": info.get("failed_reason") or "",
+    }
+
 
 def enqueue(url: str, user_id: int, username: str | None) -> dict:
     if not HAVE_BOT:
@@ -69,12 +158,28 @@ def status_summary() -> dict:
 
 
 def _row(r: Any) -> dict:
-    if isinstance(r, dict):
-        return {
-            "id":     r.get("id") or r.get("_id"),
-            "url":    r.get("url"),
-            "title":  r.get("title") or r.get("cleaned_title"),
-            "status": r.get("status"),
-            "user":   r.get("username") or r.get("submitted_by"),
-        }
-    return {"raw": str(r)}
+    if not isinstance(r, dict):
+        return {"raw": str(r)}
+
+    out = {
+        "id":     r.get("id") or r.get("_id"),
+        "url":    r.get("url"),
+        "title":  r.get("title") or r.get("cleaned_title"),
+        "status": r.get("status"),
+        "user":   r.get("username") or r.get("submitted_by"),
+        # relay_v2 writes cover_link on the queue row for both fresh
+        # completions AND dedup-hits, so the queue tab can render
+        # "Open Post" without an extra RTT to /api/gallery/{id}/status.
+        "open_link":     r.get("cover_link") or None,
+        "error_reason":  r.get("error_reason") or "",
+    }
+
+    # Best-effort: extract the numeric gallery_id from the URL so the
+    # frontend can build a fallback deep-link (still needs an extra RTT).
+    url = out["url"] or ""
+    if url and HAVE_GS:
+        try:
+            out["gallery_id"] = _gs.extract_gallery_id(url)
+        except Exception:
+            pass
+    return out
