@@ -13,6 +13,7 @@ worker.py — Main loop for the userbot worker process.
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import signal
 import sys
