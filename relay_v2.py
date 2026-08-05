@@ -478,11 +478,27 @@ async def process_job(
         db.record_processed(conn, url, url_hash)
 
         # ---- 7) Persist COMPLETED --------------------------------------
+        # BUG FIX (caption meta rows): cover.tags is now the TYPED list
+        # ({'name','type'} dicts) that hf_scraper preserves. Persist it as
+        # such so the mini-app can rebuild grouped rows and so mark_partial
+        # / re-post paths keep the same shape. If cover.tags happens to be
+        # a legacy flat name list, coerce each entry to {'name','type':'tag'}
+        # so we never break the DB schema.
+        _persist_tags = []
+        for _t in (cover.tags or []):
+            if isinstance(_t, dict) and _t.get("name"):
+                _persist_tags.append({
+                    "name": str(_t["name"]),
+                    "type": str(_t.get("type") or "tag"),
+                })
+            elif _t:
+                _persist_tags.append({"name": str(_t), "type": "tag"})
+
         gs.mark_completed(
             conn, gid,
             title=cover.title,
             pages=cover.pages,
-            tags=[{"name": n, "type": "tag"} for n in (cover.tags or [])],
+            tags=_persist_tags,
             cover_url=cover.cover_url,
             db_cover_msg_id=cover.msg_id,
             db_pdf_msg_id=pdf_msg_id,

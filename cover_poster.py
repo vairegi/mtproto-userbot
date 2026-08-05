@@ -67,13 +67,18 @@ _CAPTION_HARD_LIMIT = 1024      # Telegram caption limit (safety margin: 1000)
 
 @dataclass
 class CoverPost:
-    """Result of a successful cover-post op."""
+    """Result of a successful cover-post op.
+
+    NOTE: `tags` is now List[dict] with {'name','type'} entries (matches
+    hf_scraper.GalleryMeta.tags). Callers that only need names should use
+    `[t['name'] for t in cover.tags]`.
+    """
     msg_id: int
     channel_id: int
     open_link: str
     title: str
     pages: Optional[int]
-    tags: List[str]
+    tags: List           # List[Dict[str, str]] but kept loose for back-compat
     cover_url: Optional[str]
     used_fallback_text_only: bool = False   # True if cover download failed
 
@@ -339,21 +344,23 @@ async def post_cover(
         return None
 
     title  = str(getattr(meta, "title", "") or "")
-    # BUG 2: keep the original {'name','type'} shape so _format_caption can
-    # group by type. Plain strings still work — they fall into the 'tag'
-    # bucket via _group_tags_by_type.
+    # BUG FIX: hf_scraper now returns TYPED tags ({'name','type'} dicts).
+    # Preserve that shape end-to-end so:
+    #   - _format_caption can build grouped rows (Groups/Parodies/Artists/…)
+    #   - relay_v2 can persist typed tags on `galleries[gid].tags` so the
+    #     mini-app can rebuild the same caption for the DM forward.
     tags_v = getattr(meta, "tags", []) or []
     tags_typed: List = []
-    tags_flat: List[str] = []  # kept for the CoverPost return shape (back-compat)
     for t in tags_v:
         if isinstance(t, dict):
             n = t.get("name") or ""
             if n:
-                tags_typed.append({"name": str(n), "type": str(t.get("type") or "tag")})
-                tags_flat.append(str(n))
+                tags_typed.append({
+                    "name": str(n),
+                    "type": str(t.get("type") or "tag"),
+                })
         elif t:
             tags_typed.append({"name": str(t), "type": "tag"})
-            tags_flat.append(str(t))
     pages     = getattr(meta, "pages", None)
     cover_url = getattr(meta, "cover_url", None)
     gid       = getattr(meta, "gallery_id", None)
@@ -361,9 +368,9 @@ async def post_cover(
     caption = _format_caption(
         title, tags_typed, pages, url, requester_handle, gallery_id=gid,
     )
-    # Preserve the tags field on CoverPost as a flat name list (unchanged
-    # public shape).
-    tags = tags_flat
+    # Return the tags on CoverPost in the SAME typed dict shape
+    # (relay_v2 now persists them as-is to Mongo).
+    tags = tags_typed
 
     # 2) download cover ---------------------------------------------------
     cover_bytes = await _download_cover(cover_url) if cover_url else None

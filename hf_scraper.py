@@ -156,8 +156,11 @@ class SearchPage:
 
 @dataclass
 class GalleryMeta:
+    # BUG FIX: `tags` is now List[Dict[str,str]] with {'name','type'} so
+    # downstream (cover_poster) can build grouped meta rows.
+    # Legacy consumers can call hf_scraper._flatten_tag_names(meta.tags).
     title: str
-    tags: List[str]
+    tags: List[Dict[str, str]]
     cover_url: Optional[str]
     pages: Optional[int] = None
     gallery_id: Optional[str] = None
@@ -398,9 +401,27 @@ def _cover_url_from_detail(detail: dict) -> Optional[str]:
     return _thumb_url(detail)
 
 
-def _tag_names_from_detail(detail: dict) -> List[str]:
-    """Extract useful tag names. Keeps the fields /mpost traditionally used."""
-    out: List[str] = []
+# nhentai's tag `type` field uses these exact strings. We keep ALL of them
+# so the cover caption can build grouped meta rows
+# (Groups / Parodies / Artists / Characters / Languages / Categories) and
+# still have a trailing plain-tag row.
+_KEEP_TAG_TYPES = {
+    "tag", "artist", "parody", "character", "group", "language", "category",
+}
+
+
+def _tag_names_from_detail(detail: dict) -> List[Dict[str, str]]:
+    """Extract useful tags as [{'name','type'}, ...].
+
+    BUG FIX: previously returned plain `List[str]` (no type info) AND
+    dropped `language`/`category` tags entirely. The cover caption's
+    grouped rows were empty as a result. We now preserve the type and
+    include every meaningful category nhentai emits.
+
+    Back-compat: downstream code that expected a flat list of names can
+    call `_flatten_tag_names(...)` on the result (a helper below).
+    """
+    out: List[Dict[str, str]] = []
     for t in detail.get("tags") or []:
         if not isinstance(t, dict):
             continue
@@ -408,9 +429,14 @@ def _tag_names_from_detail(detail: dict) -> List[str]:
         name = (t.get("name") or "").strip()
         if not name:
             continue
-        if ttype in ("tag", "artist", "parody", "character", "group"):
-            out.append(name)
+        if ttype in _KEEP_TAG_TYPES:
+            out.append({"name": name, "type": ttype or "tag"})
     return out
+
+
+def _flatten_tag_names(tags: List[Dict[str, str]]) -> List[str]:
+    """Legacy helper: [{'name','type'}, ...] -> ['name', ...]."""
+    return [t.get("name", "") for t in (tags or []) if t.get("name")]
 
 
 # ---------------------------------------------------------------------------
