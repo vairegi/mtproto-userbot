@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+import httpx
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 
@@ -102,6 +103,80 @@ async def _get_bot2_entity(client: TelegramClient):
     return await client.get_entity(settings.bot2_username)
 
 
+# ---------------------------------------------------------------------------
+# Auto-DM helpers (BUG FIX — previously the userbot couldn't resolve the
+# requester's PeerUser because it had never seen them, so nothing was sent)
+# ---------------------------------------------------------------------------
+_TG_BOT_API = "https://api.telegram.org"
+_AUTO_DM_HTTP_TIMEOUT = 15.0
+
+
+def _admin_bot_token() -> str:
+    """Resolve the admin bot token from settings / env. Same fallback chain
+    the mini-app uses."""
+    tok = getattr(settings, "admin_bot_token", "") or ""
+    if tok:
+        return tok
+    for name in ("BOT_TOKEN", "ADMIN_BOT_TOKEN"):
+        v = os.environ.get(name)
+        if v:
+            return v
+    return ""
+
+
+async def _bot_api_call(method: str, payload: dict) -> dict:
+    """Bot API call from inside the async worker. Returns the JSON envelope
+    (with a normalised {'ok':False,'description':...} on failure)."""
+    token = _admin_bot_token()
+    if not token:
+        return {"ok": False, "description": "admin bot token not configured"}
+    url = f"{_TG_BOT_API}/bot{token}/{method}"
+    try:
+        async with httpx.AsyncClient(timeout=_AUTO_DM_HTTP_TIMEOUT) as c:
+            r = await c.post(url, json=payload)
+        try:
+            data = r.json() or {}
+        except Exception:
+            return {"ok": False,
+                    "description": f"non-JSON response HTTP {r.status_code}"}
+        if not data.get("ok") and "error_code" not in data:
+            data["error_code"] = r.status_code
+        return data
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "description": f"http error: {e!s}"}
+
+
+async def _copy_message_via_bot(
+    from_chat_id: int, to_chat_id: int, message_id: int,
+) -> dict:
+    """Copy a single message via Bot API copyMessage; fall back to
+    forwardMessage if the copy is refused for a non-permission reason."""
+    payload = {
+        "chat_id":       int(to_chat_id),
+        "from_chat_id":  int(from_chat_id),
+        "message_id":    int(message_id),
+    }
+    r = await _bot_api_call("copyMessage", payload)
+    if r.get("ok"):
+        return r
+    desc = (r.get("description") or "").lower()
+    # Hard failures — no point retrying with forwardMessage.
+    if any(k in desc for k in (
+        "bot can't initiate", "user is deactivated",
+        "chat not found", "blocked",
+    )):
+        return r
+    r2 = await _bot_api_call("forwardMessage", payload)
+    return r2 if r2.get("ok") else r
+
+
+async def _send_message_via_bot(chat_id: int, text: str) -> dict:
+    return await _bot_api_call(
+        "sendMessage",
+        {"chat_id": int(chat_id), "text": text},
+    )
+
+
 async def _auto_dm_requester(
     client: TelegramClient,
     user_id: int,
@@ -112,17 +187,22 @@ async def _auto_dm_requester(
     conn,
     is_admin_requester: bool = False,
 ) -> None:
-    """Forward the cover post + PDF from the DB channel into the requester's
-    DM using the userbot session (drop_author=True so it looks clean).
+    """Deliver the cover + PDF into the requester's DM automatically
+    after a fresh completion (no second tap on Queue required).
 
-    Uses the userbot rather than the admin bot so:
-      - It works even when the requester hasn't sent /start to the admin
-        bot (userbots can DM anyone the userbot has ever spoken to).
-      - The userbot is already resolved as an entity in this loop.
+    STRATEGY (in order):
+      1. **Bot API `copyMessage`** via the admin bot token. This is the
+         PRIMARY path — the admin bot can DM any user who has ever
+         `/start`'d it, and mini-app users have (initData signing requires
+         the WebApp to be opened from a Bot 1 chat button). No
+         `get_input_entity` limitation — numeric `chat_id` is enough.
+      2. **Userbot `forward_messages`** as a fallback. Only useful when
+         the userbot has already seen the user (rare for mini-app users).
 
-    Silently no-ops when:
-      - The requester is the admin (they see the channel post directly).
-      - No message IDs are available yet.
+    On success we also send a plain "📨 Sent to your DM" text so the user
+    always gets an explicit confirmation.
+
+    Skips when the requester IS the admin (they already see the channel).
 
     Best-effort: never raises. Logs on failure.
     """
@@ -135,22 +215,70 @@ async def _auto_dm_requester(
         log.info("auto-DM skipped: no cover/pdf msg IDs for uid=%s", user_id)
         return
 
-    # Resolve the requester entity. If we've never seen this user before
-    # (they queued via the Mini App without ever DMing the userbot),
-    # get_entity may 400. That's acceptable — the dedup path on their
-    # NEXT tap of Queue will succeed once the copy has been triggered from
-    # the bot side. Log and move on.
+    from_chat = int(getattr(settings, "database_channel_id", 0) or 0)
+    msg_ids = [int(m) for m in (cover_msg_id, pdf_msg_id) if m]
+
+    # -------- 1) Primary path: Bot API copyMessage -------------------------
+    if from_chat and _admin_bot_token():
+        delivered_any = False
+        last_error = ""
+        # Cover first so the PDF replies to a message the user has seen.
+        for mid in msg_ids:
+            r = await _copy_message_via_bot(from_chat, int(user_id), mid)
+            if r.get("ok"):
+                delivered_any = True
+            else:
+                last_error = str(r.get("description") or "unknown")
+                log.warning(
+                    "auto-DM copyMessage failed uid=%s msg_id=%s: %s",
+                    user_id, mid, last_error,
+                )
+                desc = last_error.lower()
+                # Hard failures for THIS user — stop trying further msgs.
+                if any(k in desc for k in (
+                    "bot can't initiate", "blocked",
+                    "user is deactivated", "chat not found",
+                )):
+                    break
+
+        if delivered_any:
+            # Send an explicit confirmation text so the user sees
+            # "📨 Sent to your DM" in the same DM thread.
+            conf = await _send_message_via_bot(
+                int(user_id), "📨 Sent to your DM",
+            )
+            if not conf.get("ok"):
+                log.info(
+                    "auto-DM confirmation sendMessage failed uid=%s: %s",
+                    user_id, conf.get("description"),
+                )
+            log.info("auto-DM: delivered via Bot API to uid=%s", user_id)
+            return
+
+        # Cover + PDF both refused via Bot API. If it's the "user never
+        # /start'd the bot" case, no fallback will help — log and stop.
+        if last_error and ("initiate conversation" in last_error.lower()
+                           or "blocked" in last_error.lower()):
+            log.info(
+                "auto-DM: user %s hasn't /start'd the bot (or blocked it) — "
+                "skipping userbot fallback", user_id,
+            )
+            return
+
+    # -------- 2) Fallback: userbot forward_messages ------------------------
     try:
         target = await _with_flood(
             lambda: client.get_input_entity(int(user_id)),
             context="resolve_requester", conn=conn,
         )
     except Exception as e:  # noqa: BLE001
-        log.info("auto-DM: can't resolve requester %s (%s) — will rely on "
-                 "mini-app dedup delivery on next tap", user_id, e)
+        log.info(
+            "auto-DM: userbot can't resolve requester %s (%s) — giving up. "
+            "Dedup path on next Queue tap will still deliver.",
+            user_id, e,
+        )
         return
 
-    msg_ids = [m for m in (cover_msg_id, pdf_msg_id) if m]
     try:
         await _with_flood(
             lambda: client.forward_messages(
@@ -158,9 +286,21 @@ async def _auto_dm_requester(
             ),
             context="auto_dm_forward", conn=conn,
         )
-        log.info("auto-DM: forwarded %d msgs to uid=%s", len(msg_ids), user_id)
+        log.info(
+            "auto-DM: userbot forwarded %d msgs to uid=%s",
+            len(msg_ids), user_id,
+        )
+        # Confirmation text via the userbot too.
+        try:
+            await _with_flood(
+                lambda: client.send_message(target, "📨 Sent to your DM"),
+                context="auto_dm_confirm", conn=conn,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.info("auto-DM confirmation via userbot failed uid=%s: %s",
+                     user_id, e)
     except Exception as e:  # noqa: BLE001
-        log.warning("auto-DM forward failed for uid=%s: %s", user_id, e)
+        log.warning("auto-DM userbot forward failed uid=%s: %s", user_id, e)
 
 
 async def _send_mpost(
