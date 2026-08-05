@@ -78,16 +78,27 @@ export const cardActions = [
     },
     disabled: ({ gallery }) => isProcessing(gallery),
     async run({ gallery, close }) {
-      // --- Already on file → jump straight to the DB channel post.
+      // --- Already on file → DM the user the cover + PDF via the admin bot.
+      // BUG 1 fix: previously this called openLink(t.me/c/<internal>/<msg>)
+      // which just jumped the user to the channel. Now we POST to the new
+      // /api/queue/deliver/<id> endpoint, which uses Bot API copyMessage
+      // to forward the cover + PDF straight into the user's DM.
       if (isCompleted(gallery)) {
-        const link = openLinkOf(gallery);
-        if (link) {
-          openLink(link);
+        try {
+          await api.post(`/api/queue/deliver/${gallery.id}`, {});
+          toast("📨 Sent to your DM", "success");
           close && close();
           return;
+        } catch (e) {
+          // Fall through to the normal enqueue path — the dedup gate is
+          // idempotent, so relay_v2 will re-post if the DB doc is stale.
+          if (e && e.status === 404) {
+            toast("Not in library yet — queuing…", "");
+          } else {
+            toast("DM delivery failed: " + ((e && e.message) || "unknown"), "error");
+            return;
+          }
         }
-        // Rare: server says COMPLETED but has no open_link. Fall through to
-        // enqueue so relay_v2 can re-post; the dedup gate is idempotent.
       }
 
       // --- Currently downloading → tell the user, don't spam.
@@ -105,15 +116,20 @@ export const cardActions = [
         // this POST (e.g. someone else queued the same gallery). Honour
         // whatever the server just said.
         if (res && res.deduped) {
-          if (res.action === "already_completed" && res.open_link) {
+          if (res.action === "already_completed") {
+            // BUG 1 fix: the backend already tried copyMessage on our
+            // behalf. Reflect what actually happened instead of opening
+            // a channel link.
             gallery.v2_status = {
               known: true,
               status: res.status || "COMPLETED",
-              open_link: res.open_link,
               title: res.title,
             };
-            openLink(res.open_link);
-            toast("Already in the library — opened", "success");
+            if (res.delivered) {
+              toast(res.message || "📨 Sent to your DM", "success");
+            } else {
+              toast(res.message || "Already in the library", "");
+            }
             close && close();
             return;
           }

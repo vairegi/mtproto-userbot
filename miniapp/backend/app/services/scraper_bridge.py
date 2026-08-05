@@ -30,6 +30,7 @@ import dataclasses
 import logging
 import os
 import sys
+import threading
 from typing import Any, Optional
 
 log = logging.getLogger("miniapp.scraper")
@@ -59,29 +60,34 @@ except Exception as e:  # noqa: BLE001
 
 
 # ---------------------------------------------------------------------------
-# Async → sync helper
+# Async → sync helper — PERSISTENT PER-THREAD EVENT LOOP
 # ---------------------------------------------------------------------------
-def _run_async(coro):
-    """
-    Run an awaitable to completion from a sync context.
+# BUG 3 fix: hf_scraper keeps a pooled httpx.AsyncClient bound to whatever
+# event loop it first ran on. asyncio.run() creates + CLOSES a fresh loop
+# on every call, so the second call on this thread hit
+#   WARNING:hf_scraper: Event loop is closed
+# The fix is to keep a single event loop alive per thread for the whole
+# FastAPI process lifetime, and reuse it on every _run_async() call.
 
-    FastAPI's `def` (sync) endpoints run in a threadpool, so there is no
-    running event loop on this thread. asyncio.run() creates and closes a
-    fresh loop for each call — safe and simple.
+_loop_holder: threading.local = threading.local()
 
-    If a running loop is somehow present (async def endpoints, background
-    tasks), we fall back to asyncio.new_event_loop() manually.
-    """
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        # An event loop is already running on this thread. Rare in this
-        # codebase, but handle it defensively.
+
+def _get_loop() -> asyncio.AbstractEventLoop:
+    loop = getattr(_loop_holder, "loop", None)
+    if loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
+        asyncio.set_event_loop(loop)
+        _loop_holder.loop = loop
+    return loop
+
+
+def _run_async(coro):
+    """Run an async coroutine on a persistent per-thread event loop.
+
+    Avoids 'Event loop is closed' warnings from hf_scraper's pooled
+    httpx.AsyncClient by NEVER closing the loop between calls.
+    """
+    return _get_loop().run_until_complete(coro)
 
 
 # ---------------------------------------------------------------------------

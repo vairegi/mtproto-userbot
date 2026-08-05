@@ -21,8 +21,13 @@ def _int(name: str, default: int) -> int:
 @dataclass
 class Settings:
     # Auth / Telegram
-    bot_token: str = os.environ.get("BOT_TOKEN", "")
+    bot_token: str = os.environ.get("BOT_TOKEN", "") or os.environ.get("ADMIN_BOT_TOKEN", "")
     admin_user_id: int = _int("ADMIN_USER_ID", 0)
+
+    # V2 DM-delivery on dedup (BUG 1) — the database channel the admin bot
+    # copyMessages from when a user taps Queue on an already-completed
+    # gallery. Same env var as the parent bot uses.
+    database_channel_id: int = _int("DATABASE_CHANNEL_ID", _int("CHANNEL_ID", 0))
 
     # Mongo — reuse the same URI as the bot
     mongo_uri: str = os.environ.get("MONGO_URI", "")
