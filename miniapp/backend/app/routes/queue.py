@@ -72,12 +72,14 @@ def enqueue(body: EnqueueBody, user: dict = Depends(get_current_user)) -> dict:
         if deliv.get("delivered"):
             out["message"] = "📨 Forwarded to your DM"
         else:
-            # Delivery failed — surface the reason but still mark it as a
-            # dedup hit; the frontend can toast the error instead of
-            # opening the channel link.
-            out["message"] = "Already in the library, but DM delivery failed."
-            out["delivery_error"] = deliv.get("reason") or deliv.get("cover_error") \
-                or deliv.get("pdf_error") or "unknown"
+            # Delivery failed — surface the reason so the frontend can
+            # tell the user what to do (e.g. "send /start to the bot first").
+            reason = (deliv.get("reason")
+                      or deliv.get("cover_error")
+                      or deliv.get("pdf_error")
+                      or "DM delivery failed")
+            out["message"] = reason
+            out["delivery_error"] = reason
         return out
 
     if verdict == "already_processing":

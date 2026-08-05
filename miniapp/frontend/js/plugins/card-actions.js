@@ -90,12 +90,19 @@ export const cardActions = [
           close && close();
           return;
         } catch (e) {
-          // Fall through to the normal enqueue path — the dedup gate is
-          // idempotent, so relay_v2 will re-post if the DB doc is stale.
+          // Fall through to the normal enqueue path only when the gallery
+          // isn't in the library yet. Everything else is a real delivery
+          // failure — surface the reason instead of silently re-queuing.
           if (e && e.status === 404) {
             toast("Not in library yet — queuing…", "");
           } else {
-            toast("DM delivery failed: " + ((e && e.message) || "unknown"), "error");
+            const msg = (e && (e.message || e.detail)) || "unknown";
+            // Telegram's classic "user hasn't started the bot" case.
+            if (/initiate conversation|\/start/i.test(msg)) {
+              toast("👋 Send /start to the bot in DM first, then try again.", "error");
+            } else {
+              toast("DM delivery failed: " + msg, "error");
+            }
             return;
           }
         }
@@ -127,10 +134,15 @@ export const cardActions = [
             };
             if (res.delivered) {
               toast(res.message || "📨 Sent to your DM", "success");
+              close && close();
             } else {
-              toast(res.message || "Already in the library", "");
+              const errMsg = res.delivery_error || res.message || "DM delivery failed";
+              if (/initiate conversation|\/start/i.test(errMsg)) {
+                toast("👋 Send /start to the bot in DM first, then try again.", "error");
+              } else {
+                toast(errMsg, "error");
+              }
             }
-            close && close();
             return;
           }
           if (res.action === "already_processing") {

@@ -1,20 +1,19 @@
 """
-dm_delivery.py — BUG 1 fix.
+dm_delivery.py — BUG 1 fix (hardened).
 
 When a user taps "Queue" on a gallery that is already in the database
 channel, we must NOT open a t.me/c/<internal>/<msg> link (which just jumps
 them to the channel). Instead, the admin bot copyMessage's the cover post
 + PDF from the database channel directly into the user's DM.
 
-copyMessage is preferred over forwardMessage because it strips the
-"Forwarded from" header cleanly.
+Delivery strategy (in order — try each until one works):
+  1. `copyMessage`  — clean copy, no "Forwarded from" tag. Preferred.
+  2. `forwardMessage` — fallback if copyMessage refuses (rare permission
+     edge case, or a service message that can't be copied).
 
-This module exposes a single sync function `deliver_to_dm(gallery_id, user_id)`
-that:
-  1. Looks up the gallery in Mongo (`galleries[gid]`) via gallery_state.
-  2. Extracts db_cover_msg_id + db_pdf_msg_id + the DB channel id.
-  3. Calls Bot-API copyMessage twice with the admin bot token.
-  4. Returns {ok, delivered, ...}.
+If Telegram returns "Forbidden: bot can't initiate conversation with a
+user", we surface it verbatim so the frontend can tell the user to send
+`/start` to the bot first.
 
 The parent bot / worker.py already writes db_cover_msg_id and db_pdf_msg_id
 onto the gallery doc when the cover post + PDF land in the DB channel.
@@ -84,36 +83,74 @@ def _channel_id() -> int:
     return 0
 
 
-def _copy_one(
+# ---------------------------------------------------------------------------
+# Low-level Bot API helpers
+# ---------------------------------------------------------------------------
+
+def _api_call(
+    token: str,
+    method: str,
+    payload: dict,
+    client: httpx.Client,
+) -> dict:
+    """Call a Bot API method and normalise the response envelope."""
+    url = f"{_TG_API}/bot{token}/{method}"
+    try:
+        r = client.post(url, json=payload, timeout=_TIMEOUT)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "description": f"http error: {e!s}"}
+    try:
+        data = r.json() or {}
+    except Exception:
+        return {"ok": False, "description": f"non-JSON response HTTP {r.status_code}"}
+    # Normalise error_code so callers can inspect it uniformly.
+    if not data.get("ok") and "error_code" not in data:
+        data["error_code"] = r.status_code
+    return data
+
+
+def _copy_or_forward(
     token: str,
     from_chat_id: int,
     chat_id: int,
     message_id: int,
     client: httpx.Client,
 ) -> dict:
-    """Call Telegram Bot API `copyMessage` once. Returns the JSON envelope
-    unchanged so callers can inspect .ok / .description."""
-    url = f"{_TG_API}/bot{token}/copyMessage"
-    r = client.post(
-        url,
-        json={
-            "chat_id":       int(chat_id),
-            "from_chat_id":  int(from_chat_id),
-            "message_id":    int(message_id),
-        },
-        timeout=_TIMEOUT,
-    )
-    try:
-        return r.json() or {}
-    except Exception:
-        return {"ok": False, "description": f"non-JSON response HTTP {r.status_code}"}
+    """Try `copyMessage` first; if it fails for a non-permission reason,
+    retry with `forwardMessage`. Returns the last envelope we saw."""
+    payload = {
+        "chat_id":       int(chat_id),
+        "from_chat_id":  int(from_chat_id),
+        "message_id":    int(message_id),
+    }
+    r = _api_call(token, "copyMessage", payload, client)
+    if r.get("ok"):
+        return r
 
+    desc = (r.get("description") or "").lower()
+    # If the user hasn't started the bot, forwardMessage will fail the same
+    # way — no point retrying, surface the copyMessage error.
+    if "bot can't initiate" in desc or "user is deactivated" in desc \
+            or "chat not found" in desc or "blocked" in desc:
+        return r
+
+    # Otherwise try forwardMessage (drops "Forwarded from" preservation, but
+    # covers service messages / media that can't be copied cleanly).
+    r2 = _api_call(token, "forwardMessage", payload, client)
+    if r2.get("ok"):
+        r2["used_forward_fallback"] = True
+    return r2 if r2.get("ok") else r
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
     """Copy the cover + PDF for `gallery_id` from the DB channel into
     the user's DM. Returns a dict describing what happened. Never raises
     on Telegram-side errors — surfaces them in the dict so the caller can
-    decide (fall back to open_link, toast a message, etc.).
+    decide (fall back to a toast, ask user to /start the bot, etc.).
     """
     if not HAVE_GS:
         return {"ok": False, "delivered": False, "reason": "gallery_state unavailable"}
@@ -146,7 +183,8 @@ def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
             pass
 
     if not doc:
-        return {"ok": False, "delivered": False, "reason": "gallery not found", "gallery_id": gid}
+        return {"ok": False, "delivered": False, "reason": "gallery not found",
+                "gallery_id": gid}
 
     cover_msg_id = doc.get("db_cover_msg_id")
     pdf_msg_id   = doc.get("db_pdf_msg_id")
@@ -159,7 +197,7 @@ def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
             "gallery_id": gid,
         }
 
-    # --- Fire copyMessage x2 -----------------------------------------------
+    # --- Fire copyMessage (with forwardMessage fallback) --------------------
     result: dict[str, Any] = {
         "ok": True,
         "delivered": False,
@@ -167,23 +205,54 @@ def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
         "cover_copied": False,
         "pdf_copied": False,
     }
+
     with httpx.Client() as client:
+        # Cover first — order matters so the PDF replies to the cover in DM.
         if cover_msg_id:
-            r = _copy_one(token, from_chat, uid, int(cover_msg_id), client)
-            result["cover_copied"] = bool(r.get("ok"))
-            if not r.get("ok"):
+            r = _copy_or_forward(token, from_chat, uid, int(cover_msg_id), client)
+            if r.get("ok"):
+                result["cover_copied"] = True
+                if r.get("used_forward_fallback"):
+                    result["cover_used_forward"] = True
+            else:
                 result["cover_error"] = r.get("description") or "unknown"
-                log.warning("cover copyMessage failed for gid=%s uid=%s: %s",
+                result["cover_error_code"] = r.get("error_code")
+                log.warning("cover delivery failed gid=%s uid=%s: %s",
                             gid, uid, result["cover_error"])
+                # If the user hasn't /start'ed the bot, no point trying the
+                # PDF — surface it immediately with a clear reason.
+                desc = (r.get("description") or "").lower()
+                if "bot can't initiate" in desc:
+                    result["ok"] = False
+                    result["delivered"] = False
+                    result["reason"] = ("Please send /start to the bot in DM "
+                                        "first, then try again.")
+                    return result
+
         if pdf_msg_id:
-            r = _copy_one(token, from_chat, uid, int(pdf_msg_id), client)
-            result["pdf_copied"] = bool(r.get("ok"))
-            if not r.get("ok"):
+            r = _copy_or_forward(token, from_chat, uid, int(pdf_msg_id), client)
+            if r.get("ok"):
+                result["pdf_copied"] = True
+                if r.get("used_forward_fallback"):
+                    result["pdf_used_forward"] = True
+            else:
                 result["pdf_error"] = r.get("description") or "unknown"
-                log.warning("pdf copyMessage failed for gid=%s uid=%s: %s",
+                result["pdf_error_code"] = r.get("error_code")
+                log.warning("pdf delivery failed gid=%s uid=%s: %s",
                             gid, uid, result["pdf_error"])
+                desc = (r.get("description") or "").lower()
+                if "bot can't initiate" in desc:
+                    result["ok"] = False
+                    result["delivered"] = False
+                    result["reason"] = ("Please send /start to the bot in DM "
+                                        "first, then try again.")
+                    return result
 
     result["delivered"] = result["cover_copied"] or result["pdf_copied"]
     if not result["delivered"]:
         result["ok"] = False
+        # Carry a first-class reason so the frontend has something short to toast.
+        result["reason"] = (result.get("cover_error")
+                            or result.get("pdf_error")
+                            or "unknown DM delivery failure")
     return result
