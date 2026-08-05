@@ -392,19 +392,61 @@ def search(q: str, page: int, sort: str, lang: str,
 
 
 def gallery_detail(gallery_id: str) -> dict:
-    """Return the full detail dict for one gallery."""
+    """Return the full detail dict for one gallery.
+
+    BUG FIX (detail sheet only showed title): the frontend `detail-sheet.js`
+    renders `d.groups`, `d.title_english`, `d.title_japanese`,
+    `d.favorites`, and `d.upload_date`. hf_scraper's `GalleryMeta` doesn't
+    carry those fields — only the direct nhentai v2 detail call does.
+
+    Strategy: ALWAYS call the direct nhentai v2 endpoint for the rich
+    fields. If that succeeds, return it. Only fall back to hf_scraper when
+    the direct call fails (network/rate-limit), so the sheet at least gets
+    a title + cover instead of nothing.
+    """
+    # Prefer the direct nhentai v2 detail — it's the only source that
+    # returns title_english, title_japanese, favorites, upload_date and
+    # grouped tags.
+    try:
+        direct = _direct_nhentai_detail(str(gallery_id))
+    except Exception as e:  # noqa: BLE001
+        log.exception("_direct_nhentai_detail failed for %s: %s",
+                      gallery_id, e)
+        direct = {}
+
+    if direct and direct.get("id"):
+        # Provide both `tag_groups` (backend-preferred key) and `groups`
+        # (what detail-sheet.js reads) so both frontends stay happy.
+        if "tag_groups" in direct and "groups" not in direct:
+            groups_by_type = {}
+            for typ, names in (direct.get("tag_groups") or {}).items():
+                groups_by_type[typ] = [{"name": n} for n in names]
+            direct["groups"] = groups_by_type
+        return direct
+
+    # Fallback: hf_scraper (returns only id/title/cover/pages/tags).
     if HAVE_HF and hasattr(_hf, "fetch_gallery_meta"):
         try:
             meta = _run_async(_hf.fetch_gallery_meta(str(gallery_id)))
             if meta is not None:
                 d = _meta_to_dict(meta)
                 if d.get("id"):
+                    # Best-effort synthesis of `groups` from the flat
+                    # typed tags so the detail sheet still renders labelled
+                    # rows in the fallback path.
+                    groups: dict = {}
+                    for t in (d.get("tags") or []):
+                        typ = str(t.get("type") or "tag")
+                        nm = str(t.get("name") or "")
+                        if nm:
+                            groups.setdefault(typ, []).append({"name": nm})
+                    if groups:
+                        d["groups"] = groups
                     return d
         except Exception as e:  # noqa: BLE001
             log.exception("hf_scraper.fetch_gallery_meta failed for %s: %s",
                           gallery_id, e)
-    # Fallback
-    return _direct_nhentai_detail(str(gallery_id))
+    return {}
 
 
 def route_status() -> dict:
