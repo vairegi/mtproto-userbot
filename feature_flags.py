@@ -11,7 +11,8 @@ Settings keys:
   auto_delete_enabled   bool
   auto_delete_hours     int   (default 24)
   share_disabled        bool
-  force_join_channels   list[dict]  [{username, title, url, chat_id}, ...]
+  force_join_channels   list[dict]
+      [{username, title, url, chat_id, invite_hash}, ...]
 
 Plus Bot API helpers for the force-join gate (getChat / getChatMember /
 sendMessage with inline keyboard) used by relay_v2's auto-DM path.
@@ -62,7 +63,7 @@ def force_join_channels(conn) -> List[Dict[str, Any]]:
     if not isinstance(v, list):
         return []
     return [c for c in v if isinstance(c, dict)
-            and (c.get("username") or c.get("chat_id"))]
+            and (c.get("username") or c.get("chat_id") or c.get("invite_hash"))]
 
 
 def force_join_enabled(conn) -> bool:
@@ -114,6 +115,26 @@ async def _api_call_async(method: str, payload: dict) -> dict:
         return {"ok": False, "description": f"http error: {e!s}"}
 
 
+async def _fetch_title(channel: Dict[str, Any]) -> str:
+    """Best-effort async Bot API getChat → result.title. Works when
+    `username` or `chat_id` is known; empty string for invite-only rows
+    the bot can't resolve yet."""
+    chat_ref: Any = None
+    if channel.get("chat_id"):
+        try:
+            chat_ref = int(channel["chat_id"])
+        except (TypeError, ValueError):
+            chat_ref = None
+    if chat_ref is None and channel.get("username"):
+        chat_ref = f"@{channel['username']}"
+    if chat_ref is None:
+        return ""
+    r = await _api_call_async("getChat", {"chat_id": chat_ref})
+    if not r.get("ok"):
+        return ""
+    return ((r.get("result") or {}).get("title") or "").strip()
+
+
 async def _resolve_chat_id(conn, channel: Dict[str, Any]) -> Optional[int]:
     cid = channel.get("chat_id")
     if cid:
@@ -123,13 +144,17 @@ async def _resolve_chat_id(conn, channel: Dict[str, Any]) -> Optional[int]:
             pass
     handle = channel.get("username") or ""
     if not handle:
+        # Invite-hash-only rows can't be resolved from the hash alone.
+        # Caller (check_membership) will fail OPEN in that case.
         return None
     r = await _api_call_async("getChat", {"chat_id": f"@{handle}"})
     if not r.get("ok"):
         log.warning("force_join getChat @%s failed: %s",
                     handle, r.get("description"))
         return None
-    new_cid = int((r.get("result") or {}).get("id") or 0) or None
+    result = r.get("result") or {}
+    new_cid = int(result.get("id") or 0) or None
+    new_title = (result.get("title") or "").strip()
     if new_cid:
         # Cache it back so the mini-app side benefits too.
         try:
@@ -139,6 +164,8 @@ async def _resolve_chat_id(conn, channel: Dict[str, Any]) -> Optional[int]:
             for c in chans:
                 if (c.get("username") or "").lower() == handle.lower():
                     c["chat_id"] = new_cid
+                    if new_title:
+                        c["title"] = new_title
             conn.db["miniapp_settings"].update_one(
                 {"_id": "singleton"},
                 {"$set": {"force_join_channels": chans}},
@@ -149,37 +176,69 @@ async def _resolve_chat_id(conn, channel: Dict[str, Any]) -> Optional[int]:
     return new_cid
 
 
-async def _is_member(user_id: int, chat_id: int) -> bool:
+def _has_pending_join_request(conn, user_id: int, chat_id: int) -> bool:
+    """Sync read of the shared `miniapp_pending_join_requests` collection
+    (populated by admin_bot.py's ChatJoinRequestHandler)."""
+    try:
+        row = conn.db["miniapp_pending_join_requests"].find_one(
+            {"user_id": int(user_id), "chat_id": int(chat_id)}
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("feature_flags: pending-request lookup failed: %s", e)
+        return False
+    if not row:
+        return False
+    status = str(row.get("status") or "").lower()
+    return status in ("pending", "approved")
+
+
+async def _is_member(conn, user_id: int, chat_id: int) -> bool:
     r = await _api_call_async(
         "getChatMember", {"chat_id": int(chat_id), "user_id": int(user_id)})
     if not r.get("ok"):
         desc = str(r.get("description") or "").lower()
         if "not found" in desc:
+            # User might have a PENDING request-to-join — treat as member.
+            if _has_pending_join_request(conn, user_id, chat_id):
+                return True
             return False
         # Bot not admin / chat not found → can't verify. Let them through
         # so a misconfigured channel never locks everyone out.
         log.warning("force_join getChatMember failed uid=%s chat=%s: %s",
                     user_id, chat_id, desc)
         return True
-    return (r.get("result") or {}).get("status", "") in _MEMBER_STATUSES
+    status = (r.get("result") or {}).get("status", "")
+    if status in _MEMBER_STATUSES:
+        return True
+    # Non-member status: fall back to pending-request table.
+    if _has_pending_join_request(conn, user_id, chat_id):
+        return True
+    return False
 
 
 async def check_membership(conn, user_id: int) -> List[Dict[str, Any]]:
     """Return the list of configured channels the user has NOT joined
-    (empty list = all good or force-join disabled)."""
+    (empty list = all good or force-join disabled). Invite-only channels
+    that couldn't be resolved fail OPEN (skipped, not treated as missing)
+    so a mid-setup admin doesn't lock everyone out."""
     missing: List[Dict[str, Any]] = []
     for c in force_join_channels(conn):
         cid = await _resolve_chat_id(conn, c)
         if not cid:
+            # Unresolvable invite-only row → fail OPEN.
             continue
-        if not await _is_member(int(user_id), cid):
+        if not await _is_member(conn, int(user_id), cid):
             missing.append(c)
     return missing
 
 
 def join_url(channel: Dict[str, Any]) -> str:
+    # Priority: admin-supplied url → invite_hash → @username → chat_id
     if channel.get("url"):
         return str(channel["url"])
+    ih = channel.get("invite_hash")
+    if ih:
+        return f"https://t.me/+{ih}"
     u = channel.get("username")
     if u:
         return f"https://t.me/{u}"
@@ -198,7 +257,14 @@ async def send_join_prompt(user_id: int, missing: List[Dict[str, Any]],
     '✅ I've joined' callback (handled by admin_bot's fj:check handler)."""
     rows = []
     for c in missing[:5]:
-        label = c.get("title") or c.get("username") or "channel"
+        label = (c.get("title") or "").strip()
+        if not label:
+            try:
+                label = await _fetch_title(c) or ""
+            except Exception:
+                label = ""
+        if not label:
+            label = c.get("username") or "channel"
         rows.append([{"text": f"🔗 Join {label}", "url": join_url(c)}])
     rows.append([{
         "text": "✅ I've joined — deliver my file",
@@ -207,7 +273,7 @@ async def send_join_prompt(user_id: int, missing: List[Dict[str, Any]],
     text = ("🔒 Please join the required channel"
             + ("s" if len(missing) > 1 else "")
             + " below to receive your file.\n\n"
-            + "After joining, tap ✅ I've joined.")
+            + "After joining (or after requesting to join), tap ✅ I've joined.")
     return await _api_call_async("sendMessage", {
         "chat_id": int(user_id),
         "text": text,

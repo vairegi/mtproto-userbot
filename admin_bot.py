@@ -34,11 +34,14 @@ from telegram.ext import (
     Application,
     ApplicationBuilder,
     CallbackQueryHandler,
+    ChatJoinRequestHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
+import time as _time_mod
 
 import db
 import feature_flags
@@ -475,6 +478,95 @@ async def cmd_auto_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await progress_tracker.start_batch_tracking(ctx.application, msg.chat_id, result.queued)
         except Exception as e:  # noqa: BLE001
             log.warning("progress tracker failed to start: %s", e)
+
+
+# --- Improvement #2: track request-to-join events so force_join can treat
+# users with a PENDING join request as members (Bot API's getChatMember
+# returns status="left" for those users until an admin approves them).
+async def cb_chat_join_request(update: Update,
+                               ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fires when a user taps an invite link on a request-to-join channel
+    where this bot is an admin. Upserts a row into
+    `miniapp_pending_join_requests` so force_join treats the user as a
+    member while they wait for admin approval."""
+    req = update.chat_join_request
+    if not req or not req.from_user or not req.chat:
+        return
+    try:
+        uid = int(req.from_user.id)
+        cid = int(req.chat.id)
+    except (TypeError, ValueError):
+        return
+    try:
+        conn = db.connect()
+        try:
+            conn.db["miniapp_pending_join_requests"].update_one(
+                {"_id": f"{uid}:{cid}"},
+                {"$set": {
+                    "_id":        f"{uid}:{cid}",
+                    "user_id":    uid,
+                    "chat_id":    cid,
+                    "status":     "pending",
+                    "created_at": _time_mod.time(),
+                }},
+                upsert=True,
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as e:  # noqa: BLE001
+        log.warning("chat_join_request upsert failed uid=%s cid=%s: %s",
+                    uid, cid, e)
+
+
+async def cb_chat_member_update(update: Update,
+                                ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fires when a user's membership status in a chat changes (admin
+    approved/declined their request, they left, etc.). We flip the
+    pending row to `approved` on success so force_join keeps letting
+    them through even if getChatMember is slow to propagate. Non-fatal
+    on any failure — the pending row alone already unblocks the user."""
+    upd = update.chat_member or update.my_chat_member
+    if not upd or not upd.new_chat_member or not upd.chat:
+        return
+    member = upd.new_chat_member
+    user = getattr(member, "user", None)
+    if not user:
+        return
+    try:
+        uid = int(user.id)
+        cid = int(upd.chat.id)
+    except (TypeError, ValueError):
+        return
+    status = str(getattr(member, "status", "") or "").lower()
+    _MEMBER_OK = {"creator", "administrator", "member", "restricted"}
+    try:
+        conn = db.connect()
+        try:
+            col = conn.db["miniapp_pending_join_requests"]
+            if status in _MEMBER_OK:
+                col.update_one(
+                    {"_id": f"{uid}:{cid}"},
+                    {"$set": {"status":     "approved",
+                              "user_id":    uid,
+                              "chat_id":    cid,
+                              "updated_at": _time_mod.time()}},
+                    upsert=False,
+                )
+            elif status in ("left", "kicked", "banned"):
+                # Admin declined or user left — drop the pending row so
+                # force_join stops treating them as a member.
+                col.delete_one({"_id": f"{uid}:{cid}"})
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as e:  # noqa: BLE001
+        log.info("chat_member update handling failed uid=%s cid=%s: %s",
+                 uid, cid, e)
 
 
 # Silent handler for anything else — never confirm existence to strangers.
@@ -1679,6 +1771,12 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_search_picker, pattern=r"^sp\|"))
     # Force-join '✅ I've joined' callback (feature 3)
     app.add_handler(CallbackQueryHandler(cb_force_join, pattern=r"^fj:"))
+    # Improvement #2: track request-to-join taps + approval events so
+    # force_join can treat pending-request users as members. MUST be
+    # registered BEFORE the catch-all MessageHandler(filters.ALL, swallow).
+    app.add_handler(ChatJoinRequestHandler(cb_chat_join_request))
+    app.add_handler(ChatMemberHandler(cb_chat_member_update,
+                                      ChatMemberHandler.ANY_CHAT_MEMBER))
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
