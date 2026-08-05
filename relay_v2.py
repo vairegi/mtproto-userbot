@@ -102,6 +102,67 @@ async def _get_bot2_entity(client: TelegramClient):
     return await client.get_entity(settings.bot2_username)
 
 
+async def _auto_dm_requester(
+    client: TelegramClient,
+    user_id: int,
+    *,
+    cover_msg_id: int,
+    pdf_msg_id: int,
+    channel,
+    conn,
+    is_admin_requester: bool = False,
+) -> None:
+    """Forward the cover post + PDF from the DB channel into the requester's
+    DM using the userbot session (drop_author=True so it looks clean).
+
+    Uses the userbot rather than the admin bot so:
+      - It works even when the requester hasn't sent /start to the admin
+        bot (userbots can DM anyone the userbot has ever spoken to).
+      - The userbot is already resolved as an entity in this loop.
+
+    Silently no-ops when:
+      - The requester is the admin (they see the channel post directly).
+      - No message IDs are available yet.
+
+    Best-effort: never raises. Logs on failure.
+    """
+    if is_admin_requester:
+        log.info("auto-DM skipped: requester %s is admin", user_id)
+        return
+    if not user_id or user_id <= 0:
+        return
+    if not cover_msg_id and not pdf_msg_id:
+        log.info("auto-DM skipped: no cover/pdf msg IDs for uid=%s", user_id)
+        return
+
+    # Resolve the requester entity. If we've never seen this user before
+    # (they queued via the Mini App without ever DMing the userbot),
+    # get_entity may 400. That's acceptable — the dedup path on their
+    # NEXT tap of Queue will succeed once the copy has been triggered from
+    # the bot side. Log and move on.
+    try:
+        target = await _with_flood(
+            lambda: client.get_input_entity(int(user_id)),
+            context="resolve_requester", conn=conn,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.info("auto-DM: can't resolve requester %s (%s) — will rely on "
+                 "mini-app dedup delivery on next tap", user_id, e)
+        return
+
+    msg_ids = [m for m in (cover_msg_id, pdf_msg_id) if m]
+    try:
+        await _with_flood(
+            lambda: client.forward_messages(
+                target, msg_ids, from_peer=channel, drop_author=True,
+            ),
+            context="auto_dm_forward", conn=conn,
+        )
+        log.info("auto-DM: forwarded %d msgs to uid=%s", len(msg_ids), user_id)
+    except Exception as e:  # noqa: BLE001
+        log.warning("auto-DM forward failed for uid=%s: %s", user_id, e)
+
+
 async def _send_mpost(
     client: TelegramClient, open_link: Optional[str], conn
 ) -> None:
@@ -517,6 +578,37 @@ async def process_job(
                     detail="sending /mpost",
                 )
             await _send_mpost(client, cover.open_link, conn)
+
+        # ---- 9) AUTO-DM the requester (BUG FIX) ------------------------
+        # After a fresh completion, forward the cover + PDF straight into
+        # the requester's DM using the userbot session (which is admin in
+        # the DB channel). No second tap on Queue required.
+        #
+        # Rules:
+        #   - Only when we know who submitted the job (`submitted_by`).
+        #   - Skip if the requester IS the admin (avoids double-DM: the
+        #     admin already sees the post in the channel).
+        #   - Best-effort: any failure is logged and the job still returns
+        #     DONE (the cover + PDF are already in the channel).
+        try:
+            admin_id = int(getattr(settings, "admin_user_id", 0) or 0)
+        except (TypeError, ValueError):
+            admin_id = 0
+        if submitted_by and int(submitted_by) > 0:
+            try:
+                await _auto_dm_requester(
+                    client, int(submitted_by),
+                    cover_msg_id=int(cover.msg_id or 0),
+                    pdf_msg_id=int(pdf_msg_id or 0),
+                    channel=channel,
+                    conn=conn,
+                    is_admin_requester=(int(submitted_by) == admin_id),
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "auto-DM to requester %s failed (non-fatal): %s",
+                    submitted_by, e,
+                )
 
         if job_id is not None:
             db.upsert_job_progress(
