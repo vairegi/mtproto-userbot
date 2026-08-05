@@ -41,6 +41,8 @@ from telegram.ext import (
 )
 
 import db
+import feature_flags
+import gallery_state as _gs
 from config import settings
 from logging_setup import setup_logging
 from queue_service import enqueue_batch
@@ -476,6 +478,191 @@ async def cmd_auto_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # Silent handler for anything else — never confirm existence to strangers.
+async def cb_force_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the '✅ I've joined — deliver my file' button.
+
+    Callback data shape:  fj:check:<gallery_id>
+    Sent by the force-join gate (mini-app's force_join service and
+    relay_v2's auto-DM path) when a user tried to receive a gallery while
+    not a member of the required channel(s).
+
+    On tap:
+      1. Re-check membership via Bot API getChatMember for every
+         configured channel.
+      2. If the user has joined all of them → deliver the remembered
+         gallery via copyMessage (same pipeline as the mini-app's
+         /api/queue/deliver), pop the pending row, and answer the
+         callback with a toast.
+      3. Otherwise answer with a 'still missing' toast and keep the
+         pending row so they can try again after joining.
+    """
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    data = q.data or ""
+    if not data.startswith("fj:"):
+        return
+
+    try:
+        uid = int(q.from_user.id)
+    except (TypeError, ValueError):
+        try:
+            await q.answer("Couldn't identify you — try again.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    gallery_id = ""
+    parts = data.split(":", 2)
+    if len(parts) == 3:
+        gallery_id = (parts[2] or "").strip()
+
+    conn = db.connect()
+    try:
+        try:
+            missing = await feature_flags.check_membership(conn, uid)
+        except Exception as e:  # noqa: BLE001
+            log.warning("fj:check membership check failed for uid=%s: %s",
+                        uid, e)
+            missing = []
+
+        if missing:
+            # Still not joined. Re-send the prompt buttons so the user can
+            # tap again after joining.
+            try:
+                await q.answer("❌ You haven't joined yet — please join first.",
+                               show_alert=True)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await feature_flags.send_join_prompt(uid, missing,
+                                                     gallery_id=gallery_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("fj:check re-prompt failed for uid=%s: %s", uid, e)
+            return
+
+        # Membership confirmed. Answer the callback first so the button
+        # stops spinning immediately.
+        try:
+            await q.answer("✅ Verified — delivering your file…")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Decide what to deliver: either the gallery the prompt was for,
+        # or anything else remembered as pending for this user.
+        to_deliver: list[str] = []
+        if gallery_id:
+            to_deliver.append(gallery_id)
+        else:
+            try:
+                rows = conn.db["miniapp_pending_deliveries"].find(
+                    {"user_id": uid}).limit(10)
+                for r in rows:
+                    gid = r.get("gallery_id")
+                    if gid:
+                        to_deliver.append(str(gid))
+            except Exception:
+                pass
+
+        if not to_deliver:
+            # Nothing pending — nothing to do.
+            return
+
+        # ---- Deliver each pending gallery via Bot API copyMessage --------
+        from_chat = int(getattr(settings, "database_channel_id", 0) or 0)
+        token = settings.admin_bot_token
+        if not from_chat or not token:
+            log.warning("fj:check: DATABASE_CHANNEL_ID / BOT_TOKEN missing")
+            return
+
+        import httpx as _hx
+
+        async def _copy_one(from_id: int, to_id: int, mid: int) -> dict:
+            url = f"https://api.telegram.org/bot{token}/copyMessage"
+            payload = {
+                "chat_id":      int(to_id),
+                "from_chat_id": int(from_id),
+                "message_id":   int(mid),
+            }
+            if feature_flags.share_disabled(conn):
+                payload["protect_content"] = True
+            async with _hx.AsyncClient(timeout=15) as c:
+                r = await c.post(url, json=payload)
+            try:
+                return r.json() or {}
+            except Exception:
+                return {"ok": False,
+                        "description": f"HTTP {r.status_code}"}
+
+        for gid in to_deliver:
+            try:
+                doc = _gs.get(conn, gid) or {}
+            except Exception:
+                doc = {}
+            cover_mid = doc.get("db_cover_msg_id")
+            pdf_mid   = doc.get("db_pdf_msg_id")
+            if not cover_mid and not pdf_mid:
+                # Gallery not posted yet (or doc missing). Leave the
+                # pending row in place — the next tap on Queue will
+                # retry.
+                log.info("fj:check: gallery %s has no stored msg IDs yet", gid)
+                continue
+
+            delivered_any = False
+            sent_msg_ids: list[int] = []
+            for mid in (cover_mid, pdf_mid):
+                if not mid:
+                    continue
+                try:
+                    r = await _copy_one(from_chat, uid, int(mid))
+                    if r.get("ok"):
+                        delivered_any = True
+                        new_mid = int((r.get("result") or {}).get("message_id") or 0)
+                        if new_mid:
+                            sent_msg_ids.append(new_mid)
+                    else:
+                        log.warning("fj:check copy failed uid=%s gid=%s mid=%s: %s",
+                                    uid, gid, mid, r.get("description"))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("fj:check copy raised uid=%s gid=%s: %s",
+                                uid, gid, e)
+
+            if delivered_any:
+                # Confirmation text in the same DM thread.
+                try:
+                    url = f"https://api.telegram.org/bot{token}/sendMessage"
+                    async with _hx.AsyncClient(timeout=10) as c:
+                        conf = await c.post(url, json={
+                            "chat_id": uid,
+                            "text":    "📨 Sent to your DM",
+                        })
+                    conf_data = conf.json() or {}
+                    if conf_data.get("ok"):
+                        conf_mid = int((conf_data.get("result") or {}).get("message_id") or 0)
+                        if conf_mid:
+                            sent_msg_ids.append(conf_mid)
+                except Exception as e:  # noqa: BLE001
+                    log.info("fj:check confirmation sendMessage failed: %s", e)
+
+                # Feature 1 (auto-delete): schedule deletion if enabled.
+                try:
+                    feature_flags.schedule_deletes(conn, uid, sent_msg_ids)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("fj:check deletion scheduling failed: %s", e)
+
+                # Clear the pending row now that delivery succeeded.
+                try:
+                    feature_flags.pop_pending(conn, uid, gid)
+                except Exception:
+                    pass
+                log.info("fj:check: delivered gid=%s to uid=%s", gid, uid)
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def swallow(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     return
 
@@ -1490,6 +1677,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("search", cmd_search))
     # Interactive picker callback (buttons on /search results)
     app.add_handler(CallbackQueryHandler(cb_search_picker, pattern=r"^sp\|"))
+    # Force-join '✅ I've joined' callback (feature 3)
+    app.add_handler(CallbackQueryHandler(cb_force_join, pattern=r"^fj:"))
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))

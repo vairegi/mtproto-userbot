@@ -42,6 +42,7 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 
 import db
+import feature_flags
 import gallery_state as gs
 import cover_poster
 import bot2_client
@@ -147,15 +148,19 @@ async def _bot_api_call(method: str, payload: dict) -> dict:
 
 
 async def _copy_message_via_bot(
-    from_chat_id: int, to_chat_id: int, message_id: int,
+    from_chat_id: int, to_chat_id: int, message_id: int, conn=None,
 ) -> dict:
     """Copy a single message via Bot API copyMessage; fall back to
-    forwardMessage if the copy is refused for a non-permission reason."""
+    forwardMessage if the copy is refused for a non-permission reason.
+    When the admin's 'Disable sharing' toggle is on, protect_content is
+    set so the recipient can't forward/save the DM."""
     payload = {
         "chat_id":       int(to_chat_id),
         "from_chat_id":  int(from_chat_id),
         "message_id":    int(message_id),
     }
+    if conn is not None and feature_flags.share_disabled(conn):
+        payload["protect_content"] = True
     r = await _bot_api_call("copyMessage", payload)
     if r.get("ok"):
         return r
@@ -185,6 +190,7 @@ async def _auto_dm_requester(
     pdf_msg_id: int,
     channel,
     conn,
+    gallery_id: str = "",
     is_admin_requester: bool = False,
 ) -> None:
     """Deliver the cover + PDF into the requester's DM automatically
@@ -215,6 +221,20 @@ async def _auto_dm_requester(
         log.info("auto-DM skipped: no cover/pdf msg IDs for uid=%s", user_id)
         return
 
+    # -------- 0) Force-join gate (admin feature 3) ------------------------
+    try:
+        missing = await feature_flags.check_membership(conn, int(user_id))
+    except Exception as e:  # noqa: BLE001
+        log.warning("force_join check failed (letting user through): %s", e)
+        missing = []
+    if missing:
+        feature_flags.remember_pending(conn, int(user_id), str(gallery_id or ""))
+        await feature_flags.send_join_prompt(int(user_id), missing,
+                                             gallery_id=str(gallery_id or ""))
+        log.info("auto-DM blocked by force-join for uid=%s (%d channels)",
+                 user_id, len(missing))
+        return
+
     from_chat = int(getattr(settings, "database_channel_id", 0) or 0)
     msg_ids = [int(m) for m in (cover_msg_id, pdf_msg_id) if m]
 
@@ -222,11 +242,15 @@ async def _auto_dm_requester(
     if from_chat and _admin_bot_token():
         delivered_any = False
         last_error = ""
+        sent_msg_ids: list[int] = []  # for the auto-delete scheduler
         # Cover first so the PDF replies to a message the user has seen.
         for mid in msg_ids:
-            r = await _copy_message_via_bot(from_chat, int(user_id), mid)
+            r = await _copy_message_via_bot(from_chat, int(user_id), mid, conn=conn)
             if r.get("ok"):
                 delivered_any = True
+                new_mid = int((r.get("result") or {}).get("message_id") or 0)
+                if new_mid:
+                    sent_msg_ids.append(new_mid)
             else:
                 last_error = str(r.get("description") or "unknown")
                 log.warning(
@@ -247,11 +271,27 @@ async def _auto_dm_requester(
             conf = await _send_message_via_bot(
                 int(user_id), "📨 Sent to your DM",
             )
-            if not conf.get("ok"):
+            if conf.get("ok"):
+                conf_mid = int((conf.get("result") or {}).get("message_id") or 0)
+                if conf_mid:
+                    sent_msg_ids.append(conf_mid)
+            else:
                 log.info(
                     "auto-DM confirmation sendMessage failed uid=%s: %s",
                     user_id, conf.get("description"),
                 )
+            # Feature 1 (Auto-delete): schedule deletion of the delivered
+            # messages after N hours (no-op unless the admin enabled it).
+            try:
+                feature_flags.schedule_deletes(conn, int(user_id), sent_msg_ids)
+            except Exception as e:  # noqa: BLE001
+                log.warning("deletion scheduling failed (non-fatal): %s", e)
+            # Force-join pending cleanup.
+            try:
+                feature_flags.pop_pending(conn, int(user_id),
+                                          str(gallery_id or ""))
+            except Exception:
+                pass
             log.info("auto-DM: delivered via Bot API to uid=%s", user_id)
             return
 
@@ -742,6 +782,7 @@ async def process_job(
                     pdf_msg_id=int(pdf_msg_id or 0),
                     channel=channel,
                     conn=conn,
+                    gallery_id=str(gid or ""),
                     is_admin_requester=(int(submitted_by) == admin_id),
                 )
             except Exception as e:  # noqa: BLE001
