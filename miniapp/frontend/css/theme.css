@@ -37,29 +37,38 @@
 
   /* ---- App-level tokens (Doujinshi Universe brand) ---- */
 
+  /* FORCED DARK THEME (antibanhack-style cinematic look).
+     We deliberately do NOT inherit surfaces/ink from Telegram's --tg-* tokens
+     anymore — Telegram light mode would otherwise turn the app white.
+     The brand is a fixed jet-black + red/orange glow regardless of the
+     user's Telegram theme. */
+
   /* Surfaces — layered from lowest (page bg) to highest (modals) */
-  --du-bg-0:             var(--tg-bg);          /* page background */
-  --du-bg-1:             var(--tg-secondary-bg); /* cards, sections */
-  --du-bg-2:             #1f1740;               /* elevated cards */
-  --du-bg-3:             #2a1f55;               /* modals, sheets */
+  --du-bg-0:             #05060a;               /* page background (near black) */
+  --du-bg-1:             #0c0e14;               /* cards, sections */
+  --du-bg-2:             #12151d;               /* elevated cards */
+  --du-bg-3:             #171a22;               /* modals, sheets */
 
   /* Ink — text hierarchy */
-  --du-ink-hi:           var(--tg-text);         /* primary text */
-  --du-ink-mid:          #cbc4e6;                /* secondary text */
-  --du-ink-lo:           var(--tg-hint);         /* tertiary/hint */
-  --du-ink-inv:          #0f0b1a;                /* text on accent bg */
+  --du-ink-hi:           #f2f4f8;               /* primary text */
+  --du-ink-mid:          #b9bec8;               /* secondary text */
+  --du-ink-lo:           #7d838f;               /* tertiary/hint */
+  --du-ink-inv:          #0b0d12;               /* text on accent bg */
 
-  /* Accents */
-  --du-accent:           #7a5cff;                /* primary purple */
-  --du-accent-2:         #4fd1c5;                /* cyan for "secure/online" */
-  --du-accent-3:         #ff4dcf;                /* magenta highlight */
-  --du-danger:           var(--tg-destructive);
+  /* Accents — red ember + orange fire (antibanhack vibe) */
+  --du-accent:           #ff3b3b;               /* primary red */
+  --du-accent-2:         #ff7a1a;               /* orange fire */
+  --du-accent-3:         #ffcf5c;               /* amber highlight */
+  --du-danger:           #ff4d5e;
   --du-warn:             #ffb84d;
-  --du-success:          #4fd1c5;
+  --du-success:          #35d0a5;
 
-  /* Borders + dividers */
-  --du-border:           rgba(255, 255, 255, 0.08);
-  --du-border-strong:    rgba(255, 255, 255, 0.16);
+  /* Header/tabbar glass over the dark bg */
+  --du-header-bg:        rgba(5, 6, 10, 0.82);
+
+  /* Borders + dividers — subtle red-tinted edges */
+  --du-border:           rgba(255, 82, 82, 0.12);
+  --du-border-strong:    rgba(255, 82, 82, 0.24);
   --du-divider:          rgba(255, 255, 255, 0.05);
 
   /* Radii — one place to change corner roundness across the app */
@@ -127,16 +136,19 @@
   --du-z-toast:          300;
 }
 
-/* Optional light-theme override — JS toggles [data-theme="light"] on <html>. */
+/* Light-theme override — INTENTIONALLY dark.
+   JS toggles [data-theme="light"] on <html> when Telegram is in light mode,
+   but this app's brand is a fixed dark cinematic look (antibanhack style).
+   Keeping these values dark means the UI stays on-brand for every user. */
 html[data-theme="light"] {
-  --du-bg-0:             #fafafa;
-  --du-bg-1:             #ffffff;
-  --du-bg-2:             #f2eefe;
-  --du-bg-3:             #ffffff;
-  --du-ink-hi:           #1a1030;
-  --du-ink-mid:          #4b3f75;
-  --du-ink-lo:           #7d75a3;
-  --du-border:           rgba(0,0,0,0.08);
-  --du-border-strong:    rgba(0,0,0,0.14);
-  --du-divider:          rgba(0,0,0,0.05);
+  --du-bg-0:             #05060a;
+  --du-bg-1:             #0c0e14;
+  --du-bg-2:             #12151d;
+  --du-bg-3:             #171a22;
+  --du-ink-hi:           #f2f4f8;
+  --du-ink-mid:          #b9bec8;
+  --du-ink-lo:           #7d838f;
+  --du-border:           rgba(255, 82, 82, 0.12);
+  --du-border-strong:    rgba(255, 82, 82, 0.24);
+  --du-divider:          rgba(255, 255, 255, 0.05);
 }

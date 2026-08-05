@@ -89,25 +89,66 @@ def _run_async(coro):
 # ---------------------------------------------------------------------------
 import httpx
 
-_NH_API = "https://nhentai.net/api"
+# nhentai retired the legacy /api/galleries/search endpoint — it now returns
+# 403 Forbidden (confirmed against live traffic 2026-08). Every direct call
+# must go through /api/v2/*.
+_NH_API = "https://nhentai.net/api/v2"
 _ENGLISH_TAG_ID = 12227   # matches hf_scraper's filter
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
 
+import re
+
+_EVENT_PREFIX = re.compile(r"^\([A-Za-z0-9+\- ]+\)\s*")
+_BRACKET_TAIL = re.compile(r"(\[[^\]]*\])\s*$")
+_T_CDN = "https://t.nhentai.net"
+
+
+def clean_title(raw: str) -> str:
+    """Strip leading event tags '(C92)' and trailing meta brackets
+    '[English] [Scans]' from an nhentai title. Returns a human-friendly
+    short title for the card grid; the FULL titles remain available on the
+    detail sheet via the v2 detail endpoint."""
+    s = (raw or "").strip()
+    s = _EVENT_PREFIX.sub("", s)
+    prev = None
+    while prev != s:
+        prev = s
+        s = _BRACKET_TAIL.sub("", s).strip()
+    return s or (raw or "").strip()
+
+
+def _title_from_item(item: dict) -> str:
+    """v2 search rows expose english_title / japanese_title (plain strings).
+    Older v1 rows exposed a title dict; handle both for safety."""
+    et = item.get("english_title")
+    if isinstance(et, str) and et.strip():
+        return clean_title(et)
+    jt = item.get("japanese_title")
+    if isinstance(jt, str) and jt.strip():
+        return clean_title(jt)
+    t = item.get("title")
+    if isinstance(t, dict):
+        return clean_title(t.get("english") or t.get("pretty") or t.get("japanese") or "")
+    if isinstance(t, str):
+        return clean_title(t)
+    return ""
+
+
 def _thumb_url_from_item(item: dict) -> str:
-    """Build the cover URL from an nhentai search item."""
+    """Build the cover/thumbnail URL. v2 search rows give `thumbnail` as a
+    CDN-relative path like 'galleries/1200622/thumb.png' (extension varies)."""
+    thumb = item.get("thumbnail")
+    if isinstance(thumb, str) and thumb.strip():
+        return _T_CDN + "/" + thumb.strip().lstrip("/")
+    # Legacy v1 shape (images.cover.t + media_id) — kept for safety.
     media_id = item.get("media_id") or ""
     images = item.get("images") or {}
     cover = images.get("cover") or images.get("thumbnail") or {}
     ext_map = {"j": "jpg", "p": "png", "g": "gif", "w": "webp"}
     ext = ext_map.get(cover.get("t", "j"), "jpg")
-    return f"https://t.nhentai.net/galleries/{media_id}/cover.{ext}"
-
-
-def _title_from_item(item: dict) -> str:
-    t = item.get("title") or {}
-    return t.get("english") or t.get("pretty") or t.get("japanese") or ""
+    return f"{_T_CDN}/galleries/{media_id}/cover.{ext}"
 
 
 def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
@@ -138,10 +179,15 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
 
     params = {"query": query, "sort": real_sort, "page": int(page or 1)}
     try:
+        # v2 endpoint: /api/v2/search (params: query, sort, page)
         r = httpx.get(
-            f"{_NH_API}/galleries/search",
+            f"{_NH_API}/search",
             params=params,
-            headers={"User-Agent": _UA, "Accept": "application/json"},
+            headers={
+                "User-Agent": _UA,
+                "Accept": "application/json",
+                "Referer": "https://nhentai.net/",
+            },
             timeout=15,
         )
         r.raise_for_status()
@@ -167,11 +213,39 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
     return out
 
 
+def _group_tags(item: dict) -> dict:
+    """Group the v2 detail tags by type so the frontend can render labelled
+    rows: artist / parody / character / group / tag / language / category."""
+    groups: dict = {}
+    for t in item.get("tags") or []:
+        if not isinstance(t, dict):
+            continue
+        typ = str(t.get("type") or "tag")
+        nm = str(t.get("name") or "").strip()
+        if not nm:
+            continue
+        groups.setdefault(typ, []).append(nm)
+    return groups
+
+
+def _iso_date(ts) -> str:
+    try:
+        import datetime
+        return datetime.datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
 def _direct_nhentai_detail(gallery_id: str) -> dict:
     try:
+        # v2 endpoint for a single gallery: /api/v2/galleries/<id>
         r = httpx.get(
-            f"{_NH_API}/gallery/{gallery_id}",
-            headers={"User-Agent": _UA, "Accept": "application/json"},
+            f"{_NH_API}/galleries/{gallery_id}",
+            headers={
+                "User-Agent": _UA,
+                "Accept": "application/json",
+                "Referer": "https://nhentai.net/",
+            },
             timeout=15,
         )
         r.raise_for_status()
@@ -180,13 +254,30 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
         log.exception("direct nhentai detail failed id=%r: %s", gallery_id, e)
         return {}
 
+    # --- caption fields (power the detail-sheet caption UI) -----------------
+    title_obj = item.get("title") or {}
+    english_full = title_obj.get("english") or "" if isinstance(title_obj, dict) else ""
+    japanese_full = title_obj.get("japanese") or "" if isinstance(title_obj, dict) else ""
+    pretty = (title_obj.get("pretty") or "") if isinstance(title_obj, dict) else ""
+
+    cover_path = (item.get("cover") or {}).get("path") or ""
+    cover = _T_CDN + "/" + cover_path.lstrip("/") if cover_path else _thumb_url_from_item(item)
+
+    groups = _group_tags(item)
+    flat_tags = [{"name": n, "type": typ} for typ, names in groups.items() for n in names]
+
     return {
-        "id":    item.get("id"),
-        "title": _title_from_item(item),
-        "cover": _thumb_url_from_item(item),
-        "pages": item.get("num_pages"),
-        "tags":  [{"name": t.get("name"), "type": t.get("type")}
-                  for t in item.get("tags") or []],
+        "id":       item.get("id"),
+        "title":    clean_title(pretty) if pretty else _title_from_item(item),
+        "title_english":  english_full,
+        "title_japanese": japanese_full,
+        "cover":    cover,
+        "pages":    item.get("num_pages"),
+        "favorites": item.get("num_favorites"),
+        "upload_date": _iso_date(item.get("upload_date")),
+        "scanlator": item.get("scanlator") or "",
+        "tags":     flat_tags,
+        "tag_groups": groups,
     }
 
 

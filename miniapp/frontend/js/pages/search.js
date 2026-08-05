@@ -137,27 +137,94 @@ export async function render(root, { me }) {
         };
       });
 
-    const body = h("div", {},
-      g.cover ? h("img", {
-        src: g.cover, alt: g.title,
-        style: { width: "60%", maxWidth: "220px", margin: "0 auto",
-                 display: "block", borderRadius: "12px",
-                 border: "1px solid var(--du-border)" },
-      }) : null,
-      h("div", { style: { textAlign: "center", marginTop: "12px",
-                          fontSize: "15px", fontWeight: "600" } }, g.title || `#${g.id}`),
-      h("div", { style: { textAlign: "center", color: "var(--du-ink-lo)",
-                          fontSize: "13px", marginTop: "4px" } },
-        `#${g.id} · ${g.pages || "?"} pages`),
-      g.tags && g.tags.length
-        ? h("div", { class: "chip-row", style: { justifyContent: "center" } },
-            ...g.tags.slice(0, 8).map(t =>
-              h("span", { class: "chip", "aria-pressed": "false" }, t.name || t)))
-        : null,
-    );
+    // ---- detail-sheet body --------------------------------------------------
+    // Shows cover + clean title immediately, then swaps in the full caption
+    // (titles, grouped tags, favorites, upload date) when /api/gallery/{id}
+    // returns. The sheet content is rebuilt in place so there's no flash.
+    const GROUP_ORDER = ["parody", "character", "artist", "group", "language", "category", "tag"];
+    const GROUP_LABEL = {
+      parody: "Parody", character: "Characters", artist: "Artist",
+      group: "Circle", language: "Language", category: "Category", tag: "Tags",
+    };
+    const fmtNum = (n) => {
+      n = parseInt(n || 0, 10);
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+      return String(n || 0);
+    };
 
-    const sheet = make("sheet", { title: "Gallery", body, actions });
+    const $body = h("div", { class: "d-root" });
+
+    function renderBase() {
+      $body.innerHTML = "";
+      $body.append(
+        g.cover ? h("img", {
+          class: "d-cover", src: g.cover, alt: g.title || "",
+          loading: "lazy",
+        }) : null,
+        h("div", { class: "d-title" }, g.title || `#${g.id}`),
+        h("div", { class: "d-sub" }, `#${g.id} · ${g.pages || "?"} pages`),
+        h("div", { class: "d-loading" }, "Loading details…"),
+      );
+    }
+
+    function renderFull(d) {
+      // d is the detail payload from GET /api/gallery/{id}
+      const groups = d.tag_groups || {};
+      $body.innerHTML = "";
+
+      const coverSrc = d.cover || g.cover;
+      if (coverSrc) {
+        $body.append(h("img", { class: "d-cover", src: coverSrc, alt: d.title || "" }));
+      }
+
+      // Bold clean title, then the FULL original titles as subtitles.
+      $body.append(h("div", { class: "d-title" }, d.title || g.title || `#${g.id}`));
+      if (d.title_english && d.title_english !== d.title) {
+        $body.append(h("div", { class: "d-full-title" }, d.title_english));
+      }
+      if (d.title_japanese) {
+        $body.append(h("div", { class: "d-jpn-title" }, d.title_japanese));
+      }
+
+      // Meta line: id · pages · ♥ favorites · upload date
+      const metaBits = [`#${d.id || g.id}`];
+      if (d.pages || g.pages) metaBits.push(`${d.pages || g.pages} pages`);
+      if (d.favorites) metaBits.push(`♥ ${fmtNum(d.favorites)}`);
+      if (d.upload_date) metaBits.push(d.upload_date);
+      if (d.scanlator) metaBits.push(`scans: ${d.scanlator}`);
+      $body.append(h("div", { class: "d-sub" }, metaBits.join("  ·  ")));
+
+      // Grouped tag rows with labels — this is the "caption" the user asked for.
+      for (const typ of GROUP_ORDER) {
+        const names = groups[typ];
+        if (!names || !names.length) continue;
+        $body.append(h("div", { class: "d-meta-row" },
+          h("span", { class: "d-meta-label" }, GROUP_LABEL[typ] + ":"),
+          h("div", { class: "d-meta-tags" },
+            ...names.slice(0, 12).map(n => h("span", { class: "d-tag" }, n))),
+        ));
+      }
+
+      // Fallback: if the API gave no groups but the card had tags, show them.
+      if (!Object.keys(groups).length && g.tags && g.tags.length) {
+        $body.append(h("div", { class: "d-meta-row" },
+          h("span", { class: "d-meta-label" }, "Tags:"),
+          h("div", { class: "d-meta-tags" },
+            ...g.tags.slice(0, 12).map(t => h("span", { class: "d-tag" }, t.name || t))),
+        ));
+      }
+    }
+
+    renderBase();
+
+    const sheet = make("sheet", { title: "Gallery", body: $body, actions });
     sheet.open();
+
+    // Load the full caption in the background and rebuild the body in place.
+    api.get(`/api/gallery/${g.id}`)
+      .then(d => { if (d && d.id) renderFull(d); else $body.querySelector(".d-loading")?.remove(); })
+      .catch(() => { $body.querySelector(".d-loading")?.remove(); });
   }
 
   function emptyState() {

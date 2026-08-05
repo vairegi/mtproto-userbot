@@ -24,10 +24,15 @@ html {
 body {
   min-height: 100vh;
   min-height: 100dvh;
+  /* antibanhack-style cinematic background: near-black base, a soft red
+     radial glow behind the upper content, and a faint orange ember bottom-
+     right — mirrors the reference site's dark + red/fire hero treatment. */
   background:
-    radial-gradient(1200px 600px at 20% -10%, rgba(122,92,255,0.15), transparent 60%),
-    radial-gradient(900px 500px at 100% 110%, rgba(79,209,197,0.10), transparent 60%),
+    radial-gradient(1100px 700px at 50% -8%, rgba(255, 58, 58, 0.16), transparent 62%),
+    radial-gradient(800px 520px at 88% 108%, rgba(255, 122, 26, 0.10), transparent 62%),
+    radial-gradient(600px 400px at 8% 108%, rgba(255, 58, 58, 0.06), transparent 65%),
     var(--du-bg-0);
+  background-attachment: fixed;
 }
 
 button, input, textarea, select {
@@ -52,7 +57,9 @@ a { color: var(--du-accent); text-decoration: none; }
   position: sticky; top: 0; z-index: var(--du-z-header);
   height: calc(var(--du-header-h) + var(--du-safe-top));
   padding-top: var(--du-safe-top);
-  background: var(--tg-header-bg);
+  background: var(--du-header-bg, rgba(5, 6, 10, 0.82));
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
   border-bottom: 1px solid var(--du-border);
   display: flex; align-items: center;
   padding-inline: var(--du-space-4);
@@ -69,7 +76,9 @@ a { color: var(--du-accent); text-decoration: none; }
   z-index: var(--du-z-tabbar);
   height: calc(var(--du-tabbar-h) + var(--du-safe-bot));
   padding-bottom: var(--du-safe-bot);
-  background: var(--tg-header-bg);
+  background: var(--du-header-bg, rgba(5, 6, 10, 0.82));
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
   border-top: 1px solid var(--du-border);
   display: flex; align-items: stretch;
 }
