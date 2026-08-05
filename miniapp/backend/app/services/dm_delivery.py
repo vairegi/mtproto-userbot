@@ -28,6 +28,7 @@ from typing import Any, Optional
 import httpx
 
 from ..config import settings
+from . import deletion_scheduler, force_join, share_guard
 
 log = logging.getLogger("miniapp.dm_delivery")
 
@@ -122,6 +123,9 @@ def _copy_or_forward(
         "chat_id":       int(chat_id),
         "from_chat_id":  int(from_chat_id),
         "message_id":    int(message_id),
+        # Feature 2 (Disable sharing): when the admin toggles this on,
+        # Telegram blocks the recipient from forwarding / saving the DM.
+        **share_guard.payload(),
     }
     r = _api_call(token, "copyMessage", payload, client)
     if r.get("ok"):
@@ -172,6 +176,26 @@ def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
     except (TypeError, ValueError):
         return {"ok": False, "delivered": False, "reason": "bad user_id"}
 
+    # --- Feature 3 (Force-join): block delivery until the user has joined
+    # every required channel. On block we send them a 'please join' prompt
+    # with Join buttons + an 'I've joined' callback (handled by the admin
+    # bot, which re-triggers this same function).
+    try:
+        gate = force_join.check_membership(uid)
+    except Exception as e:  # noqa: BLE001
+        log.warning("force_join check failed (letting user through): %s", e)
+        gate = {"missing": [], "enabled": False}
+    if gate.get("missing"):
+        force_join.remember_pending(uid, gid)
+        force_join.send_join_prompt(uid, gate["missing"], gallery_id=gid)
+        return {
+            "ok": True,
+            "delivered": False,
+            "blocked_by_force_join": True,
+            "gallery_id": gid,
+            "reason": "Please join the required channel(s) — check your DM.",
+        }
+
     # --- Look up the gallery doc --------------------------------------------
     conn = _bot_db.connect()
     try:
@@ -206,12 +230,17 @@ def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
         "pdf_copied": False,
     }
 
+    sent_msg_ids: list[int] = []  # collected for the auto-delete scheduler
+
     with httpx.Client() as client:
         # Cover first — order matters so the PDF replies to the cover in DM.
         if cover_msg_id:
             r = _copy_or_forward(token, from_chat, uid, int(cover_msg_id), client)
             if r.get("ok"):
                 result["cover_copied"] = True
+                new_mid = int((r.get("result") or {}).get("message_id") or 0)
+                if new_mid:
+                    sent_msg_ids.append(new_mid)
                 if r.get("used_forward_fallback"):
                     result["cover_used_forward"] = True
             else:
@@ -233,6 +262,9 @@ def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
             r = _copy_or_forward(token, from_chat, uid, int(pdf_msg_id), client)
             if r.get("ok"):
                 result["pdf_copied"] = True
+                new_mid = int((r.get("result") or {}).get("message_id") or 0)
+                if new_mid:
+                    sent_msg_ids.append(new_mid)
                 if r.get("used_forward_fallback"):
                     result["pdf_used_forward"] = True
             else:
@@ -255,4 +287,17 @@ def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
         result["reason"] = (result.get("cover_error")
                             or result.get("pdf_error")
                             or "unknown DM delivery failure")
+    else:
+        # Feature 1 (Auto-delete): schedule deletion of the delivered msgs
+        # after N hours (no-op unless the admin enabled it).
+        try:
+            deletion_scheduler.schedule(uid, sent_msg_ids)
+        except Exception as e:  # noqa: BLE001
+            log.warning("deletion scheduling failed (non-fatal): %s", e)
+        # Force-join pending cleanup: the delivery succeeded, so forget
+        # any remembered pending row for this user+gallery.
+        try:
+            force_join.pop_pending(uid, gid)
+        except Exception:
+            pass
     return result

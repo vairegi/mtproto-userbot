@@ -21,8 +21,192 @@ export async function render(root, { me }) {
   root.appendChild(sectionStats());
   root.appendChild(sectionVisibility());
   root.appendChild(sectionRateLimits());
+  root.appendChild(sectionAutoDelete());
+  root.appendChild(sectionShareGuard());
+  root.appendChild(sectionForceJoin());
   root.appendChild(sectionUsers());
   root.appendChild(sectionDiag());
+}
+
+// Small helpers shared by the new feature sections ------------------------
+function makeToggle(initial, onFlip) {
+  const t = h("button", {
+    class: "toggle",
+    "aria-checked": initial ? "true" : "false",
+    "aria-label": "Toggle",
+    onclick: async () => {
+      const cur = t.getAttribute("aria-checked") === "true";
+      const next = !cur;
+      t.setAttribute("aria-checked", next ? "true" : "false");
+      haptic("light");
+      try { await onFlip(next); }
+      catch (e) {
+        // Roll back on failure.
+        t.setAttribute("aria-checked", cur ? "true" : "false");
+        toast(e.message, "error");
+      }
+    },
+  });
+  return t;
+}
+
+// -------- 3. Auto-delete (feature 1) --------
+function sectionAutoDelete() {
+  const wrap = h("div", { class: "admin-section" });
+  wrap.appendChild(h("h3", {}, "⏱️ Auto-delete DM'd files"));
+
+  const row = h("div", { class: "kv-row" });
+  const toggle = makeToggle(false, async (on) => {
+    const hours = parseInt(hoursInput.value || "24", 10) || 24;
+    await api.post("/api/admin/autodelete", { enabled: on, hours });
+    toast(on ? "Auto-delete ON" : "Auto-delete OFF", on ? "success" : "");
+  });
+  row.append(
+    h("span", { class: "k" }, "Auto-delete files sent to users"),
+    toggle,
+  );
+
+  const hoursRow = h("div", { class: "kv-row" });
+  const hoursInput = h("input", {
+    type: "number", min: "1", max: "720", step: "1",
+    style: { width: "80px" }, value: "24",
+  });
+  const hoursSave = h("button", { class: "btn",
+    onclick: async () => {
+      const enabled = toggle.getAttribute("aria-checked") === "true";
+      const hours = parseInt(hoursInput.value || "24", 10) || 24;
+      if (hours < 1) { toast("Hours must be ≥ 1", "error"); return; }
+      haptic("medium");
+      try {
+        await api.post("/api/admin/autodelete", { enabled, hours });
+        toast(`Auto-delete every ${hours}h saved`, "success");
+      } catch (e) { toast(e.message, "error"); }
+    },
+  }, "Save");
+  hoursRow.append(
+    h("span", { class: "k" }, "Delete after (hours)"),
+    hoursInput, hoursSave,
+  );
+
+  wrap.append(row, hoursRow);
+
+  (async () => {
+    try {
+      const s = await api.get("/api/admin/autodelete");
+      toggle.setAttribute("aria-checked", s.enabled ? "true" : "false");
+      hoursInput.value = String(s.hours || 24);
+    } catch (e) { toast(e.message, "error"); }
+  })();
+
+  return wrap;
+}
+
+// -------- 4. Disable sharing (feature 2) --------
+function sectionShareGuard() {
+  const wrap = h("div", { class: "admin-section" });
+  wrap.appendChild(h("h3", {}, "🔒 Disable sharing"));
+
+  const row = h("div", { class: "kv-row" });
+  const toggle = makeToggle(false, async (on) => {
+    await api.post("/api/admin/shareguard", { enabled: on });
+    toast(on ? "Users can no longer forward/save files" : "Sharing re-enabled",
+          on ? "success" : "");
+  });
+  row.append(
+    h("span", { class: "k" }, "Users cannot share post or file"),
+    toggle,
+  );
+
+  const hint = h("div", {
+    style: { color: "var(--du-ink-lo)", fontSize: "11px", marginTop: "4px" },
+  }, "When ON, Telegram blocks forwarding / saving on everything the bot sends.");
+
+  wrap.append(row, hint);
+
+  (async () => {
+    try {
+      const s = await api.get("/api/admin/shareguard");
+      toggle.setAttribute("aria-checked", s.enabled ? "true" : "false");
+    } catch (e) { toast(e.message, "error"); }
+  })();
+
+  return wrap;
+}
+
+// -------- 5. Force-join channels (feature 3) --------
+function sectionForceJoin() {
+  const wrap = h("div", { class: "admin-section" });
+  wrap.appendChild(h("h3", {}, "👥 Force-join channel"));
+
+  const list = h("div", {});
+  const hint = h("div", {
+    style: { color: "var(--du-ink-lo)", fontSize: "11px", margin: "4px 0 8px" },
+  }, "Users must join these channels before the bot DMs them any file. "
+   + "Add as @channelname or a private -100… ID.");
+
+  const input = h("input", {
+    type: "text", placeholder: "@channelname or -1001234567890",
+    style: { flex: "1", minWidth: "0" },
+  });
+  const addBtn = h("button", { class: "btn primary",
+    onclick: async () => {
+      const v = (input.value || "").trim();
+      if (!v) { toast("Enter a channel handle first", "error"); return; }
+      haptic("medium");
+      try {
+        const r = await api.post("/api/admin/forcejoin/add", { channel: v });
+        input.value = "";
+        toast(r.already ? "Already in the list" : "Channel added", "success");
+        renderList(r.channels || []);
+      } catch (e) { toast(e.message, "error"); }
+    },
+  }, "Add");
+
+  const addRow = h("div", {
+    style: { display: "flex", gap: "8px", alignItems: "center" },
+  }, input, addBtn);
+
+  function renderList(channels) {
+    list.innerHTML = "";
+    if (!channels.length) {
+      list.appendChild(h("div", {
+        style: { color: "var(--du-ink-lo)", fontSize: "12px" },
+      }, "No force-join channels — feature is OFF."));
+      return;
+    }
+    for (const c of channels) {
+      const label = c.title || (c.username ? "@" + c.username
+                                             : ("#" + (c.chat_id || "")));
+      const removeBtn = h("button", { class: "btn danger",
+        onclick: async () => {
+          const key = c.username || String(c.chat_id || "");
+          if (!key) return;
+          haptic("warning");
+          try {
+            const r = await api.post("/api/admin/forcejoin/remove",
+                                     { channel: key });
+            toast("Channel removed", "success");
+            renderList(r.channels || []);
+          } catch (e) { toast(e.message, "error"); }
+        },
+      }, "Remove");
+      list.appendChild(h("div", { class: "kv-row" },
+        h("span", { class: "k" }, label),
+        removeBtn,
+      ));
+    }
+  }
+
+  wrap.append(hint, list, addRow);
+
+  (async () => {
+    try {
+      const s = await api.get("/api/admin/forcejoin");
+      renderList(s.channels || []);
+    } catch (e) { toast(e.message, "error"); }
+  })();
+
+  return wrap;
 }
 
 // -------- 0. KPI stats (uses /api/admin/stats) --------

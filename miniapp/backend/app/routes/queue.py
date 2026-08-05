@@ -69,7 +69,13 @@ def enqueue(body: EnqueueBody, user: dict = Depends(get_current_user)) -> dict:
             "delivered": bool(deliv.get("delivered")),
             "usage": ratelimit.usage_summary(uid),
         }
-        if deliv.get("delivered"):
+        if deliv.get("blocked_by_force_join"):
+            # Force-join gate fired — the bot already DM'd a 'please join'
+            # prompt with Join buttons. Frontend should show this verbatim.
+            out["blocked_by_force_join"] = True
+            out["message"] = deliv.get("reason") or (
+                "Please join the required channel(s) — check your DM.")
+        elif deliv.get("delivered"):
             out["message"] = "📨 Forwarded to your DM"
         else:
             # Delivery failed — surface the reason so the frontend can
@@ -123,6 +129,12 @@ def deliver(gallery_id: str, user: dict = Depends(get_current_user)) -> dict:
         raise HTTPException(403, "App is currently private (admin only).")
 
     res = dm_delivery.deliver_to_dm(gallery_id, uid)
+    if res.get("blocked_by_force_join"):
+        # Not an error — the user got a 'please join' prompt in DM.
+        return {"ok": True, "delivered": False,
+                "blocked_by_force_join": True,
+                "gallery_id": res.get("gallery_id"),
+                "message": res.get("reason") or "Join the required channel(s)."}
     if not res.get("ok"):
         # 404 when the gallery isn't in the library; 502 when Telegram
         # itself refused the copy; 500 for anything else.

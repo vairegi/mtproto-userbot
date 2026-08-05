@@ -23,7 +23,10 @@ from pydantic import BaseModel
 
 from .. import db
 from ..auth import require_admin
-from ..services import scraper_bridge, queue_bridge
+from ..services import (
+    deletion_scheduler, force_join, queue_bridge, scraper_bridge,
+    share_guard,
+)
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -111,6 +114,71 @@ def ban(uid: int, _a: dict = Depends(require_admin)) -> dict:
 def unban(uid: int, _a: dict = Depends(require_admin)) -> dict:
     db.set_banned(uid, False)
     return {"ok": True}
+
+
+# ---- Feature 1: Auto-delete DM'd content ----
+class AutoDeleteBody(BaseModel):
+    enabled: bool = False
+    hours: int = 24
+
+
+@router.get("/autodelete")
+def get_autodelete(_a: dict = Depends(require_admin)) -> dict:
+    return {
+        "enabled": deletion_scheduler.is_enabled(),
+        "hours":   deletion_scheduler.hours(),
+    }
+
+
+@router.post("/autodelete")
+def set_autodelete(body: AutoDeleteBody, _a: dict = Depends(require_admin)) -> dict:
+    db.set_setting("auto_delete_enabled", bool(body.enabled))
+    db.set_setting("auto_delete_hours",   max(1, int(body.hours)))
+    return {"ok": True, "enabled": bool(body.enabled),
+            "hours": max(1, int(body.hours))}
+
+
+# ---- Feature 2: Disable sharing (protect_content on every delivery) ----
+class ShareGuardBody(BaseModel):
+    enabled: bool
+
+
+@router.get("/shareguard")
+def get_shareguard(_a: dict = Depends(require_admin)) -> dict:
+    return {"enabled": share_guard.is_enabled()}
+
+
+@router.post("/shareguard")
+def set_shareguard(body: ShareGuardBody, _a: dict = Depends(require_admin)) -> dict:
+    db.set_setting("share_disabled", bool(body.enabled))
+    return {"ok": True, "enabled": bool(body.enabled)}
+
+
+# ---- Feature 3: Force-join channels ----
+class ForceJoinAddBody(BaseModel):
+    channel: str
+    title: str = ""
+    url: str = ""
+
+
+class ForceJoinRemoveBody(BaseModel):
+    channel: str
+
+
+@router.get("/forcejoin")
+def get_forcejoin(_a: dict = Depends(require_admin)) -> dict:
+    chans = force_join.get_channels()
+    return {"enabled": bool(chans), "channels": chans}
+
+
+@router.post("/forcejoin/add")
+def forcejoin_add(body: ForceJoinAddBody, _a: dict = Depends(require_admin)) -> dict:
+    return force_join.add_channel(body.channel, title=body.title, url=body.url)
+
+
+@router.post("/forcejoin/remove")
+def forcejoin_remove(body: ForceJoinRemoveBody, _a: dict = Depends(require_admin)) -> dict:
+    return force_join.remove_channel(body.channel)
 
 
 # ---- Diagnostics ----

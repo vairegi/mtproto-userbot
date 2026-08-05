@@ -72,6 +72,21 @@ mount_all(app)
 
 
 # ---------------------------------------------------------------------------
+# Startup: kick off the auto-delete background loop (feature 1)
+# ---------------------------------------------------------------------------
+@app.on_event("startup")
+async def _start_deletion_scheduler() -> None:
+    """Start the background loop that deletes DM'd content after N hours.
+    Idempotent — safe on every (re)boot."""
+    try:
+        from app.services import deletion_scheduler
+        deletion_scheduler.start_background_loop()
+        log.info("deletion_scheduler background loop started")
+    except Exception as e:  # noqa: BLE001
+        log.warning("deletion_scheduler failed to start (non-fatal): %s", e)
+
+
+# ---------------------------------------------------------------------------
 # HTML shell — served at "/" and also as an SPA fallback for unknown paths
 # ---------------------------------------------------------------------------
 def _serve_index() -> Response:

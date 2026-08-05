@@ -97,8 +97,12 @@ export const cardActions = [
             toast("Not in library yet — queuing…", "");
           } else {
             const msg = (e && (e.message || e.detail)) || "unknown";
-            // Telegram's classic "user hasn't started the bot" case.
-            if (/initiate conversation|\/start/i.test(msg)) {
+            // Feature 3 (force-join): backend may surface a join-required
+            // block as a 200 with blocked_by_force_join — but if it ever
+            // arrives as an error, handle it here too.
+            if (/join the required|force.?join/i.test(msg)) {
+              toast("🔒 Join the required channel(s) — check your DM", "");
+            } else if (/initiate conversation|\/start/i.test(msg)) {
               toast("👋 Send /start to the bot in DM first, then try again.", "error");
             } else {
               toast("DM delivery failed: " + msg, "error");
@@ -135,6 +139,10 @@ export const cardActions = [
             if (res.delivered) {
               toast(res.message || "📨 Sent to your DM", "success");
               close && close();
+            } else if (res.blocked_by_force_join) {
+              // Feature 3 (force-join): the bot already DM'd a 'please join'
+              // prompt with Join buttons + an 'I've joined' callback.
+              toast(res.message || "🔒 Join the required channel(s) — check your DM", "");
             } else {
               const errMsg = res.delivery_error || res.message || "DM delivery failed";
               if (/initiate conversation|\/start/i.test(errMsg)) {
