@@ -288,8 +288,33 @@ def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
                             or result.get("pdf_error")
                             or "unknown DM delivery failure")
     else:
+        # --- Improvement #4: the DEDUP-DELIVER path was missing the
+        # "📨 Sent to your DM" confirmation that the auto-DM path in
+        # relay_v2 already sends. Send it here too, from the admin bot,
+        # so the user actually gets a Telegram DM (not just an in-app
+        # toast). Merge share_guard.payload() so protect_content sticks
+        # when the admin toggled Disable-sharing. Wrap in a try/except
+        # that only logs on failure (never blocks the response).
+        try:
+            with httpx.Client() as _client:
+                _confirm = _api_call(token, "sendMessage", {
+                    "chat_id": int(uid),
+                    "text":    "📨 Sent to your DM",
+                    **share_guard.payload(),
+                }, _client)
+            if _confirm.get("ok"):
+                _mid = int((_confirm.get("result") or {}).get("message_id") or 0)
+                if _mid:
+                    sent_msg_ids.append(_mid)
+            else:
+                log.info("dedup-deliver confirmation sendMessage failed: %s",
+                         _confirm.get("description"))
+        except Exception as _e:  # noqa: BLE001
+            log.info("dedup-deliver confirmation raised (non-fatal): %s", _e)
+
         # Feature 1 (Auto-delete): schedule deletion of the delivered msgs
-        # after N hours (no-op unless the admin enabled it).
+        # after N hours (no-op unless the admin enabled it). Includes the
+        # confirmation message appended above.
         try:
             deletion_scheduler.schedule(uid, sent_msg_ids)
         except Exception as e:  # noqa: BLE001

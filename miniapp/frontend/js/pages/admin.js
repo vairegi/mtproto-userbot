@@ -142,10 +142,12 @@ function sectionForceJoin() {
   const hint = h("div", {
     style: { color: "var(--du-ink-lo)", fontSize: "11px", margin: "4px 0 8px" },
   }, "Users must join these channels before the bot DMs them any file. "
-   + "Add as @channelname or a private -100… ID.");
+   + "Add a public @handle, a private invite link (t.me/+…), "
+   + "or a numeric -100… channel ID. Bot must be admin in each channel.");
 
   const input = h("input", {
-    type: "text", placeholder: "@channelname or -1001234567890",
+    type: "text",
+    placeholder: "@channel  OR  https://t.me/+abcXYZ  OR  -1001234567890",
     style: { flex: "1", minWidth: "0" },
   });
   const addBtn = h("button", { class: "btn primary",

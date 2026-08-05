@@ -14,16 +14,18 @@ remembered gallery.
 
 Setting `force_join_channels` → list[dict]:
     [{"username": "my_channel", "title": "My Channel",
-      "url": null, "chat_id": null}, ...]
+      "url": null, "chat_id": null, "invite_hash": null}, ...]
   - `username` has no leading '@' (normalised on write).
   - `url` overrides the default `https://t.me/<username>` join link.
   - `chat_id` is cached on first successful getChat lookup so private
     (-100…) channels also work.
+  - `invite_hash` supports private channels added via a t.me/+... link.
 """
 from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -39,6 +41,16 @@ _HTTP_TIMEOUT = 10.0
 # getChatMember statuses we count as "is a member":
 _MEMBER_STATUSES = {"creator", "administrator", "member", "restricted"}
 
+# Matches Telegram invite links:
+#   https://t.me/+ABC123
+#   http://telegram.me/+ABC123
+#   t.me/joinchat/ABC123
+#   telegram.me/joinchat/ABC123
+_INVITE_LINK_RE = re.compile(
+    r"^(?:https?://)?t(?:elegram)?\.me/(?:joinchat/|\+)([A-Za-z0-9_\-]+)/?$",
+    re.IGNORECASE,
+)
+
 
 def _bot_token() -> str:
     return (
@@ -52,6 +64,10 @@ def _pending_col():
     return _db.db()["miniapp_pending_deliveries"]
 
 
+def _pending_join_requests_col():
+    return _db.db()["miniapp_pending_join_requests"]
+
+
 # ---------------------------------------------------------------------------
 # Settings I/O
 # ---------------------------------------------------------------------------
@@ -60,7 +76,7 @@ def get_channels() -> List[Dict[str, Any]]:
     if not isinstance(v, list):
         return []
     return [c for c in v if isinstance(c, dict)
-            and (c.get("username") or c.get("chat_id"))]
+            and (c.get("username") or c.get("chat_id") or c.get("invite_hash"))]
 
 
 def set_channels(items: List[Dict[str, Any]]) -> None:
@@ -73,10 +89,38 @@ def is_enabled() -> bool:
 
 
 def _normalise_handle(raw: str) -> str:
+    """Normalise an admin-supplied channel reference.
+
+    Returns one of:
+      * `"invite:<hash>"`   — for `t.me/+…` or `t.me/joinchat/…` links.
+      * `"<numeric_id>"`     — for `-100…` style numeric channel IDs.
+      * `"<handle>"`         — for `@handle` or plain public handles
+                               (leading '@' and http(s)://t.me/ prefix
+                               stripped).
+    """
     s = str(raw or "").strip()
+    if not s:
+        return s
+
+    m = _INVITE_LINK_RE.match(s)
+    if m:
+        return "invite:" + m.group(1)
+
+    # Strip protocol / t.me/ prefix from public links like https://t.me/foo.
+    low = s.lower()
+    for prefix in ("https://", "http://"):
+        if low.startswith(prefix):
+            s = s[len(prefix):]
+            low = s.lower()
+            break
+    for prefix in ("t.me/", "telegram.me/"):
+        if low.startswith(prefix):
+            s = s[len(prefix):]
+            break
+
     if s.startswith("@"):
         s = s[1:]
-    return s
+    return s.strip("/ ")
 
 
 def add_channel(username_or_id: str, title: str = "", url: str = "") -> Dict[str, Any]:
@@ -84,8 +128,14 @@ def add_channel(username_or_id: str, title: str = "", url: str = "") -> Dict[str
     if not handle:
         raise ValueError("empty channel handle")
 
+    invite_hash: Optional[str] = None
+    if handle.startswith("invite:"):
+        invite_hash = handle[len("invite:"):]
+        if not invite_hash:
+            raise ValueError("empty invite hash")
+
     numeric_id: Optional[int] = None
-    if handle.lstrip("-").isdigit():
+    if invite_hash is None and handle.lstrip("-").isdigit():
         try:
             numeric_id = int(handle)
         except ValueError:
@@ -93,19 +143,44 @@ def add_channel(username_or_id: str, title: str = "", url: str = "") -> Dict[str
 
     current = get_channels()
     for c in current:
+        if invite_hash is not None \
+                and (c.get("invite_hash") or "") == invite_hash:
+            return {"ok": True, "already": True, "channels": current}
         if numeric_id is not None and int(c.get("chat_id") or 0) == numeric_id:
             return {"ok": True, "already": True, "channels": current}
-        if (c.get("username") or "").lower() == handle.lower():
+        if invite_hash is None and numeric_id is None \
+                and (c.get("username") or "").lower() == handle.lower():
             return {"ok": True, "already": True, "channels": current}
 
+    # Auto-default url for invite-hash rows so join button always works.
+    if invite_hash is not None and not (url or "").strip():
+        url = f"https://t.me/+{invite_hash}"
+
+    if invite_hash is not None:
+        default_title = f"Private channel (+{invite_hash[:6]}…)"
+    elif numeric_id is not None:
+        default_title = f"#{numeric_id}"
+    else:
+        default_title = handle
+
     new_row: Dict[str, Any] = {
-        "username": handle if numeric_id is None else "",
-        "chat_id":  numeric_id,
-        "title":    (title or "").strip()
-                    or (handle if numeric_id is None else f"#{numeric_id}"),
-        "url":      (url or "").strip() or None,
-        "added_at": time.time(),
+        "username":    "" if (invite_hash is not None or numeric_id is not None)
+                       else handle,
+        "chat_id":     numeric_id,
+        "invite_hash": invite_hash,
+        "title":       (title or "").strip() or default_title,
+        "url":         (url or "").strip() or None,
+        "added_at":    time.time(),
     }
+
+    # Best-effort: try to prefill the real channel title from Bot API.
+    try:
+        real_title = _fetch_channel_title(new_row)
+        if real_title:
+            new_row["title"] = real_title
+    except Exception as e:  # noqa: BLE001
+        log.info("add_channel: _fetch_channel_title failed (non-fatal): %s", e)
+
     current.append(new_row)
     set_channels(current)
     return {"ok": True, "already": False, "channels": current}
@@ -113,18 +188,28 @@ def add_channel(username_or_id: str, title: str = "", url: str = "") -> Dict[str
 
 def remove_channel(username_or_id: str) -> Dict[str, Any]:
     handle = _normalise_handle(username_or_id)
+    invite_hash: Optional[str] = None
+    if handle.startswith("invite:"):
+        invite_hash = handle[len("invite:"):]
+
     numeric = None
-    if handle.lstrip("-").isdigit():
+    if invite_hash is None and handle.lstrip("-").isdigit():
         try:
             numeric = int(handle)
         except ValueError:
             numeric = None
+
     kept, removed = [], False
     for c in get_channels():
+        if invite_hash is not None \
+                and (c.get("invite_hash") or "") == invite_hash:
+            removed = True
+            continue
         if numeric is not None and int(c.get("chat_id") or 0) == numeric:
             removed = True
             continue
-        if (c.get("username") or "").lower() == handle.lower():
+        if invite_hash is None and numeric is None \
+                and (c.get("username") or "").lower() == handle.lower():
             removed = True
             continue
         kept.append(c)
@@ -133,8 +218,12 @@ def remove_channel(username_or_id: str) -> Dict[str, Any]:
 
 
 def join_url(channel: Dict[str, Any]) -> str:
+    # Priority: admin-supplied url → invite_hash → @username → chat_id
     if channel.get("url"):
         return str(channel["url"])
+    ih = channel.get("invite_hash")
+    if ih:
+        return f"https://t.me/+{ih}"
     u = channel.get("username")
     if u:
         return f"https://t.me/{u}"
@@ -164,9 +253,36 @@ def _sync_call(method: str, payload: dict) -> dict:
         return {"ok": False, "description": f"http error: {e!s}"}
 
 
+def _fetch_channel_title(channel: Dict[str, Any]) -> str:
+    """Best-effort Bot API getChat → result.title.
+
+    Works when:
+      * `username` is set (public @handle), OR
+      * `chat_id` is set (already resolved / numeric -100… channel).
+
+    Returns "" for invite-only rows we can't resolve yet.
+    """
+    chat_ref: Any = None
+    if channel.get("chat_id"):
+        try:
+            chat_ref = int(channel["chat_id"])
+        except (TypeError, ValueError):
+            chat_ref = None
+    if chat_ref is None and channel.get("username"):
+        chat_ref = f"@{channel['username']}"
+    if chat_ref is None:
+        return ""
+
+    r = _sync_call("getChat", {"chat_id": chat_ref})
+    if not r.get("ok"):
+        return ""
+    title = ((r.get("result") or {}).get("title") or "").strip()
+    return title
+
+
 def _resolve_chat_id(channel: Dict[str, Any]) -> Optional[int]:
     """Return the numeric chat_id for a configured channel (cached after
-    the first successful lookup)."""
+    the first successful lookup). Also refreshes the cached title."""
     cid = channel.get("chat_id")
     if cid:
         try:
@@ -176,21 +292,50 @@ def _resolve_chat_id(channel: Dict[str, Any]) -> Optional[int]:
 
     handle = channel.get("username") or ""
     if not handle:
+        # Invite-hash rows can't be resolved from the hash alone — the
+        # admin bot must be an admin in the channel first, which will
+        # arrive via ChatMember updates. Fail open in that case (handled
+        # upstream in check_membership).
         return None
+
     r = _sync_call("getChat", {"chat_id": f"@{handle}"})
     if not r.get("ok"):
         log.warning("force_join: getChat @%s failed: %s",
                     handle, r.get("description"))
         return None
-    new_cid = int((r.get("result") or {}).get("id") or 0) or None
+    result = r.get("result") or {}
+    new_cid = int(result.get("id") or 0) or None
+    new_title = (result.get("title") or "").strip()
     if new_cid:
         # Cache back to settings so we don't call getChat every delivery.
         current = get_channels()
         for c in current:
             if (c.get("username") or "").lower() == handle.lower():
                 c["chat_id"] = new_cid
+                if new_title:
+                    c["title"] = new_title
         set_channels(current)
     return new_cid
+
+
+def _has_pending_join_request(user_id: int, chat_id: int) -> bool:
+    """True if the user has tapped a request-to-join invite link for
+    `chat_id` and is waiting for admin approval. The row is populated
+    by admin_bot.py's ChatJoinRequestHandler."""
+    try:
+        row = _pending_join_requests_col().find_one(
+            {"user_id": int(user_id), "chat_id": int(chat_id)}
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("force_join: pending-request lookup failed: %s", e)
+        return False
+    if not row:
+        return False
+    status = str(row.get("status") or "").lower()
+    # 'pending' = request sent, awaiting approval — treat as member.
+    # 'approved' = admin accepted — also fine (getChatMember should agree,
+    # but keep this here in case Telegram is slow to propagate).
+    return status in ("pending", "approved")
 
 
 def _is_member(user_id: int, chat_id: int) -> bool:
@@ -199,6 +344,10 @@ def _is_member(user_id: int, chat_id: int) -> bool:
     if not r.get("ok"):
         desc = str(r.get("description") or "").lower()
         if "not found" in desc:
+            # User isn't a member — but they may have a PENDING join
+            # request (request-to-join channels). Treat pending as member.
+            if _has_pending_join_request(user_id, chat_id):
+                return True
             return False
         # Bot not admin / chat not found → can't verify. Safe default:
         # let the user through so a misconfigured channel never locks
@@ -207,7 +356,13 @@ def _is_member(user_id: int, chat_id: int) -> bool:
                     user_id, chat_id, desc)
         return True
     status = (r.get("result") or {}).get("status", "")
-    return status in _MEMBER_STATUSES
+    if status in _MEMBER_STATUSES:
+        return True
+    # Non-member status (e.g. "left", "kicked"): fall back to the
+    # pending-request table for request-to-join channels.
+    if _has_pending_join_request(user_id, chat_id):
+        return True
+    return False
 
 
 def check_membership(user_id: int) -> Dict[str, Any]:
@@ -222,6 +377,10 @@ def check_membership(user_id: int) -> Dict[str, Any]:
     for c in channels:
         cid = _resolve_chat_id(c)
         if not cid:
+            # Invite-only row we can't resolve yet (bot not admin, or
+            # invite_hash with no cached chat_id). Fail OPEN so a
+            # correctly-configured admin doesn't lock everyone out
+            # during setup.
             continue
         if not _is_member(user_id, cid):
             missing.append(c)
@@ -232,7 +391,15 @@ def build_join_keyboard(missing_channels: List[Dict[str, Any]],
                         gallery_id: Optional[str] = None) -> Dict[str, Any]:
     rows: List[List[Dict[str, Any]]] = []
     for c in missing_channels[:5]:
-        label = c.get("title") or c.get("username") or "channel"
+        label = (c.get("title") or "").strip()
+        if not label:
+            # Try to fetch the real title once before falling back.
+            try:
+                label = _fetch_channel_title(c) or ""
+            except Exception:
+                label = ""
+        if not label:
+            label = c.get("username") or "channel"
         rows.append([{"text": f"🔗 Join {label}", "url": join_url(c)}])
     rows.append([{
         "text": "✅ I've joined — deliver my file",
@@ -247,7 +414,7 @@ def send_join_prompt(user_id: int, missing: List[Dict[str, Any]],
         "🔒 Please join the required channel"
         + ("s" if len(missing) > 1 else "")
         + " below to receive your file.\n\n"
-        + "After joining, tap ✅ I've joined."
+        + "After joining (or after requesting to join), tap ✅ I've joined."
     )
     return _sync_call("sendMessage", {
         "chat_id": int(user_id),
