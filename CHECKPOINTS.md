@@ -1,30 +1,31 @@
-# Checkpoint ledger
+# CHECKPOINTS.md — FixPack (3-bug patch)
 
-Every intermediate recovery archive produced while migrating this project
-from SQLite + PM2 to MongoDB Atlas + `start.sh`.
+Task size: **SMALL** (≤3 file edits + 1 new module) → **50% + 100%** grid.
 
-| %   | Milestone                                                             | File-wrapper URL                                    | AI Drive mirror                                          |
-|-----|-----------------------------------------------------------------------|-----------------------------------------------------|----------------------------------------------------------|
-| 20% | New MongoDB `db.py` (drop-in replacement) + `requirements.txt`        | https://www.genspark.ai/api/files/s/vZ5bnx3V        | /mtproto_userbot_checkpoints/MTProto_Recovery_20pct.zip  |
-| 40% | `queue_service.py`, `config.py`, `startup_check.py`, `logging_setup.py` migrated + 128-test suite passing | https://www.genspark.ai/api/files/s/t3brvJqm | /mtproto_userbot_checkpoints/MTProto_Recovery_40pct.zip |
-| 80% | `start.sh`, `userbot.py`, `Dockerfile`, `README_HF.md`, `.env.example`, `.gitignore` + all 14 modules import clean | https://www.genspark.ai/api/files/s/eiX5sUaW | /mtproto_userbot_checkpoints/MTProto_Recovery_80pct.zip |
-| 100%| Final deliverable — `DEPLOYMENT_GUIDE.md` added + cleanup             | (see final message)                                 | (see final message)                                      |
+| %    | Description                                                                 | File-wrapper URL                                     | AI Drive mirror                                                    |
+|------|-----------------------------------------------------------------------------|------------------------------------------------------|--------------------------------------------------------------------|
+| 50%  | All three bug fixes applied; `py_compile` green on every edited `.py`; JS parses clean; caption smoke-test matches screenshot format exactly. | https://www.genspark.ai/api/files/s/rugh58NV        | `/DoujinshiUniverse_v2_checkpoints/FixPack_50pct.zip`             |
+| 100% | `verify_v2.sh` — all 5 stages green (required files, py_compile, grep tripwires, miniapp/verify.sh, tests_v2_smoke.py: 43 PASS). FINAL zip uploaded + mirrored. | *(FINAL URL — see chat)*                             | `/DoujinshiUniverse_v2_checkpoints/FixPack_FINAL.zip`             |
 
-## Verification performed at each stage
+## Files changed
 
-- Compile check (`python3 -m py_compile`) on every Python file.
-- Bash syntax check (`bash -n start.sh`).
-- Functional test of `db.py` against the real MongoDB API surface
-  (`tests_db_mongo.py`, 128 assertions, all green).
-- Whole-project import test (`test_imports.py`): every one of the 14 modules
-  loads cleanly on top of the new MongoDB `db.py`.
-- Dependency-resolution dry run: `pymongo[srv]==4.9.2 dnspython==2.7.0
-  motor==3.6.0` verified as installable together (the naive `pymongo==4.10.1`
-  pair produces a `ResolutionImpossible` error and would break the HF build).
+| File | Bug | Purpose of change |
+|------|-----|-------------------|
+| `miniapp/backend/app/services/scraper_bridge.py`     | BUG 3 | Replaced `asyncio.run()` per call with a persistent per-thread event loop (`threading.local` + `_get_loop()`). Kills the "Event loop is closed" warning from `hf_scraper`'s pooled `httpx.AsyncClient`. |
+| `cover_poster.py`                                     | BUG 2 | Rewrote `_format_caption`: strips `(C92)` event prefix + trailing `[English]` brackets; emits `➤ #<gallery_id>`; grouped meta rows (Groups / Parodies / Artists / Characters / Languages / Categories); trailing `➤ Tags:` row capped at 600 chars; **no nhentai URL anywhere**. Reuses existing `_hashtagify`. |
+| `miniapp/backend/app/services/dm_delivery.py` *(new)* | BUG 1 | New helper module. `deliver_to_dm(gallery_id, user_id)` reads `db_cover_msg_id` + `db_pdf_msg_id` from the Mongo gallery doc and calls Telegram Bot API `copyMessage` twice with the admin bot token (`copyMessage` strips the "Forwarded from" tag). |
+| `miniapp/backend/app/routes/queue.py`                 | BUG 1 | Added `POST /api/queue/deliver/{gallery_id}`. Changed the `already_completed` branch of `POST /api/queue` to call `dm_delivery.deliver_to_dm(...)` and return `{deduped:true, delivered:true, message:"📨 Forwarded to your DM"}` instead of `open_link`. |
+| `miniapp/backend/app/config.py`                       | BUG 1 | Added `database_channel_id` setting (from `DATABASE_CHANNEL_ID` / `CHANNEL_ID` env), and made `bot_token` fall back to `ADMIN_BOT_TOKEN`. |
+| `miniapp/frontend/js/plugins/card-actions.js`         | BUG 1 | Replaced the `openLink(res.open_link)` branch (both the pre-check `isCompleted` path and the server-dedup response path) with a `POST /api/queue/deliver/<id>` call → `toast("📨 Sent to your DM")` and close the sheet. No more channel jump. |
 
-## Recovery events
+## Acceptance
 
-A sandbox recycle occurred between the 40% and 80% checkpoints. Recovery was
-performed automatically by re-downloading `MTProto_Recovery_40pct.zip` from
-the file-wrapper URL and continuing from the next milestone — no work was
-lost.
+- **BUG 1** — user taps Queue on a completed gallery → bot DMs them the cover image + PDF; no channel jump. Fallback: if delivery fails (Bot API refuses, no message IDs stored), the frontend toasts the error and does NOT open the channel link.
+- **BUG 2** — cover post in DB channel matches the exact screenshot: bold clean title, `➤ #<id>`, aligned grouped meta rows in order (Groups → Parodies → Artists → Characters → Languages → Categories), then `➤ Tags: …`, no nhentai URL. Smoke-test output verified inline.
+- **BUG 3** — `_run_async` now runs on a persistent per-thread loop; `hf_scraper`'s pooled `httpx.AsyncClient` stays bound to a loop that never closes → no more "Event loop is closed" warnings on `/api/gallery/<id>`.
+
+## Verification
+
+- `python3 -m py_compile` — **green** on every edited `.py`.
+- Bracket balance — **green** (`card-actions.js` parses under `new Function()`).
+- `verify_v2.sh` — **all 5 stages green** (43 assertions passed in `tests_v2_smoke.py`).

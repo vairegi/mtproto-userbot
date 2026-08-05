@@ -115,40 +115,148 @@ def _hashtagify(tag: str) -> str:
     return f"#{cleaned}" if cleaned else ""
 
 
+# Title-cleaning regexes (BUG 2 fix). These strip the leading event tag
+# '(C92)' and the trailing meta brackets '[English] [Scans]' so the caption
+# opens with a clean bold title.
+_EVENT_PREFIX_RE = re.compile(r"^\([A-Za-z0-9+\- ]+\)\s*")
+_BRACKET_TAIL_RE = re.compile(r"(\[[^\]]*\])\s*$")
+
+
+def _clean_title(raw: str) -> str:
+    """Strip leading '(C92)' event tags and trailing '[English] [Scans]'
+    metadata brackets from an nhentai title."""
+    s = (raw or "").strip()
+    s = _EVENT_PREFIX_RE.sub("", s)
+    prev = None
+    while prev != s:
+        prev = s
+        s = _BRACKET_TAIL_RE.sub("", s).strip()
+    return s or (raw or "").strip()
+
+
+# BUG 2 fix — tag types we emit as their own labelled row, in this exact
+# order. Anything with type=='tag' (the plain flat tag list) goes into the
+# trailing '➤ Tags:' row.
+_META_ROW_ORDER = [
+    ("group",     "Groups"),
+    ("parody",    "Parodies"),
+    ("artist",    "Artists"),
+    ("character", "Characters"),
+    ("language",  "Languages"),
+    ("category",  "Categories"),
+]
+_TAGS_ROW_MAX = 600   # cap the '➤ Tags:' hashtag row (Telegram caption is 1024)
+
+
+def _group_tags_by_type(tags) -> dict:
+    """Group a flat list of {'name','type'} dicts (or plain strings) by tag
+    type. Plain strings fall into the 'tag' bucket."""
+    groups: dict = {}
+    for t in tags or []:
+        if isinstance(t, dict):
+            typ = str(t.get("type") or "tag").lower()
+            nm = str(t.get("name") or "").strip()
+        else:
+            typ = "tag"
+            nm = str(t or "").strip()
+        if nm:
+            groups.setdefault(typ, []).append(nm)
+    return groups
+
+
 def _format_caption(
     title: str,
-    tags: List[str],
+    tags,
     pages: Optional[int],
     url: str,
     requester_handle: Optional[str] = None,
+    gallery_id: Optional[str] = None,
 ) -> str:
-    """Build the cover-post caption. Kept close to Bot 1's original format so
-    the progress tracker's regexes and the /mpost caption matcher continue
-    to work without changes.
+    """Build the cover-post caption in the exact screenshot format:
+
+        Kakkou no Su | The Cuckoo
+
+        ➤ #295679
+
+        ➤ Groups:     #Community #Taxonomy ...
+        ➤ Parodies:   #original
+        ➤ Artists:    #nakamura_regura
+        ➤ Languages:  #translated #english
+        ➤ Categories: #doujinshi
+
+        ➤ Tags:       #big_breasts #sole_female ...
+
+    Rules (BUG 2):
+      * No nhentai.net URL anywhere.
+      * Clean bold title (event prefix + trailing brackets stripped).
+      * '➤ #<gallery_id>' line, blank line above and below.
+      * Meta rows in the order Groups → Parodies → Artists → Characters
+        → Languages → Categories. Rows with no tags of that type are
+        omitted entirely.
+      * Trailing '➤ Tags: ...' row from the flat 'tag'-type tags,
+        capped at ~600 chars.
+      * Hashtags use _hashtagify: spaces → underscores, punctuation stripped.
     """
     lines: List[str] = []
 
-    header = title.strip() if title else "(untitled)"
-    if pages:
-        header = f"{header}  ·  {int(pages)}p"
-    lines.append(header)
+    # --- Clean, bold title ------------------------------------------------
+    clean = _clean_title(title) if title else "(untitled)"
+    # Telegram supports HTML parse-mode; but the userbot may be sending
+    # plain text — emit as-is (bold visually via clear formatting). If the
+    # caller wants HTML bold they can wrap the string.
+    lines.append(f"**{clean}**")
 
+    # --- ➤ #<gallery_id> --------------------------------------------------
+    if gallery_id:
+        gid_str = str(gallery_id).strip().lstrip("#")
+        if gid_str:
+            lines.append("")
+            lines.append(f"➤ #{gid_str}")
+
+    # --- Grouped metadata rows -------------------------------------------
+    groups = _group_tags_by_type(tags)
+    meta_lines: List[str] = []
+    # Longest label determines column width ("Categories:" == 11 chars).
+    label_width = max(len(lbl) for _, lbl in _META_ROW_ORDER) + 1  # +1 for ':'
+    for key, label in _META_ROW_ORDER:
+        names = groups.get(key) or []
+        if not names:
+            continue
+        hashtags = [h for h in (_hashtagify(n) for n in names) if h]
+        if not hashtags:
+            continue
+        # Left-align 'Groups:', 'Parodies:', ... so hashtags line up like
+        # the screenshot's column.
+        col = (label + ":").ljust(label_width)
+        meta_lines.append(f"➤ {col} {' '.join(hashtags)}")
+
+    if meta_lines:
+        lines.append("")
+        lines.extend(meta_lines)
+
+    # --- Trailing ➤ Tags: row -------------------------------------------
+    plain_tags = groups.get("tag") or []
+    if plain_tags:
+        hashtags = [h for h in (_hashtagify(n) for n in plain_tags) if h]
+        if hashtags:
+            joined = " ".join(hashtags)
+            # Cap the tags row before assembly (Telegram caption ≤ 1024).
+            if len(joined) > _TAGS_ROW_MAX:
+                joined = joined[:_TAGS_ROW_MAX].rsplit(" ", 1)[0]
+            col = ("Tags:").ljust(label_width)
+            lines.append("")
+            lines.append(f"➤ {col} {joined}")
+
+    # --- Optional 'requested by' line (kept, but at the very end) --------
     if requester_handle:
         h = requester_handle if requester_handle.startswith("@") else f"@{requester_handle}"
+        lines.append("")
         lines.append(f"requested by {h}")
 
-    if url:
-        lines.append("")
-        lines.append(url)
-
-    hashtags = [t for t in (_hashtagify(x) for x in (tags or [])) if t]
-    if hashtags:
-        # Cap the hashtag block so we don't blow the caption limit.
-        joined = " ".join(hashtags)
-        if len(joined) > 600:
-            joined = joined[:600].rsplit(" ", 1)[0]
-        lines.append("")
-        lines.append(joined)
+    # NOTE: BUG 2 explicitly forbids emitting the nhentai URL, so `url` is
+    # intentionally ignored here. The parameter is kept for call-site
+    # compatibility.
+    _ = url
 
     out = "\n".join(lines)
     if len(out) > _CAPTION_HARD_LIMIT:
@@ -231,18 +339,31 @@ async def post_cover(
         return None
 
     title  = str(getattr(meta, "title", "") or "")
+    # BUG 2: keep the original {'name','type'} shape so _format_caption can
+    # group by type. Plain strings still work — they fall into the 'tag'
+    # bucket via _group_tags_by_type.
     tags_v = getattr(meta, "tags", []) or []
-    tags: List[str] = []
+    tags_typed: List = []
+    tags_flat: List[str] = []  # kept for the CoverPost return shape (back-compat)
     for t in tags_v:
         if isinstance(t, dict):
             n = t.get("name") or ""
-            if n: tags.append(str(n))
+            if n:
+                tags_typed.append({"name": str(n), "type": str(t.get("type") or "tag")})
+                tags_flat.append(str(n))
         elif t:
-            tags.append(str(t))
+            tags_typed.append({"name": str(t), "type": "tag"})
+            tags_flat.append(str(t))
     pages     = getattr(meta, "pages", None)
     cover_url = getattr(meta, "cover_url", None)
+    gid       = getattr(meta, "gallery_id", None)
 
-    caption = _format_caption(title, tags, pages, url, requester_handle)
+    caption = _format_caption(
+        title, tags_typed, pages, url, requester_handle, gallery_id=gid,
+    )
+    # Preserve the tags field on CoverPost as a flat name list (unchanged
+    # public shape).
+    tags = tags_flat
 
     # 2) download cover ---------------------------------------------------
     cover_bytes = await _download_cover(cover_url) if cover_url else None
