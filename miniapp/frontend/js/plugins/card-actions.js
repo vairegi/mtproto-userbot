@@ -78,6 +78,16 @@ export const cardActions = [
     },
     disabled: ({ gallery }) => isProcessing(gallery),
     async run({ gallery, close }) {
+      // v11: paint the hourglass overlay IMMEDIATELY so the click feels
+      // accepted in <50 ms. Every code path below releases the token via
+      // the outer try/finally (both primary and swap tokens).
+      const _ldr = showActionLoader(
+        isCompleted(gallery) ? "Sending to your DM…" : "Queuing…"
+      );
+      // Secondary token used only to swap the label between phases.
+      // Kept as `let` so we can rebind it after each phase transition.
+      let _ldr_swap = _ldr;
+      try {
       // --- Already on file → DM the user the cover + PDF via the admin bot.
       // BUG 1 fix: previously this called openLink(t.me/c/<internal>/<msg>)
       // which just jumped the user to the channel. Now we POST to the new
@@ -117,6 +127,11 @@ export const cardActions = [
         toast("Already downloading — hang tight", "");
         return;
       }
+
+      // v11: swap the overlay label — we're about to hit /api/queue,
+      // which is the slow leg (3–4 s in the field).
+      hideActionLoader(_ldr_swap);
+      _ldr_swap = showActionLoader("Queuing your download…");
 
       // --- Normal enqueue path (relay_v2 will de-dup at the server too).
       try {
@@ -186,6 +201,13 @@ export const cardActions = [
         } else {
           toast("Failed: " + ((e && e.message) || "unknown"), "error");
         }
+      }
+      } finally {
+        // v11: always release the loader — both primary and swap tokens.
+        // hideActionLoader() is a no-op on unknown / already-released ids,
+        // so releasing both is safe even when they refer to the same overlay.
+        hideActionLoader(_ldr_swap);
+        hideActionLoader(_ldr);
       }
     },
   },

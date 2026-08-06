@@ -242,6 +242,29 @@ def _iso_date(ts) -> str:
         return ""
 
 
+# v11: nhentai image-extension code -> file extension (mirror of the
+# table in hf_scraper._NH_EXT_MAP; kept here so the direct-detail path
+# also builds page-1 URLs without importing hf_scraper's private symbol).
+_NH_EXT_MAP = {"j": "jpg", "p": "png", "g": "gif", "w": "webp"}
+
+
+def _direct_nhentai_page1(item: dict) -> str:
+    """Build the high-quality page-1 URL from a raw nhentai detail dict.
+
+    Returns '' when the detail is missing `media_id` or `images.pages[0]`.
+    Example: media_id=614941, pages[0].t='j' -> 
+    'https://i.nhentai.net/galleries/614941/1.jpg'.
+    """
+    media_id = str(item.get("media_id") or "").strip()
+    images = item.get("images") or {}
+    pages = images.get("pages") if isinstance(images, dict) else None
+    if not (media_id and isinstance(pages, list) and pages):
+        return ""
+    first = pages[0] if isinstance(pages[0], dict) else {}
+    ext = _NH_EXT_MAP.get((first.get("t") or "j").strip().lower(), "jpg")
+    return f"https://i.nhentai.net/galleries/{media_id}/1.{ext}"
+
+
 def _direct_nhentai_detail(gallery_id: str) -> dict:
     try:
         # v2 endpoint for a single gallery: /api/v2/galleries/<id>
@@ -267,7 +290,11 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
     pretty = (title_obj.get("pretty") or "") if isinstance(title_obj, dict) else ""
 
     cover_path = (item.get("cover") or {}).get("path") or ""
-    cover = _T_CDN + "/" + cover_path.lstrip("/") if cover_path else _thumb_url_from_item(item)
+    cover_thumb = _T_CDN + "/" + cover_path.lstrip("/") if cover_path else _thumb_url_from_item(item)
+    # v11: prefer page 1 as the cover image (i.nhentai.net/.../1.<ext> is
+    # served at full resolution vs t.nhentai.net/.../cover.jpg.webp).
+    page1 = _direct_nhentai_page1(item)
+    cover = page1 or cover_thumb
 
     groups = _group_tags(item)
     flat_tags = [{"name": n, "type": typ} for typ, names in groups.items() for n in names]
@@ -278,6 +305,8 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
         "title_english":  english_full,
         "title_japanese": japanese_full,
         "cover":    cover,
+        # v11: expose page1_url separately alongside `cover`.
+        "page1_url": page1,
         "pages":    item.get("num_pages"),
         "favorites": item.get("num_favorites"),
         "upload_date": _iso_date(item.get("upload_date")),
@@ -339,10 +368,20 @@ def _meta_to_dict(meta) -> dict:
             tag_dicts.append(t)
         else:
             tag_dicts.append({"name": str(t), "type": "tag"})
+    # v11: hf_scraper.GalleryMeta now carries `page1_url` (the high-quality
+    # https://i.nhentai.net/galleries/<media_id>/1.<ext> image). Prefer it
+    # for the mini-app card cover; fall back to the traditional thumbnail
+    # for legacy / partial payloads that don't have media_id + images.
+    page1 = d.get("page1_url") or ""
+    cover = page1 or d.get("cover_url") or d.get("cover") or ""
     return {
         "id":    d.get("gallery_id") or d.get("id"),
         "title": d.get("title") or "",
-        "cover": d.get("cover_url") or d.get("cover") or "",
+        "cover": cover,
+        # v11: expose page1_url separately so consumers that specifically
+        # need the full-quality first-page image (e.g. detail-sheet hero,
+        # future "reader" preview) can request it without another scrape.
+        "page1_url": page1,
         "pages": d.get("pages") or d.get("num_pages"),
         "tags":  tag_dicts,
     }

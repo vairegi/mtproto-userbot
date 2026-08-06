@@ -19,6 +19,9 @@
        btn-lift, btn-pill, btn-ripple, btn-icon-only). MUST load last so
        its rules override the base .btn styles. -->
   <link rel="stylesheet" href="/static/css/buttons.css" />
+  <!-- v11: instant hourglass loader shown on Download-Now click.
+       Loads after buttons.css so its .loader-overlay wins the cascade. -->
+  <link rel="stylesheet" href="/static/css/loader-hourglass.css" />
 
   <!--
     ES-modules import-map polyfill.
@@ -45,7 +48,8 @@
         "core/":       "/static/js/core/",
         "components/": "/static/js/components/",
         "pages/":      "/static/js/pages/",
-        "plugins/":    "/static/js/plugins/"
+        "plugins/":    "/static/js/plugins/",
+        "ui/":         "/static/js/ui/"
       }
     }
   </script>
