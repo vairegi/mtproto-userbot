@@ -61,12 +61,12 @@ export const cardActions = [
     // disabled "Downloading…" while in flight, and "Queue to Channel"
     // for everything else.
     label: ({ gallery }) => {
-      if (isCompleted(gallery))  return "Open Post";
+      if (isCompleted(gallery))  return "Download Now";
       if (isProcessing(gallery)) return "Downloading…";
-      return "Queue to Channel";
+      return "Download Now";
     },
     icon: ({ gallery }) => {
-      if (isCompleted(gallery))  return "🔗";
+      if (isCompleted(gallery))  return "📥";
       if (isProcessing(gallery)) return "⏳";
       return "📥";
     },
@@ -180,14 +180,24 @@ export const cardActions = [
   },
   {
     id: "preview",
-    label: "Preview First Pages",
+    // UI text v9: was "Preview First Pages" — shortened per admin request.
+    label: "Preview",
     icon: "👁️",
     kind: "secondary",
     run({ gallery }) { openPreview(gallery); },
   },
   {
     id: "bookmark",
-    label: "Bookmark",
+    // UI text v9: was "Bookmark" — now "Save", flipping to "Saved Already"
+    // when the gallery is already in the user's bookmarks. The toggle
+    // behaviour is unchanged (tap again = remove from bookmarks), only
+    // the label reflects the current state.
+    label: ({ gallery }) => {
+      const cur = store.get("bookmarks", []);
+      return cur.some(b => String(b.id) === String(gallery.id))
+        ? "Saved Already"
+        : "Save";
+    },
     icon: "⭐",
     kind: "secondary",
     async run({ gallery }) {
@@ -204,18 +214,10 @@ export const cardActions = [
             pages: gallery.pages,
           });
           store.set("bookmarks", [...cur, gallery]);
-          toast("⭐ Bookmarked", "success");
+          toast("⭐ Saved", "success");
         }
       } catch (e) { toast("Failed: " + e.message, "error"); }
     },
   },
-  {
-    id: "open_source",
-    label: "Open on nhentai",
-    icon: "🔗",
-    kind: "secondary",
-    run({ gallery }) {
-      openLink(`https://nhentai.net/g/${gallery.id}/`);
-    },
-  },
+  // UI text v9: "Open on nhentai" action REMOVED per admin request.
 ];

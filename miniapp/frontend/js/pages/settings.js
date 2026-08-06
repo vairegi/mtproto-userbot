@@ -12,7 +12,7 @@
 
 import { h, make } from "core/components.js";
 import { prefs } from "core/prefs.js";
-import { haptic } from "core/telegram.js";
+import { haptic, openLink } from "core/telegram.js";
 
 export async function render(root, { me }) {
   root.appendChild(section("Appearance", [
@@ -37,6 +37,14 @@ export async function render(root, { me }) {
       root.innerHTML = "";
       render(root, { me });
     }, "danger"),
+  ]));
+
+  // UI text v9: "Contact Admin" — user can report a problem or ask for a
+  // new feature. Tapping opens the admin's dedicated report bot
+  // (@reportupdatesbot) in Telegram so the conversation happens in DM,
+  // not inside the Mini App.
+  root.appendChild(section("Support", [
+    contactAdminRow(),
   ]));
 
   root.appendChild(h("div", {
@@ -98,4 +106,31 @@ function buttonRow(label, onClick, kind = "secondary") {
     style: { marginTop: "8px" },
     onclick: onClick,
   }, label);
+}
+
+// UI text v9: stylish "Contact Admin" row — gradient accent, subtle
+// shadow, hover-lift (matches the new `.btn-stylish` class in
+// components.css). Opens the admin's dedicated report bot in Telegram.
+function contactAdminRow() {
+  return h("div", {
+    style: { marginTop: "8px" },
+  },
+    h("button", {
+      class: "btn primary block btn-stylish",
+      onclick: () => {
+        haptic("medium");
+        try {
+          openLink("https://t.me/reportupdatesbot");
+        } catch (e) {
+          // Fallback: open in a new tab if openLink is unavailable
+          window.open("https://t.me/reportupdatesbot", "_blank");
+        }
+      },
+    }, "💬 Contact Admin"),
+    h("div", {
+      style: { color: "var(--du-ink-lo)", fontSize: "11px",
+               margin: "6px 2px 0", lineHeight: "1.4" },
+    }, "Report a bug, request a feature, or ask the admin anything — "
+     + "opens @reportupdatesbot in Telegram."),
+  );
 }

@@ -27,16 +27,33 @@ const GROUP_ORDER = ["parody", "character", "tag", "artist", "group",
 export function openGalleryDetail(g, me) {
   const body = h("div", { class: "d-root" });
 
+  // Improvement (UI text v9): action.label / action.icon may be a string
+  // OR a function of ctx (used by the dynamic queue / bookmark labels).
+  // The old code interpolated them as template literals — a function
+  // would have been stringified to its source text. Resolve them
+  // properly here.
+  const resolve = (val, ctx) =>
+    typeof val === "function" ? val(ctx) : val;
+
   const sheet = make("sheet", {
     title: "Gallery",
     body,
     actions: cardActions
       .filter(a => !a.when || a.when({ gallery: g, me }))
-      .map(a => ({
-        label: `${a.icon} ${a.label}`,
-        kind: a.kind || "secondary",
-        onClick: (s) => a.run({ gallery: g, me, close: s.close }),
-      })),
+      .map(a => {
+        const ctx = { gallery: g, me };
+        const icon = resolve(a.icon, ctx);
+        const label = resolve(a.label, ctx);
+        const isDisabled = typeof a.disabled === "function"
+          ? a.disabled(ctx)
+          : !!a.disabled;
+        return {
+          label: `${icon ? icon + " " : ""}${label}`,
+          kind: a.kind || "secondary",
+          disabled: isDisabled,
+          onClick: (s) => a.run({ gallery: g, me, close: s.close }),
+        };
+      }),
   });
 
   renderBase(body, g);

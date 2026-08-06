@@ -182,7 +182,9 @@
   font-weight: var(--du-fw-semibold);
   transition: transform var(--du-dur-fast) var(--du-ease),
               opacity var(--du-dur-fast) var(--du-ease),
-              background var(--du-dur-fast) var(--du-ease);
+              background var(--du-dur-fast) var(--du-ease),
+              box-shadow var(--du-dur-fast) var(--du-ease),
+              filter var(--du-dur-fast) var(--du-ease);
 }
 .btn:active { transform: scale(0.97); }
 .btn:disabled { opacity: 0.5; pointer-events: none; }
@@ -191,6 +193,101 @@
 .btn.ghost     { background: transparent;           color: var(--du-ink-hi); }
 .btn.danger    { background: var(--du-danger);      color: #fff; }
 .btn.block     { width: 100%; }
+
+/* ============================================================
+   STYLISH BUTTON VARIANTS (UI text v9)
+   Polished gradients + soft shadows + hover-lift. Falls back
+   cleanly on platforms without gradient support (solid colour
+   is the gradient's first stop).
+   ============================================================ */
+.btn.primary {
+  background: linear-gradient(135deg,
+              var(--du-accent) 0%,
+              color-mix(in srgb, var(--du-accent) 78%, #000 22%) 100%);
+  background-color: var(--du-accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18),
+              0 1px 2px rgba(0, 0, 0, 0.10);
+  letter-spacing: 0.2px;
+}
+.btn.primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.24),
+              0 2px 4px rgba(0, 0, 0, 0.12);
+  transform: translateY(-1px);
+}
+.btn.primary:active:not(:disabled) {
+  transform: scale(0.97) translateY(0);
+  filter: brightness(0.98);
+}
+
+.btn.secondary {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+.btn.secondary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--du-bg-2) 82%, var(--du-ink-hi) 18%);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.14);
+  transform: translateY(-1px);
+}
+.btn.secondary:active:not(:disabled) {
+  transform: scale(0.97) translateY(0);
+}
+
+.btn.danger {
+  background: linear-gradient(135deg,
+              var(--du-danger) 0%,
+              color-mix(in srgb, var(--du-danger) 80%, #000 20%) 100%);
+  background-color: var(--du-danger);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+.btn.danger:hover:not(:disabled) {
+  filter: brightness(1.05);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.22);
+  transform: translateY(-1px);
+}
+
+/* Extra-polished variant for hero CTAs (e.g. Settings → Contact Admin). */
+.btn-stylish {
+  padding: var(--du-space-3) var(--du-space-6);
+  border-radius: var(--du-radius-lg, var(--du-radius-md));
+  font-size: calc(var(--du-fs-md) + 1px);
+  font-weight: var(--du-fw-bold, var(--du-fw-semibold));
+  letter-spacing: 0.3px;
+  background: linear-gradient(135deg,
+              var(--du-accent) 0%,
+              color-mix(in srgb, var(--du-accent) 70%, #5a2dd8 30%) 50%,
+              color-mix(in srgb, var(--du-accent) 60%, #000 40%) 100%);
+  background-color: var(--du-accent);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22),
+              0 1px 3px rgba(0, 0, 0, 0.12),
+              inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  position: relative;
+  overflow: hidden;
+}
+.btn-stylish::after {
+  /* Subtle sheen sweep on hover. */
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(115deg,
+              transparent 30%,
+              rgba(255, 255, 255, 0.22) 50%,
+              transparent 70%);
+  transform: translateX(-120%);
+  transition: transform 0.6s var(--du-ease);
+  pointer-events: none;
+}
+.btn-stylish:hover:not(:disabled)::after { transform: translateX(120%); }
+.btn-stylish:hover:not(:disabled) {
+  filter: brightness(1.07);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28),
+              0 2px 5px rgba(0, 0, 0, 0.14),
+              inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  transform: translateY(-1px);
+}
+.btn-stylish:active:not(:disabled) {
+  transform: scale(0.97) translateY(0);
+  filter: brightness(0.98);
+}
 
 /* ============================================================
    BOTTOM SHEET / MODAL
