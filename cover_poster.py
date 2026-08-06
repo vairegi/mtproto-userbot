@@ -42,6 +42,11 @@ from telethon.tl.types import InputMediaUploadedPhoto
 
 import hf_scraper
 from config import settings
+# v11.2: normalise arbitrary cover bytes into a well-formed JPEG before
+# uploading to Telegram — fixes the "tiny preview" bug where .webp / .gif
+# covers were rejected by InputMediaUploadedPhoto with "The extension of
+# the photo is invalid" and fell back to a non-photo send.
+from cover_image_normalise import normalise_cover_bytes
 
 log = logging.getLogger("cover_poster")
 
@@ -387,8 +392,15 @@ async def post_cover(
     # spoiler without any change on the copy side.
     try:
         if cover_bytes:
-            buf = io.BytesIO(cover_bytes)
-            buf.name = f"cover_{getattr(meta, 'gallery_id', 'x')}{_guess_extension(cover_url or '')}"
+            # v11.2: re-encode to JPEG so Telegram never rejects the photo.
+            # `normalise_cover_bytes` returns (bytes, ext); on failure it
+            # returns the original bytes with a best-guess extension so
+            # the pre-v11.2 behaviour is preserved.
+            norm_bytes, norm_ext = normalise_cover_bytes(
+                cover_bytes, source_url=cover_url or "",
+            )
+            buf = io.BytesIO(norm_bytes if norm_bytes else cover_bytes)
+            buf.name = f"cover_{getattr(meta, 'gallery_id', 'x')}{norm_ext or _guess_extension(cover_url or '')}"
             try:
                 uploaded = await client.upload_file(
                     buf, file_name=buf.name,

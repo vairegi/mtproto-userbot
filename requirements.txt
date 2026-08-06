@@ -13,6 +13,12 @@ python-dotenv==1.0.1
 # HTTP client — used by hf_scraper.py (nhentai JSON API) and source_api.py
 httpx==0.27.2
 
+# Image normalisation (v11.2) — cover_poster re-encodes non-JPEG covers to
+# JPEG before uploading to Telegram, because Telethon rejects .webp/.gif
+# with "The extension of the photo is invalid" and falls back to a
+# non-photo send that renders as a tiny sticker-style preview in clients.
+Pillow==10.4.0
+
 # HTML parsing — kept because source_api.py still uses BeautifulSoup for
 # the optional fallback source. hf_scraper.py itself no longer needs it
 # (nhentai returns pure JSON), but removing the dep would break source_api.

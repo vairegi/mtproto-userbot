@@ -172,36 +172,102 @@ class GalleryMeta:
 
 
 # ---------------------------------------------------------------------------
-# HTTP layer — one shared AsyncClient, plain httpx GETs to nhentai
+# HTTP layer — one shared AsyncClient per event loop, plain httpx GETs to nhentai
 # ---------------------------------------------------------------------------
+#
+# v11.2 bug fix: previously a single process-wide AsyncClient was created
+# on first use and reused forever. Uvicorn's reload mode and the start.sh
+# relay-restart cycle both create a fresh event loop for the next worker,
+# but the old AsyncClient (and the asyncio.Event primitives inside
+# httpx's connection-pool limits) stayed bound to the DEAD loop. First
+# request into the new loop then blew up with:
+#
+#   nhentai request failed for /search: <asyncio.locks.Event object at
+#   0x... [unset]> is bound to a different event loop
+#
+# Fix: key the client by the currently-running event loop. When a loop is
+# torn down its entry in the dict becomes unreachable and gets garbage
+# collected on the next tick.
 _client_lock = threading.Lock()
-_client: Optional[httpx.AsyncClient] = None
+# v11.2: keyed by the loop object itself (NOT id(loop)) — CPython may
+# reuse the same id() for a new loop after the previous one is
+# garbage-collected, which would silently hand a closed-loop client to
+# the new loop and re-trigger the exact bug we're fixing. Loop objects
+# are hashable and identity-stable.
+_clients_by_loop: "dict[asyncio.AbstractEventLoop, httpx.AsyncClient]" = {}
 
 
 async def _get_client() -> httpx.AsyncClient:
-    """Return the shared AsyncClient, creating on first use."""
-    global _client
-    if _client is None:
-        with _client_lock:
-            if _client is None:
-                _client = httpx.AsyncClient(
-                    timeout=_TIMEOUT,
-                    follow_redirects=True,
-                    headers=_HEADERS,
-                    http2=False,   # nhentai serves fine over http/1.1
-                )
-    return _client
+    """Return the shared AsyncClient for the CURRENT event loop.
+
+    Stale-closed-loop entries are evicted lazily on first call in the
+    new loop so the dict stays bounded even under heavy uvicorn reloads.
+    """
+    loop = asyncio.get_running_loop()
+    existing = _clients_by_loop.get(loop)
+    if existing is not None:
+        return existing
+    with _client_lock:
+        # Drop entries whose loop has been closed — they can never be
+        # used again and would otherwise accumulate forever.
+        stale = [lp for lp in _clients_by_loop if lp.is_closed()]
+        for lp in stale:
+            _clients_by_loop.pop(lp, None)
+
+        existing = _clients_by_loop.get(loop)
+        if existing is None:
+            existing = httpx.AsyncClient(
+                timeout=_TIMEOUT,
+                follow_redirects=True,
+                headers=_HEADERS,
+                http2=False,   # nhentai serves fine over http/1.1
+            )
+            _clients_by_loop[loop] = existing
+    return existing
+
+
+# Back-compat shim: some legacy code paths read the raw `_client` global.
+# Keep the symbol defined as None so any such reader hits its own
+# None-guard instead of NameError.
+_client: Optional[httpx.AsyncClient] = None
+
+
+# v11.2: short per-path back-off cache for 429s. When nhentai
+# rate-limits us, subsequent identical paths hit this cache instead of
+# hammering upstream and flooding the log. Keyed by (path, frozenset(params)).
+_RATE_LIMIT_CACHE: "dict[tuple, float]" = {}
+_RATE_LIMIT_TTL_SEC = 30
 
 
 async def _http_get_json(path: str, params: Optional[dict] = None) -> Optional[dict]:
     """
     GET a nhentai JSON endpoint and return its parsed body, or None on failure.
     Never raises upward — callers get None and can surface a clean UX error.
+
+    v11.2 changes:
+      - 429s are soft-failed with a single WARNING (no stack trace) and a
+        30s per-key back-off so the log stops flooding when the upstream
+        rate-limits us.
+      - Generic exceptions are also logged at WARNING without a traceback
+        so transient network failures don't drown out real errors.
     """
     url = f"{API_URL}{path}"
+    cache_key = (path, frozenset((params or {}).items()))
+    now = time.time()
+    ban = _RATE_LIMIT_CACHE.get(cache_key)
+    if ban and ban > now:
+        # Still inside the back-off window — soft-fail silently.
+        return None
     try:
         client = await _get_client()
         r = await client.get(url, params=params)
+        if r.status_code == 429:
+            _RATE_LIMIT_CACHE[cache_key] = now + _RATE_LIMIT_TTL_SEC
+            log.warning(
+                "nhentai HTTP 429 for %s params=%s — backing off for %ss",
+                path, params, _RATE_LIMIT_TTL_SEC,
+            )
+            return None
         if r.status_code != 200:
             log.warning("nhentai HTTP %s for %s params=%s", r.status_code, path, params)
             return None
@@ -211,6 +277,20 @@ async def _http_get_json(path: str, params: Optional[dict] = None) -> Optional[d
             log.warning("nhentai returned non-JSON (%s) for %s: %s",
                         e, path, r.text[:120])
             return None
+    except RuntimeError as e:
+        # v11.2: catch the asyncio event-loop binding error explicitly so
+        # it's a single-line warning, not an opaque traceback. The
+        # per-loop _get_client above already fixed the root cause; this
+        # is belt-and-braces for any third-party path that bypasses it.
+        if "event loop" in str(e).lower() or "different loop" in str(e).lower():
+            log.warning(
+                "nhentai request failed (event-loop binding) for %s: %s "
+                "— likely a stale AsyncClient; will recover on next call",
+                path, e,
+            )
+            return None
+        log.warning("nhentai request failed for %s: %s", path, e)
+        return None
     except Exception as e:  # noqa: BLE001
         log.warning("nhentai request failed for %s: %s", path, e)
         return None
