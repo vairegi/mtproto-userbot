@@ -38,6 +38,7 @@ from typing import List, Optional
 import httpx
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, MessageDeleteForbiddenError
+from telethon.tl.types import InputMediaUploadedPhoto
 
 import hf_scraper
 from config import settings
@@ -376,16 +377,47 @@ async def post_cover(
     cover_bytes = await _download_cover(cover_url) if cover_url else None
 
     # 3) post to the DB channel -------------------------------------------
+    # Improvement #7: post the cover as a SPOILER-blurred photo. Telethon
+    # exposes `spoiler` on InputMediaUploadedPhoto only (not on the
+    # high-level send_file kwargs), so we upload the bytes first and then
+    # build the InputMedia manually with spoiler=True. Since Bot API's
+    # copyMessage preserves the media's original spoiler flag, every
+    # downstream DM copy — dm_delivery.py, relay_v2.py auto-DM, and
+    # admin_bot.py's fj:check re-delivery — automatically inherits the
+    # spoiler without any change on the copy side.
     try:
         if cover_bytes:
             buf = io.BytesIO(cover_bytes)
             buf.name = f"cover_{getattr(meta, 'gallery_id', 'x')}{_guess_extension(cover_url or '')}"
-            sent = await client.send_file(
-                channel_id,
-                file=buf,
-                caption=caption,
-                force_document=False,   # send as photo, not doc
-            )
+            try:
+                uploaded = await client.upload_file(
+                    buf, file_name=buf.name,
+                )
+                spoiler_media = InputMediaUploadedPhoto(
+                    file=uploaded, spoiler=True,
+                )
+                sent = await client.send_file(
+                    channel_id,
+                    file=spoiler_media,
+                    caption=caption,
+                    force_document=False,   # send as photo, not doc
+                )
+            except Exception as _spoiler_err:  # noqa: BLE001
+                # If the spoiler-media path fails for any reason (older
+                # Telegram DC edge case, upload_file quirk, etc.), fall
+                # back to the plain non-spoiler send so a cover still
+                # lands — the PDF-reply chain must not break.
+                log.warning(
+                    "cover_poster: spoiler upload failed, falling back to "
+                    "non-spoiler send: %s", _spoiler_err,
+                )
+                buf.seek(0)
+                sent = await client.send_file(
+                    channel_id,
+                    file=buf,
+                    caption=caption,
+                    force_document=False,
+                )
             used_fallback = False
         else:
             # Text-only fallback: the PDF still needs something to reply to.
