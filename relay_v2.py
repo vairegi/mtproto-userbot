@@ -50,6 +50,38 @@ from config import settings
 
 log = logging.getLogger("relay_v2")
 
+
+# ---------------------------------------------------------------------------
+# v10: granular progress events for the mini-app live progress card.
+# Writes one row per pipeline phase into `progress_events`; the mini-app's
+# services/progress.py reads the newest row to render phase + pct + detail.
+# Fire-and-forget: any failure is logged and swallowed so the download
+# pipeline never blocks on a metrics write.
+# ---------------------------------------------------------------------------
+_PHASE_PCT = {
+    "scrape":     20,
+    "cover":      40,
+    "bot2_send":  55,
+    "bot2_wait":  70,
+    "pdf_received": 85,
+    "delivered":  100,
+}
+
+
+def _emit_progress(conn, gallery_id: str, phase: str, detail: str = "",
+                   pct: Optional[int] = None) -> None:
+    try:
+        conn.db["progress_events"].insert_one({
+            "gallery_id": str(gallery_id),
+            "phase": phase,
+            "detail": (detail or "")[:200],
+            "pct": int(pct if pct is not None
+                       else _PHASE_PCT.get(phase, 0)),
+            "ts": time.time(),
+        })
+    except Exception as e:  # noqa: BLE001
+        log.info("progress event write failed (non-fatal): %s", e)
+
 # Sentinel status codes — kept aligned with V1 relay.py so worker.py can log
 # them uniformly.
 DONE          = "done"
@@ -525,6 +557,8 @@ async def process_job(
                            reason="V2 disabled at runtime", purge=True)
             return JobOutcome(FAILED_OTHER, "V2 disabled via SELF_COVER_POST_ENABLED=0")
 
+        _emit_progress(conn, gid, "scrape", "Scraping gallery metadata + cover")
+
         try:
             cover = await _with_flood(
                 lambda: cover_poster.post_cover(
@@ -569,6 +603,11 @@ async def process_job(
                 detail="cover posted, contacting Bot 2",
             )
 
+        _emit_progress(conn, gid, "cover",
+                       "Cover posted to DB channel")
+        _emit_progress(conn, gid, "bot2_send",
+                       "Contacting PDF generator bot")
+
         # ---- 4) DM Bot 2 + wait for PDF --------------------------------
         try:
             since_ts = await _with_flood(
@@ -594,6 +633,8 @@ async def process_job(
                 title=(cover.title or url)[:80],
                 detail="waiting for PDF from Bot 2",
             )
+        _emit_progress(conn, gid, "bot2_wait",
+                       "Your PDF is being generated…")
 
         try:
             outcome = await bot2_client.wait_for_pdf(
@@ -687,6 +728,8 @@ async def process_job(
         # OUTCOME_OK — we have the PDF message.
         bot2_msg = outcome.pdf_message
         db.touch_bot_ping(conn, "bot2")
+        _emit_progress(conn, gid, "pdf_received",
+                       "PDF received — posting to channel")
 
         # ---- 6) Forward PDF as reply to our cover ----------------------
         if job_id is not None:
@@ -797,6 +840,8 @@ async def process_job(
                 title=(cover.title or url)[:80],
                 detail="posted ✅",
             )
+        _emit_progress(conn, gid, "delivered",
+                       "Ready — delivering to your DM…")
         return JobOutcome(DONE, "cover + PDF posted", open_link=cover.open_link)
 
     finally:
