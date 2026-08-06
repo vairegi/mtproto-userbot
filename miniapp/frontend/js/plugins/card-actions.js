@@ -30,6 +30,11 @@ import { make } from "core/components.js";
 import { openLink } from "core/telegram.js";
 import { store } from "core/state.js";
 import { openPreview } from "plugins/preview-modal.js";
+// v11 hotfix (v11.1): this import was dropped in the v11 100% ship, which
+// made every "Download Now" click throw ReferenceError: showActionLoader is
+// not defined — silently swallowed by the async run() so nothing at all
+// happened on the UI and no POST /api/queue was ever fired. Restored here.
+import { showActionLoader, hideActionLoader } from "ui/action-loader.js";
 
 const toast = (text, kind) => make("toast", { text, kind });
 
