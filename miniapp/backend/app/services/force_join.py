@@ -189,15 +189,44 @@ def add_channel(username_or_id: str, title: str = "", url: str = "") -> Dict[str
             invite_hash = m.group(1)
 
     current = get_channels()
-    for c in current:
-        if invite_hash is not None \
-                and (c.get("invite_hash") or "") == invite_hash:
-            return {"ok": True, "already": True, "channels": current}
+    # Improvement #6b: when the admin re-adds an existing row WITH new
+    # data (a fresh invite URL, an invite hash, or a title), UPDATE the
+    # stored row in place instead of returning early with 'already'.
+    # This is what lets an admin fix a private numeric-ID row whose
+    # Join button currently emits the unjoinable t.me/c/<internal>
+    # link — they just re-Add it with the invite link filled in.
+    def _matches(c: Dict[str, Any]) -> bool:
+        if invite_hash is not None and (c.get("invite_hash") or "") == invite_hash:
+            return True
         if numeric_id is not None and int(c.get("chat_id") or 0) == numeric_id:
-            return {"ok": True, "already": True, "channels": current}
+            return True
         if invite_hash is None and numeric_id is None \
                 and (c.get("username") or "").lower() == handle.lower():
-            return {"ok": True, "already": True, "channels": current}
+            return True
+        return False
+
+    for c in current:
+        if not _matches(c):
+            continue
+        # Row already exists. Merge in any new information.
+        changed = False
+        if url and (c.get("url") or "") != url.strip():
+            c["url"] = url.strip()
+            changed = True
+        if invite_hash and (c.get("invite_hash") or "") != invite_hash:
+            c["invite_hash"] = invite_hash
+            changed = True
+        if numeric_id is not None and int(c.get("chat_id") or 0) != numeric_id:
+            c["chat_id"] = numeric_id
+            changed = True
+        if title and (c.get("title") or "") != title.strip():
+            c["title"] = title.strip()
+            changed = True
+        if changed:
+            set_channels(current)
+            return {"ok": True, "already": False, "updated": True,
+                    "channels": current}
+        return {"ok": True, "already": True, "channels": current}
 
     # Auto-default url for invite-hash rows so join button always works.
     if invite_hash is not None and not (url or "").strip():

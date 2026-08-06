@@ -200,16 +200,27 @@ function sectionForceJoin() {
     }
     for (const c of channels) {
       const label = c.title || (c.username ? "@" + c.username
-                                             : ("#" + (c.chat_id || "")));
+                                             : (c.invite_hash
+                                                ? "Private channel (+" + c.invite_hash.slice(0,6) + "…)"
+                                                : ("#" + (c.chat_id || ""))));
       const removeBtn = h("button", { class: "btn danger",
         onclick: async () => {
-          const key = c.username || String(c.chat_id || "");
-          if (!key) return;
+          // Improvement (Bug 2 fix): invite-hash-only rows have empty
+          // username AND null chat_id, so the previous key derivation
+          // returned "" and the Remove button silently no-op'd. Fall
+          // back to a t.me/+<hash> string here — the backend's
+          // _split_channel_and_invite() + _normalise_handle() already
+          // decode that shape correctly.
+          let key = c.username
+                 || (c.chat_id ? String(c.chat_id) : "")
+                 || (c.invite_hash ? "https://t.me/+" + c.invite_hash : "");
+          if (!key) { toast("Cannot identify this row — please reload", "error"); return; }
           haptic("warning");
           try {
             const r = await api.post("/api/admin/forcejoin/remove",
                                      { channel: key });
-            toast("Channel removed", "success");
+            toast(r.removed ? "Channel removed" : "Nothing to remove",
+                  r.removed ? "success" : "");
             renderList(r.channels || []);
           } catch (e) { toast(e.message, "error"); }
         },
@@ -393,30 +404,86 @@ function sectionRateLimits() {
   return wrap;
 }
 
-// -------- 3. Per-user rate-limit table --------
+// -------- 3. Per-user rate-limit table (collapsible, collapsed by default) --------
 function sectionUsers() {
   const wrap = h("div", { class: "admin-section" });
-  wrap.appendChild(h("h3", {}, "👥 Users"));
 
+  // Improvement (Bug 3): make the whole Users section collapsible. The
+  // header row is now a button-styled div with a rotating caret; the
+  // list body is hidden by default and only fetched on first expand,
+  // so the (potentially large) /api/admin/users request doesn't fire
+  // just because the admin scrolled past.
+  const caret = h("span", {
+    style: {
+      display: "inline-block",
+      transition: "transform 0.18s ease",
+      transform: "rotate(-90deg)",   // ▼ rotated → points right when collapsed
+      marginLeft: "6px",
+      fontSize: "12px",
+      color: "var(--du-ink-mid)",
+    },
+  }, "▼");
+
+  const header = h("h3", {
+    style: { display: "flex", alignItems: "center",
+             justifyContent: "space-between", cursor: "pointer",
+             userSelect: "none", margin: "0" },
+    role: "button",
+    tabindex: "0",
+    "aria-expanded": "false",
+  },
+    h("span", {}, "👥 Users"),
+    caret,
+  );
+
+  const body = h("div", {
+    style: { display: "none", marginTop: "8px" },
+  });
   const list = h("div", {});
   const empty = h("div", { class: "empty" },
     h("div", { class: "icon" }, "👤"),
     h("div", { class: "title" }, "No users yet"),
   );
-  wrap.append(list);
+  body.appendChild(list);
+
+  let expanded = false;
+  let everFetched = false;
 
   async function refresh() {
     list.innerHTML = "";
+    list.appendChild(h("div", {
+      style: { color: "var(--du-ink-lo)", fontSize: "12px", padding: "6px 0" },
+    }, "Loading users…"));
     try {
       const res = await api.get("/api/admin/users");
       const users = res.items || [];
+      list.innerHTML = "";
       if (!users.length) { list.appendChild(empty); return; }
       for (const u of users) list.appendChild(userRow(u, refresh));
     } catch (e) {
+      list.innerHTML = "";
       list.appendChild(h("div", {}, "Failed: " + e.message));
     }
   }
-  refresh();
+
+  function toggle() {
+    expanded = !expanded;
+    body.style.display = expanded ? "block" : "none";
+    caret.style.transform = expanded ? "rotate(0deg)" : "rotate(-90deg)";
+    header.setAttribute("aria-expanded", expanded ? "true" : "false");
+    haptic("light");
+    if (expanded && !everFetched) {
+      everFetched = true;
+      refresh();
+    }
+  }
+
+  header.addEventListener("click", toggle);
+  header.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(); }
+  });
+
+  wrap.append(header, body);
   return wrap;
 }
 
