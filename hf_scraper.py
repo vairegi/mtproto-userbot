@@ -164,6 +164,11 @@ class GalleryMeta:
     cover_url: Optional[str]
     pages: Optional[int] = None
     gallery_id: Optional[str] = None
+    # v11: page-1 image URL. nhentai's `cover.path` is a downscaled
+    # thumbnail (`cover.jpg.webp`); page 1 is the high-quality equivalent
+    # served from i.nhentai.net at full resolution. Falls back to
+    # `cover_url` when the detail response is missing `media_id`/`images`.
+    page1_url: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +406,35 @@ def _cover_url_from_detail(detail: dict) -> Optional[str]:
     return _thumb_url(detail)
 
 
+# v11: nhentai extension codes -> file extensions. This is the same table
+# used by the site's own frontend to build https://i.nhentai.net/... URLs.
+# 'j' = JPEG, 'p' = PNG, 'g' = GIF, 'w' = WebP.
+_NH_EXT_MAP = {"j": "jpg", "p": "png", "g": "gif", "w": "webp"}
+
+
+def _page1_url_from_detail(detail: dict) -> Optional[str]:
+    """Build the high-quality page-1 image URL from an nhentai detail dict.
+
+    Example: for gallery 146595 with media_id="614941" and images.pages[0]
+    of shape {"t": "j", "w": ..., "h": ...}, this returns
+    ``https://i.nhentai.net/galleries/614941/1.jpg`` — which is what the
+    site itself serves under /g/146595/1/ and is significantly higher
+    quality than the ``t.nhentai.net/.../cover.jpg.webp`` thumbnail.
+
+    Returns None when the detail response is missing either `media_id`
+    or a first page entry; callers should fall back to `_cover_url_from_detail`.
+    """
+    media_id = str(detail.get("media_id") or "").strip()
+    images = detail.get("images") or {}
+    pages = images.get("pages") if isinstance(images, dict) else None
+    if not (media_id and isinstance(pages, list) and pages):
+        return None
+    first = pages[0] if isinstance(pages[0], dict) else {}
+    ext_code = (first.get("t") or "j").strip().lower()
+    ext = _NH_EXT_MAP.get(ext_code, "jpg")
+    return f"https://i.nhentai.net/galleries/{media_id}/1.{ext}"
+
+
 # nhentai's tag `type` field uses these exact strings. We keep ALL of them
 # so the cover caption can build grouped meta rows
 # (Groups / Parodies / Artists / Characters / Languages / Categories) and
@@ -560,12 +594,19 @@ async def fetch_gallery_meta(gallery_url_or_id: str) -> Optional[GalleryMeta]:
         return None
 
     try:
+        # v11: prefer page 1 as the cover image (nhentai's `cover.path`
+        # is a downscaled JPEG-WebP; /1.<ext> is served at full resolution).
+        # Fall back to the traditional cover thumbnail when we can't build a
+        # page-1 URL — that keeps behaviour on legacy / partial payloads.
+        _cover_thumb = _cover_url_from_detail(data)
+        _page1 = _page1_url_from_detail(data)
         return GalleryMeta(
             title=_pretty_title_from_detail(data),
             tags=_tag_names_from_detail(data),
-            cover_url=_cover_url_from_detail(data),
+            cover_url=_page1 or _cover_thumb,
             pages=int(data["num_pages"]) if data.get("num_pages") is not None else None,
             gallery_id=str(data.get("id") or gid),
+            page1_url=_page1,
         )
     except Exception as e:  # noqa: BLE001
         log.warning("nhentai: failed to normalise gallery %s: %s", gid, e)
