@@ -31,6 +31,7 @@ import logging
 import os
 import sys
 import threading
+import time as _time
 from typing import Any, Optional
 
 log = logging.getLogger("miniapp.scraper")
@@ -100,6 +101,15 @@ import httpx
 # must go through /api/v2/*.
 _NH_API = "https://nhentai.net/api/v2"
 _ENGLISH_TAG_ID = 12227   # matches hf_scraper's filter
+
+# v11.2: soft 429 back-off cache. Keyed by (query, sort, page) for
+# _direct_nhentai_search and by ("detail", gallery_id) for
+# _direct_nhentai_detail. Values are absolute expiry timestamps. When a
+# key is present and not yet expired, the direct call short-circuits
+# with an empty result instead of hitting nhentai again — the exact bug
+# in the user's log (dozens of ERROR + full traceback per second under 429).
+_RATE_LIMIT_CACHE: dict = {}
+_RATE_LIMIT_TTL_SEC = 30
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
@@ -184,6 +194,15 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
     query = q.strip() if q else "english"
 
     params = {"query": query, "sort": real_sort, "page": int(page or 1)}
+
+    # v11.2: 429 back-off — short-circuit while the ban is live so we
+    # don't hammer upstream and don't dump a full traceback per request.
+    cache_key = ("search", query, real_sort, int(page or 1))
+    now = _time.time()
+    ban = _RATE_LIMIT_CACHE.get(cache_key)
+    if ban and ban > now:
+        return []
+
     try:
         # v2 endpoint: /api/v2/search (params: query, sort, page)
         r = httpx.get(
@@ -196,10 +215,28 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
             },
             timeout=15,
         )
+        # v11.2: 429 is expected under load. Log at WARNING level ONCE
+        # (not ERROR + full traceback every request) and cache the ban.
+        if r.status_code == 429:
+            _RATE_LIMIT_CACHE[cache_key] = now + _RATE_LIMIT_TTL_SEC
+            log.warning(
+                "nhentai HTTP 429 for /search q=%r sort=%r page=%s — "
+                "backing off for %ss", q, real_sort, page, _RATE_LIMIT_TTL_SEC,
+            )
+            return []
         r.raise_for_status()
         data = r.json() or {}
+    except httpx.HTTPStatusError as e:
+        # Any other 4xx/5xx: log once at warning, no traceback.
+        log.warning(
+            "nhentai search HTTP %s for q=%r sort=%r: %s",
+            getattr(e.response, "status_code", "?"), q, real_sort, e,
+        )
+        return []
     except Exception as e:  # noqa: BLE001
-        log.exception("direct nhentai search failed q=%r sort=%r: %s", q, real_sort, e)
+        # Network / DNS / timeout: warn without a full stack trace so the
+        # log stays readable.
+        log.warning("direct nhentai search failed q=%r sort=%r: %s", q, real_sort, e)
         return []
 
     out: list[dict] = []
@@ -266,6 +303,12 @@ def _direct_nhentai_page1(item: dict) -> str:
 
 
 def _direct_nhentai_detail(gallery_id: str) -> dict:
+    # v11.2: 429 back-off cache (same rationale as _direct_nhentai_search).
+    cache_key = ("detail", str(gallery_id))
+    now = _time.time()
+    ban = _RATE_LIMIT_CACHE.get(cache_key)
+    if ban and ban > now:
+        return {}
     try:
         # v2 endpoint for a single gallery: /api/v2/galleries/<id>
         r = httpx.get(
@@ -277,10 +320,24 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
             },
             timeout=15,
         )
+        # v11.2: 429 -> log ONCE at WARNING + back-off, no stack trace.
+        if r.status_code == 429:
+            _RATE_LIMIT_CACHE[cache_key] = now + _RATE_LIMIT_TTL_SEC
+            log.warning(
+                "nhentai HTTP 429 for /galleries/%s — backing off for %ss",
+                gallery_id, _RATE_LIMIT_TTL_SEC,
+            )
+            return {}
         r.raise_for_status()
         item = r.json() or {}
+    except httpx.HTTPStatusError as e:
+        log.warning(
+            "nhentai detail HTTP %s for id=%r: %s",
+            getattr(e.response, "status_code", "?"), gallery_id, e,
+        )
+        return {}
     except Exception as e:  # noqa: BLE001
-        log.exception("direct nhentai detail failed id=%r: %s", gallery_id, e)
+        log.warning("direct nhentai detail failed id=%r: %s", gallery_id, e)
         return {}
 
     # --- caption fields (power the detail-sheet caption UI) -----------------
