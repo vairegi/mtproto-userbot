@@ -24,6 +24,9 @@ export async function render(root, { me }) {
   root.appendChild(sectionAutoDelete());
   root.appendChild(sectionShareGuard());
   root.appendChild(sectionForceJoin());
+  root.appendChild(sectionRescrape());    // v10: Force Re-scrape + Failed galleries
+  root.appendChild(sectionBroadcast());   // v10: Broadcast to users
+  root.appendChild(sectionBackground());  // v10: App-wide default background
   root.appendChild(sectionUsers());
   root.appendChild(sectionDiag());
 }
@@ -71,7 +74,7 @@ function sectionAutoDelete() {
     type: "number", min: "1", max: "720", step: "1",
     style: { width: "80px" }, value: "24",
   });
-  const hoursSave = h("button", { class: "btn",
+  const hoursSave = h("button", { class: "btn secondary btn-lift",
     onclick: async () => {
       const enabled = toggle.getAttribute("aria-checked") === "true";
       const hours = parseInt(hoursInput.value || "24", 10) || 24;
@@ -162,7 +165,7 @@ function sectionForceJoin() {
     placeholder: "Optional invite link (https://t.me/+…) — required for private -100… channels",
     style: { flex: "1", minWidth: "0" },
   });
-  const addBtn = h("button", { class: "btn primary",
+  const addBtn = h("button", { class: "btn primary btn-glow btn-ripple",
     onclick: async () => {
       const v  = (input.value || "").trim();
       const iv = (inviteInput.value || "").trim();
@@ -203,7 +206,7 @@ function sectionForceJoin() {
                                              : (c.invite_hash
                                                 ? "Private channel (+" + c.invite_hash.slice(0,6) + "…)"
                                                 : ("#" + (c.chat_id || ""))));
-      const removeBtn = h("button", { class: "btn danger",
+      const removeBtn = h("button", { class: "btn danger btn-glow",
         onclick: async () => {
           // Improvement (Bug 2 fix): invite-hash-only rows have empty
           // username AND null chat_id, so the previous key derivation
@@ -502,7 +505,7 @@ function userRow(u, refresh) {
       ),
       h("div", { style: { display: "flex", gap: "6px" } },
         h("button", {
-          class: "btn ghost",
+          class: "btn ghost btn-lift",
           onclick: async () => {
             haptic("light");
             try { await api.post(`/api/admin/users/${u.user_id}/reset`);
@@ -511,7 +514,7 @@ function userRow(u, refresh) {
           },
         }, "Reset"),
         h("button", {
-          class: "btn secondary",
+          class: "btn secondary btn-lift",
           onclick: async () => {
             const val = prompt("New daily limit for this user (0 = unlimited)", String(u.limit || 20));
             if (val === null) return;
@@ -523,14 +526,14 @@ function userRow(u, refresh) {
           },
         }, "Set"),
         u.banned
-          ? h("button", { class: "btn secondary",
+          ? h("button", { class: "btn secondary btn-lift",
               onclick: async () => {
                 haptic("light");
                 try { await api.post(`/api/admin/users/${u.user_id}/unban`);
                       refresh(); }
                 catch (e) { toast(e.message, "error"); }
               } }, "Unban")
-          : h("button", { class: "btn danger",
+          : h("button", { class: "btn danger btn-glow",
               onclick: async () => {
                 if (!confirm("Ban this user from the app?")) return;
                 haptic("warning");
@@ -544,6 +547,281 @@ function userRow(u, refresh) {
   return row;
 }
 
+// -------- v10. Force Re-scrape + Failed galleries --------
+function sectionRescrape() {
+  const wrap = h("div", { class: "admin-section" });
+  wrap.appendChild(h("h3", {}, "♻️ Force Re-scrape"));
+  wrap.appendChild(h("div", {
+    style: { color: "var(--du-ink-lo)", fontSize: "11px", margin: "4px 0 8px" },
+  }, "Galleries that failed to download (including \"scrape returned "
+   + "nothing\" errors) show up here with their exact failure reason. "
+   + "Force Re-scrape purges the stuck state and re-queues the gallery."));
+
+  // Manual single-URL/id input --------------------------------------------
+  const input = h("input", {
+    type: "text",
+    placeholder: "Gallery URL or numeric ID (e.g. 390009)",
+    style: { flex: "1", minWidth: "0" },
+  });
+  const goBtn = h("button", { class: "btn primary btn-glow",
+    onclick: async () => {
+      const v = (input.value || "").trim();
+      if (!v) { toast("Enter a URL or gallery id", "error"); return; }
+      haptic("medium");
+      try {
+        const r = await api.post("/api/admin/rescrape", { url: v });
+        if (r.ok) {
+          toast(`✅ Re-queued as job #${r.job_id}`, "success");
+          input.value = "";
+          refreshList();
+        } else {
+          toast("Re-scrape failed: " + (r.reason || "unknown"), "error");
+        }
+      } catch (e) { toast(e.message, "error"); }
+    },
+  }, "Force");
+  const diagBtn = h("button", { class: "btn ghost btn-lift",
+    onclick: async () => {
+      const v = (input.value || "").trim();
+      if (!v) { toast("Enter a URL or gallery id first", "error"); return; }
+      haptic("light");
+      try {
+        const r = await api.get("/api/admin/rescrape/diag?target=" + encodeURIComponent(v));
+        toast(JSON.stringify(r).slice(0, 140), "");
+      } catch (e) { toast(e.message, "error"); }
+    },
+  }, "Diag");
+  wrap.appendChild(h("div", {
+    style: { display: "flex", gap: "8px", alignItems: "center", marginBottom: "8px" },
+  }, input, goBtn, diagBtn));
+
+  // Failed-galleries list --------------------------------------------------
+  const list = h("div", {});
+  async function refreshList() {
+    list.innerHTML = "";
+    list.appendChild(h("div", {
+      style: { color: "var(--du-ink-lo)", fontSize: "12px", padding: "4px 0" },
+    }, "Loading failed galleries…"));
+    try {
+      const r = await api.get("/api/admin/rescrape/failed?limit=25");
+      const items = r.items || [];
+      list.innerHTML = "";
+      if (!items.length) {
+        list.appendChild(h("div", {
+          style: { color: "var(--du-ink-lo)", fontSize: "12px", padding: "6px 0" },
+        }, "🎉 No failed galleries right now."));
+        return;
+      }
+      for (const g of items) list.appendChild(failedRow(g, refreshList));
+    } catch (e) {
+      list.innerHTML = "";
+      list.appendChild(h("div", {}, "Failed: " + e.message));
+    }
+  }
+  wrap.appendChild(list);
+  refreshList();
+  return wrap;
+}
+
+function failedRow(g, refreshList) {
+  const label = g.title || ("#" + (g.gallery_id || "?"));
+  const reason = (g.failed_reason || g.status || "").slice(0, 90);
+  return h("div", {
+    style: { padding: "8px 0", borderBottom: "1px solid var(--du-divider)" },
+  },
+    h("div", { style: { fontWeight: "600", fontSize: "13px",
+                        color: "var(--du-ink-hi)" } }, label),
+    h("div", { style: { fontSize: "11px", color: "var(--du-warn, #ffb84d)",
+                        marginTop: "2px" } },
+      `${g.status || "?"} — ${reason || "no reason recorded"}`),
+    h("div", { style: { display: "flex", gap: "6px", marginTop: "6px" } },
+      h("button", { class: "btn primary btn-glow",
+        style: { fontSize: "12px", padding: "4px 10px" },
+        onclick: async () => {
+          haptic("medium");
+          try {
+            const r = await api.post("/api/admin/rescrape",
+                                     { gallery_id: g.gallery_id });
+            if (r.ok) {
+              toast(`✅ Re-queued #${g.gallery_id} as job #${r.job_id}`, "success");
+              refreshList();
+            } else {
+              toast("Failed: " + (r.reason || "unknown"), "error");
+            }
+          } catch (e) { toast(e.message, "error"); }
+        },
+      }, "♻️ Re-scrape"),
+    ),
+  );
+}
+
+// -------- v10. Broadcast to users --------
+function sectionBroadcast() {
+  const wrap = h("div", { class: "admin-section" });
+  wrap.appendChild(h("h3", {}, "📣 Broadcast to Users"));
+  wrap.appendChild(h("div", {
+    style: { color: "var(--du-ink-lo)", fontSize: "11px", margin: "4px 0 8px" },
+  }, "Sends a Telegram DM from the admin bot to every registered mini-app "
+   + "user (banned users are skipped). Optionally attach a single button. "
+   + "Delivery is rate-limited (~20 msg/s) to stay under Telegram's caps."));
+
+  const textEl = h("textarea", {
+    rows: "4",
+    placeholder: "Your message to all users…",
+    style: {
+      width: "100%", background: "var(--du-bg-2)",
+      border: "1px solid var(--du-border)", borderRadius: "8px",
+      padding: "10px", color: "var(--du-ink-hi)",
+      fontFamily: "inherit", fontSize: "13px",
+    },
+  });
+  const btnTextEl = h("input", {
+    type: "text",
+    placeholder: "Button text (optional)",
+    style: { flex: "1", minWidth: "0" },
+  });
+  const btnUrlEl = h("input", {
+    type: "text",
+    placeholder: "Button URL (optional)",
+    style: { flex: "1", minWidth: "0" },
+  });
+  const preview = h("div", {
+    style: { color: "var(--du-ink-mid)", fontSize: "12px", margin: "6px 0" },
+  }, "…");
+  const statusEl = h("div", {
+    style: { fontSize: "12px", marginTop: "8px" },
+  }, "");
+
+  const sendBtn = h("button", { class: "btn primary btn-glow btn-shine block",
+    style: { marginTop: "8px" },
+    onclick: async () => {
+      const text = (textEl.value || "").trim();
+      if (!text) { toast("Write a message first", "error"); return; }
+      if (!confirm("Send this broadcast to ALL users?")) return;
+      haptic("medium");
+      try {
+        const r = await api.post("/api/admin/broadcast", {
+          text: text,
+          button_text: (btnTextEl.value || "").trim(),
+          button_url:  (btnUrlEl.value  || "").trim(),
+        });
+        if (!r.ok) { toast("Broadcast failed: " + (r.reason || "unknown"), "error"); return; }
+        toast(`📣 Broadcast started to ${r.total} users`, "success");
+        textEl.value = "";
+        btnTextEl.value = "";
+        btnUrlEl.value = "";
+        pollStatus(r.run_id);
+      } catch (e) { toast(e.message, "error"); }
+    },
+  }, "📣 Send broadcast");
+
+  async function pollStatus(runId) {
+    if (!runId) return;
+    const tick = async () => {
+      try {
+        const s = await api.get("/api/admin/broadcast/status/" + runId);
+        if (!s.ok) return;
+        statusEl.textContent =
+          `Run ${s.run_id}: ${s.status} — sent ${s.sent}/${s.total} `
+          + `(blocked: ${s.failed_blocked}, errors: ${s.failed_other})`;
+        if (s.status === "running") setTimeout(tick, 3000);
+        else if (s.status === "done") {
+          toast("✅ Broadcast finished", "success");
+          refreshHistory();
+        }
+      } catch (e) { /* ignore one-off poll failures */ }
+    };
+    setTimeout(tick, 1500);
+  }
+
+  const historyList = h("div", { style: { marginTop: "12px" } });
+  async function refreshHistory() {
+    historyList.innerHTML = "";
+    try {
+      const r = await api.get("/api/admin/broadcast/recent?limit=5");
+      const items = r.items || [];
+      if (!items.length) return;
+      historyList.appendChild(h("div", {
+        style: { fontSize: "11px", color: "var(--du-ink-lo)",
+                 margin: "4px 0", fontWeight: "600" },
+      }, "Recent broadcasts"));
+      for (const it of items) {
+        historyList.appendChild(h("div", {
+          style: { fontSize: "11px", color: "var(--du-ink-mid)",
+                   padding: "3px 0", borderBottom: "1px solid var(--du-divider)" },
+        },
+          `${it.status === "done" ? "✅" : "⏳"} ${it.sent}/${it.total} — ${it.text_preview || ""}`));
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // Initial recipient count preview
+  (async () => {
+    try {
+      const p = await api.get("/api/admin/broadcast/preview");
+      preview.textContent = `Will reach ~${p.total} users (banned excluded).`;
+    } catch (e) { preview.textContent = ""; }
+  })();
+
+  wrap.append(textEl, preview,
+              h("div", { style: { display: "flex", gap: "6px" } }, btnTextEl, btnUrlEl),
+              sendBtn, statusEl, historyList);
+  refreshHistory();
+  return wrap;
+}
+
+// -------- v10. App-wide default background theme --------
+function sectionBackground() {
+  const wrap = h("div", { class: "admin-section" });
+  wrap.appendChild(h("h3", {}, "🎨 Default Background (all users)"));
+  wrap.appendChild(h("div", {
+    style: { color: "var(--du-ink-lo)", fontSize: "11px", margin: "4px 0 8px" },
+  }, "Sets the background every user sees when they open the app. Users "
+   + "can still override it locally in their own Settings → Appearance; "
+   + "their explicit choice always wins over this server default."));
+
+  const sel = h("select", {
+    style: {
+      background: "var(--du-bg-2)", color: "var(--du-ink-hi)",
+      border: "1px solid var(--du-border)", borderRadius: "8px",
+      padding: "8px 10px", fontSize: "13px", flex: "1",
+    },
+  },
+    h("option", { value: "ember" },  "🔥 Ember (default dark red)"),
+    h("option", { value: "light" },  "☀️ Light (white paper)"),
+    h("option", { value: "purple" }, "💜 Purple nebula"),
+  );
+
+  const saveBtn = h("button", { class: "btn primary btn-glow",
+    onclick: async () => {
+      haptic("medium");
+      try {
+        const r = await api.post("/api/admin/background", { theme: sel.value });
+        if (r.ok) {
+          toast("Default background set to " + r.theme, "success");
+          // Apply immediately to the admin's own session too.
+          document.documentElement.dataset.bgTheme = r.theme;
+        } else {
+          toast("Failed: " + (r.reason || "unknown"), "error");
+        }
+      } catch (e) { toast(e.message, "error"); }
+    },
+  }, "Save");
+
+  wrap.appendChild(h("div", {
+    style: { display: "flex", gap: "8px", alignItems: "center" },
+  }, sel, saveBtn));
+
+  (async () => {
+    try {
+      const r = await api.get("/api/admin/background");
+      if (r && r.theme) sel.value = r.theme;
+    } catch (e) { /* leave default selection */ }
+  })();
+
+  return wrap;
+}
+
 // -------- 4. Diagnostics --------
 function sectionDiag() {
   const wrap = h("div", { class: "admin-section" });
@@ -553,7 +831,7 @@ function sectionDiag() {
              borderRadius: "8px", fontSize: "12px", overflowX: "auto",
              color: "var(--du-ink-mid)", margin: "0" },
   }, "Tap Run to probe the scraper + queue…");
-  const btn = h("button", { class: "btn primary block",
+  const btn = h("button", { class: "btn primary btn-glow btn-ripple block",
     style: { marginTop: "12px" },
     onclick: async () => {
       haptic("medium");

@@ -24,9 +24,31 @@ register("sheet", ({ title, body, actions }) => {
     actions && actions.length
       ? h("div", { style: { display: "flex", gap: "8px", marginTop: "16px" } },
           ...actions.map(a => {
+            // v10 stylish variants — primary CTA gets the glow + ripple,
+            // secondary buttons get the neumorphic lift, danger keeps the
+            // default red gradient from components.css. Callers can pass
+            // `variant` to override (e.g. "btn-shine" for Contact Admin).
+            const kind = a.kind || "secondary";
+            let variantClasses = "";
+            if (a.variant) {
+              variantClasses = " " + a.variant;
+            } else if (kind === "primary") {
+              variantClasses = " btn-glow btn-ripple";
+            } else if (kind === "secondary") {
+              variantClasses = " btn-lift";
+            } else if (kind === "danger") {
+              variantClasses = " btn-glow";
+            }
             const btn = h("button", {
-              class: "btn " + (a.kind || "secondary") + " " + (a.block ? "block" : ""),
-              onclick: () => { haptic(a.haptic || "light"); a.onClick && a.onClick(api); },
+              class: "btn " + kind
+                     + (a.block ? " block" : "")
+                     + variantClasses,
+              disabled: a.disabled ? "disabled" : null,
+              onclick: () => {
+                if (a.disabled) return;
+                haptic(a.haptic || "light");
+                a.onClick && a.onClick(api);
+              },
             }, a.label);
             return btn;
           }))

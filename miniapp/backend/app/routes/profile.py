@@ -45,3 +45,18 @@ def me(user: dict = Depends(get_current_user)) -> dict:
         "stats":       stats,
         "banned":      bool(stored.get("banned", False)),
     }
+
+
+@router.get("/preferences")
+def preferences(user: dict = Depends(get_current_user)) -> dict:
+    """Server-side app-wide defaults the frontend reads at boot.
+
+    v10: currently only carries `default_background_theme` (set by the
+    admin via POST /api/admin/background). The client merges this with
+    its own local pref — the local explicit choice wins; the server
+    value is used when the user has never picked one.
+    """
+    return {
+        "default_background_theme":
+            db.get_setting("default_background_theme", "ember") or "ember",
+    }

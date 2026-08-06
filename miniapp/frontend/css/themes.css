@@ -1,0 +1,94 @@
+/*
+  ============================================================================
+  themes.css — Admin-selectable background themes (v10)
+  ============================================================================
+  The base body background lives in base.css (the default "ember" dark theme).
+  This stylesheet overlays alternative backgrounds when the user picks a
+  different theme from Settings → Appearance → Background theme.
+
+  Themes are activated by setting `data-bg-theme` on the <html> element:
+      document.documentElement.dataset.bgTheme = "purple";
+  See core/prefs.js for the persisted preference and core/telegram.js's
+  apply() call for the wiring.
+
+  Three themes ship v10:
+    * ember   (default — no override needed; base.css handles it)
+    * light   (bright white paper look, dark ink)
+    * purple  (soft purple nebula matching the reference screenshot the
+               user provided: near-black base with two blurred purple glows
+               top-right and mid-left)
+
+  Adding a new theme: add a `[data-bg-theme="foo"]` block below and expose
+  the name in prefs.js DEFAULTS + settings.js selectRow options.
+  ============================================================================
+*/
+
+/* -----------------------------------------------------------------------
+   Light theme — white paper, dark ink, subtle red accent glow retained
+   for brand continuity. Everything readable in bright sunlight.
+   ----------------------------------------------------------------------- */
+html[data-bg-theme="light"] {
+  --du-bg-0:          #f6f7fb;
+  --du-bg-1:          #ffffff;
+  --du-bg-2:          #f0f2f8;
+  --du-bg-3:          #e6e9f2;
+
+  --du-ink-hi:        #111318;
+  --du-ink-mid:       #3a3f4c;
+  --du-ink-lo:        #6b7280;
+  --du-ink-inv:       #ffffff;
+
+  --du-border:        rgba(0, 0, 0, 0.10);
+  --du-border-strong: rgba(0, 0, 0, 0.18);
+  --du-divider:       rgba(0, 0, 0, 0.06);
+
+  --du-header-bg:     rgba(255, 255, 255, 0.85);
+}
+
+html[data-bg-theme="light"] body {
+  background:
+    radial-gradient(700px 460px at 50% -6%, rgba(255, 58, 58, 0.06), transparent 65%),
+    radial-gradient(560px 360px at 92% 108%, rgba(255, 122, 26, 0.05), transparent 65%),
+    var(--du-bg-0);
+  background-attachment: fixed;
+}
+
+
+/* -----------------------------------------------------------------------
+   Purple theme — near-black base with two blurred purple glows (top-right
+   + mid-left), mirroring the reference screenshot. Keeps the same red
+   accent for buttons so brand continuity is preserved; only the ambient
+   surface changes.
+   ----------------------------------------------------------------------- */
+html[data-bg-theme="purple"] {
+  --du-bg-0:          #0a0714;
+  --du-bg-1:          #120c22;
+  --du-bg-2:          #1a1230;
+  --du-bg-3:          #22183f;
+
+  --du-border:        rgba(160, 120, 255, 0.14);
+  --du-border-strong: rgba(160, 120, 255, 0.28);
+  --du-divider:       rgba(255, 255, 255, 0.06);
+
+  --du-header-bg:     rgba(10, 7, 20, 0.82);
+}
+
+html[data-bg-theme="purple"] body {
+  background:
+    /* top-right big blurred purple glow */
+    radial-gradient(760px 640px at 88% -8%, rgba(120, 66, 220, 0.55), transparent 62%),
+    /* mid-left softer violet glow */
+    radial-gradient(560px 520px at 6% 42%, rgba(88, 40, 190, 0.42), transparent 66%),
+    /* subtle indigo fade bottom */
+    radial-gradient(900px 620px at 50% 118%, rgba(60, 24, 140, 0.28), transparent 70%),
+    var(--du-bg-0);
+  background-attachment: fixed;
+}
+
+
+/* -----------------------------------------------------------------------
+   Ember (default) — no override needed. Keeping the block here (empty)
+   as documentation so the admin panel can list all three themes without
+   guessing which one is the default.
+   ----------------------------------------------------------------------- */
+html[data-bg-theme="ember"] { /* falls through to base.css defaults */ }

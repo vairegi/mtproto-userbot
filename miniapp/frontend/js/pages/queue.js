@@ -69,6 +69,82 @@ export async function render(root, { me }) {
     }
   }
 
+  // v10: per-job progress poll registry. Each PROCESSING row spins up
+  // its own 2.5s interval that hits /api/queue/progress/<gallery_id>
+  // and updates a small card underneath the row. Cleaned up on page
+  // teardown via the same returned cleanup fn.
+  const progressTimers = new Map();
+
+  function stopProgress(galleryId) {
+    const t = progressTimers.get(String(galleryId));
+    if (t) { clearInterval(t); progressTimers.delete(String(galleryId)); }
+  }
+
+  function startProgress(galleryId, mount) {
+    const key = String(galleryId);
+    if (!key || key === "undefined" || key === "null") return;
+    if (progressTimers.has(key)) return;  // already polling
+    const tick = async () => {
+      try {
+        const s = await api.get("/api/queue/progress/" + encodeURIComponent(key));
+        renderProgressCard(mount, s);
+        if (!s.is_active) {
+          stopProgress(key);   // finished or failed — stop polling
+        }
+      } catch (e) {
+        // One-off poll failure — keep trying, the row may still be active.
+      }
+    };
+    tick();
+    progressTimers.set(key, setInterval(tick, 2500));
+  }
+
+  function renderProgressCard(mount, s) {
+    if (!mount) return;
+    const pct = (typeof s.pct === "number") ? Math.max(0, Math.min(100, s.pct)) : null;
+    const bar = pct === null ? null : h("div", {
+      style: {
+        marginTop: "8px", height: "6px", background: "var(--du-bg-2)",
+        borderRadius: "999px", overflow: "hidden",
+      },
+    },
+      h("div", {
+        style: {
+          height: "100%", width: pct + "%",
+          background: "linear-gradient(90deg, var(--du-accent), var(--du-accent-2))",
+          transition: "width 0.4s ease",
+        },
+      }),
+    );
+    mount.innerHTML = "";
+    mount.appendChild(h("div", {
+      style: {
+        marginTop: "10px", padding: "10px 12px",
+        background: "var(--du-bg-2)", borderRadius: "10px",
+        border: "1px solid var(--du-border)",
+      },
+    },
+      h("div", {
+        style: { fontSize: "13px", fontWeight: "600",
+                 color: "var(--du-ink-hi)",
+                 display: "flex", alignItems: "center", gap: "6px" },
+      },
+        s.is_done ? "✅" : (s.is_failed ? "❌" : "⏳"),
+        h("span", {}, s.human || "Working…"),
+      ),
+      s.detail ? h("div", {
+        style: { fontSize: "11px", color: "var(--du-ink-lo)", marginTop: "4px" },
+      }, s.detail) : null,
+      bar,
+      pct !== null ? h("div", {
+        style: { fontSize: "10px", color: "var(--du-ink-lo)", marginTop: "4px" },
+      }, pct + "% complete") : null,
+      (s.is_failed && s.failed_reason) ? h("div", {
+        style: { fontSize: "11px", color: "var(--du-danger, #d33)", marginTop: "6px" },
+      }, "Error: " + s.failed_reason) : null,
+    ));
+  }
+
   function renderJob(j) {
     const status = String(j.status || "").toLowerCase();
     const isDone       = status === "done" || status === "completed";
@@ -114,7 +190,7 @@ export async function render(root, { me }) {
     if ((isDone || isPartial) && j.open_link) {
       actions = h("div", { style: { marginTop: "8px" } },
         h("button", {
-          class: "btn primary",
+          class: "btn primary btn-glow btn-ripple",
           onClick: () => openLink(j.open_link),
         }, "🔗 Open Post"),
       );
@@ -123,7 +199,7 @@ export async function render(root, { me }) {
       // demand via /api/gallery/{id}/status (one RTT, then open).
       actions = h("div", { style: { marginTop: "8px" } },
         h("button", {
-          class: "btn secondary",
+          class: "btn secondary btn-lift",
           onClick: async (ev) => {
             const btn = ev.currentTarget;
             btn.disabled = true;
@@ -139,14 +215,28 @@ export async function render(root, { me }) {
       );
     }
 
+    // v10: live progress card for PROCESSING rows. The card updates in
+    // place every 2.5s via /api/queue/progress/<gallery_id> — when the
+    // worker finishes, the next 5s tick() refresh will replace the row
+    // with a COMPLETED one and stopProgress will fire automatically.
+    let progressMount = null;
+    if (isProcessing && j.gallery_id) {
+      progressMount = h("div", {});
+      startProgress(j.gallery_id, progressMount);
+    }
+
     return h("div", { class: "admin-section" },
-      header, titleLine, urlLine, reasonLine, actions,
+      header, titleLine, urlLine, reasonLine, actions, progressMount,
     );
   }
 
   await tick();
   const t = setInterval(tick, 5000);
-  return () => clearInterval(t);
+  return () => {
+    clearInterval(t);
+    for (const [, timerId] of progressTimers) clearInterval(timerId);
+    progressTimers.clear();
+  };
 }
 
 function statusClass(s) {

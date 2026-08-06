@@ -21,6 +21,13 @@ export async function render(root, { me }) {
       { value: "dark",  label: "Always Dark" },
       { value: "light", label: "Always Light" },
     ]),
+    // v10: background theme selector. The names map to the
+    // [data-bg-theme="…"] overrides in css/themes.css.
+    selectRow("Background", "background_theme", [
+      { value: "ember",  label: "🔥 Ember (default dark red)" },
+      { value: "light",  label: "☀️ Light (white paper)" },
+      { value: "purple", label: "💜 Purple nebula" },
+    ]),
     toggleRow("Reduce motion",    "reduced_motion"),
   ]));
   root.appendChild(section("Interaction", [
@@ -94,6 +101,11 @@ function selectRow(label, key, opts) {
     if (key === "theme_override") {
       document.documentElement.dataset.theme =
         sel.value === "auto" ? (window.Telegram?.WebApp?.colorScheme || "dark") : sel.value;
+    }
+    // v10: background theme also re-applies immediately via prefs.apply()
+    // (invoked inside prefs.set).
+    if (key === "background_theme") {
+      document.documentElement.dataset.bgTheme = sel.value;
     }
   });
   row.append(h("span", { class: "k" }, label), sel);

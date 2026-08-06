@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from .. import db, ratelimit
 from ..auth import get_current_user
 from ..config import settings
-from ..services import dm_delivery, queue_bridge
+from ..services import dm_delivery, progress, queue_bridge
 
 router = APIRouter(prefix="/api/queue", tags=["queue"])
 
@@ -104,10 +104,31 @@ def enqueue(body: EnqueueBody, user: dict = Depends(get_current_user)) -> dict:
     rl = ratelimit.check_and_consume(uid)
 
     # Actually enqueue into the bot's shared queue.
+    #
+    # BUG FIX (v10): the previous handler raised HTTPException(503,
+    # "enqueue_batch returned nothing") whenever queue_service filtered
+    # the URL as a duplicate / completed / rejected row — which surfaced
+    # to the user as a scary "Failed: enqueue_batch returned nothing"
+    # toast even though the gallery is often just a stale tombstone.
+    # Now we soft-fail with a friendly message that suggests the admin's
+    # Force Re-scrape escape hatch.
     try:
         r = queue_bridge.enqueue(body.url, uid, user.get("username"))
     except RuntimeError as e:
-        raise HTTPException(503, str(e))
+        msg = str(e)
+        if "returned nothing" in msg.lower():
+            return {
+                "ok": False,
+                "deduped": False,
+                "action": "empty_result",
+                "message": ("This URL couldn't be queued right now — it may "
+                            "already be completed, pending, or rejected. "
+                            "Try again in a minute, or ask an admin to "
+                            "Force Re-scrape it."),
+                "reason": msg,
+                "usage": ratelimit.usage_summary(uid),
+            }
+        raise HTTPException(503, msg)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"Enqueue failed: {e}")
 
@@ -152,3 +173,12 @@ def deliver(gallery_id: str, user: dict = Depends(get_current_user)) -> dict:
 @router.get("/status")
 def status(_user: dict = Depends(get_current_user)) -> dict:
     return queue_bridge.status_summary()
+
+
+@router.get("/progress/{gallery_id}")
+def progress_lookup(gallery_id: str,
+                    _user: dict = Depends(get_current_user)) -> dict:
+    """Live-progress payload for the mini-app to poll while a gallery is
+    being downloaded. Compact + JSON-friendly so it's cheap to poll at
+    2-3 second intervals. See services/progress.py for the data sources."""
+    return progress.lookup(gallery_id)

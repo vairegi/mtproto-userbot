@@ -27,6 +27,7 @@ import "components/skeleton.js";
 import { bootTelegram, haptic, showBackButton } from "core/telegram.js";
 import { api } from "core/api.js";
 import { store } from "core/state.js";
+import { prefs } from "core/prefs.js";
 import { pages, findPage } from "core/registry.js";
 import { h } from "core/components.js";
 
@@ -51,6 +52,25 @@ async function boot() {
     store.set("boot_error", e.message || String(e));
   }
   store.set("me", me);
+
+  // v10: apply the server-side default background theme. A local
+  // explicit choice (user picked one in Settings) always wins; the
+  // server value only applies when the user has never touched the
+  // Background selector. We detect "never touched" by comparing against
+  // the factory default ("ember").
+  try {
+    const p = await api.get("/api/profile/preferences");
+    const serverBg = (p && p.default_background_theme) || "";
+    const localBg = prefs.get("background_theme");
+    if (serverBg && (localBg === "ember" || !localBg) && serverBg !== localBg) {
+      document.documentElement.dataset.bgTheme = serverBg;
+      // Note: we deliberately do NOT prefs.set() here — the server
+      // default should not overwrite the user's stored preference, it
+      // only styles this session until the user picks their own.
+    }
+  } catch (e) {
+    // Preferences endpoint down — keep whatever the local pref applied.
+  }
 
   renderHeader(me);
   renderTabbar(me);

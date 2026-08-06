@@ -162,6 +162,17 @@ export const cardActions = [
             toast("Already downloading — hang tight", "");
             return;
           }
+          // v10 soft-fail bug fix: when queue_service filtered the URL as
+          // a stale duplicate / completed / rejected row, the backend now
+          // returns `action: "empty_result"` with a friendly message
+          // (instead of a 503 "enqueue_batch returned nothing"). Show the
+          // hint so the user knows to ask an admin for Force Re-scrape.
+          if (res && res.ok === false && res.action === "empty_result") {
+            toast(res.message
+                   || "This URL couldn't be queued right now — ask an admin to Force Re-scrape it.",
+                  "error");
+            return;
+          }
         }
 
         // Fresh enqueue succeeded.

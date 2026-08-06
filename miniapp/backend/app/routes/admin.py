@@ -24,8 +24,8 @@ from pydantic import BaseModel
 from .. import db
 from ..auth import require_admin
 from ..services import (
-    deletion_scheduler, force_join, queue_bridge, scraper_bridge,
-    share_guard,
+    broadcast, deletion_scheduler, force_join, queue_bridge, rescrape,
+    scraper_bridge, share_guard,
 )
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -179,6 +179,109 @@ def forcejoin_add(body: ForceJoinAddBody, _a: dict = Depends(require_admin)) -> 
 @router.post("/forcejoin/remove")
 def forcejoin_remove(body: ForceJoinRemoveBody, _a: dict = Depends(require_admin)) -> dict:
     return force_join.remove_channel(body.channel)
+
+
+# ---- Feature 4: Force Re-scrape (admin escape hatch for failed / stuck galleries) ----
+class RescrapeBody(BaseModel):
+    url: str = ""
+    gallery_id: str = ""
+
+
+@router.get("/rescrape/failed")
+def list_failed(limit: int = 50, _a: dict = Depends(require_admin)) -> dict:
+    """Return recent failed / partial galleries so the admin can pick one
+    to re-scrape. Each row includes the specific `failed_reason` field so
+    the admin knows WHY it failed (e.g. 'scrape returned nothing')."""
+    return {
+        "items": rescrape.list_failed_galleries(limit=int(max(1, min(500, limit)))),
+    }
+
+
+@router.post("/rescrape")
+def rescrape_one(body: RescrapeBody, a: dict = Depends(require_admin)) -> dict:
+    """Force a fresh scrape for a URL or gallery id: purges the dedup
+    row + any lingering queue rows, then re-enqueues via queue_service."""
+    target = (body.gallery_id or body.url or "").strip()
+    if not target:
+        return {"ok": False, "reason": "missing url / gallery_id"}
+    return rescrape.force_rescrape(
+        target,
+        submitted_by=int(a.get("id") or 0),
+        username=a.get("username") or "admin",
+    )
+
+
+@router.get("/rescrape/diag")
+def rescrape_diag(target: str, _a: dict = Depends(require_admin)) -> dict:
+    """Non-destructive lookup: current galleries doc + lingering queue
+    rows for a URL or gallery id. Useful for the admin to inspect a
+    stuck job before deciding to re-scrape."""
+    return rescrape.diagnose(target)
+
+
+# ---- Feature 5: Broadcast to all users ----
+class BroadcastBody(BaseModel):
+    text: str
+    button_text: str = ""
+    button_url: str = ""
+
+
+@router.post("/broadcast")
+def broadcast_start(body: BroadcastBody, a: dict = Depends(require_admin)) -> dict:
+    """Kick off a broadcast. Delivery happens in a background thread; the
+    admin panel polls /broadcast/status/<run_id> for progress."""
+    return broadcast.start_broadcast(
+        text=body.text,
+        button_text=body.button_text,
+        button_url=body.button_url,
+        initiated_by=int(a.get("id") or 0),
+    )
+
+
+@router.get("/broadcast/status/{run_id}")
+def broadcast_status(run_id: str, _a: dict = Depends(require_admin)) -> dict:
+    s = broadcast.status(run_id)
+    if s is None:
+        return {"ok": False, "reason": "run_id not found"}
+    return {"ok": True, **s}
+
+
+@router.get("/broadcast/recent")
+def broadcast_recent(limit: int = 10,
+                     _a: dict = Depends(require_admin)) -> dict:
+    return {"items": broadcast.list_recent(limit=int(max(1, min(50, limit))))}
+
+
+@router.get("/broadcast/preview")
+def broadcast_preview(_a: dict = Depends(require_admin)) -> dict:
+    """Return the number of users a broadcast would target (banned users
+    excluded). Used by the admin panel to confirm before Send."""
+    recipients = broadcast.list_recipients()
+    return {"total": len(recipients)}
+
+
+# ---- Feature 6: Default background theme (app-wide) ----
+# The admin sets the default background here. It is read at boot by every
+# user via GET /api/profile/preferences. Users may still override their
+# own local background_theme in Settings → Appearance (client-side pref
+# wins over the server default when explicitly set).
+class BackgroundThemeBody(BaseModel):
+    theme: str = "ember"
+
+
+@router.get("/background")
+def get_background(_a: dict = Depends(require_admin)) -> dict:
+    return {"theme": db.get_setting("default_background_theme", "ember") or "ember"}
+
+
+@router.post("/background")
+def set_background(body: BackgroundThemeBody,
+                   _a: dict = Depends(require_admin)) -> dict:
+    theme = (body.theme or "ember").strip().lower()
+    if theme not in ("ember", "light", "purple"):
+        return {"ok": False, "reason": "unknown theme (use ember | light | purple)"}
+    db.set_setting("default_background_theme", theme)
+    return {"ok": True, "theme": theme}
 
 
 # ---- Diagnostics ----

@@ -104,7 +104,7 @@ export async function render(root, { me }) {
     $saved.appendChild(grid);
     if (items.length > 12) {
       $saved.appendChild(h("button", {
-        class: "btn secondary block",
+        class: "btn secondary btn-lift block",
         style: { marginTop: "12px" },
         onclick: () => { location.hash = "#bookmarks"; },
       }, `See all ${items.length} bookmarks →`));

@@ -12,6 +12,13 @@
   <link rel="stylesheet" href="/static/css/theme.css" />
   <link rel="stylesheet" href="/static/css/base.css" />
   <link rel="stylesheet" href="/static/css/components.css" />
+  <!-- v10: admin-selectable background themes. MUST load after base.css
+       so the [data-bg-theme="…"] overrides win the cascade. -->
+  <link rel="stylesheet" href="/static/css/themes.css" />
+  <!-- v10: stylish button variants (btn-glow, btn-shine, btn-outline-slide,
+       btn-lift, btn-pill, btn-ripple, btn-icon-only). MUST load last so
+       its rules override the base .btn styles. -->
+  <link rel="stylesheet" href="/static/css/buttons.css" />
 
   <!--
     ES-modules import-map polyfill.
