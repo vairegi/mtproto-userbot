@@ -123,8 +123,46 @@ def _normalise_handle(raw: str) -> str:
     return s.strip("/ ")
 
 
+def _split_channel_and_invite(raw: str) -> tuple:
+    """Split an admin-supplied 'channel + optional invite link' input.
+
+    Accepts formats like:
+      * '-1002252758260'
+      * '-1002252758260 https://t.me/+abcXYZ'
+      * '-1002252758260, https://t.me/+abcXYZ'
+      * '-1002252758260 | https://t.me/+abcXYZ'
+      * '@channelname https://t.me/+abcXYZ'
+      * a single 'https://t.me/+abcXYZ'
+      * a single 'https://t.me/joinchat/abcXYZ'
+
+    Returns (channel_ref, invite_url) — either half may be empty.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ("", "")
+    tokens = [t for t in re.split(r"[\s,|;]+", s) if t]
+    if not tokens:
+        return ("", "")
+    channel_ref = tokens[0]
+    invite_url = ""
+    for tk in tokens[1:]:
+        if _INVITE_LINK_RE.match(tk):
+            invite_url = tk
+            break
+    return (channel_ref, invite_url)
+
+
 def add_channel(username_or_id: str, title: str = "", url: str = "") -> Dict[str, Any]:
-    handle = _normalise_handle(username_or_id)
+    # Improvement #6: extract an optional second-token invite URL from the
+    # raw input so admins can pair a numeric -100… ID (or a public @handle)
+    # with a joinable invite link in a single Add tap.
+    channel_ref, embedded_url = _split_channel_and_invite(username_or_id)
+    if not channel_ref:
+        raise ValueError("empty channel handle")
+    if not (url or "").strip() and embedded_url:
+        url = embedded_url
+
+    handle = _normalise_handle(channel_ref)
     if not handle:
         raise ValueError("empty channel handle")
 
@@ -140,6 +178,15 @@ def add_channel(username_or_id: str, title: str = "", url: str = "") -> Dict[str
             numeric_id = int(handle)
         except ValueError:
             numeric_id = None
+
+    # Improvement #6: if the admin also supplied an invite URL alongside
+    # the numeric ID / @handle, harvest its invite hash so join_url()
+    # emits the proper t.me/+… link (not the unjoinable t.me/c/<internal>
+    # fallback that private numeric channels would otherwise get).
+    if url:
+        m = _INVITE_LINK_RE.match(url.strip())
+        if m and not invite_hash:
+            invite_hash = m.group(1)
 
     current = get_channels()
     for c in current:
@@ -163,9 +210,14 @@ def add_channel(username_or_id: str, title: str = "", url: str = "") -> Dict[str
     else:
         default_title = handle
 
+    # `username` is only meaningful for a public @handle. Numeric-ID or
+    # invite-hash rows never carry a public handle.
+    username_field = ""
+    if numeric_id is None and not handle.startswith("invite:"):
+        username_field = handle
+
     new_row: Dict[str, Any] = {
-        "username":    "" if (invite_hash is not None or numeric_id is not None)
-                       else handle,
+        "username":    username_field,
         "chat_id":     numeric_id,
         "invite_hash": invite_hash,
         "title":       (title or "").strip() or default_title,
@@ -187,7 +239,10 @@ def add_channel(username_or_id: str, title: str = "", url: str = "") -> Dict[str
 
 
 def remove_channel(username_or_id: str) -> Dict[str, Any]:
-    handle = _normalise_handle(username_or_id)
+    # Same split-input tolerance as add_channel(): ignore any trailing
+    # invite URL the admin may have kept in the field.
+    channel_ref, _ = _split_channel_and_invite(username_or_id)
+    handle = _normalise_handle(channel_ref or username_or_id)
     invite_hash: Optional[str] = None
     if handle.startswith("invite:"):
         invite_hash = handle[len("invite:"):]

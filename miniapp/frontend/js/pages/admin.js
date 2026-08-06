@@ -143,21 +143,39 @@ function sectionForceJoin() {
     style: { color: "var(--du-ink-lo)", fontSize: "11px", margin: "4px 0 8px" },
   }, "Users must join these channels before the bot DMs them any file. "
    + "Add a public @handle, a private invite link (t.me/+…), "
-   + "or a numeric -100… channel ID. Bot must be admin in each channel.");
+   + "or a numeric -100… channel ID. Bot must be admin in each channel. "
+   + "For private channels added by numeric ID, also paste an invite link "
+   + "(t.me/+…) below — otherwise the Join button won't work for non-members.");
 
   const input = h("input", {
     type: "text",
     placeholder: "@channel  OR  https://t.me/+abcXYZ  OR  -1001234567890",
     style: { flex: "1", minWidth: "0" },
   });
+  // Improvement #6: dedicated field for a joinable invite URL. When the
+  // channel is a numeric -100… ID (a private channel), the button we send
+  // users would otherwise fall back to a t.me/c/<internal> link, which is
+  // NOT joinable for non-members. Admins can paste a real t.me/+… invite
+  // link here so the button actually works.
+  const inviteInput = h("input", {
+    type: "text",
+    placeholder: "Optional invite link (https://t.me/+…) — required for private -100… channels",
+    style: { flex: "1", minWidth: "0" },
+  });
   const addBtn = h("button", { class: "btn primary",
     onclick: async () => {
-      const v = (input.value || "").trim();
+      const v  = (input.value || "").trim();
+      const iv = (inviteInput.value || "").trim();
       if (!v) { toast("Enter a channel handle first", "error"); return; }
+      // Send both tokens on one line; the backend's _split_channel_and_invite()
+      // separates them and stores the invite hash for the Join button.
+      const payload = iv ? (v + " " + iv) : v;
       haptic("medium");
       try {
-        const r = await api.post("/api/admin/forcejoin/add", { channel: v });
+        const r = await api.post("/api/admin/forcejoin/add",
+                                 { channel: payload });
         input.value = "";
+        inviteInput.value = "";
         toast(r.already ? "Already in the list" : "Channel added", "success");
         renderList(r.channels || []);
       } catch (e) { toast(e.message, "error"); }
@@ -167,6 +185,10 @@ function sectionForceJoin() {
   const addRow = h("div", {
     style: { display: "flex", gap: "8px", alignItems: "center" },
   }, input, addBtn);
+  const inviteRow = h("div", {
+    style: { display: "flex", gap: "8px", alignItems: "center",
+             marginTop: "6px" },
+  }, inviteInput);
 
   function renderList(channels) {
     list.innerHTML = "";
@@ -199,7 +221,7 @@ function sectionForceJoin() {
     }
   }
 
-  wrap.append(hint, list, addRow);
+  wrap.append(hint, list, addRow, inviteRow);
 
   (async () => {
     try {
