@@ -329,6 +329,182 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("▶️ Resumed.")
 
 
+@only_admin
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """v11.4 — /broadcast. Reply to ANY message (text, photo, video, document,
+    styled caption with spoilers, etc.) with /broadcast and that exact message
+    is copied to every registered, non-banned mini-app user.
+
+    Uses copyMessage so media attachments, caption formatting, and spoiler
+    entities are preserved verbatim — the old mini-app textarea broadcast
+    could only send plain text. Rate-limited to ~20 msg/s to stay under
+    Telegram's global cap. Banned users are skipped.
+    """
+    msg = update.effective_message
+    src = msg.reply_to_message if msg else None
+    if not src:
+        await msg.reply_text(
+            "📣 Usage: reply to the message you want to broadcast with /broadcast.\n"
+            "Works with text, photos, videos, documents, and styled/spoiler "
+            "captions — whatever you reply to is forwarded verbatim to every user."
+        )
+        return
+
+    # Build the recipient list from the miniapp users collection (same source
+    # the retired mini-app broadcast used), skipping banned users.
+    conn = db.connect()
+    try:
+        rows = list(conn.db["miniapp_users"].find(
+            {}, {"_id": 1, "banned": 1}))
+    finally:
+        conn.close()
+    recipients = []
+    for r in rows:
+        try:
+            if r.get("banned"):
+                continue
+            uid = int(r.get("_id"))
+            if uid > 0:
+                recipients.append(uid)
+        except Exception:
+            continue
+
+    if not recipients:
+        await msg.reply_text("No registered mini-app users to broadcast to.")
+        return
+
+    status = await msg.reply_text(
+        f"📣 Broadcasting to {len(recipients)} user(s)… (~20 msg/s)"
+    )
+
+    sent = failed = 0
+    src_chat = src.chat_id
+    src_msg_id = src.message_id
+    for uid in recipients:
+        try:
+            await ctx.bot.copy_message(
+                chat_id=uid,
+                from_chat_id=src_chat,
+                message_id=src_msg_id,
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+        # ~20 msg/s pacing; also yields the event loop so other handlers run.
+        await asyncio.sleep(0.05)
+
+    try:
+        await status.edit_text(
+            f"📣 Broadcast complete.\n✅ Sent: {sent}\n❌ Failed: {failed}"
+        )
+    except Exception:
+        pass
+
+
+def _glink(gid) -> str:
+    """v11.4 — canonical gallery link for a numeric gallery id."""
+    return f"https://nhentai.net/g/{gid}/"
+
+
+@only_admin
+async def cmd_topsave(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """v11.4 — /topsave. Lists the most-saved doujinshi across ALL users,
+    ranked by how many distinct users bookmarked each gallery."""
+    conn = db.connect()
+    try:
+        rows = list(conn.db["miniapp_bookmarks"].aggregate([
+            {"$group": {
+                "_id": "$gallery_id",
+                "count": {"$sum": 1},
+                "title": {"$first": "$title"},
+            }},
+            {"$sort": {"count": -1}},
+            {"$limit": 15},
+        ]))
+    finally:
+        conn.close()
+
+    if not rows:
+        await update.effective_message.reply_text("📚 No saved doujinshi yet.")
+        return
+
+    lines = ["🔥 Most saved doujinshi (all users)\n"]
+    for i, r in enumerate(rows, 1):
+        gid = r.get("_id")
+        title = (r.get("title") or f"#{gid}")
+        if len(title) > 60:
+            title = title[:57] + "..."
+        # escape the [ ] in titles so Markdown links don't break
+        title = title.replace("[", "(").replace("]", ")")
+        lines.append(
+            f"{i}. [{title}]({_glink(gid)}) — saved by {r.get('count', 0)} user(s)"
+        )
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+
+
+@only_admin
+async def cmd_allsaved(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """v11.4 — /allsaved. Per-user save summary: username, total saves, and
+    that user's 5 most recent saved doujinshi (title + link). Shows the top
+    10 users by total saves to keep the message within Telegram limits."""
+    conn = db.connect()
+    try:
+        # Top users by total bookmarks
+        top_users = list(conn.db["miniapp_bookmarks"].aggregate([
+            {"$group": {"_id": "$user_id", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 10},
+        ]))
+        if not top_users:
+            await update.effective_message.reply_text("📚 No saved doujinshi yet.")
+            return
+
+        # Resolve usernames in one query
+        uids = [int(r["_id"]) for r in top_users if r.get("_id") is not None]
+        udocs = list(conn.db["miniapp_users"].find(
+            {"_id": {"$in": uids}}, {"_id": 1, "username": 1, "first_name": 1}))
+        umap = {int(u["_id"]): u for u in udocs}
+
+        blocks = ["📚 Saved doujinshi per user\n"]
+        for r in top_users:
+            uid = int(r["_id"])
+            total = r.get("count", 0)
+            u = umap.get(uid, {})
+            who = ("@" + u["username"]) if u.get("username") \
+                else (u.get("first_name") or f"user {uid}")
+
+            recent = list(conn.db["miniapp_bookmarks"].find(
+                {"user_id": uid}).sort("created_at", -1).limit(5))
+
+            block = f"\n👤 {who} — {total} saved"
+            for b in recent:
+                t = (b.get("title") or f"#{b.get('gallery_id')}")
+                if len(t) > 50:
+                    t = t[:47] + "..."
+                # escape the [ ] in titles so Markdown links don't break
+                t = t.replace("[", "(").replace("]", ")")
+                block += f"\n  • [{t}]({_glink(b.get('gallery_id'))})"
+            blocks.append(block)
+    finally:
+        conn.close()
+
+    # Split into <=3500-char chunks so long lists don't hit Telegram's 4096 cap
+    chunk = blocks[0]
+    for b in blocks[1:]:
+        if len(chunk) + len(b) > 3500:
+            await update.effective_message.reply_text(
+                chunk, parse_mode="Markdown", disable_web_page_preview=True)
+            chunk = b.lstrip("\n")
+        else:
+            chunk += b
+    await update.effective_message.reply_text(
+        chunk, parse_mode="Markdown", disable_web_page_preview=True)
+
+
 @only_public
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     conn = db.connect()
@@ -1780,6 +1956,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("topsave", cmd_topsave))
+    app.add_handler(CommandHandler("allsaved", cmd_allsaved))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("last", cmd_last))
     app.add_handler(CommandHandler("health", cmd_health))
