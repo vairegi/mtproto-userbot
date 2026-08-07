@@ -434,6 +434,21 @@
   border-radius: var(--du-radius-lg);
   padding: var(--du-space-4);
   margin-bottom: var(--du-space-3);
+  /* v11.4: prevent horizontal overflow on mobile — a section may never be
+     wider than its parent, and any wide child (long IDs, code, links) wraps
+     or clips inside the card instead of pushing the whole page sideways. */
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+.admin-section * {
+  min-width: 0;                /* let flex/grid children shrink below content */
+}
+.admin-section .k,
+.admin-section .v,
+.admin-section div {
+  overflow-wrap: anywhere;     /* long ids/usernames/URLs wrap, never scroll */
+  word-break: break-word;
 }
 .admin-section h3 {
   margin: 0 0 var(--du-space-3);

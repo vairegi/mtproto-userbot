@@ -26,7 +26,10 @@ export async function render(root, { me }) {
   root.appendChild(sectionForceJoin());
   root.appendChild(sectionRescrape());    // v10: Force Re-scrape + Failed galleries
   root.appendChild(sectionForceDelete()); // v11.3: Force-Delete (purge, no re-queue)
-  root.appendChild(sectionBroadcast());   // v10: Broadcast to users
+  // v11.4: Broadcast moved OUT of the mini-app. It is now a bot command
+  // (/broadcast) so the admin can attach videos / photos / styled & spoiler
+  // text — none of which the mini-app textarea could carry. The backend
+  // /api/admin/broadcast routes remain for backward-compat but are unused.
   root.appendChild(sectionBackground());  // v10: App-wide default background
   root.appendChild(sectionUsers());
   root.appendChild(sectionDiag());
@@ -286,8 +289,11 @@ function sectionStats() {
             fontSize: "12px", fontWeight: "600", margin: "8px 0 4px" } },
           "🔥 Top queuers today"));
         for (const r of s.top_queuers_today) {
+          // v11.4: show @username (or first name) alongside the numeric id
+          const who = r.username ? ("@" + r.username)
+                    : (r.first_name || "#" + r.user_id);
           top.appendChild(h("div", { class: "kv-row" },
-            h("span", { class: "k" }, "#" + r.user_id),
+            h("span", { class: "k" }, who + " · " + r.user_id),
             h("span", { class: "v" }, `${r.count} queues`),
           ));
         }
@@ -497,14 +503,15 @@ function userRow(u, refresh) {
              display: "flex", flexDirection: "column", gap: "6px" },
   },
     h("div", { style: { display: "flex", justifyContent: "space-between",
-                        alignItems: "center" } },
-      h("div", {},
-        h("div", { style: { fontWeight: "600" } },
+                        alignItems: "center", flexWrap: "wrap", gap: "8px" } },
+      h("div", { style: { minWidth: "0", flex: "1 1 auto" } },
+        h("div", { style: { fontWeight: "600", overflowWrap: "anywhere" } },
           (u.first_name || u.username || "user") + " · " + u.user_id),
         h("div", { style: { color: "var(--du-ink-lo)", fontSize: "12px" } },
           `Used ${u.used_today || 0} / ${u.limit || "∞"} today`),
       ),
-      h("div", { style: { display: "flex", gap: "6px" } },
+      h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap",
+                          flexShrink: "0" } },
         h("button", {
           class: "btn ghost btn-lift",
           onclick: async () => {
@@ -676,7 +683,8 @@ function sectionForceDelete() {
     },
   }, "🗑️ Force-Delete");
   wrap.appendChild(h("div", {
-    style: { display: "flex", gap: "8px", alignItems: "center" },
+    style: { display: "flex", gap: "8px", alignItems: "center",
+             flexWrap: "wrap" },
   }, input, delBtn));
   return wrap;
 }
@@ -711,121 +719,6 @@ function failedRow(g, refreshList) {
       }, "♻️ Re-scrape"),
     ),
   );
-}
-
-// -------- v10. Broadcast to users --------
-function sectionBroadcast() {
-  const wrap = h("div", { class: "admin-section" });
-  wrap.appendChild(h("h3", {}, "📣 Broadcast to Users"));
-  wrap.appendChild(h("div", {
-    style: { color: "var(--du-ink-lo)", fontSize: "11px", margin: "4px 0 8px" },
-  }, "Sends a Telegram DM from the admin bot to every registered mini-app "
-   + "user (banned users are skipped). Optionally attach a single button. "
-   + "Delivery is rate-limited (~20 msg/s) to stay under Telegram's caps."));
-
-  const textEl = h("textarea", {
-    rows: "4",
-    placeholder: "Your message to all users…",
-    style: {
-      width: "100%", background: "var(--du-bg-2)",
-      border: "1px solid var(--du-border)", borderRadius: "8px",
-      padding: "10px", color: "var(--du-ink-hi)",
-      fontFamily: "inherit", fontSize: "13px",
-    },
-  });
-  const btnTextEl = h("input", {
-    type: "text",
-    placeholder: "Button text (optional)",
-    style: { flex: "1", minWidth: "0" },
-  });
-  const btnUrlEl = h("input", {
-    type: "text",
-    placeholder: "Button URL (optional)",
-    style: { flex: "1", minWidth: "0" },
-  });
-  const preview = h("div", {
-    style: { color: "var(--du-ink-mid)", fontSize: "12px", margin: "6px 0" },
-  }, "…");
-  const statusEl = h("div", {
-    style: { fontSize: "12px", marginTop: "8px" },
-  }, "");
-
-  const sendBtn = h("button", { class: "btn primary btn-glow btn-shine block",
-    style: { marginTop: "8px" },
-    onclick: async () => {
-      const text = (textEl.value || "").trim();
-      if (!text) { toast("Write a message first", "error"); return; }
-      if (!confirm("Send this broadcast to ALL users?")) return;
-      haptic("medium");
-      try {
-        const r = await api.post("/api/admin/broadcast", {
-          text: text,
-          button_text: (btnTextEl.value || "").trim(),
-          button_url:  (btnUrlEl.value  || "").trim(),
-        });
-        if (!r.ok) { toast("Broadcast failed: " + (r.reason || "unknown"), "error"); return; }
-        toast(`📣 Broadcast started to ${r.total} users`, "success");
-        textEl.value = "";
-        btnTextEl.value = "";
-        btnUrlEl.value = "";
-        pollStatus(r.run_id);
-      } catch (e) { toast(e.message, "error"); }
-    },
-  }, "📣 Send broadcast");
-
-  async function pollStatus(runId) {
-    if (!runId) return;
-    const tick = async () => {
-      try {
-        const s = await api.get("/api/admin/broadcast/status/" + runId);
-        if (!s.ok) return;
-        statusEl.textContent =
-          `Run ${s.run_id}: ${s.status} — sent ${s.sent}/${s.total} `
-          + `(blocked: ${s.failed_blocked}, errors: ${s.failed_other})`;
-        if (s.status === "running") setTimeout(tick, 3000);
-        else if (s.status === "done") {
-          toast("✅ Broadcast finished", "success");
-          refreshHistory();
-        }
-      } catch (e) { /* ignore one-off poll failures */ }
-    };
-    setTimeout(tick, 1500);
-  }
-
-  const historyList = h("div", { style: { marginTop: "12px" } });
-  async function refreshHistory() {
-    historyList.innerHTML = "";
-    try {
-      const r = await api.get("/api/admin/broadcast/recent?limit=5");
-      const items = r.items || [];
-      if (!items.length) return;
-      historyList.appendChild(h("div", {
-        style: { fontSize: "11px", color: "var(--du-ink-lo)",
-                 margin: "4px 0", fontWeight: "600" },
-      }, "Recent broadcasts"));
-      for (const it of items) {
-        historyList.appendChild(h("div", {
-          style: { fontSize: "11px", color: "var(--du-ink-mid)",
-                   padding: "3px 0", borderBottom: "1px solid var(--du-divider)" },
-        },
-          `${it.status === "done" ? "✅" : "⏳"} ${it.sent}/${it.total} — ${it.text_preview || ""}`));
-      }
-    } catch (e) { /* ignore */ }
-  }
-
-  // Initial recipient count preview
-  (async () => {
-    try {
-      const p = await api.get("/api/admin/broadcast/preview");
-      preview.textContent = `Will reach ~${p.total} users (banned excluded).`;
-    } catch (e) { preview.textContent = ""; }
-  })();
-
-  wrap.append(textEl, preview,
-              h("div", { style: { display: "flex", gap: "6px" } }, btnTextEl, btnUrlEl),
-              sendBtn, statusEl, historyList);
-  refreshHistory();
-  return wrap;
 }
 
 // -------- v10. App-wide default background theme --------

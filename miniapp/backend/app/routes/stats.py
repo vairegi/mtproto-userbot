@@ -40,12 +40,22 @@ def stats(_a: dict = Depends(require_admin)) -> dict:
     active_today    = usage_coll.count_documents({"date": _today_str()})
     total_bookmarks = bm_coll.count_documents({})
 
-    # Top 5 queuers today
+    # Top 5 queuers today (v11.4: join miniapp_users for username/first_name)
     top_today = list(usage_coll.aggregate([
         {"$match": {"date": _today_str()}},
         {"$sort": {"count": -1}},
         {"$limit": 5},
-        {"$project": {"user_id": 1, "count": 1, "_id": 0}},
+        {"$lookup": {
+            "from": "miniapp_users",
+            "localField": "user_id",
+            "foreignField": "_id",
+            "as": "u",
+        }},
+        {"$project": {
+            "user_id": 1, "count": 1, "_id": 0,
+            "username":   {"$ifNull": [{"$arrayElemAt": ["$u.username", 0]}, None]},
+            "first_name": {"$ifNull": [{"$arrayElemAt": ["$u.first_name", 0]}, None]},
+        }},
     ]))
 
     # Top 5 bookmarked galleries (across all users)
