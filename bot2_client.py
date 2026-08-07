@@ -150,10 +150,31 @@ async def send_link(
     The pre-send timestamp is what wait_for_pdf() should compare against;
     it gives us a small safety margin (~1s) so we never miss the reply due
     to clock skew between our host and Telegram's servers.
+
+    v11.3: also records the SENT message's id into module-level state
+    (``_last_sent_msg_id``) so ``wait_for_pdf`` can anchor on a hard
+    message-ID floor in addition to the timestamp. This kills the
+    cover-pairing race where a late PDF from a previous (timed-out) job
+    was claimed by the NEXT job's wait — the exact "coverpost +
+    coverpost back-to-back" symptom in the DB channel.
     """
+    global _last_sent_msg_id
     since = time.time()
-    await client.send_message(bot2_entity, url)
+    sent = await client.send_message(bot2_entity, url)
+    _last_sent_msg_id = int(getattr(sent, "id", 0) or 0)
     return since
+
+
+# v11.3: message-ID of the most recent outbound link we DM'd to Bot 2.
+# Read by wait_for_pdf() as a strict floor; anything at or below this id
+# is either our own message or a reply to an EARLIER job.
+_last_sent_msg_id: int = 0
+
+
+def last_sent_msg_id() -> int:
+    """Return the id of the most recent link message we sent to Bot 2.
+    0 means unknown — callers should fall back to timestamp-only filtering."""
+    return _last_sent_msg_id
 
 
 async def wait_for_pdf(
@@ -168,6 +189,11 @@ async def wait_for_pdf(
 
     - Ignores our own outbound messages.
     - Ignores messages older than `since_ts - 1` (clock-skew tolerance).
+    - v11.3: ALSO ignores any message with id <= the id of the link we
+      sent (see ``_last_sent_msg_id``). A PDF arriving later than our
+      timeout for a previous job would otherwise be claimed as THIS
+      job's reply — that is how covers ended up posted back-to-back
+      without their matching PDFs between them.
     - Ignores progress-style text ("Queued", "Downloading", "Converting").
     - Returns OK the moment a PDF document arrives.
     - Returns TEXT_REPLY (with `error_text`) the moment Bot 2 sends either
@@ -177,6 +203,9 @@ async def wait_for_pdf(
     """
     deadline = time.monotonic() + max(1, int(timeout_sec))
     seen_ids: set = set()
+    # v11.3: hard message-ID floor — replies to earlier jobs (which may
+    # be late by minutes if Bot 2 was slow) must never satisfy this wait.
+    floor_id = _last_sent_msg_id
 
     while time.monotonic() < deadline:
         try:
@@ -184,6 +213,11 @@ async def wait_for_pdf(
                 if msg.id in seen_ids:
                     break
                 seen_ids.add(msg.id)
+
+                # v11.3: anything at/below our own sent link id is either
+                # our outbound message or a reply to an earlier job.
+                if floor_id and getattr(msg, "id", 0) and msg.id <= floor_id:
+                    break
 
                 # Older than our send → stop scanning this batch.
                 if not msg.date or msg.date.timestamp() < since_ts - 1:
