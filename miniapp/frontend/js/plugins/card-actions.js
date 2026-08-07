@@ -182,17 +182,21 @@ export const cardActions = [
             toast("Already downloading — hang tight", "");
             return;
           }
-          // v10 soft-fail bug fix: when queue_service filtered the URL as
-          // a stale duplicate / completed / rejected row, the backend now
-          // returns `action: "empty_result"` with a friendly message
-          // (instead of a 503 "enqueue_batch returned nothing"). Show the
-          // hint so the user knows to ask an admin for Force Re-scrape.
-          if (res && res.ok === false && res.action === "empty_result") {
-            toast(res.message
-                   || "This URL couldn't be queued right now — ask an admin to Force Re-scrape it.",
-                  "error");
-            return;
-          }
+        }
+
+        // v11.5 fix: the empty_result branch used to be nested INSIDE the
+        // `if (res.deduped)` block above, but empty_result responses have
+        // deduped:false — so this handler was unreachable and the code
+        // fell through to a false-positive "✅ Queued" toast. Handling it
+        // at the correct scope now: any ok:false soft-fail from the
+        // backend must NOT be shown as a success.
+        if (res && res.ok === false) {
+          const msg = res.message
+            || (res.action === "empty_result"
+                  ? "This URL couldn't be queued right now — ask an admin to Force Re-scrape it."
+                  : ("Failed: " + (res.reason || res.action || "unknown")));
+          toast(msg, "error");
+          return;
         }
 
         // Fresh enqueue succeeded.

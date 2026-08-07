@@ -120,6 +120,25 @@ def dedup_peek(url: str) -> dict:
     }
 
 
+class EnqueueEmptyResult(RuntimeError):
+    """v11.5 — raised when queue_service returns no queued rows for the URL.
+
+    Carries the raw skipped/rejected diagnostics from the EnqueueResult so
+    the /api/queue route can surface them to admins without them having to
+    scrape server logs.
+    """
+    def __init__(self, msg: str, *,
+                 skipped_already_done: list | None = None,
+                 skipped_already_pending: list | None = None,
+                 skipped_duplicates: list | None = None,
+                 rejected: list | None = None):
+        super().__init__(msg)
+        self.skipped_already_done    = list(skipped_already_done or [])
+        self.skipped_already_pending = list(skipped_already_pending or [])
+        self.skipped_duplicates      = list(skipped_duplicates or [])
+        self.rejected                = list(rejected or [])
+
+
 def enqueue(url: str, user_id: int, username: str | None) -> dict:
     if not HAVE_BOT:
         raise RuntimeError("queue_service not available in this deployment")
@@ -132,7 +151,13 @@ def enqueue(url: str, user_id: int, username: str | None) -> dict:
         chat_id=None,
     )
     if not result or not getattr(result, "queued", None):
-        raise RuntimeError("enqueue_batch returned nothing")
+        raise EnqueueEmptyResult(
+            "enqueue_batch returned nothing",
+            skipped_already_done=list(getattr(result, "skipped_already_done", []) or []),
+            skipped_already_pending=list(getattr(result, "skipped_already_pending", []) or []),
+            skipped_duplicates=list(getattr(result, "skipped_duplicates", []) or []),
+            rejected=list(getattr(result, "rejected", []) or []),
+        )
     job_id, gallery_url = result.queued[0][0], result.queued[0][1]
     return {"job_id": job_id, "url": gallery_url}
 

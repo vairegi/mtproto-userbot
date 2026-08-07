@@ -114,21 +114,31 @@ def enqueue(body: EnqueueBody, user: dict = Depends(get_current_user)) -> dict:
     # Force Re-scrape escape hatch.
     try:
         r = queue_bridge.enqueue(body.url, uid, user.get("username"))
+    except queue_bridge.EnqueueEmptyResult as e:
+        # v11.5: soft-fail with the raw skipped/rejected diagnostics so
+        # admins can see WHY the enqueue produced no queued row (usually a
+        # lingering processed_urls tombstone — the exact case Force-Delete
+        # + Force Re-scrape now clear). Frontend already shows a friendly
+        # "ask an admin to Force Re-scrape" toast; these fields let a
+        # triaging admin skip the log dive.
+        return {
+            "ok": False,
+            "deduped": False,
+            "action": "empty_result",
+            "message": ("This URL couldn't be queued right now — it may "
+                        "already be completed, pending, or rejected. "
+                        "Try again in a minute, or ask an admin to "
+                        "Force Re-scrape it."),
+            "reason": str(e),
+            "skipped_already_done":    e.skipped_already_done,
+            "skipped_already_pending": e.skipped_already_pending,
+            "skipped_duplicates":      e.skipped_duplicates,
+            "rejected":                e.rejected,
+            "usage": ratelimit.usage_summary(uid),
+        }
     except RuntimeError as e:
-        msg = str(e)
-        if "returned nothing" in msg.lower():
-            return {
-                "ok": False,
-                "deduped": False,
-                "action": "empty_result",
-                "message": ("This URL couldn't be queued right now — it may "
-                            "already be completed, pending, or rejected. "
-                            "Try again in a minute, or ask an admin to "
-                            "Force Re-scrape it."),
-                "reason": msg,
-                "usage": ratelimit.usage_summary(uid),
-            }
-        raise HTTPException(503, msg)
+        # Legacy path (queue_service not available in this deployment, etc.)
+        raise HTTPException(503, str(e))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"Enqueue failed: {e}")
 

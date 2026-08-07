@@ -112,7 +112,14 @@ def list_failed_galleries(limit: int = 50) -> List[Dict[str, Any]]:
 
 
 def _purge_queue_rows(url: str) -> Dict[str, Any]:
-    """Delete every queue row that shares the same url_hash as `url`."""
+    """Delete every queue row that shares the same url_hash as `url`.
+
+    v11.5: ALSO clears the processed_urls tombstone. The queue_service dedup
+    gate reads processed_urls.completed_at to decide "already done"; leaving
+    it behind after a Force Re-scrape was the reason Force Re-scrape used to
+    fail silently (enqueue_batch reported skipped_already_done and produced
+    no queued rows).
+    """
     if not parse_batch:
         return {"purged": 0, "reason": "url_utils unavailable"}
     parsed = parse_batch(url, max_links=1)
@@ -121,8 +128,21 @@ def _purge_queue_rows(url: str) -> Dict[str, Any]:
     p = parsed.accepted[0]
     conn = _bot_db.connect()
     try:
-        r = conn.queue.delete_many({"url_hash": p.url_hash})
-        return {"purged": int(r.deleted_count), "url_hash": p.url_hash}
+        rq = conn.queue.delete_many({"url_hash": p.url_hash})
+        pu_n = 0
+        try:
+            r_pu = conn.processed_urls.delete_many({"_id": p.url_hash})
+            pu_n += int(r_pu.deleted_count)
+            r_pu2 = conn.processed_urls.delete_many({"url": p.normalised})
+            pu_n += int(r_pu2.deleted_count)
+        except Exception as e:  # noqa: BLE001
+            log.warning("purge: processed_urls delete failed: %s", e)
+            pu_n = -1
+        return {
+            "purged": int(rq.deleted_count),
+            "processed_urls_purged": pu_n,
+            "url_hash": p.url_hash,
+        }
     finally:
         try: conn.close()
         except Exception: pass
@@ -317,16 +337,38 @@ def purge_gallery(gallery_id: str) -> Dict[str, Any]:
             deleted["galleries"] = -1
 
         # 2) queue rows (pending / processing / completed / failed) ---------
+        #    Also purges processed_urls (v11.5 fix): the queue_service dedup
+        #    gate reads processed_urls.completed_at to decide "already done",
+        #    so leaving that tombstone behind is why Force-Delete used to
+        #    silently swallow the next enqueue attempt.
+        url_hash = None
         if parse_batch:
             try:
                 parsed = parse_batch(url, max_links=1)
                 if parsed.accepted:
                     p = parsed.accepted[0]
-                    r = conn.queue.delete_many({"url_hash": p.url_hash})
+                    url_hash = p.url_hash
+                    r = conn.queue.delete_many({"url_hash": url_hash})
                     deleted["queue"] = int(r.deleted_count)
             except Exception as e:  # noqa: BLE001
                 log.warning("purge: queue delete_many failed: %s", e)
                 deleted["queue"] = -1
+
+        # 2b) processed_urls tombstone (v11.5) ------------------------------
+        #     _id == url_hash; delete by hash if we have it, and also do a
+        #     belt-and-braces delete by url string for older rows that were
+        #     keyed differently.
+        try:
+            n = 0
+            if url_hash:
+                r = conn.processed_urls.delete_many({"_id": url_hash})
+                n += int(r.deleted_count)
+            r = conn.processed_urls.delete_many({"url": url})
+            n += int(r.deleted_count)
+            deleted["processed_urls"] = n
+        except Exception as e:  # noqa: BLE001
+            log.warning("purge: processed_urls delete failed: %s", e)
+            deleted["processed_urls"] = -1
 
         # 3) progress events (live UI cards) --------------------------------
         try:
