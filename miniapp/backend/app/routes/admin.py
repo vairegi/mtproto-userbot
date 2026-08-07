@@ -219,6 +219,21 @@ def rescrape_diag(target: str, _a: dict = Depends(require_admin)) -> dict:
     return rescrape.diagnose(target)
 
 
+# v11.3 — Force-Delete: purge a gallery from MongoDB WITHOUT re-enqueue.
+# Unlike /rescrape (which always re-queues), this just hard-deletes the
+# galleries doc + queue rows + progress/metrics events so the next
+# enqueue of the same URL is a completely fresh job. Admin-only.
+@router.delete("/purge/{gallery_id}")
+def purge_gallery_by_id(gallery_id: str, a: dict = Depends(require_admin)) -> dict:
+    """Hard-delete all MongoDB state for a gallery id (e.g. 650361).
+
+    Use this when a gallery is stuck/poisoned and should NOT be
+    re-queued automatically — the admin can re-add it later by just
+    using it in the app like a brand-new link.
+    """
+    return rescrape.purge_gallery(gallery_id)
+
+
 # ---- Feature 5: Broadcast to all users ----
 class BroadcastBody(BaseModel):
     text: str

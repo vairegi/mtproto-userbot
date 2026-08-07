@@ -264,3 +264,100 @@ def diagnose(url_or_id: str) -> Dict[str, Any]:
         try: conn.close()
         except Exception: pass
     return out
+
+
+# ---------------------------------------------------------------------------
+# v11.3 — Force-Delete (purge WITHOUT re-enqueue)
+# ---------------------------------------------------------------------------
+#
+# The existing force_rescrape() always re-enqueues the URL after purging,
+# which is not what an admin wants when they just need a stuck gallery
+# GONE from the database (e.g. duplicate processing bugs, a poisoned
+# doc that keeps claiming PROCESSING slots, or a takedown). purge_gallery
+# removes every trace of the gallery from MongoDB:
+#
+#   * galleries        — the dedup / status doc (via _id = gallery_id)
+#   * queue            — every row whose url_hash matches the gallery URL
+#   * progress_events  — live-progress rows so stale UI entries disappear
+#   * metrics_events   — any pipeline metrics rows referencing the gid
+#                        (best-effort; skipped if the collection doesn't
+#                        have a gallery_id field)
+#
+# Returns a dict describing what was deleted so the admin panel can show
+# it. This is a HARD delete — there is no tombstone. After purge, the
+# next enqueue of the same URL behaves as a completely fresh job.
+
+
+def purge_gallery(gallery_id: str) -> Dict[str, Any]:
+    """Hard-delete a gallery from MongoDB by numeric id (e.g. "650361").
+
+    Returns {"ok": True, "deleted": {...}} on success, or
+    {"ok": False, "reason": ...} on failure.
+    """
+    if not HAVE_BOT:
+        return {"ok": False, "reason": "bot helpers unavailable"}
+
+    gid_raw = (gallery_id or "").strip()
+    if not gid_raw:
+        return {"ok": False, "reason": "empty gallery id"}
+    if not gid_raw.isdigit():
+        return {"ok": False, "reason": "gallery id must be numeric (e.g. 650361)"}
+
+    url = f"https://nhentai.net/g/{gid_raw}/"
+    deleted: Dict[str, int] = {}
+
+    conn = _bot_db.connect()
+    try:
+        # 1) galleries doc (the dedup gate) ---------------------------------
+        try:
+            r = conn.galleries.delete_one({"_id": str(gid_raw)})
+            deleted["galleries"] = int(r.deleted_count)
+        except Exception as e:  # noqa: BLE001
+            log.warning("purge: galleries delete_one failed: %s", e)
+            deleted["galleries"] = -1
+
+        # 2) queue rows (pending / processing / completed / failed) ---------
+        if parse_batch:
+            try:
+                parsed = parse_batch(url, max_links=1)
+                if parsed.accepted:
+                    p = parsed.accepted[0]
+                    r = conn.queue.delete_many({"url_hash": p.url_hash})
+                    deleted["queue"] = int(r.deleted_count)
+            except Exception as e:  # noqa: BLE001
+                log.warning("purge: queue delete_many failed: %s", e)
+                deleted["queue"] = -1
+
+        # 3) progress events (live UI cards) --------------------------------
+        try:
+            r = conn.db["progress_events"].delete_many(
+                {"gallery_id": str(gid_raw)})
+            deleted["progress_events"] = int(r.deleted_count)
+        except Exception as e:  # noqa: BLE001
+            log.warning("purge: progress_events delete failed: %s", e)
+            deleted["progress_events"] = -1
+
+        # 4) metrics events (best-effort; field may not exist) --------------
+        try:
+            r = conn.db["metrics_events"].delete_many(
+                {"gallery_id": str(gid_raw)})
+            deleted["metrics_events"] = int(r.deleted_count)
+        except Exception:  # noqa: BLE001
+            # Collection may not have this field — not an error.
+            deleted["metrics_events"] = 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    total = sum(v for v in deleted.values() if isinstance(v, int) and v > 0)
+    log.info("purge_gallery(%s) deleted=%s", gid_raw, deleted)
+    return {
+        "ok": True,
+        "gallery_id": gid_raw,
+        "url": url,
+        "deleted": deleted,
+        "total_deleted": total,
+        "note": "gallery fully purged — next enqueue will be a fresh job",
+    }

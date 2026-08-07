@@ -25,6 +25,7 @@ export async function render(root, { me }) {
   root.appendChild(sectionShareGuard());
   root.appendChild(sectionForceJoin());
   root.appendChild(sectionRescrape());    // v10: Force Re-scrape + Failed galleries
+  root.appendChild(sectionForceDelete()); // v11.3: Force-Delete (purge, no re-queue)
   root.appendChild(sectionBroadcast());   // v10: Broadcast to users
   root.appendChild(sectionBackground());  // v10: App-wide default background
   root.appendChild(sectionUsers());
@@ -620,6 +621,63 @@ function sectionRescrape() {
   }
   wrap.appendChild(list);
   refreshList();
+  return wrap;
+}
+
+// -------- v11.3. Force-Delete (purge WITHOUT re-queue) --------
+function sectionForceDelete() {
+  const wrap = h("div", { class: "admin-section" });
+  wrap.appendChild(h("h3", {}, "🗑️ Force-Delete gallery"));
+  wrap.appendChild(h("div", {
+    style: { color: "var(--du-ink-lo)", fontSize: "11px", margin: "4px 0 8px" },
+  }, "Hard-delete a gallery from the database by its numeric ID "
+   + "(e.g. 650361). Unlike Force Re-scrape this does NOT re-queue it "
+   + "— the link can then be added again as a completely fresh job "
+   + "the next time anyone uses it. Removes the galleries doc, every "
+   + "queue row, and any stale progress events."));
+
+  const input = h("input", {
+    type: "text",
+    inputmode: "numeric",
+    placeholder: "Gallery ID only (e.g. 650361)",
+    style: { flex: "1", minWidth: "0" },
+  });
+  const delBtn = h("button", { class: "btn danger btn-glow",
+    onclick: async () => {
+      const v = (input.value || "").trim();
+      if (!v) { toast("Enter a gallery id", "error"); return; }
+      if (!/^\d+$/.test(v)) {
+        toast("Gallery id must be numeric (e.g. 650361)", "error");
+        return;
+      }
+      // Confirm-destructive: one extra tap guards against accidental
+      // purges of a gallery a user is actively downloading.
+      if (!window.confirm(
+        `Hard-delete gallery #${v} from MongoDB?\n\n` +
+        "This removes the dedup doc, all queue rows, and progress " +
+        "events. The gallery is NOT re-queued."
+      )) return;
+      haptic("heavy");
+      try {
+        // NOTE: the api helper exposes `del` (not `delete`, a reserved word).
+        const r = await api.del(`/api/admin/purge/${encodeURIComponent(v)}`);
+        if (r.ok) {
+          toast(
+            `✅ Purged #${v} — ${r.total_deleted || 0} doc(s) removed ` +
+            `(galleries: ${r.deleted?.galleries ?? 0}, ` +
+            `queue: ${r.deleted?.queue ?? 0})`,
+            "success",
+          );
+          input.value = "";
+        } else {
+          toast("Purge failed: " + (r.reason || "unknown"), "error");
+        }
+      } catch (e) { toast(e.message, "error"); }
+    },
+  }, "🗑️ Force-Delete");
+  wrap.appendChild(h("div", {
+    style: { display: "flex", gap: "8px", alignItems: "center" },
+  }, input, delBtn));
   return wrap;
 }
 
