@@ -505,6 +505,269 @@ async def cmd_allsaved(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         chunk, parse_mode="Markdown", disable_web_page_preview=True)
 
 
+# ---------------------------------------------------------------------------
+# v11.5 — Manual safety-net commands.
+#
+# Purpose: when the automatic pipeline fails to relay a gallery (e.g. the
+# post is stuck "queued" in the mini-app and neither Force Re-scrape nor
+# Force-Delete unblocks it), the admin can drop into a manual fallback:
+#
+#   /coverpost <url>              — the bot scrapes metadata, posts the
+#                                   cover to the DB channel itself, and
+#                                   replies with the message-id so the admin
+#                                   can find it easily.
+#   /verify <url> <cover_msg_id>  — bind an already-posted cover (posted
+#                                   manually or by /coverpost) to the gallery's
+#                                   MongoDB doc. Marks it COMPLETED with the
+#                                   right db_cover_msg_id + open_link so the
+#                                   mini-app forwards straight from the DB
+#                                   channel next time anyone taps it.
+# ---------------------------------------------------------------------------
+def _build_open_link(channel_id: int, msg_id: int) -> str:
+    """Same convention cover_poster.build_open_link uses:
+    channel id -100xxxxxxxxxx -> t.me/c/xxxxxxxxxx/<msg_id>.
+    """
+    cid = str(int(channel_id))
+    if cid.startswith("-100"):
+        cid = cid[4:]
+    elif cid.startswith("-"):
+        cid = cid[1:]
+    return f"https://t.me/c/{cid}/{int(msg_id)}"
+
+
+@only_admin
+async def cmd_coverpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually post a cover for a nhentai gallery to the DB channel.
+
+    Usage: /coverpost <url|gallery_id>
+
+    The bot scrapes metadata via hf_scraper, builds the standard cover
+    caption, and posts the cover photo to `database_channel_id` using
+    PTB's send_photo (which uploads by URL). Replies to the admin with
+    the resulting message-id + open-link so they know exactly what to
+    /verify next.
+    """
+    msg = update.effective_message
+    args = ctx.args or []
+    if not args:
+        await msg.reply_text(
+            "Usage: /coverpost <url_or_gallery_id>\n"
+            "Example: /coverpost 393878\n"
+            "Example: /coverpost https://nhentai.net/g/393878/"
+        )
+        return
+
+    raw = args[0].strip()
+    url = f"https://nhentai.net/g/{raw}/" if raw.isdigit() else raw
+
+    await msg.reply_text(f"🔎 Scraping metadata for {url} …")
+
+    try:
+        meta = await hf_scraper.fetch_gallery_meta(url)
+    except Exception as e:  # noqa: BLE001
+        await msg.reply_text(f"❌ hf_scraper raised: {e!s}")
+        return
+
+    if meta is None or not (getattr(meta, "title", None)
+                            or getattr(meta, "gallery_id", None)):
+        await msg.reply_text(
+            "❌ hf_scraper returned no metadata. The gallery may have been "
+            "removed, or the source is currently rate-limiting us."
+        )
+        return
+
+    # Build the caption using cover_poster's helper so it looks identical to
+    # the automatic pipeline (grouped tags, gallery-id line, no URL).
+    try:
+        import cover_poster as _cp
+        caption = _cp._format_caption(
+            title=str(getattr(meta, "title", "") or ""),
+            tags=getattr(meta, "tags", []) or [],
+            pages=getattr(meta, "pages", None),
+            url=url,
+            requester_handle=None,
+            gallery_id=str(getattr(meta, "gallery_id", "") or ""),
+        )
+    except Exception as e:  # noqa: BLE001
+        # Fallback caption if cover_poster's helper isn't importable here.
+        log.warning("cmd_coverpost: _format_caption failed: %s", e)
+        caption = (f"**{getattr(meta, 'title', '(untitled)')}**\n\n"
+                   f"➤ #{getattr(meta, 'gallery_id', '?')}")
+
+    cover_url = getattr(meta, "cover_url", None)
+    if not cover_url:
+        await msg.reply_text(
+            "❌ hf_scraper returned no cover_url for this gallery. "
+            "You'll need to post the cover manually."
+        )
+        return
+
+    channel_id = int(settings.database_channel_id)
+    try:
+        sent = await ctx.bot.send_photo(
+            chat_id=channel_id,
+            photo=cover_url,
+            caption=caption,
+            parse_mode="Markdown",
+        )
+    except Exception as e:  # noqa: BLE001
+        await msg.reply_text(
+            f"❌ Failed to send_photo to DB channel: {e!s}\n"
+            "You can post the cover manually and then use /verify."
+        )
+        return
+
+    open_link = _build_open_link(channel_id, sent.message_id)
+    await msg.reply_text(
+        "✅ Cover posted to DB channel.\n\n"
+        f"📑 Message id: `{sent.message_id}`\n"
+        f"🔗 Open link: {open_link}\n\n"
+        f"Now post the PDF in the DB channel, then run:\n"
+        f"`/verify {url} {sent.message_id}`\n\n"
+        "That binds this cover to the gallery so the mini-app forwards "
+        "from here next time anyone taps this post.",
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+
+
+@only_admin
+async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bind an already-posted cover (posted manually or via /coverpost) to a
+    gallery's MongoDB doc, marking it COMPLETED so the mini-app forwards
+    from the DB channel next time anyone taps this post.
+
+    Usage: /verify <url|gallery_id> <cover_msg_id> [pdf_msg_id]
+
+    Also clears the processed_urls / queue tombstones so the doc is clean.
+    """
+    msg = update.effective_message
+    args = ctx.args or []
+    if len(args) < 2:
+        await msg.reply_text(
+            "Usage: /verify <url_or_gallery_id> <cover_msg_id> [pdf_msg_id]\n"
+            "Example: /verify 393878 12345\n"
+            "Example: /verify https://nhentai.net/g/393878/ 12345 12346"
+        )
+        return
+
+    raw = args[0].strip()
+    try:
+        cover_msg_id = int(args[1])
+    except (TypeError, ValueError):
+        await msg.reply_text("cover_msg_id must be an integer.")
+        return
+    pdf_msg_id: Optional[int] = None
+    if len(args) >= 3:
+        try:
+            pdf_msg_id = int(args[2])
+        except (TypeError, ValueError):
+            await msg.reply_text("pdf_msg_id (optional) must be an integer.")
+            return
+
+    url = f"https://nhentai.net/g/{raw}/" if raw.isdigit() else raw
+
+    # Extract the gallery_id from the URL exactly like the pipeline does.
+    try:
+        gid = _gs.extract_gallery_id(url)
+    except Exception as e:  # noqa: BLE001
+        await msg.reply_text(f"Failed to extract gallery_id: {e!s}")
+        return
+    if not gid:
+        await msg.reply_text("Could not extract a numeric gallery id from that URL.")
+        return
+
+    # Best-effort metadata scrape so the doc carries title/pages/tags.
+    meta_title = None
+    meta_pages = None
+    try:
+        meta = await hf_scraper.fetch_gallery_meta(url)
+        if meta:
+            meta_title = getattr(meta, "title", None)
+            meta_pages = getattr(meta, "pages", None)
+    except Exception as e:  # noqa: BLE001
+        log.warning("/verify: metadata fetch failed for %s: %s", url, e)
+
+    channel_id = int(settings.database_channel_id)
+    open_link = _build_open_link(channel_id, cover_msg_id)
+    now_ts = _time_mod.time()
+
+    conn = db.connect()
+    try:
+        # 1) Upsert the galleries doc as COMPLETED with the manual msg ids.
+        set_doc = {
+            "status": "COMPLETED",
+            "gallery_id": str(gid),
+            "open_link": open_link,
+            "db_cover_msg_id": int(cover_msg_id),
+            "completed_at": now_ts,
+            "updated_at": now_ts,
+            "manual_verified": True,
+            "manual_verified_by": int(update.effective_user.id),
+        }
+        if pdf_msg_id is not None:
+            set_doc["db_pdf_msg_id"] = int(pdf_msg_id)
+        if meta_title:
+            set_doc["title"] = meta_title
+        if meta_pages:
+            set_doc["pages"] = int(meta_pages)
+
+        conn.galleries.update_one(
+            {"_id": str(gid)},
+            {"$set": set_doc, "$setOnInsert": {"created_at": now_ts}},
+            upsert=True,
+        )
+
+        # 2) Clear stale queue rows + processed_urls tombstone by url_hash.
+        purged_queue = 0
+        purged_processed = 0
+        try:
+            from url_utils import parse_batch as _pb
+            parsed = _pb(url, max_links=1)
+            if parsed.accepted:
+                p = parsed.accepted[0]
+                r = conn.queue.delete_many({"url_hash": p.url_hash})
+                purged_queue = int(r.deleted_count)
+                # We're rewriting the tombstone below — clear the old one first.
+                r2 = conn.processed_urls.delete_many({"_id": p.url_hash})
+                purged_processed = int(r2.deleted_count)
+                # 3) Write a fresh processed_urls tombstone with completed_at
+                #    so any second attempt at auto-relaying this URL will be
+                #    correctly recognised as "already done".
+                conn.processed_urls.update_one(
+                    {"_id": p.url_hash},
+                    {"$set": {
+                        "_id":           p.url_hash,
+                        "url":           p.normalised,
+                        "first_seen_at": now_ts,
+                        "completed_at":  now_ts,
+                        "manual":        True,
+                    }},
+                    upsert=True,
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("/verify: queue/processed_urls cleanup failed: %s", e)
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+    await msg.reply_text(
+        "✅ Gallery verified & bound.\n\n"
+        f"• gallery_id  : `{gid}`\n"
+        f"• status      : COMPLETED\n"
+        f"• cover_msg_id: `{cover_msg_id}`"
+        + (f"\n• pdf_msg_id  : `{pdf_msg_id}`" if pdf_msg_id is not None else "")
+        + f"\n• open_link   : {open_link}\n"
+        f"• title       : {meta_title or '(unavailable)'}\n"
+        f"• queue rows purged     : {purged_queue}\n"
+        f"• processed_urls purged : {purged_processed}\n\n"
+        "The mini-app will now forward directly from the DB channel when "
+        "anyone taps this post.",
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+
+
 @only_public
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     conn = db.connect()
@@ -1310,43 +1573,80 @@ async def cb_search_picker(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
 @only_public
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """v11.5 — full command reference. Every registered command is listed
+    here so admins can discover /topsave, /allsaved, /broadcast, /coverpost,
+    /verify, and the auto-queue / mini-app control commands without having
+    to read the source.
+    """
     uid = int(update.effective_user.id)
     is_super = _is_super(uid)
     is_admin = _is_admin(uid)
     is_public = _is_public()
 
-    lines = ["Available commands:", ""]
-    # Everyone-friendly commands
-    lines.append("Everyday:")
-    lines.append("  /search <keyword>  search hentaifox.com directly (uses tokens for non-admins)")
+    lines: list[str] = ["Available commands:", ""]
+
+    # ---- Everyday (all users, subject to public-mode gate) ---------------
+    lines.append("🔹 Everyday:")
+    lines.append("  /search <keyword>  search directly (uses tokens for non-admins)")
     lines.append("  /token             show your remaining daily tokens")
-    lines.append("  /queue             pending/processing/done counts")
+    lines.append("  /queue             pending / processing / done counts")
     lines.append("  /status            last 5 jobs with status")
     lines.append("  /help              show this message")
     lines.append("")
+
+    # ---- URL submission --------------------------------------------------
     if is_admin:
-        lines.append("Admin URL submission (goes to Bot 1 + Bot 2 only, no /mpost):")
+        lines.append("🔹 URL submission (goes to Bot 1 + Bot 2 only, no /mpost):")
         lines.append("  /fetch <url>       queue one or more gallery URLs (one per line)")
-        lines.append("  Auto-fetch: send any message containing a whitelisted URL.")
+        lines.append("  Auto-fetch         send any message containing a whitelisted URL")
     else:
         lines.append("Only admins can drop URLs directly. Use /search to post from the catalog.")
+    lines.append("")
+
+    # ---- Admin: queue / broadcast / saves stats --------------------------
     if is_admin:
-        lines.append("")
-        lines.append("Admin only:")
+        lines.append("🔹 Admin — queue control:")
         lines.append("  /pause             stop consuming new jobs (finish current)")
         lines.append("  /resume            resume consuming")
         lines.append("  /last              full error text of the most recent failed job")
         lines.append("  /health            session, disk, queue depth, last bot pings")
+        lines.append("  /diag              scraper diagnostics (source, endpoint, cache)")
         lines.append("  /alltoken          everyone's daily token usage (sorted)")
-        lines.append("  /autoon          enable daily random-gallery auto-queue")
-        lines.append("  /autooff         disable auto-queue")
-        lines.append("  /autotime HH:MM  set daily queue time (IST, 24-hour)")
-        lines.append("  /autocooldown N  set minutes between auto-posts (default 30)")
-
-        lines.append("  /autostatus      show auto-queue configuration")
-    if is_super:
         lines.append("")
-        lines.append("Super-admin only:")
+        lines.append("🔹 Admin — broadcast (v11.4):")
+        lines.append("  /broadcast         reply to a message to broadcast it verbatim")
+        lines.append("                     (text / photo / video / document / styled")
+        lines.append("                     caption with spoilers — all preserved)")
+        lines.append("")
+        lines.append("🔹 Admin — saves stats (v11.4):")
+        lines.append("  /topsave           most-saved doujinshi across all users")
+        lines.append("  /allsaved          per-user save summary (top 10 users +")
+        lines.append("                     each user's 5 most recent saved links)")
+        lines.append("")
+        lines.append("🔹 Admin — manual relay safety-net (v11.5):")
+        lines.append("  /coverpost <url>                   post a cover to the DB channel")
+        lines.append("                                     yourself (returns msg_id)")
+        lines.append("  /verify <url> <cover_msg_id> [pdf_msg_id]")
+        lines.append("                                     bind an already-posted cover to")
+        lines.append("                                     a gallery so the mini-app")
+        lines.append("                                     forwards from the DB channel")
+        lines.append("")
+        lines.append("🔹 Admin — auto-queue scheduler:")
+        lines.append("  /autoon            enable daily random-gallery auto-queue")
+        lines.append("  /autooff           disable auto-queue")
+        lines.append("  /autotime HH:MM    set daily queue time (IST, 24-hour)")
+        lines.append("  /autocooldown N    set minutes between auto-posts (default 30)")
+        lines.append("  /autostatus        show auto-queue configuration")
+        lines.append("")
+        lines.append("🔹 Admin — mini-app control:")
+        lines.append("  /app               open the mini-app (with WebApp button)")
+        lines.append("  /appon             mark the mini-app publicly visible")
+        lines.append("  /appoff            hide the mini-app (admins only)")
+        lines.append("")
+
+    # ---- Super-admin -----------------------------------------------------
+    if is_super:
+        lines.append("🔹 Super-admin only:")
         lines.append("  /onpublic               open bot to any user (public mode ON)")
         lines.append("  /offpublic              close bot to admins only (public mode OFF)")
         lines.append("  /freepost <n>           set daily token cap for regular users")
@@ -1357,7 +1657,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("  /addsuperadmin <id>     grant super-admin")
         lines.append("  /removesuperadmin <id>  demote super-admin to regular")
         lines.append("  /listadmins             show all admins and tiers")
-    lines.append("")
+        lines.append("")
+
     lines.append(f"Public mode is currently: {'🌐 ON' if is_public else '🔒 OFF'}")
     lines.append("📢 All doujinshi posted here → https://t.me/+uyNxVAVPdUBlOWU9")
     await update.effective_message.reply_text("\n".join(lines))
@@ -1959,6 +2260,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("topsave", cmd_topsave))
     app.add_handler(CommandHandler("allsaved", cmd_allsaved))
+    app.add_handler(CommandHandler("coverpost", cmd_coverpost))
+    app.add_handler(CommandHandler("verify", cmd_verify))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("last", cmd_last))
     app.add_handler(CommandHandler("health", cmd_health))
