@@ -1573,10 +1573,18 @@ async def cb_search_picker(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
 @only_public
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """v11.5 — full command reference. Every registered command is listed
-    here so admins can discover /topsave, /allsaved, /broadcast, /coverpost,
-    /verify, and the auto-queue / mini-app control commands without having
-    to read the source.
+    """v11.6 — SLIM /help.
+
+    Per user's rules for v11.6, the everyday listing is now short.
+    The following commands have been REMOVED from /help but remain
+    registered internally (back-compat, unchanged behaviour):
+      /search /token /queue /status /fetch
+      /pause /resume /last /health
+      /alltoken
+      /autoon /autooff /autotime /autocooldown /autostatus
+
+    For a full screenshot-style command reference (bullet + example
+    per command), see /description.
     """
     uid = int(update.effective_user.id)
     is_super = _is_super(uid)
@@ -1585,63 +1593,24 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines: list[str] = ["Available commands:", ""]
 
-    # ---- Everyday (all users, subject to public-mode gate) ---------------
+    # ---- Everyday --------------------------------------------------------
     lines.append("🔹 Everyday:")
-    lines.append("  /search <keyword>  search directly (uses tokens for non-admins)")
-    lines.append("  /token             show your remaining daily tokens")
-    lines.append("  /queue             pending / processing / done counts")
-    lines.append("  /status            last 5 jobs with status")
-    lines.append("  /help              show this message")
+    lines.append("  /help          compact command list")
+    lines.append("  /description   full screenshot-style command reference")
     lines.append("")
 
-    # ---- URL submission --------------------------------------------------
+    # ---- Admin -----------------------------------------------------------
     if is_admin:
-        lines.append("🔹 URL submission (goes to Bot 1 + Bot 2 only, no /mpost):")
-        lines.append("  /fetch <url>       queue one or more gallery URLs (one per line)")
-        lines.append("  Auto-fetch         send any message containing a whitelisted URL")
-    else:
-        lines.append("Only admins can drop URLs directly. Use /search to post from the catalog.")
-    lines.append("")
-
-    # ---- Admin: queue / broadcast / saves stats --------------------------
-    if is_admin:
-        lines.append("🔹 Admin — queue control:")
-        lines.append("  /pause             stop consuming new jobs (finish current)")
-        lines.append("  /resume            resume consuming")
-        lines.append("  /last              full error text of the most recent failed job")
-        lines.append("  /health            session, disk, queue depth, last bot pings")
-        lines.append("  /diag              scraper diagnostics (source, endpoint, cache)")
-        lines.append("  /alltoken          everyone's daily token usage (sorted)")
-        lines.append("")
-        lines.append("🔹 Admin — broadcast (v11.4):")
-        lines.append("  /broadcast         reply to a message to broadcast it verbatim")
-        lines.append("                     (text / photo / video / document / styled")
-        lines.append("                     caption with spoilers — all preserved)")
-        lines.append("")
-        lines.append("🔹 Admin — saves stats (v11.4):")
-        lines.append("  /topsave           most-saved doujinshi across all users")
-        lines.append("  /allsaved          per-user save summary (top 10 users +")
-        lines.append("                     each user's 5 most recent saved links)")
-        lines.append("")
-        lines.append("🔹 Admin — manual relay safety-net (v11.5):")
+        lines.append("🔹 Admin:")
+        lines.append("  /diag                              scraper diagnostics")
         lines.append("  /coverpost <url>                   post a cover to the DB channel")
-        lines.append("                                     yourself (returns msg_id)")
-        lines.append("  /verify <url> <cover_msg_id> [pdf_msg_id]")
-        lines.append("                                     bind an already-posted cover to")
-        lines.append("                                     a gallery so the mini-app")
-        lines.append("                                     forwards from the DB channel")
-        lines.append("")
-        lines.append("🔹 Admin — auto-queue scheduler:")
-        lines.append("  /autoon            enable daily random-gallery auto-queue")
-        lines.append("  /autooff           disable auto-queue")
-        lines.append("  /autotime HH:MM    set daily queue time (IST, 24-hour)")
-        lines.append("  /autocooldown N    set minutes between auto-posts (default 30)")
-        lines.append("  /autostatus        show auto-queue configuration")
-        lines.append("")
-        lines.append("🔹 Admin — mini-app control:")
-        lines.append("  /app               open the mini-app (with WebApp button)")
-        lines.append("  /appon             mark the mini-app publicly visible")
-        lines.append("  /appoff            hide the mini-app (admins only)")
+        lines.append("  /verify <url> <cover_id> [pdf_id]  bind a cover to a gallery")
+        lines.append("  /broadcast                         reply to a message to broadcast it")
+        lines.append("  /topsave                           most-saved doujinshi across all users")
+        lines.append("  /allsaved                          per-user save summary")
+        lines.append("  /app                               open the mini-app")
+        lines.append("  /appon                             show mini-app to everyone")
+        lines.append("  /appoff                            hide mini-app from non-admins")
         lines.append("")
 
     # ---- Super-admin -----------------------------------------------------
@@ -1662,6 +1631,122 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append(f"Public mode is currently: {'🌐 ON' if is_public else '🔒 OFF'}")
     lines.append("📢 All doujinshi posted here → https://t.me/+uyNxVAVPdUBlOWU9")
     await update.effective_message.reply_text("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# /description — v11.6 screenshot-style FULL command reference.
+#
+# Matches the layout the user pointed at (Doujinshi File bot screenshot):
+# each command appears as a bullet with a short description and an example.
+# Uses Markdown so the example lines render as inline code. Web-page preview
+# is disabled so the trailing t.me invite doesn't blow up into a big card.
+# ---------------------------------------------------------------------------
+@only_public
+async def cmd_description(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Full command reference, category-wise, bullet+example per command."""
+    from telegram.constants import ParseMode  # local import, avoid top-level churn
+
+    uid = int(update.effective_user.id)
+    is_super = _is_super(uid)
+    is_admin = _is_admin(uid)
+
+    L: list[str] = []
+    L.append("📖 *Full command reference*")
+    L.append("")
+
+    # ---- General (everyone) ---------------------------------------------
+    L.append("👤 *General*")
+    L.append("• /help — compact command list")
+    L.append("    _example:_ `/help`")
+    L.append("• /description — this full reference")
+    L.append("    _example:_ `/description`")
+    L.append("")
+
+    if is_admin:
+        # ---- Admin: diagnostics ------------------------------------------
+        L.append("🩺 *Admin — diagnostics*")
+        L.append("• /diag — scraper diagnostics (source, endpoint, live search)")
+        L.append("    _example:_ `/diag`")
+        L.append("")
+
+        # ---- Admin: manual relay safety-net ------------------------------
+        L.append("🛠 *Admin — manual relay safety-net*")
+        L.append("• /coverpost `<url_or_id>` — post a cover to the DB channel; "
+                 "replies with the message id and open link")
+        L.append("    _example:_ `/coverpost https://nhentai.net/g/393878/`")
+        L.append("• /verify `<url_or_id> <cover_msg_id> [pdf_msg_id]` — bind an "
+                 "already-posted cover to a gallery so the mini-app forwards "
+                 "from the DB channel")
+        L.append("    _example:_ `/verify 393878 12345 12346`")
+        L.append("")
+
+        # ---- Admin: broadcast --------------------------------------------
+        L.append("📣 *Admin — broadcast*")
+        L.append("• /broadcast — reply to any message (text / photo / video / "
+                 "document / styled caption with spoilers) to copy it to every "
+                 "non-banned mini-app user (~20 msg/s)")
+        L.append("    _example:_ reply `/broadcast` to the message you want sent")
+        L.append("")
+
+        # ---- Admin: saves stats ------------------------------------------
+        L.append("⭐ *Admin — saves stats*")
+        L.append("• /topsave — most-saved doujinshi across all users")
+        L.append("    _example:_ `/topsave`")
+        L.append("• /allsaved — per-user save summary (top 10 users + each "
+                 "user's 5 most recent saved links)")
+        L.append("    _example:_ `/allsaved`")
+        L.append("")
+
+        # ---- Admin: mini-app control -------------------------------------
+        L.append("📱 *Admin — mini-app control*")
+        L.append("• /app — open the mini-app (WebApp button)")
+        L.append("    _example:_ `/app`")
+        L.append("• /appon — make the mini-app publicly visible")
+        L.append("    _example:_ `/appon`")
+        L.append("• /appoff — hide the mini-app from non-admins")
+        L.append("    _example:_ `/appoff`")
+        L.append("")
+
+    if is_super:
+        L.append("👑 *Super-admin only*")
+        L.append("• /onpublic — open bot to any user (public mode ON)")
+        L.append("    _example:_ `/onpublic`")
+        L.append("• /offpublic — close bot to admins only (public mode OFF)")
+        L.append("    _example:_ `/offpublic`")
+        L.append("• /freepost `<n>` — set daily token cap for regular users")
+        L.append("    _example:_ `/freepost 10`")
+        L.append("• /settoken `@user <n>` — set a user's remaining tokens for today")
+        L.append("    _example:_ `/settoken @alice 5`")
+        L.append("• /resettokens — reset everyone's used_today to 0 now")
+        L.append("    _example:_ `/resettokens`")
+        L.append("• /addadmin `<id>` — grant regular admin")
+        L.append("    _example:_ `/addadmin 123456789`")
+        L.append("• /removeadmin `<id>` — revoke admin (any tier)")
+        L.append("    _example:_ `/removeadmin 123456789`")
+        L.append("• /addsuperadmin `<id>` — grant super-admin")
+        L.append("    _example:_ `/addsuperadmin 123456789`")
+        L.append("• /removesuperadmin `<id>` — demote super-admin to regular")
+        L.append("    _example:_ `/removesuperadmin 123456789`")
+        L.append("• /listadmins — show all admins and tiers")
+        L.append("    _example:_ `/listadmins`")
+        L.append("")
+
+    # ---- Hidden-but-registered (back-compat; still work if typed) --------
+    if is_admin:
+        L.append("💤 *Still registered (hidden from /help)*")
+        L.append("_These work but are intentionally not listed in /help:_")
+        L.append("`/search  /token  /queue  /status  /fetch  /pause  /resume  "
+                 "/last  /health  /alltoken  /autoon  /autooff  /autotime  "
+                 "/autocooldown  /autostatus`")
+        L.append("")
+
+    L.append("📢 All doujinshi posted here → https://t.me/+uyNxVAVPdUBlOWU9")
+
+    await update.effective_message.reply_text(
+        "\n".join(L),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
 
 
 async def _on_startup(app: Application) -> None:
@@ -2266,6 +2351,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("last", cmd_last))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("help", cmd_help))
+    # v11.6: full screenshot-style command reference.
+    app.add_handler(CommandHandler("description", cmd_description))
     # Super-admin commands
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))

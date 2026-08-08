@@ -232,11 +232,53 @@ async def _get_client() -> httpx.AsyncClient:
 _client: Optional[httpx.AsyncClient] = None
 
 
-# v11.2: short per-path back-off cache for 429s. When nhentai
+# v11.2 / v11.6: short per-path back-off cache for 429s. When nhentai
 # rate-limits us, subsequent identical paths hit this cache instead of
 # hammering upstream and flooding the log. Keyed by (path, frozenset(params)).
+#
+# v11.6 hardening:
+#   * Base TTL raised 30s -> 60s (empirically nhentai's window is closer
+#     to a full minute; 30s often just re-hit the ban).
+#   * Exponential ramp on repeat 429s for the same key (cap 300s).
+#   * Honour the server's `Retry-After` header when present.
+#   * All three tunables env-overridable so ops can adjust without redeploy:
+#         NH_RATE_LIMIT_TTL_SEC        (default 60)
+#         NH_RATE_LIMIT_TTL_CAP_SEC    (default 300)
+#         NH_RATE_LIMIT_RAMP           (default 2.0)
+import os as _os_rl  # local alias, avoid collision with top-level `os`
 _RATE_LIMIT_CACHE: "dict[tuple, float]" = {}
-_RATE_LIMIT_TTL_SEC = 30
+_RATE_LIMIT_STRIKES: "dict[tuple, int]" = {}
+try:
+    _RATE_LIMIT_TTL_SEC = int(_os_rl.environ.get("NH_RATE_LIMIT_TTL_SEC", "60"))
+except (TypeError, ValueError):
+    _RATE_LIMIT_TTL_SEC = 60
+try:
+    _RATE_LIMIT_TTL_CAP_SEC = int(_os_rl.environ.get("NH_RATE_LIMIT_TTL_CAP_SEC", "300"))
+except (TypeError, ValueError):
+    _RATE_LIMIT_TTL_CAP_SEC = 300
+try:
+    _RATE_LIMIT_RAMP = float(_os_rl.environ.get("NH_RATE_LIMIT_RAMP", "2.0"))
+except (TypeError, ValueError):
+    _RATE_LIMIT_RAMP = 2.0
+
+
+def _rate_limit_backoff_sec(cache_key: tuple, retry_after: Optional[str]) -> int:
+    """Compute the next back-off duration for a rate-limited key.
+
+    - If the upstream sent Retry-After (seconds), respect it (clamped to cap).
+    - Otherwise, TTL * ramp^strikes, clamped to [TTL, TTL_CAP].
+    Strike count is stored per key and reset only when the key succeeds.
+    """
+    if retry_after:
+        try:
+            ra = int(float(str(retry_after).strip()))
+            return max(_RATE_LIMIT_TTL_SEC, min(_RATE_LIMIT_TTL_CAP_SEC, ra))
+        except (TypeError, ValueError):
+            pass
+    strikes = _RATE_LIMIT_STRIKES.get(cache_key, 0)
+    dur = _RATE_LIMIT_TTL_SEC * (_RATE_LIMIT_RAMP ** strikes)
+    _RATE_LIMIT_STRIKES[cache_key] = strikes + 1
+    return int(max(_RATE_LIMIT_TTL_SEC, min(_RATE_LIMIT_TTL_CAP_SEC, dur)))
 
 
 async def _http_get_json(path: str, params: Optional[dict] = None) -> Optional[dict]:
@@ -262,12 +304,20 @@ async def _http_get_json(path: str, params: Optional[dict] = None) -> Optional[d
         client = await _get_client()
         r = await client.get(url, params=params)
         if r.status_code == 429:
-            _RATE_LIMIT_CACHE[cache_key] = now + _RATE_LIMIT_TTL_SEC
+            retry_after = r.headers.get("Retry-After") if hasattr(r, "headers") else None
+            dur = _rate_limit_backoff_sec(cache_key, retry_after)
+            _RATE_LIMIT_CACHE[cache_key] = now + dur
             log.warning(
-                "nhentai HTTP 429 for %s params=%s — backing off for %ss",
-                path, params, _RATE_LIMIT_TTL_SEC,
+                "nhentai HTTP 429 for %s params=%s — backing off for %ss"
+                "%s",
+                path, params, dur,
+                f" (Retry-After={retry_after})" if retry_after else "",
             )
             return None
+        # Success path: reset the strike counter for this key so a later
+        # 429 for the same key starts back at the base TTL.
+        if 200 <= r.status_code < 300:
+            _RATE_LIMIT_STRIKES.pop(cache_key, None)
         if r.status_code != 200:
             log.warning("nhentai HTTP %s for %s params=%s", r.status_code, path, params)
             return None
