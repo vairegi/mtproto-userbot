@@ -446,6 +446,154 @@ async def cmd_topsave(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# v11.7 — /weekly digest
+# ---------------------------------------------------------------------------
+_WEEKLY_DIGEST_TASK_KEY     = "_weekly_digest_task"
+_WEEKLY_DIGEST_DEFAULT_TIME = "10:00"   # IST (UTC+5:30)
+_WEEKLY_DIGEST_DEFAULT_DOW  = 6         # 0=Mon..6=Sun
+
+
+def _weekly_digest_last_run(conn) -> str:
+    return db.get_flag(conn, "weekly_digest_last_run", "")
+
+
+def _weekly_digest_mark_ran(conn, when_iso: str) -> None:
+    db.set_flag(conn, "weekly_digest_last_run", when_iso)
+
+
+def _compose_weekly_digest(conn) -> Optional[str]:
+    """Return a Markdown-formatted digest, or None if there were no saves this week."""
+    week_ago = dt.datetime.utcnow() - dt.timedelta(days=7)
+    rows = list(conn.db["miniapp_bookmarks"].aggregate([
+        {"$match": {"created_at": {"$gte": week_ago}}},
+        {"$group": {
+            "_id":   "$gallery_id",
+            "count": {"$sum": 1},
+            "title": {"$first": "$title"},
+        }},
+        {"$sort":  {"count": -1}},
+        {"$limit": 5},
+    ]))
+    if not rows:
+        return None
+    lines = ["🔥 *This week's top 5 saves*", ""]
+    for i, r in enumerate(rows, 1):
+        gid = r.get("_id")
+        title = (r.get("title") or f"#{gid}")
+        if len(title) > 60:
+            title = title[:57] + "..."
+        title = title.replace("[", "(").replace("]", ")")
+        lines.append(f"{i}. [{title}]({_glink(gid)}) — saved by {r.get('count', 0)} user(s)")
+    lines.append("")
+    lines.append("👋 Enjoying the bot? Open the mini-app and browse more!")
+    return "\n".join(lines)
+
+
+async def _broadcast_weekly_digest(app, body: str) -> tuple[int, int]:
+    """Send the digest to every non-banned mini-app user. Returns (ok, fail)."""
+    conn = db.connect()
+    try:
+        users = list(conn.db["miniapp_users"].find(
+            {"banned": {"$ne": True}}, {"_id": 1}))
+    finally:
+        conn.close()
+    ok = fail = 0
+    for u in users:
+        uid = int(u.get("_id") or 0)
+        if not uid:
+            continue
+        try:
+            await app.bot.send_message(
+                chat_id=uid, text=body,
+                parse_mode="Markdown", disable_web_page_preview=True,
+            )
+            ok += 1
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            log.debug("weekly digest to %s failed: %s", uid, e)
+        await asyncio.sleep(0.06)   # ~16 msg/s
+    return ok, fail
+
+
+@only_admin
+async def cmd_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually broadcast this week's top-5 saves right now."""
+    conn = db.connect()
+    try:
+        body = _compose_weekly_digest(conn)
+    finally:
+        conn.close()
+    if not body:
+        await update.effective_message.reply_text(
+            "📚 No saves this week — nothing to broadcast.")
+        return
+    await update.effective_message.reply_text("📤 Broadcasting weekly digest…")
+    ok, fail = await _broadcast_weekly_digest(ctx.application, body)
+    conn = db.connect()
+    try:
+        _weekly_digest_mark_ran(conn, dt.datetime.utcnow().isoformat())
+    finally:
+        conn.close()
+    await update.effective_message.reply_text(
+        f"✅ Weekly digest sent — {ok} delivered, {fail} failed.")
+
+
+async def _weekly_digest_tick(app) -> None:
+    """Called every 60s. Fires once/week on the configured DOW+time in IST."""
+    try:
+        ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    except Exception:  # noqa: BLE001
+        return
+    if ist_now.weekday() != _WEEKLY_DIGEST_DEFAULT_DOW:
+        return
+    if ist_now.strftime("%H:%M") != _WEEKLY_DIGEST_DEFAULT_TIME:
+        return
+    conn = db.connect()
+    try:
+        last = _weekly_digest_last_run(conn)
+        if last:
+            try:
+                prev = dt.datetime.fromisoformat(last)
+                if (dt.datetime.utcnow() - prev).total_seconds() < 6 * 24 * 3600:
+                    return
+            except (TypeError, ValueError):
+                pass
+        body = _compose_weekly_digest(conn)
+    finally:
+        conn.close()
+    if not body:
+        return
+    log.info("weekly digest: firing automatic broadcast")
+    ok, fail = await _broadcast_weekly_digest(app, body)
+    conn = db.connect()
+    try:
+        _weekly_digest_mark_ran(conn, dt.datetime.utcnow().isoformat())
+    finally:
+        conn.close()
+    log.info("weekly digest: automatic broadcast done — ok=%s fail=%s", ok, fail)
+
+
+async def _weekly_digest_loop(app) -> None:
+    await asyncio.sleep(30)
+    log.info("weekly-digest loop started (60s poll)")
+    while True:
+        try:
+            await _weekly_digest_tick(app)
+        except Exception as e:  # noqa: BLE001
+            log.exception("weekly-digest tick crashed (non-fatal): %s", e)
+        await asyncio.sleep(60)
+
+
+def _ensure_weekly_digest_running(app) -> None:
+    existing = app.bot_data.get(_WEEKLY_DIGEST_TASK_KEY)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.get_event_loop().create_task(_weekly_digest_loop(app))
+    app.bot_data[_WEEKLY_DIGEST_TASK_KEY] = task
+    log.info("weekly-digest background task spawned")
+
+
 @only_admin
 async def cmd_allsaved(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """v11.4 — /allsaved. Per-user save summary: username, total saves, and
@@ -2325,6 +2473,7 @@ def build_app() -> Application:
     app = ApplicationBuilder().token(settings.admin_bot_token).post_init(_on_startup).build()
 
     _ensure_auto_queue_running(app)  # 👈 FIXED! 'app' banne ke BAAD call kiya
+    _ensure_weekly_digest_running(app)   # v11.7: weekly digest scheduler
 
     # Regular-admin commands
     app.add_handler(CommandHandler("fetch", cmd_fetch))
@@ -2344,6 +2493,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("topsave", cmd_topsave))
+    app.add_handler(CommandHandler("weekly", cmd_weekly))   # v11.7
     app.add_handler(CommandHandler("allsaved", cmd_allsaved))
     app.add_handler(CommandHandler("coverpost", cmd_coverpost))
     app.add_handler(CommandHandler("verify", cmd_verify))

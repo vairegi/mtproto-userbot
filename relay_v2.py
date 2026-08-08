@@ -50,7 +50,11 @@ from config import settings
 # v11.3: adaptive Bot 2 timeout that scales with page count.
 # @Gallery_DLBot needs ~1.6s per page to build the PDF; 200-page
 # galleries (~150 MB) were timing out at the flat 60/480s cap.
-from pdf_wait_timing import compute_pdf_timeout, describe_timeout
+from pdf_wait_timing import (
+    compute_pdf_timeout,
+    describe_timeout,
+    record_bot2_latency,   # v11.7: auto-tuning telemetry
+)
 
 log = logging.getLogger("relay_v2")
 
@@ -790,6 +794,16 @@ async def process_job(
         # OUTCOME_OK — we have the PDF message.
         bot2_msg = outcome.pdf_message
         db.touch_bot_ping(conn, "bot2")
+
+        # v11.7: telemetry for the auto-tuner. Latency = (now - Bot2 send ts).
+        # Best-effort; never raises upward.
+        try:
+            _lat = float(int(time.time()) - int(since_ts or 0))
+            if _lat > 0:
+                record_bot2_latency(getattr(cover, "pages", None), _lat)
+        except Exception:  # noqa: BLE001
+            pass
+
         _emit_progress(conn, gid, "pdf_received",
                        "PDF received — posting to channel")
 
