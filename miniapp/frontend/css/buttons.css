@@ -1,48 +1,35 @@
 /*
   ============================================================================
-  buttons.css — Stylish button variants (v10)
+  buttons.css — Stylish button variants (v11.7 — palette-driven)
   ============================================================================
-  Inspired by the CSS Buttons gallery (getcssscan.com/css-buttons-examples):
-  every variant here is a pure-CSS effect (no JS, no external assets) that
-  layers on top of the base `.btn` rules in components.css.
+  Every effect below uses `var(--du-accent)` and `var(--du-accent-rgb)` so
+  buttons re-tint automatically when the user switches palette. NO more
+  per-palette selectors — one rule, all 9 themes.
 
   Usage:
     <button class="btn primary btn-glow">Download Now</button>
     <button class="btn secondary btn-outline-slide">Preview</button>
-    <button class="btn primary btn-shine">Contact Admin</button>
-
-  Every variant respects `prefers-reduced-motion` and the app's
-  `data-reduced-motion="1"` flag (see prefs.js) — animations are disabled
-  when the user opts out.
-
-  Adding a new variant:
-    1. Pick a `.btn-<name>` class.
-    2. Layer effects via ::before / ::after (never touch the base `.btn`).
-    3. Test in both dark (ember/purple) and light theme.
   ============================================================================
 */
 
 
-/* ---------------------------------------------------------------------------
-   Global button polish — subtle micro-interaction that ALL buttons inherit.
-   Overrides the flat defaults from components.css while keeping the same
-   class semantics (.btn.primary, .btn.secondary, .btn.danger, .btn.ghost).
-   --------------------------------------------------------------------------- */
+/* Global button polish — everything below layers on top of components.css */
 .btn {
   position: relative;
   overflow: hidden;
   isolation: isolate;
   letter-spacing: 0.2px;
   will-change: transform, box-shadow;
+  transition: background 220ms var(--du-ease, ease),
+              color      220ms var(--du-ease, ease),
+              border-color 220ms var(--du-ease, ease),
+              box-shadow  220ms var(--du-ease, ease),
+              transform   180ms var(--du-ease, ease);
 }
-
-/* Universal press micro-response */
 .btn:active:not(:disabled) {
-  transform: scale(0.97) translateY(0);
+  transform: scale(0.97);
   transition-duration: 60ms;
 }
-
-/* Hide default focus ring on touch; show a subtle glow only on keyboard focus */
 .btn:focus:not(:focus-visible) { outline: none; }
 .btn:focus-visible {
   outline: 2px solid var(--du-accent);
@@ -50,75 +37,19 @@
 }
 
 
-/* ---------------------------------------------------------------------------
-   .btn-glow — smooth accent-coloured glow that pulses on hover.
-   Great default for the primary CTA (e.g. Download Now).
-   --------------------------------------------------------------------------- */
+/* .btn-glow — palette-driven glow. Works for every theme automatically. */
 .btn-glow {
-  box-shadow: 0 2px 10px rgba(255, 59, 59, 0.30),
+  box-shadow: 0 2px 10px rgba(var(--du-accent-rgb, 255, 59, 59), 0.30),
               0 1px 2px rgba(0, 0, 0, 0.18);
 }
 .btn-glow:hover:not(:disabled) {
-  box-shadow: 0 6px 22px rgba(255, 59, 59, 0.42),
+  box-shadow: 0 6px 22px rgba(var(--du-accent-rgb, 255, 59, 59), 0.42),
               0 2px 6px rgba(0, 0, 0, 0.22);
   transform: translateY(-1px);
 }
 
-/* v11.6: theme-aware glow. Palettes whose accent isn't red get a glow
-   colour matching their accent so the CTA doesn't clash with the ambient
-   background. Palettes not listed here (dark, ember, light, sepia, amoled)
-   fall through to the red glow defined above, which matches their
-   red accent. */
-html[data-bg-theme="dracula"] .btn-glow {
-  box-shadow: 0 2px 12px rgba(255, 121, 198, 0.42),
-              0 1px 2px rgba(0, 0, 0, 0.20);
-}
-html[data-bg-theme="dracula"] .btn-glow:hover:not(:disabled) {
-  box-shadow: 0 6px 26px rgba(255, 141, 210, 0.60),
-              0 2px 6px rgba(0, 0, 0, 0.25);
-}
 
-html[data-bg-theme="midnight"] .btn-glow {
-  box-shadow: 0 2px 12px rgba(79, 140, 255, 0.42),
-              0 1px 2px rgba(0, 0, 0, 0.20);
-}
-html[data-bg-theme="midnight"] .btn-glow:hover:not(:disabled) {
-  box-shadow: 0 6px 26px rgba(99, 160, 255, 0.60),
-              0 2px 6px rgba(0, 0, 0, 0.25);
-}
-
-html[data-bg-theme="nord"] .btn-glow {
-  box-shadow: 0 2px 12px rgba(136, 192, 208, 0.42),
-              0 1px 2px rgba(0, 0, 0, 0.20);
-}
-html[data-bg-theme="nord"] .btn-glow:hover:not(:disabled) {
-  box-shadow: 0 6px 26px rgba(156, 212, 228, 0.60),
-              0 2px 6px rgba(0, 0, 0, 0.25);
-}
-
-html[data-bg-theme="solarized"] .btn-glow {
-  box-shadow: 0 2px 12px rgba(181, 137, 0, 0.42),
-              0 1px 2px rgba(0, 0, 0, 0.20);
-}
-html[data-bg-theme="solarized"] .btn-glow:hover:not(:disabled) {
-  box-shadow: 0 6px 26px rgba(201, 157, 20, 0.60),
-              0 2px 6px rgba(0, 0, 0, 0.25);
-}
-
-html[data-bg-theme="forest"] .btn-glow {
-  box-shadow: 0 2px 12px rgba(76, 175, 80, 0.42),
-              0 1px 2px rgba(0, 0, 0, 0.20);
-}
-html[data-bg-theme="forest"] .btn-glow:hover:not(:disabled) {
-  box-shadow: 0 6px 26px rgba(96, 195, 100, 0.60),
-              0 2px 6px rgba(0, 0, 0, 0.25);
-}
-
-
-/* ---------------------------------------------------------------------------
-   .btn-shine — diagonal sheen sweep on hover.
-   Used for the Contact Admin CTA in Settings.
-   --------------------------------------------------------------------------- */
+/* .btn-shine — diagonal sheen sweep on hover */
 .btn-shine::before {
   content: "";
   position: absolute;
@@ -136,15 +67,11 @@ html[data-bg-theme="forest"] .btn-glow:hover:not(:disabled) {
 .btn-shine:hover:not(:disabled)::before { transform: translateX(120%); }
 
 
-/* ---------------------------------------------------------------------------
-   .btn-outline-slide — hollow button that fills with accent on hover.
-   Perfect for a secondary action next to a primary (e.g. Preview).
-   --------------------------------------------------------------------------- */
+/* .btn-outline-slide — hollow, fills with accent on hover */
 .btn-outline-slide {
   background: transparent !important;
   border: 1.5px solid var(--du-accent) !important;
   color: var(--du-accent) !important;
-  transition: color 0.28s ease, border-color 0.28s ease;
 }
 .btn-outline-slide::before {
   content: "";
@@ -165,10 +92,7 @@ html[data-bg-theme="forest"] .btn-glow:hover:not(:disabled) {
 }
 
 
-/* ---------------------------------------------------------------------------
-   .btn-lift — soft neumorphic lift for the "Save / Saved Already" toggle.
-   Subtle, so it doesn't compete with the primary CTA.
-   --------------------------------------------------------------------------- */
+/* .btn-lift — soft neumorphic lift */
 .btn-lift {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16),
               inset 0 1px 0 rgba(255, 255, 255, 0.05);
@@ -181,9 +105,7 @@ html[data-bg-theme="forest"] .btn-glow:hover:not(:disabled) {
 }
 
 
-/* ---------------------------------------------------------------------------
-   .btn-pill — extra-round pill shape used for the tag chips + minor actions.
-   --------------------------------------------------------------------------- */
+/* .btn-pill — pill shape for tag chips */
 .btn-pill {
   border-radius: var(--du-radius-pill);
   padding-left:  var(--du-space-6);
@@ -191,12 +113,7 @@ html[data-bg-theme="forest"] .btn-glow:hover:not(:disabled) {
 }
 
 
-/* ---------------------------------------------------------------------------
-   .btn-ripple — Material-style expanding circle on click. Uses a pseudo
-   element positioned by the browser's default focus origin; not perfectly
-   centred on the click point (would need JS) but reads as a satisfying
-   "confirm" flourish.
-   --------------------------------------------------------------------------- */
+/* .btn-ripple — Material-style expanding circle on click */
 .btn-ripple::after {
   content: "";
   position: absolute;
@@ -217,10 +134,7 @@ html[data-bg-theme="forest"] .btn-glow:hover:not(:disabled) {
 }
 
 
-/* ---------------------------------------------------------------------------
-   .btn-icon-only — square 44x44 tap-target for icon-only actions (e.g.
-   caret toggles, close buttons). Keeps Telegram's 44px minimum accessible.
-   --------------------------------------------------------------------------- */
+/* .btn-icon-only — square 44x44 tap-target */
 .btn-icon-only {
   width: 44px;
   height: 44px;
@@ -230,10 +144,7 @@ html[data-bg-theme="forest"] .btn-glow:hover:not(:disabled) {
 }
 
 
-/* ---------------------------------------------------------------------------
-   Global reduced-motion handling. Respects BOTH the OS-level preference and
-   the app's own `data-reduced-motion="1"` toggle from prefs.js.
-   --------------------------------------------------------------------------- */
+/* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
   .btn, .btn::before, .btn::after {
     transition-duration: 0.01ms !important;
@@ -242,7 +153,6 @@ html[data-bg-theme="forest"] .btn-glow:hover:not(:disabled) {
   .btn-glow:hover:not(:disabled),
   .btn-lift:hover:not(:disabled) { transform: none; }
 }
-
 html[data-reduced-motion="1"] .btn,
 html[data-reduced-motion="1"] .btn::before,
 html[data-reduced-motion="1"] .btn::after {
@@ -255,31 +165,11 @@ html[data-reduced-motion="1"] .btn-lift:hover:not(:disabled) {
 }
 
 
-/* ---------------------------------------------------------------------------
-   Light-theme adjustments — the default palette assumes a dark bg. When
-   the admin switches to the light theme, some effects need lighter
-   shadow / ripple / sheen values to stay visible on white.
-   --------------------------------------------------------------------------- */
-html[data-bg-theme="light"] .btn-glow {
-  box-shadow: 0 2px 10px rgba(255, 59, 59, 0.20),
-              0 1px 2px rgba(0, 0, 0, 0.08);
-}
-html[data-bg-theme="light"] .btn-glow:hover:not(:disabled) {
-  box-shadow: 0 6px 20px rgba(255, 59, 59, 0.30),
-              0 2px 6px rgba(0, 0, 0, 0.10);
-}
-
-html[data-bg-theme="light"] .btn-lift {
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.10);
-}
-html[data-bg-theme="light"] .btn-lift:hover:not(:disabled) {
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.14);
-}
-
-html[data-bg-theme="light"] .btn-ripple::after {
+/* Light-palette-only tweaks (ripple + secondary border adapt to bright bg) */
+html[data-bg-theme="light"] .btn-ripple::after,
+html[data-bg-theme="sepia"] .btn-ripple::after {
   background: rgba(0, 0, 0, 0.12);
 }
-
 html[data-bg-theme="light"] .btn.secondary {
   border: 1px solid rgba(0, 0, 0, 0.10);
   background: #ffffff;

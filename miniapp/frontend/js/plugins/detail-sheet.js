@@ -11,6 +11,7 @@
 import { api } from "core/api.js";
 import { h, make } from "core/components.js";
 import { cardActions } from "plugins/card-actions.js";
+import { renderStarRating } from "plugins/star-rating.js";  // v11.7
 
 const GROUP_LABELS = {
   parody:    "Parodies",
@@ -110,6 +111,9 @@ async function enrich(root, g) {
       + (d.favorites != null ? ` · ♥ ${fmtNum(d.favorites)}` : "")
       + (d.upload_date ? ` · ${fmtDate(d.upload_date)}` : "")),
   );
+
+  // v11.7: interactive star-rating widget between header and tag rows.
+  root.appendChild(renderStarRating(d.id));
 
   const groups = d.groups || {};
   for (const key of GROUP_ORDER) {

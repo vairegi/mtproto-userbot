@@ -1,35 +1,32 @@
 /*
-  prefs.js — Client-side user preferences (localStorage)
+  prefs.js — Client-side user preferences (localStorage)  [v11.7]
 
-  Keeps small, purely-UI settings on the device: haptics on/off, forced
-  theme override, infinite-scroll on/off, etc. Non-critical stuff that
-  doesn't need to survive a re-install and isn't worth a MongoDB round-trip.
-
-  For per-user data that MUST persist across devices (bookmarks, rate-limit
-  quota, ban status, etc.) use the backend + Mongo — that's what
-  /api/bookmarks + /api/admin/users are for.
-
-  Add a new preference:
-    1. Add a default in DEFAULTS below.
-    2. Read via prefs.get("myKey").
-    3. Write via prefs.set("myKey", value).
-    4. Optionally expose a toggle on the Settings sub-page.
+  v11.7 changes:
+    * DEFAULTS.background_theme = "auto"  — new "auto" option that follows
+      the OS-level color-scheme (prefers-color-scheme) + optional Telegram
+      colorScheme hint. Concrete palette is resolved at apply() time.
+    * apply() now writes a *resolved* palette name to <html data-bg-theme>
+      whenever background_theme = "auto", and re-runs on `matchMedia`
+      change so the app flips instantly with the OS.
+    * v11.6's "ember" alias of "dark" preserved for back-compat.
 */
 
 const KEY = "du_prefs_v1";
 
 const DEFAULTS = {
   theme_override: "auto",       // "auto" | "dark" | "light"
-  // v11.6: user-selectable palette theme. Applies to the whole app.
-  // Ships 9 palettes — see css/themes.css for the full list:
-  //   dark (default), light, sepia, dracula, midnight, amoled,
-  //   nord, solarized, forest. "ember" is kept as an alias of dark
-  //   so old localStorage values keep resolving.
-  background_theme: "dark",
+  // v11.7: palette theme.
+  //   "auto"      — follow OS (prefers-color-scheme) → picks dark or light
+  //   "dark"      — force dark
+  //   "light"     — force light
+  //   "sepia" | "dracula" | "midnight" | "amoled" |
+  //   "nord"  | "solarized" | "forest"
+  //   "ember"     — legacy alias of dark (kept so old localStorage resolves)
+  background_theme: "auto",
   haptics_enabled: true,
   infinite_scroll: true,
   reduced_motion: false,
-  show_hint_bar: true,           // the "Try: tag:vanilla" hint under search
+  show_hint_bar: true,
 };
 
 function load() {
@@ -49,11 +46,28 @@ function persist() {
   try { localStorage.setItem(KEY, JSON.stringify(cache)); } catch (_) {}
 }
 
+// v11.7: resolve "auto" -> concrete palette by inspecting OS + Telegram.
+// Exported so settings.js can display the resolved value in the label.
+export function resolvePalette(name) {
+  if (name && name !== "auto") return name === "ember" ? "dark" : name;
+  // 1. Telegram's own colorScheme (matches the user's Telegram theme).
+  const tgScheme = window.Telegram?.WebApp?.colorScheme;
+  if (tgScheme === "light") return "light";
+  if (tgScheme === "dark")  return "dark";
+  // 2. Fall back to the OS media query.
+  if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+    return "light";
+  }
+  return "dark";
+}
+
 export const prefs = {
   get(key)         { return cache[key]; },
   set(key, value)  { cache[key] = value; persist(); apply(); },
   all()            { return { ...cache }; },
   reset()          { cache = { ...DEFAULTS }; persist(); apply(); },
+  // v11.7: exposed so settings.js can show "Auto (currently: Light)".
+  resolveBgTheme() { return resolvePalette(cache.background_theme); },
 };
 
 function apply() {
@@ -61,8 +75,20 @@ function apply() {
   if (override === "auto") delete document.documentElement.dataset.themeForced;
   else document.documentElement.dataset.theme = override;
   document.documentElement.dataset.reducedMotion = cache.reduced_motion ? "1" : "0";
-  // v11.6: palette theme (see themes.css for the [data-bg-theme="…"] rules).
-  const bg = cache.background_theme || "dark";
-  document.documentElement.dataset.bgTheme = bg;
+  // v11.7: resolve "auto" to a real palette before writing to the DOM so
+  // themes.css always finds a matching [data-bg-theme=X] block.
+  const resolved = resolvePalette(cache.background_theme);
+  document.documentElement.dataset.bgTheme = resolved;
 }
 apply();
+
+// v11.7: when the user is on "auto", re-apply whenever the OS toggles
+// between light and dark (e.g. iOS Night Shift, macOS sunset). Users on a
+// forced palette are unaffected — apply() only touches the DOM.
+if (window.matchMedia) {
+  const mq = window.matchMedia("(prefers-color-scheme: light)");
+  const rerun = () => { if (cache.background_theme === "auto") apply(); };
+  // Chrome / Firefox / Safari 14+
+  if (mq.addEventListener) mq.addEventListener("change", rerun);
+  else if (mq.addListener) mq.addListener(rerun);  // legacy Safari
+}

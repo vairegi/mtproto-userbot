@@ -24,15 +24,13 @@ html {
 body {
   min-height: 100vh;
   min-height: 100dvh;
-  /* antibanhack-style cinematic background: near-black base, a soft red
-     radial glow behind the upper content, and a faint orange ember bottom-
-     right — mirrors the reference site's dark + red/fire hero treatment. */
-  background:
-    radial-gradient(1100px 700px at 50% -8%, rgba(255, 58, 58, 0.16), transparent 62%),
-    radial-gradient(800px 520px at 88% 108%, rgba(255, 122, 26, 0.10), transparent 62%),
-    radial-gradient(600px 400px at 8% 108%, rgba(255, 58, 58, 0.06), transparent 65%),
-    var(--du-bg-0);
+  /* v11.7: body background is driven by the active palette. Each palette
+     defines --du-body-bg in themes.css — switching themes instantly
+     repaints without any per-palette selector here. */
+  background: var(--du-body-bg, var(--du-bg-0));
   background-attachment: fixed;
+  transition: background 260ms var(--du-ease, cubic-bezier(.2,.8,.2,1)),
+              color      260ms var(--du-ease, cubic-bezier(.2,.8,.2,1));
 }
 
 button, input, textarea, select {

@@ -651,43 +651,84 @@ function sectionForceDelete() {
     placeholder: "Gallery ID only (e.g. 650361)",
     style: { flex: "1", minWidth: "0" },
   });
-  const delBtn = h("button", { class: "btn danger btn-glow",
-    onclick: async () => {
-      const v = (input.value || "").trim();
-      if (!v) { toast("Enter a gallery id", "error"); return; }
-      if (!/^\d+$/.test(v)) {
-        toast("Gallery id must be numeric (e.g. 650361)", "error");
-        return;
-      }
-      // Confirm-destructive: one extra tap guards against accidental
-      // purges of a gallery a user is actively downloading.
-      if (!window.confirm(
-        `Hard-delete gallery #${v} from MongoDB?\n\n` +
-        "This removes the dedup doc, all queue rows, and progress " +
-        "events. The gallery is NOT re-queued."
-      )) return;
-      haptic("heavy");
-      try {
-        // NOTE: the api helper exposes `del` (not `delete`, a reserved word).
-        const r = await api.del(`/api/admin/purge/${encodeURIComponent(v)}`);
-        if (r.ok) {
-          toast(
-            `✅ Purged #${v} — ${r.total_deleted || 0} doc(s) removed ` +
-            `(galleries: ${r.deleted?.galleries ?? 0}, ` +
-            `queue: ${r.deleted?.queue ?? 0})`,
-            "success",
-          );
-          input.value = "";
-        } else {
-          toast("Purge failed: " + (r.reason || "unknown"), "error");
-        }
-      } catch (e) { toast(e.message, "error"); }
+  // v11.7: safe Force-Delete — 3-second HOLD required. A misclick can't
+  // purge a live gallery any more; releasing early cancels cleanly.
+  const HOLD_MS = 3000;
+  const delBtn = h("button", {
+    class: "btn danger btn-glow",
+    style: { position: "relative", overflow: "hidden" },
+  }, "🗑️ Hold 3s to Force-Delete");
+  const holdBar = h("span", {
+    style: {
+      position: "absolute", left: "0", top: "0", bottom: "0", width: "0%",
+      background: "rgba(255, 255, 255, 0.22)", pointerEvents: "none",
+      transition: `width ${HOLD_MS}ms linear`,
     },
-  }, "🗑️ Force-Delete");
+  });
+  delBtn.appendChild(holdBar);
+
+  let holdTimer = null;
+  let cancelled = false;
+
+  async function doPurge(v) {
+    haptic("heavy");
+    try {
+      const r = await api.del(`/api/admin/purge/${encodeURIComponent(v)}`);
+      if (r.ok) {
+        toast(
+          `✅ Purged #${v} — ${r.total_deleted || 0} doc(s) removed ` +
+          `(galleries: ${r.deleted?.galleries ?? 0}, ` +
+          `queue: ${r.deleted?.queue ?? 0})`,
+          "success",
+        );
+        input.value = "";
+      } else {
+        toast("Purge failed: " + (r.reason || "unknown"), "error");
+      }
+    } catch (e) { toast(e.message, "error"); }
+  }
+
+  function beginHold(e) {
+    e.preventDefault();
+    const v = (input.value || "").trim();
+    if (!v)               { toast("Enter a gallery id", "error"); return; }
+    if (!/^\d+$/.test(v)) { toast("Gallery id must be numeric", "error"); return; }
+    cancelled = false;
+    holdBar.style.transition = "width 0ms";
+    holdBar.style.width = "0%";
+    requestAnimationFrame(() => {
+      holdBar.style.transition = `width ${HOLD_MS}ms linear`;
+      holdBar.style.width = "100%";
+    });
+    haptic("light");
+    holdTimer = setTimeout(() => {
+      if (cancelled) return;
+      holdTimer = null;
+      holdBar.style.width = "0%";
+      doPurge(v);
+    }, HOLD_MS);
+  }
+  function cancelHold() {
+    cancelled = true;
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    holdBar.style.transition = "width 160ms ease-out";
+    holdBar.style.width = "0%";
+  }
+
+  delBtn.addEventListener("mousedown",  beginHold);
+  delBtn.addEventListener("touchstart", beginHold, { passive: false });
+  ["mouseup", "mouseleave", "touchend", "touchcancel", "blur"].forEach(ev =>
+    delBtn.addEventListener(ev, cancelHold));
+  delBtn.addEventListener("click", (e) => e.preventDefault());
+
   wrap.appendChild(h("div", {
     style: { display: "flex", gap: "8px", alignItems: "center",
              flexWrap: "wrap" },
   }, input, delBtn));
+  wrap.appendChild(h("div", {
+    style: { color: "var(--du-ink-lo)", fontSize: "10px",
+             marginTop: "6px", fontStyle: "italic" },
+  }, "Press and hold the button for 3 seconds. Release early to cancel."));
   return wrap;
 }
 

@@ -261,5 +261,60 @@ export const cardActions = [
       } catch (e) { toast("Failed: " + e.message, "error"); }
     },
   },
-  // UI text v9: "Open on nhentai" action REMOVED per admin request.
+  // v11.7 — Share button. Copies a Telegram deep-link so the recipient
+  // opens the mini-app directly on this gallery.
+  {
+    id: "share",
+    label: "Share",
+    icon:  "🔗",
+    kind:  "secondary",
+    async run({ gallery, close }) {
+      const gid = String(gallery.id || "");
+      if (!gid) { toast("Nothing to share", "error"); return; }
+
+      // Prefer t.me/<bot>/app?startapp=g_<id> when running inside Telegram;
+      // fall back to a hash-URL for external browsers.
+      let shareUrl = "";
+      try {
+        const tg = window.Telegram && window.Telegram.WebApp;
+        const botUser =
+          tg?.initDataUnsafe?.bot?.username ||
+          window.__DU_BOT_USERNAME__;
+        if (botUser) {
+          shareUrl = `https://t.me/${botUser}/app?startapp=g_${gid}`;
+        } else {
+          const base = window.location.href.split("#")[0];
+          shareUrl = `${base}#/gallery/${gid}`;
+        }
+      } catch (_) {
+        shareUrl = `${window.location.href.split("#")[0]}#/gallery/${gid}`;
+      }
+
+      // Native share sheet (mobile) first, clipboard second, prompt last.
+      let delivered = false;
+      try {
+        if (navigator.share) {
+          await navigator.share({
+            title: gallery.title || `Gallery #${gid}`,
+            text:  gallery.title || "",
+            url:   shareUrl,
+          });
+          delivered = true;
+        } else if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(shareUrl);
+          toast("🔗 Link copied", "success");
+          delivered = true;
+        }
+      } catch (_) { /* user cancelled */ }
+      if (!delivered) {
+        try { window.prompt("Copy this link:", shareUrl); } catch (_) {}
+      }
+
+      // Telemetry for the Sharer badge — fire-and-forget.
+      try { await api.post("/api/stats/share", { gallery_id: gid }); }
+      catch (_) { /* ignore */ }
+
+      close && close();
+    },
+  },
 ];

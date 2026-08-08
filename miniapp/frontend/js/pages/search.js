@@ -15,6 +15,7 @@ import { haptic } from "core/telegram.js";
 import { store } from "core/state.js";
 import { parseSearch } from "plugins/search-operators.js";
 import { cardActions } from "plugins/card-actions.js";
+import { renderTrendingTags, renderRecommendations } from "plugins/home-rows.js";  // v11.7
 
 const PAGE_SIZE = 25;
 
@@ -37,10 +38,28 @@ export async function render(root, { me }) {
     h("code", {}, "pages:>30"), " ",
     h("code", {}, "sort:popular"),
   );
+  // v11.7: home widgets — visible only when there's no active query.
+  const $trending = renderTrendingTags((tagExpr) => {
+    if (!$bar) return;
+    const input = $bar.querySelector("input");
+    if (input) {
+      input.value = tagExpr;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    haptic("light");
+  });
+  const $recs = renderRecommendations(me);
+  const $home = h("div", { class: "home-rows" }, $trending, $recs);
   const $grid = h("div", { class: "card-grid" });
   const $footer = h("div", { class: "u-center", style: { padding: "24px 0" } });
 
-  root.append($bar, $hint, $chips, $grid, $footer);
+  root.append($bar, $hint, $chips, $home, $grid, $footer);
+
+  function toggleHomeRows() {
+    const active = !!(state.query && state.query.trim());
+    $home.style.display = active ? "none" : "block";
+  }
+  toggleHomeRows();
 
   // Initial load with a skeleton grid.
   showSkeleton();
@@ -253,6 +272,7 @@ function buildSearchBar(state, refetch) {
   input.addEventListener("input", () => {
     state.query = input.value;
     state.parsed = parseSearch(state.query);
+    toggleHomeRows();  // v11.7: hide trending + recs while a query is active
     clear.classList.toggle("u-hide", !state.query);
     clearTimeout(timer);
     timer = setTimeout(() => { haptic("select"); refetch(); }, 350);
@@ -286,5 +306,42 @@ function buildChipRow(state, refetch) {
     if (state.sort === o.sort) chip.setAttribute("aria-pressed", "true");
     row.appendChild(chip);
   }
+
+  // v11.7: Random button. Tag-aware when the user has bookmarks (uses their
+  // top saved tags); falls back to popular when they don't.
+  const randomChip = h("button", {
+    class: "chip",
+    style: {
+      background: "linear-gradient(135deg, var(--du-accent), var(--du-accent-hover))",
+      color: "var(--du-ink-inv)",
+      border: "0", fontWeight: "600",
+    },
+    title: "Open a random gallery (uses your top tags when available)",
+  }, "🎲 Random");
+  randomChip.addEventListener("click", async () => {
+    try { haptic("medium"); } catch (_) {}
+    randomChip.disabled = true;
+    const originalLabel = randomChip.textContent;
+    randomChip.textContent = "🎲 Picking…";
+    try {
+      const g = await api.get("/api/random?respect_tags=1");
+      if (g && g.id) {
+        const m = await import("plugins/detail-sheet.js");
+        m.openGalleryDetail(g, undefined);
+        if (g._reason) {
+          try { make("toast", { text: `🎲 Picked because ${g._reason}`, kind: "success" }); } catch (_) {}
+        }
+      } else {
+        try { make("toast", { text: "No gallery available", kind: "error" }); } catch (_) {}
+      }
+    } catch (e) {
+      try { make("toast", { text: "Random failed: " + (e.message || e), kind: "error" }); } catch (_) {}
+    } finally {
+      randomChip.disabled = false;
+      randomChip.textContent = originalLabel;
+    }
+  });
+  row.appendChild(randomChip);
+
   return row;
 }

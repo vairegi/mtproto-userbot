@@ -1,47 +1,66 @@
 /*
   ============================================================================
-  themes.css — User-selectable palette themes (v11.6)
+  themes.css — User-selectable palette themes (v11.7)
   ============================================================================
-  The base body background lives in base.css (the default "ember/dark" theme).
-  This stylesheet overlays alternative palettes when the user picks a
-  different theme from Settings → Appearance → Theme.
-
   Themes are activated by setting `data-bg-theme` on the <html> element:
       document.documentElement.dataset.bgTheme = "dracula";
-  See core/prefs.js for the persisted preference and core/telegram.js's
-  apply() call for the wiring.
+  See core/prefs.js for the persisted preference.
 
-  v11.6 ships 9 palettes:
-    * dark        (default — falls through to base.css)
-    * ember       (alias of dark — kept so old localStorage still resolves)
-    * light       (bright white paper look, dark ink)
-    * sepia       (warm off-white / brown ink, easy on the eyes)
-    * dracula     (classic dracula: purple/pink on dark navy)
-    * midnight    (deep navy blues, gentle indigo glows)
-    * amoled      (pure #000 body — no gradients — for OLED battery savings)
-    * nord        (cool arctic blue-grey palette)
-    * solarized   (solarized dark: teal base, yellow accents)
-    * forest      (deep greens with mossy glow)
+  v11.7 fix — EVERY palette now overrides:
+    * --du-bg-{0..3}   (surfaces)
+    * --du-ink-{hi..inv}
+    * --du-accent, --du-accent-hover
+    * --du-accent-rgb  (R,G,B triplet used by base/buttons for rgba() glows)
+    * --du-border, --du-border-strong, --du-divider
+    * --du-header-bg
+    * --du-body-bg     (full body background gradient — replaces base.css)
 
-  Adding a new theme: add a `[data-bg-theme="foo"]` block below and expose
-  the name in prefs.js DEFAULTS (optional) + settings.js selectRow options.
-  Every palette overrides the same set of CSS variables so every component
-  (buttons, cards, borders, ink, headers) picks up the palette automatically
-  with no per-component CSS change.
+  base.css now reads `background: var(--du-body-bg)` on body, so switching
+  palettes instantly repaints the ambient background — no per-palette
+  `html[data-bg-theme=X] body` selector needed.
+
+  9 palettes: dark (default), light, sepia, dracula, midnight, amoled,
+              nord, solarized, forest.  "ember" is a legacy alias of dark.
   ============================================================================
 */
 
 
 /* -----------------------------------------------------------------------
-   DARK — default. Empty block kept as documentation so the settings
-   dropdown can list "Dark" without special-casing it.
+   DARK — default. Explicitly defines every var so it wins over :root
+   fallbacks and never leaves the app in a half-themed state.
    ----------------------------------------------------------------------- */
-html[data-bg-theme="dark"]  { /* falls through to base.css defaults */ }
-html[data-bg-theme="ember"] { /* legacy alias of dark — kept for back-compat */ }
+html[data-bg-theme="dark"],
+html[data-bg-theme="ember"] {
+  --du-bg-0:          #05060a;
+  --du-bg-1:          #0c0e14;
+  --du-bg-2:          #12151d;
+  --du-bg-3:          #171a22;
+
+  --du-ink-hi:        #f2f4f8;
+  --du-ink-mid:       #b9bec8;
+  --du-ink-lo:        #7d838f;
+  --du-ink-inv:       #0b0d12;
+
+  --du-accent:        #ff3b3b;
+  --du-accent-hover:  #e02525;
+  --du-accent-rgb:    255, 59, 59;
+
+  --du-border:        rgba(255, 82, 82, 0.12);
+  --du-border-strong: rgba(255, 82, 82, 0.24);
+  --du-divider:       rgba(255, 255, 255, 0.05);
+
+  --du-header-bg:     rgba(5, 6, 10, 0.82);
+
+  --du-body-bg:
+    radial-gradient(1100px 700px at 50% -8%,  rgba(255, 58, 58, 0.16),  transparent 62%),
+    radial-gradient(800px  520px at 88% 108%, rgba(255, 122, 26, 0.10), transparent 62%),
+    radial-gradient(600px  400px at 8%  108%, rgba(255, 58, 58, 0.06),  transparent 65%),
+    var(--du-bg-0);
+}
 
 
 /* -----------------------------------------------------------------------
-   LIGHT — white paper, dark ink, subtle red accent retained for brand.
+   LIGHT
    ----------------------------------------------------------------------- */
 html[data-bg-theme="light"] {
   --du-bg-0:          #f6f7fb;
@@ -56,24 +75,23 @@ html[data-bg-theme="light"] {
 
   --du-accent:        #d92626;
   --du-accent-hover:  #b81f1f;
+  --du-accent-rgb:    217, 38, 38;
 
   --du-border:        rgba(0, 0, 0, 0.10);
   --du-border-strong: rgba(0, 0, 0, 0.18);
   --du-divider:       rgba(0, 0, 0, 0.06);
 
   --du-header-bg:     rgba(255, 255, 255, 0.85);
-}
-html[data-bg-theme="light"] body {
-  background:
-    radial-gradient(700px 460px at 50% -6%, rgba(255, 58, 58, 0.06), transparent 65%),
+
+  --du-body-bg:
+    radial-gradient(700px 460px at 50% -6%,  rgba(255, 58, 58, 0.06),  transparent 65%),
     radial-gradient(560px 360px at 92% 108%, rgba(255, 122, 26, 0.05), transparent 65%),
     var(--du-bg-0);
-  background-attachment: fixed;
 }
 
 
 /* -----------------------------------------------------------------------
-   SEPIA — warm off-white paper with brown ink.
+   SEPIA
    ----------------------------------------------------------------------- */
 html[data-bg-theme="sepia"] {
   --du-bg-0:          #f4ecd8;
@@ -88,24 +106,23 @@ html[data-bg-theme="sepia"] {
 
   --du-accent:        #a0522d;
   --du-accent-hover:  #8a4425;
+  --du-accent-rgb:    160, 82, 45;
 
   --du-border:        rgba(90, 65, 38, 0.18);
   --du-border-strong: rgba(90, 65, 38, 0.32);
   --du-divider:       rgba(90, 65, 38, 0.10);
 
   --du-header-bg:     rgba(251, 243, 222, 0.88);
-}
-html[data-bg-theme="sepia"] body {
-  background:
-    radial-gradient(720px 480px at 50% -6%, rgba(160, 82, 45, 0.10), transparent 65%),
+
+  --du-body-bg:
+    radial-gradient(720px 480px at 50% -6%,  rgba(160, 82, 45, 0.10), transparent 65%),
     radial-gradient(600px 400px at 92% 108%, rgba(120, 60, 30, 0.08), transparent 65%),
     var(--du-bg-0);
-  background-attachment: fixed;
 }
 
 
 /* -----------------------------------------------------------------------
-   DRACULA — classic dracula palette on dark navy/purple.
+   DRACULA
    ----------------------------------------------------------------------- */
 html[data-bg-theme="dracula"] {
   --du-bg-0:          #282a36;
@@ -120,25 +137,24 @@ html[data-bg-theme="dracula"] {
 
   --du-accent:        #ff79c6;
   --du-accent-hover:  #ff5aa6;
+  --du-accent-rgb:    255, 121, 198;
 
   --du-border:        rgba(189, 147, 249, 0.16);
   --du-border-strong: rgba(189, 147, 249, 0.32);
   --du-divider:       rgba(255, 255, 255, 0.06);
 
   --du-header-bg:     rgba(40, 42, 54, 0.85);
-}
-html[data-bg-theme="dracula"] body {
-  background:
-    radial-gradient(760px 620px at 90% -8%, rgba(189, 147, 249, 0.32), transparent 62%),
-    radial-gradient(560px 520px at 6% 42%, rgba(255, 121, 198, 0.22), transparent 66%),
-    radial-gradient(900px 620px at 50% 118%, rgba(80, 250, 123, 0.10), transparent 70%),
+
+  --du-body-bg:
+    radial-gradient(760px 620px at 90% -8%,  rgba(189, 147, 249, 0.32), transparent 62%),
+    radial-gradient(560px 520px at 6%  42%,  rgba(255, 121, 198, 0.22), transparent 66%),
+    radial-gradient(900px 620px at 50% 118%, rgba(80,  250, 123, 0.10), transparent 70%),
     var(--du-bg-0);
-  background-attachment: fixed;
 }
 
 
 /* -----------------------------------------------------------------------
-   MIDNIGHT — deep navy blues with gentle indigo glows.
+   MIDNIGHT
    ----------------------------------------------------------------------- */
 html[data-bg-theme="midnight"] {
   --du-bg-0:          #050a1a;
@@ -153,25 +169,24 @@ html[data-bg-theme="midnight"] {
 
   --du-accent:        #4f8cff;
   --du-accent-hover:  #3572ee;
+  --du-accent-rgb:    79, 140, 255;
 
   --du-border:        rgba(100, 140, 255, 0.14);
   --du-border-strong: rgba(100, 140, 255, 0.28);
   --du-divider:       rgba(255, 255, 255, 0.06);
 
   --du-header-bg:     rgba(5, 10, 26, 0.85);
-}
-html[data-bg-theme="midnight"] body {
-  background:
-    radial-gradient(780px 640px at 88% -6%, rgba(64, 112, 220, 0.48), transparent 62%),
-    radial-gradient(560px 520px at 6% 42%, rgba(46, 76, 190, 0.36), transparent 66%),
-    radial-gradient(900px 620px at 50% 118%, rgba(30, 50, 140, 0.28), transparent 70%),
+
+  --du-body-bg:
+    radial-gradient(780px 640px at 88% -6%,  rgba(64,  112, 220, 0.48), transparent 62%),
+    radial-gradient(560px 520px at 6%  42%,  rgba(46,  76,  190, 0.36), transparent 66%),
+    radial-gradient(900px 620px at 50% 118%, rgba(30,  50,  140, 0.28), transparent 70%),
     var(--du-bg-0);
-  background-attachment: fixed;
 }
 
 
 /* -----------------------------------------------------------------------
-   AMOLED — pure black body, no gradients, max OLED savings.
+   AMOLED — pure #000, no gradients, max OLED savings.
    ----------------------------------------------------------------------- */
 html[data-bg-theme="amoled"] {
   --du-bg-0:          #000000;
@@ -186,20 +201,20 @@ html[data-bg-theme="amoled"] {
 
   --du-accent:        #ff3a3a;
   --du-accent-hover:  #e02525;
+  --du-accent-rgb:    255, 58, 58;
 
   --du-border:        rgba(255, 255, 255, 0.10);
   --du-border-strong: rgba(255, 255, 255, 0.22);
   --du-divider:       rgba(255, 255, 255, 0.06);
 
   --du-header-bg:     rgba(0, 0, 0, 0.92);
-}
-html[data-bg-theme="amoled"] body {
-  background: #000000;
+
+  --du-body-bg:       #000000;
 }
 
 
 /* -----------------------------------------------------------------------
-   NORD — cool arctic blue-grey.
+   NORD
    ----------------------------------------------------------------------- */
 html[data-bg-theme="nord"] {
   --du-bg-0:          #2e3440;
@@ -214,24 +229,23 @@ html[data-bg-theme="nord"] {
 
   --du-accent:        #88c0d0;
   --du-accent-hover:  #6faabb;
+  --du-accent-rgb:    136, 192, 208;
 
   --du-border:        rgba(216, 222, 233, 0.14);
   --du-border-strong: rgba(216, 222, 233, 0.28);
   --du-divider:       rgba(255, 255, 255, 0.06);
 
   --du-header-bg:     rgba(46, 52, 64, 0.85);
-}
-html[data-bg-theme="nord"] body {
-  background:
+
+  --du-body-bg:
     radial-gradient(780px 620px at 88% -8%, rgba(136, 192, 208, 0.30), transparent 62%),
-    radial-gradient(560px 520px at 6% 42%, rgba(94, 129, 172, 0.28), transparent 66%),
+    radial-gradient(560px 520px at 6%  42%, rgba(94,  129, 172, 0.28), transparent 66%),
     var(--du-bg-0);
-  background-attachment: fixed;
 }
 
 
 /* -----------------------------------------------------------------------
-   SOLARIZED — solarized dark: teal base, yellow accent.
+   SOLARIZED (dark)
    ----------------------------------------------------------------------- */
 html[data-bg-theme="solarized"] {
   --du-bg-0:          #002b36;
@@ -246,24 +260,23 @@ html[data-bg-theme="solarized"] {
 
   --du-accent:        #b58900;
   --du-accent-hover:  #9c7500;
+  --du-accent-rgb:    181, 137, 0;
 
   --du-border:        rgba(147, 161, 161, 0.16);
   --du-border-strong: rgba(147, 161, 161, 0.30);
   --du-divider:       rgba(255, 255, 255, 0.06);
 
   --du-header-bg:     rgba(0, 43, 54, 0.85);
-}
-html[data-bg-theme="solarized"] body {
-  background:
-    radial-gradient(760px 620px at 88% -8%, rgba(181, 137, 0, 0.24), transparent 62%),
-    radial-gradient(560px 520px at 6% 42%, rgba(38, 139, 210, 0.22), transparent 66%),
+
+  --du-body-bg:
+    radial-gradient(760px 620px at 88% -8%, rgba(181, 137, 0,  0.24), transparent 62%),
+    radial-gradient(560px 520px at 6%  42%, rgba(38,  139, 210, 0.22), transparent 66%),
     var(--du-bg-0);
-  background-attachment: fixed;
 }
 
 
 /* -----------------------------------------------------------------------
-   FOREST — deep greens with mossy glow.
+   FOREST
    ----------------------------------------------------------------------- */
 html[data-bg-theme="forest"] {
   --du-bg-0:          #0b1a10;
@@ -278,18 +291,17 @@ html[data-bg-theme="forest"] {
 
   --du-accent:        #4caf50;
   --du-accent-hover:  #3d9142;
+  --du-accent-rgb:    76, 175, 80;
 
   --du-border:        rgba(140, 200, 150, 0.14);
   --du-border-strong: rgba(140, 200, 150, 0.28);
   --du-divider:       rgba(255, 255, 255, 0.06);
 
   --du-header-bg:     rgba(11, 26, 16, 0.85);
-}
-html[data-bg-theme="forest"] body {
-  background:
-    radial-gradient(760px 620px at 88% -8%, rgba(76, 175, 80, 0.32), transparent 62%),
-    radial-gradient(560px 520px at 6% 42%, rgba(40, 120, 60, 0.28), transparent 66%),
-    radial-gradient(900px 620px at 50% 118%, rgba(20, 80, 40, 0.22), transparent 70%),
+
+  --du-body-bg:
+    radial-gradient(760px 620px at 88% -8%,  rgba(76, 175, 80, 0.32), transparent 62%),
+    radial-gradient(560px 520px at 6%  42%,  rgba(40, 120, 60, 0.28), transparent 66%),
+    radial-gradient(900px 620px at 50% 118%, rgba(20, 80,  40, 0.22), transparent 70%),
     var(--du-bg-0);
-  background-attachment: fixed;
 }

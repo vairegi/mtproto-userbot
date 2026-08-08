@@ -46,6 +46,10 @@ def col_settings() -> Collection:  return db()["miniapp_settings"]
 def col_users() -> Collection:     return db()["miniapp_users"]
 def col_usage() -> Collection:     return db()["miniapp_usage"]
 def col_bookmarks() -> Collection: return db()["miniapp_bookmarks"]
+# v11.7 additions
+def col_ratings() -> Collection:   return db()["miniapp_ratings"]      # star ratings
+def col_shares()  -> Collection:   return db()["miniapp_shares"]        # share-link events
+def col_stats()   -> Collection:   return db()["miniapp_user_stats"]    # per-user counters
 
 
 # ---- Settings singleton --------------------------------------------------
@@ -181,3 +185,205 @@ def remove_bookmark(user_id: int, gallery_id: Any) -> None:
 def list_bookmarks(user_id: int, limit: int = 200) -> list[dict]:
     cur = col_bookmarks().find({"user_id": int(user_id)}).sort("created_at", -1).limit(limit)
     return list(cur)
+
+
+# ---- v11.7 Ratings -------------------------------------------------------
+def _rate_key(user_id: int, gallery_id: Any) -> str:
+    return f"{int(user_id)}_{gallery_id}"
+
+
+def set_rating(user_id: int, gallery_id: Any, stars: int) -> None:
+    """Record a 1..5-star rating for a gallery. Overwrites any previous vote."""
+    stars = max(1, min(5, int(stars)))
+    col_ratings().update_one(
+        {"_id": _rate_key(user_id, gallery_id)},
+        {"$set": {
+            "user_id": int(user_id),
+            "gallery_id": gallery_id,
+            "stars": stars,
+            "updated_at": _dt.datetime.utcnow(),
+        }},
+        upsert=True,
+    )
+
+
+def clear_rating(user_id: int, gallery_id: Any) -> None:
+    col_ratings().delete_one({"_id": _rate_key(user_id, gallery_id)})
+
+
+def get_user_rating(user_id: int, gallery_id: Any) -> Optional[int]:
+    d = col_ratings().find_one({"_id": _rate_key(user_id, gallery_id)}, {"stars": 1})
+    return int(d["stars"]) if d else None
+
+
+def get_aggregate_rating(gallery_id: Any) -> dict:
+    """Return {avg: float, count: int, dist: {"1":n,"2":n,...}} for a gallery."""
+    pipeline = [
+        {"$match": {"gallery_id": gallery_id}},
+        {"$group": {
+            "_id": None,
+            "avg":   {"$avg": "$stars"},
+            "count": {"$sum": 1},
+        }},
+    ]
+    out = list(col_ratings().aggregate(pipeline))
+    if not out:
+        return {"avg": 0.0, "count": 0, "dist": {}}
+    dist = {str(s): col_ratings().count_documents(
+        {"gallery_id": gallery_id, "stars": s}) for s in range(1, 6)}
+    return {
+        "avg":   round(float(out[0].get("avg") or 0.0), 2),
+        "count": int(out[0].get("count") or 0),
+        "dist":  dist,
+    }
+
+
+# ---- v11.7 Trending tags -------------------------------------------------
+def trending_tags(limit: int = 12, days: int = 7) -> list[dict]:
+    """Return the top tags across all bookmarks created in the last `days`.
+    Each row: {name, type, count}. Empty list if there are no recent saves."""
+    cutoff = _dt.datetime.utcnow() - _dt.timedelta(days=int(max(1, days)))
+    pipeline = [
+        {"$match": {"created_at": {"$gte": cutoff}}},
+        {"$unwind": "$tags"},
+        {"$match": {"tags.name": {"$type": "string", "$ne": ""}}},
+        {"$group": {
+            "_id":   {"name": "$tags.name", "type": "$tags.type"},
+            "count": {"$sum": 1},
+        }},
+        {"$sort":  {"count": -1}},
+        {"$limit": int(max(1, min(50, limit)))},
+    ]
+    try:
+        rows = list(col_bookmarks().aggregate(pipeline))
+    except Exception:
+        return []
+    return [{
+        "name":  r["_id"].get("name"),
+        "type":  r["_id"].get("type") or "tag",
+        "count": int(r.get("count") or 0),
+    } for r in rows if r["_id"].get("name")]
+
+
+def top_user_tags(user_id: int, limit: int = 3) -> list[str]:
+    """Return the user's own most-saved tag NAMES (used by tag-aware random +
+    recommendations). Excludes the language tag which is always 'english' here."""
+    pipeline = [
+        {"$match": {"user_id": int(user_id)}},
+        {"$unwind": "$tags"},
+        {"$match": {
+            "tags.name": {"$type": "string", "$ne": ""},
+            "tags.type": {"$nin": ["language", "category"]},
+        }},
+        {"$group":  {"_id": "$tags.name", "count": {"$sum": 1}}},
+        {"$sort":   {"count": -1}},
+        {"$limit":  int(max(1, min(20, limit)))},
+    ]
+    try:
+        rows = list(col_bookmarks().aggregate(pipeline))
+    except Exception:
+        return []
+    return [str(r["_id"]) for r in rows if r.get("_id")]
+
+
+def recommend_from_bookmarks(user_id: int, limit: int = 12) -> list[dict]:
+    """Collaborative-lite: 'Because you saved X'.
+    Find galleries OTHER users bookmarked whose tag overlap with this user's
+    top tags is highest, excluding what THIS user already saved.
+    Returns [{id, title, cover, pages, tags, score}]."""
+    my_tags = set(top_user_tags(user_id, limit=6))
+    if not my_tags:
+        return []
+    my_ids = {b.get("gallery_id") for b in list_bookmarks(user_id, limit=500)}
+    # Pull recent bookmarks by others (last 60 days) — cap the scan.
+    cutoff = _dt.datetime.utcnow() - _dt.timedelta(days=60)
+    cur = (col_bookmarks()
+           .find({"user_id": {"$ne": int(user_id)},
+                  "created_at": {"$gte": cutoff}},
+                 {"gallery_id": 1, "title": 1, "cover": 1, "pages": 1, "tags": 1})
+           .sort("created_at", -1)
+           .limit(2000))
+    scored: dict = {}
+    for r in cur:
+        gid = r.get("gallery_id")
+        if not gid or gid in my_ids:
+            continue
+        names = {t.get("name") for t in (r.get("tags") or []) if t.get("name")}
+        overlap = len(my_tags & names)
+        if overlap <= 0:
+            continue
+        prev = scored.get(gid)
+        if prev is None or overlap > prev["score"]:
+            scored[gid] = {
+                "id":    gid,
+                "title": r.get("title"),
+                "cover": r.get("cover"),
+                "pages": r.get("pages"),
+                "tags":  r.get("tags") or [],
+                "score": overlap,
+            }
+    ranked = sorted(scored.values(), key=lambda x: (-x["score"], str(x.get("title") or "")))
+    return ranked[: int(max(1, min(50, limit)))]
+
+
+# ---- v11.7 User stats & badges ------------------------------------------
+def user_stats(user_id: int) -> dict:
+    """Aggregate counters + earned badges for the profile page."""
+    uid = int(user_id)
+    saves = col_bookmarks().count_documents({"user_id": uid})
+    ratings_given = col_ratings().count_documents({"user_id": uid})
+    shares  = col_shares().count_documents({"user_id": uid})
+    # Streak: consecutive daily-active days ending today (uses miniapp_usage keys).
+    streak = _consecutive_active_days(uid)
+    badges = _compute_badges(saves, ratings_given, shares, streak)
+    return {
+        "saves":         saves,
+        "ratings_given": ratings_given,
+        "shares":        shares,
+        "streak_days":   streak,
+        "badges":        badges,
+    }
+
+
+def _consecutive_active_days(user_id: int) -> int:
+    keys = {d["_id"] for d in col_usage()
+            .find({"_id": {"$regex": f"^{int(user_id)}_"}}, {"_id": 1})}
+    if not keys:
+        return 0
+    today = _dt.date.today()
+    streak = 0
+    while True:
+        k = f"{int(user_id)}_{(today - _dt.timedelta(days=streak)).isoformat()}"
+        if k in keys:
+            streak += 1
+            if streak > 3650:  # 10-year sanity cap
+                break
+        else:
+            break
+    return streak
+
+
+def _compute_badges(saves: int, ratings: int, shares: int, streak: int) -> list[dict]:
+    B = []
+    def add(icon, name, desc, unlocked):
+        B.append({"icon": icon, "name": name, "desc": desc, "unlocked": bool(unlocked)})
+    add("🌱", "First Save",   "Bookmark your first gallery",         saves   >= 1)
+    add("📚", "Collector",     "Bookmark 10 galleries",                saves   >= 10)
+    add("🏰", "Archivist",     "Bookmark 50 galleries",                saves   >= 50)
+    add("🏆", "Librarian",     "Bookmark 200 galleries",               saves   >= 200)
+    add("⭐", "First Rating", "Rate any gallery",                     ratings >= 1)
+    add("🎯", "Critic",        "Rate 25 galleries",                    ratings >= 25)
+    add("📤", "Sharer",        "Share your first gallery",             shares  >= 1)
+    add("🔥", "3-day Streak",  "Open the app 3 days in a row",         streak  >= 3)
+    add("⚡", "Week Streak",  "Open the app 7 days in a row",         streak  >= 7)
+    add("💎", "Monthly",       "Open the app 30 days in a row",        streak  >= 30)
+    return B
+
+
+# ---- v11.7 Share events (used by the Sharer badge) ----------------------
+def record_share(user_id: int, gallery_id: Any) -> None:
+    col_shares().insert_one({
+        "user_id":    int(user_id),
+        "gallery_id": gallery_id,
+        "ts":         _dt.datetime.utcnow(),
+    })
