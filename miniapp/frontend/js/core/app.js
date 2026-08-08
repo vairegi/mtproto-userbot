@@ -53,16 +53,19 @@ async function boot() {
   }
   store.set("me", me);
 
-  // v10: apply the server-side default background theme. A local
-  // explicit choice (user picked one in Settings) always wins; the
-  // server value only applies when the user has never touched the
-  // Background selector. We detect "never touched" by comparing against
-  // the factory default ("ember").
+  // v11.6: apply the server-side default background theme, but ONLY when
+  // the user has never touched the Theme selector. "Never touched" means
+  // the local pref still equals a factory default: v11.6's "dark", or the
+  // legacy "ember" alias (users who upgraded from v10/v11 will still have
+  // "ember" persisted). The admin sectionBackground UI is gone in v11.6,
+  // so this only matters for deployments where the setting was last
+  // written by an older admin build.
   try {
     const p = await api.get("/api/profile/preferences");
     const serverBg = (p && p.default_background_theme) || "";
     const localBg = prefs.get("background_theme");
-    if (serverBg && (localBg === "ember" || !localBg) && serverBg !== localBg) {
+    const isFactoryDefault = (!localBg || localBg === "dark" || localBg === "ember");
+    if (serverBg && isFactoryDefault && serverBg !== localBg) {
       document.documentElement.dataset.bgTheme = serverBg;
       // Note: we deliberately do NOT prefs.set() here — the server
       // default should not overwrite the user's stored preference, it

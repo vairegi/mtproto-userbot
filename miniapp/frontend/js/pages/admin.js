@@ -30,7 +30,9 @@ export async function render(root, { me }) {
   // (/broadcast) so the admin can attach videos / photos / styled & spoiler
   // text — none of which the mini-app textarea could carry. The backend
   // /api/admin/broadcast routes remain for backward-compat but are unused.
-  root.appendChild(sectionBackground());  // v10: App-wide default background
+  // v11.6: sectionBackground() removed. The admin-wide default background
+  // was retired in favour of a per-device Theme dropdown in Settings
+  // (9 palettes). The function body has been deleted below as well.
   root.appendChild(sectionUsers());
   root.appendChild(sectionDiag());
 }
@@ -721,57 +723,11 @@ function failedRow(g, refreshList) {
   );
 }
 
-// -------- v10. App-wide default background theme --------
-function sectionBackground() {
-  const wrap = h("div", { class: "admin-section" });
-  wrap.appendChild(h("h3", {}, "🎨 Default Background (all users)"));
-  wrap.appendChild(h("div", {
-    style: { color: "var(--du-ink-lo)", fontSize: "11px", margin: "4px 0 8px" },
-  }, "Sets the background every user sees when they open the app. Users "
-   + "can still override it locally in their own Settings → Appearance; "
-   + "their explicit choice always wins over this server default."));
-
-  const sel = h("select", {
-    style: {
-      background: "var(--du-bg-2)", color: "var(--du-ink-hi)",
-      border: "1px solid var(--du-border)", borderRadius: "8px",
-      padding: "8px 10px", fontSize: "13px", flex: "1",
-    },
-  },
-    h("option", { value: "ember" },  "🔥 Ember (default dark red)"),
-    h("option", { value: "light" },  "☀️ Light (white paper)"),
-    h("option", { value: "purple" }, "💜 Purple nebula"),
-  );
-
-  const saveBtn = h("button", { class: "btn primary btn-glow",
-    onclick: async () => {
-      haptic("medium");
-      try {
-        const r = await api.post("/api/admin/background", { theme: sel.value });
-        if (r.ok) {
-          toast("Default background set to " + r.theme, "success");
-          // Apply immediately to the admin's own session too.
-          document.documentElement.dataset.bgTheme = r.theme;
-        } else {
-          toast("Failed: " + (r.reason || "unknown"), "error");
-        }
-      } catch (e) { toast(e.message, "error"); }
-    },
-  }, "Save");
-
-  wrap.appendChild(h("div", {
-    style: { display: "flex", gap: "8px", alignItems: "center" },
-  }, sel, saveBtn));
-
-  (async () => {
-    try {
-      const r = await api.get("/api/admin/background");
-      if (r && r.theme) sel.value = r.theme;
-    } catch (e) { /* leave default selection */ }
-  })();
-
-  return wrap;
-}
+// -------- v11.6: sectionBackground() removed --------
+// The admin-wide default background was retired. Themes are now a
+// purely per-device preference (Settings → Theme, 9 palettes). The
+// legacy /api/admin/background routes remain untouched on the backend
+// for backward-compat but are no longer surfaced anywhere in the UI.
 
 // -------- 4. Diagnostics --------
 function sectionDiag() {

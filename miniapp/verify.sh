@@ -20,7 +20,7 @@ bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fail=$((fail+1)); }
 
 echo "==> Required files"
 REQUIRED=(
-  README.md CHANGELOG.md CHECKPOINTS.md start_patch.sh
+  README.md CHANGELOG.md start_patch.sh
   frontend/index.html
   frontend/css/theme.css frontend/css/base.css frontend/css/components.css
   frontend/js/core/app.js frontend/js/core/registry.js

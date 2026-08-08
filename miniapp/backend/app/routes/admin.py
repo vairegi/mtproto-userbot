@@ -276,25 +276,36 @@ def broadcast_preview(_a: dict = Depends(require_admin)) -> dict:
 
 
 # ---- Feature 6: Default background theme (app-wide) ----
-# The admin sets the default background here. It is read at boot by every
-# user via GET /api/profile/preferences. Users may still override their
-# own local background_theme in Settings → Appearance (client-side pref
-# wins over the server default when explicitly set).
+# v11.6: the admin UI for this feature has been removed (sectionBackground
+# was deleted from admin.js); themes are now a per-device preference in
+# Settings → Theme (9 palettes). These endpoints remain for backward-compat
+# so any external tooling or older Mini App clients still calling them keep
+# working. The allowlist has been widened to the v11.6 palette set.
+#
+# Users' explicit local Theme choice always wins over this server default.
+_ALLOWED_BG_THEMES = {
+    "dark", "ember",  # ember is a legacy alias of dark
+    "light", "sepia", "dracula", "midnight", "amoled",
+    "nord", "solarized", "forest",
+}
+
+
 class BackgroundThemeBody(BaseModel):
-    theme: str = "ember"
+    theme: str = "dark"
 
 
 @router.get("/background")
 def get_background(_a: dict = Depends(require_admin)) -> dict:
-    return {"theme": db.get_setting("default_background_theme", "ember") or "ember"}
+    return {"theme": db.get_setting("default_background_theme", "dark") or "dark"}
 
 
 @router.post("/background")
 def set_background(body: BackgroundThemeBody,
                    _a: dict = Depends(require_admin)) -> dict:
-    theme = (body.theme or "ember").strip().lower()
-    if theme not in ("ember", "light", "purple"):
-        return {"ok": False, "reason": "unknown theme (use ember | light | purple)"}
+    theme = (body.theme or "dark").strip().lower()
+    if theme not in _ALLOWED_BG_THEMES:
+        allowed = " | ".join(sorted(_ALLOWED_BG_THEMES))
+        return {"ok": False, "reason": f"unknown theme (allowed: {allowed})"}
     db.set_setting("default_background_theme", theme)
     return {"ok": True, "theme": theme}
 

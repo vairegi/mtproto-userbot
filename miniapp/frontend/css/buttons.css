@@ -64,13 +64,53 @@
   transform: translateY(-1px);
 }
 
-/* Theme-aware: purple background gets a purple glow instead of red */
-html[data-bg-theme="purple"] .btn-glow {
-  box-shadow: 0 2px 12px rgba(120, 66, 220, 0.42),
+/* v11.6: theme-aware glow. Palettes whose accent isn't red get a glow
+   colour matching their accent so the CTA doesn't clash with the ambient
+   background. Palettes not listed here (dark, ember, light, sepia, amoled)
+   fall through to the red glow defined above, which matches their
+   red accent. */
+html[data-bg-theme="dracula"] .btn-glow {
+  box-shadow: 0 2px 12px rgba(255, 121, 198, 0.42),
               0 1px 2px rgba(0, 0, 0, 0.20);
 }
-html[data-bg-theme="purple"] .btn-glow:hover:not(:disabled) {
-  box-shadow: 0 6px 26px rgba(140, 80, 240, 0.60),
+html[data-bg-theme="dracula"] .btn-glow:hover:not(:disabled) {
+  box-shadow: 0 6px 26px rgba(255, 141, 210, 0.60),
+              0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+html[data-bg-theme="midnight"] .btn-glow {
+  box-shadow: 0 2px 12px rgba(79, 140, 255, 0.42),
+              0 1px 2px rgba(0, 0, 0, 0.20);
+}
+html[data-bg-theme="midnight"] .btn-glow:hover:not(:disabled) {
+  box-shadow: 0 6px 26px rgba(99, 160, 255, 0.60),
+              0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+html[data-bg-theme="nord"] .btn-glow {
+  box-shadow: 0 2px 12px rgba(136, 192, 208, 0.42),
+              0 1px 2px rgba(0, 0, 0, 0.20);
+}
+html[data-bg-theme="nord"] .btn-glow:hover:not(:disabled) {
+  box-shadow: 0 6px 26px rgba(156, 212, 228, 0.60),
+              0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+html[data-bg-theme="solarized"] .btn-glow {
+  box-shadow: 0 2px 12px rgba(181, 137, 0, 0.42),
+              0 1px 2px rgba(0, 0, 0, 0.20);
+}
+html[data-bg-theme="solarized"] .btn-glow:hover:not(:disabled) {
+  box-shadow: 0 6px 26px rgba(201, 157, 20, 0.60),
+              0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+html[data-bg-theme="forest"] .btn-glow {
+  box-shadow: 0 2px 12px rgba(76, 175, 80, 0.42),
+              0 1px 2px rgba(0, 0, 0, 0.20);
+}
+html[data-bg-theme="forest"] .btn-glow:hover:not(:disabled) {
+  box-shadow: 0 6px 26px rgba(96, 195, 100, 0.60),
               0 2px 6px rgba(0, 0, 0, 0.25);
 }
 

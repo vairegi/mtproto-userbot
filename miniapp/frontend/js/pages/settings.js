@@ -21,12 +21,19 @@ export async function render(root, { me }) {
       { value: "dark",  label: "Always Dark" },
       { value: "light", label: "Always Light" },
     ]),
-    // v10: background theme selector. The names map to the
+    // v11.6: palette theme selector. The names map to the
     // [data-bg-theme="…"] overrides in css/themes.css.
-    selectRow("Background", "background_theme", [
-      { value: "ember",  label: "🔥 Ember (default dark red)" },
-      { value: "light",  label: "☀️ Light (white paper)" },
-      { value: "purple", label: "💜 Purple nebula" },
+    // 9 palettes shipped; "ember" is an alias of "dark" (kept for back-compat).
+    selectRow("Theme", "background_theme", [
+      { value: "dark",      label: "⚫ Dark" },
+      { value: "light",     label: "⚪ Light" },
+      { value: "sepia",     label: "📜 Sepia" },
+      { value: "dracula",   label: "🧛 Dracula" },
+      { value: "midnight",  label: "🌃 Midnight" },
+      { value: "amoled",    label: "🔲 AMOLED" },
+      { value: "nord",      label: "❄️ Nord" },
+      { value: "solarized", label: "🌞 Solarized" },
+      { value: "forest",    label: "🌲 Forest" },
     ]),
     toggleRow("Reduce motion",    "reduced_motion"),
   ]));

@@ -20,11 +20,12 @@ const KEY = "du_prefs_v1";
 
 const DEFAULTS = {
   theme_override: "auto",       // "auto" | "dark" | "light"
-  // v10: admin-selectable background theme. Applies to the whole app.
-  //   "ember"  — default red/orange cinematic (matches base.css)
-  //   "light"  — bright white paper look
-  //   "purple" — soft purple nebula (reference screenshot)
-  background_theme: "ember",
+  // v11.6: user-selectable palette theme. Applies to the whole app.
+  // Ships 9 palettes — see css/themes.css for the full list:
+  //   dark (default), light, sepia, dracula, midnight, amoled,
+  //   nord, solarized, forest. "ember" is kept as an alias of dark
+  //   so old localStorage values keep resolving.
+  background_theme: "dark",
   haptics_enabled: true,
   infinite_scroll: true,
   reduced_motion: false,
@@ -60,8 +61,8 @@ function apply() {
   if (override === "auto") delete document.documentElement.dataset.themeForced;
   else document.documentElement.dataset.theme = override;
   document.documentElement.dataset.reducedMotion = cache.reduced_motion ? "1" : "0";
-  // v10: background theme (see themes.css for the [data-bg-theme="…"] rules).
-  const bg = cache.background_theme || "ember";
+  // v11.6: palette theme (see themes.css for the [data-bg-theme="…"] rules).
+  const bg = cache.background_theme || "dark";
   document.documentElement.dataset.bgTheme = bg;
 }
 apply();

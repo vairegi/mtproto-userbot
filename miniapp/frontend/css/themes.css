@@ -1,31 +1,47 @@
 /*
   ============================================================================
-  themes.css — Admin-selectable background themes (v10)
+  themes.css — User-selectable palette themes (v11.6)
   ============================================================================
-  The base body background lives in base.css (the default "ember" dark theme).
-  This stylesheet overlays alternative backgrounds when the user picks a
-  different theme from Settings → Appearance → Background theme.
+  The base body background lives in base.css (the default "ember/dark" theme).
+  This stylesheet overlays alternative palettes when the user picks a
+  different theme from Settings → Appearance → Theme.
 
   Themes are activated by setting `data-bg-theme` on the <html> element:
-      document.documentElement.dataset.bgTheme = "purple";
+      document.documentElement.dataset.bgTheme = "dracula";
   See core/prefs.js for the persisted preference and core/telegram.js's
   apply() call for the wiring.
 
-  Three themes ship v10:
-    * ember   (default — no override needed; base.css handles it)
-    * light   (bright white paper look, dark ink)
-    * purple  (soft purple nebula matching the reference screenshot the
-               user provided: near-black base with two blurred purple glows
-               top-right and mid-left)
+  v11.6 ships 9 palettes:
+    * dark        (default — falls through to base.css)
+    * ember       (alias of dark — kept so old localStorage still resolves)
+    * light       (bright white paper look, dark ink)
+    * sepia       (warm off-white / brown ink, easy on the eyes)
+    * dracula     (classic dracula: purple/pink on dark navy)
+    * midnight    (deep navy blues, gentle indigo glows)
+    * amoled      (pure #000 body — no gradients — for OLED battery savings)
+    * nord        (cool arctic blue-grey palette)
+    * solarized   (solarized dark: teal base, yellow accents)
+    * forest      (deep greens with mossy glow)
 
   Adding a new theme: add a `[data-bg-theme="foo"]` block below and expose
-  the name in prefs.js DEFAULTS + settings.js selectRow options.
+  the name in prefs.js DEFAULTS (optional) + settings.js selectRow options.
+  Every palette overrides the same set of CSS variables so every component
+  (buttons, cards, borders, ink, headers) picks up the palette automatically
+  with no per-component CSS change.
   ============================================================================
 */
 
+
 /* -----------------------------------------------------------------------
-   Light theme — white paper, dark ink, subtle red accent glow retained
-   for brand continuity. Everything readable in bright sunlight.
+   DARK — default. Empty block kept as documentation so the settings
+   dropdown can list "Dark" without special-casing it.
+   ----------------------------------------------------------------------- */
+html[data-bg-theme="dark"]  { /* falls through to base.css defaults */ }
+html[data-bg-theme="ember"] { /* legacy alias of dark — kept for back-compat */ }
+
+
+/* -----------------------------------------------------------------------
+   LIGHT — white paper, dark ink, subtle red accent retained for brand.
    ----------------------------------------------------------------------- */
 html[data-bg-theme="light"] {
   --du-bg-0:          #f6f7fb;
@@ -38,13 +54,15 @@ html[data-bg-theme="light"] {
   --du-ink-lo:        #6b7280;
   --du-ink-inv:       #ffffff;
 
+  --du-accent:        #d92626;
+  --du-accent-hover:  #b81f1f;
+
   --du-border:        rgba(0, 0, 0, 0.10);
   --du-border-strong: rgba(0, 0, 0, 0.18);
   --du-divider:       rgba(0, 0, 0, 0.06);
 
   --du-header-bg:     rgba(255, 255, 255, 0.85);
 }
-
 html[data-bg-theme="light"] body {
   background:
     radial-gradient(700px 460px at 50% -6%, rgba(255, 58, 58, 0.06), transparent 65%),
@@ -55,40 +73,223 @@ html[data-bg-theme="light"] body {
 
 
 /* -----------------------------------------------------------------------
-   Purple theme — near-black base with two blurred purple glows (top-right
-   + mid-left), mirroring the reference screenshot. Keeps the same red
-   accent for buttons so brand continuity is preserved; only the ambient
-   surface changes.
+   SEPIA — warm off-white paper with brown ink.
    ----------------------------------------------------------------------- */
-html[data-bg-theme="purple"] {
-  --du-bg-0:          #0a0714;
-  --du-bg-1:          #120c22;
-  --du-bg-2:          #1a1230;
-  --du-bg-3:          #22183f;
+html[data-bg-theme="sepia"] {
+  --du-bg-0:          #f4ecd8;
+  --du-bg-1:          #fbf3de;
+  --du-bg-2:          #ecdfc0;
+  --du-bg-3:          #e0d0a9;
 
-  --du-border:        rgba(160, 120, 255, 0.14);
-  --du-border-strong: rgba(160, 120, 255, 0.28);
-  --du-divider:       rgba(255, 255, 255, 0.06);
+  --du-ink-hi:        #3b2a17;
+  --du-ink-mid:       #5a4126;
+  --du-ink-lo:        #7d5c3a;
+  --du-ink-inv:       #fbf3de;
 
-  --du-header-bg:     rgba(10, 7, 20, 0.82);
+  --du-accent:        #a0522d;
+  --du-accent-hover:  #8a4425;
+
+  --du-border:        rgba(90, 65, 38, 0.18);
+  --du-border-strong: rgba(90, 65, 38, 0.32);
+  --du-divider:       rgba(90, 65, 38, 0.10);
+
+  --du-header-bg:     rgba(251, 243, 222, 0.88);
 }
-
-html[data-bg-theme="purple"] body {
+html[data-bg-theme="sepia"] body {
   background:
-    /* top-right big blurred purple glow */
-    radial-gradient(760px 640px at 88% -8%, rgba(120, 66, 220, 0.55), transparent 62%),
-    /* mid-left softer violet glow */
-    radial-gradient(560px 520px at 6% 42%, rgba(88, 40, 190, 0.42), transparent 66%),
-    /* subtle indigo fade bottom */
-    radial-gradient(900px 620px at 50% 118%, rgba(60, 24, 140, 0.28), transparent 70%),
+    radial-gradient(720px 480px at 50% -6%, rgba(160, 82, 45, 0.10), transparent 65%),
+    radial-gradient(600px 400px at 92% 108%, rgba(120, 60, 30, 0.08), transparent 65%),
     var(--du-bg-0);
   background-attachment: fixed;
 }
 
 
 /* -----------------------------------------------------------------------
-   Ember (default) — no override needed. Keeping the block here (empty)
-   as documentation so the admin panel can list all three themes without
-   guessing which one is the default.
+   DRACULA — classic dracula palette on dark navy/purple.
    ----------------------------------------------------------------------- */
-html[data-bg-theme="ember"] { /* falls through to base.css defaults */ }
+html[data-bg-theme="dracula"] {
+  --du-bg-0:          #282a36;
+  --du-bg-1:          #343746;
+  --du-bg-2:          #3d3f52;
+  --du-bg-3:          #44475a;
+
+  --du-ink-hi:        #f8f8f2;
+  --du-ink-mid:       #d0d0c8;
+  --du-ink-lo:        #a5a5a2;
+  --du-ink-inv:       #282a36;
+
+  --du-accent:        #ff79c6;
+  --du-accent-hover:  #ff5aa6;
+
+  --du-border:        rgba(189, 147, 249, 0.16);
+  --du-border-strong: rgba(189, 147, 249, 0.32);
+  --du-divider:       rgba(255, 255, 255, 0.06);
+
+  --du-header-bg:     rgba(40, 42, 54, 0.85);
+}
+html[data-bg-theme="dracula"] body {
+  background:
+    radial-gradient(760px 620px at 90% -8%, rgba(189, 147, 249, 0.32), transparent 62%),
+    radial-gradient(560px 520px at 6% 42%, rgba(255, 121, 198, 0.22), transparent 66%),
+    radial-gradient(900px 620px at 50% 118%, rgba(80, 250, 123, 0.10), transparent 70%),
+    var(--du-bg-0);
+  background-attachment: fixed;
+}
+
+
+/* -----------------------------------------------------------------------
+   MIDNIGHT — deep navy blues with gentle indigo glows.
+   ----------------------------------------------------------------------- */
+html[data-bg-theme="midnight"] {
+  --du-bg-0:          #050a1a;
+  --du-bg-1:          #0a1330;
+  --du-bg-2:          #101a44;
+  --du-bg-3:          #16225a;
+
+  --du-ink-hi:        #eef2ff;
+  --du-ink-mid:       #c1c8e0;
+  --du-ink-lo:        #8892b0;
+  --du-ink-inv:       #050a1a;
+
+  --du-accent:        #4f8cff;
+  --du-accent-hover:  #3572ee;
+
+  --du-border:        rgba(100, 140, 255, 0.14);
+  --du-border-strong: rgba(100, 140, 255, 0.28);
+  --du-divider:       rgba(255, 255, 255, 0.06);
+
+  --du-header-bg:     rgba(5, 10, 26, 0.85);
+}
+html[data-bg-theme="midnight"] body {
+  background:
+    radial-gradient(780px 640px at 88% -6%, rgba(64, 112, 220, 0.48), transparent 62%),
+    radial-gradient(560px 520px at 6% 42%, rgba(46, 76, 190, 0.36), transparent 66%),
+    radial-gradient(900px 620px at 50% 118%, rgba(30, 50, 140, 0.28), transparent 70%),
+    var(--du-bg-0);
+  background-attachment: fixed;
+}
+
+
+/* -----------------------------------------------------------------------
+   AMOLED — pure black body, no gradients, max OLED savings.
+   ----------------------------------------------------------------------- */
+html[data-bg-theme="amoled"] {
+  --du-bg-0:          #000000;
+  --du-bg-1:          #0a0a0a;
+  --du-bg-2:          #121212;
+  --du-bg-3:          #1a1a1a;
+
+  --du-ink-hi:        #ffffff;
+  --du-ink-mid:       #cfcfcf;
+  --du-ink-lo:        #8f8f8f;
+  --du-ink-inv:       #000000;
+
+  --du-accent:        #ff3a3a;
+  --du-accent-hover:  #e02525;
+
+  --du-border:        rgba(255, 255, 255, 0.10);
+  --du-border-strong: rgba(255, 255, 255, 0.22);
+  --du-divider:       rgba(255, 255, 255, 0.06);
+
+  --du-header-bg:     rgba(0, 0, 0, 0.92);
+}
+html[data-bg-theme="amoled"] body {
+  background: #000000;
+}
+
+
+/* -----------------------------------------------------------------------
+   NORD — cool arctic blue-grey.
+   ----------------------------------------------------------------------- */
+html[data-bg-theme="nord"] {
+  --du-bg-0:          #2e3440;
+  --du-bg-1:          #3b4252;
+  --du-bg-2:          #434c5e;
+  --du-bg-3:          #4c566a;
+
+  --du-ink-hi:        #eceff4;
+  --du-ink-mid:       #d8dee9;
+  --du-ink-lo:        #a3aabf;
+  --du-ink-inv:       #2e3440;
+
+  --du-accent:        #88c0d0;
+  --du-accent-hover:  #6faabb;
+
+  --du-border:        rgba(216, 222, 233, 0.14);
+  --du-border-strong: rgba(216, 222, 233, 0.28);
+  --du-divider:       rgba(255, 255, 255, 0.06);
+
+  --du-header-bg:     rgba(46, 52, 64, 0.85);
+}
+html[data-bg-theme="nord"] body {
+  background:
+    radial-gradient(780px 620px at 88% -8%, rgba(136, 192, 208, 0.30), transparent 62%),
+    radial-gradient(560px 520px at 6% 42%, rgba(94, 129, 172, 0.28), transparent 66%),
+    var(--du-bg-0);
+  background-attachment: fixed;
+}
+
+
+/* -----------------------------------------------------------------------
+   SOLARIZED — solarized dark: teal base, yellow accent.
+   ----------------------------------------------------------------------- */
+html[data-bg-theme="solarized"] {
+  --du-bg-0:          #002b36;
+  --du-bg-1:          #073642;
+  --du-bg-2:          #0a4552;
+  --du-bg-3:          #0f5461;
+
+  --du-ink-hi:        #fdf6e3;
+  --du-ink-mid:       #eee8d5;
+  --du-ink-lo:        #93a1a1;
+  --du-ink-inv:       #002b36;
+
+  --du-accent:        #b58900;
+  --du-accent-hover:  #9c7500;
+
+  --du-border:        rgba(147, 161, 161, 0.16);
+  --du-border-strong: rgba(147, 161, 161, 0.30);
+  --du-divider:       rgba(255, 255, 255, 0.06);
+
+  --du-header-bg:     rgba(0, 43, 54, 0.85);
+}
+html[data-bg-theme="solarized"] body {
+  background:
+    radial-gradient(760px 620px at 88% -8%, rgba(181, 137, 0, 0.24), transparent 62%),
+    radial-gradient(560px 520px at 6% 42%, rgba(38, 139, 210, 0.22), transparent 66%),
+    var(--du-bg-0);
+  background-attachment: fixed;
+}
+
+
+/* -----------------------------------------------------------------------
+   FOREST — deep greens with mossy glow.
+   ----------------------------------------------------------------------- */
+html[data-bg-theme="forest"] {
+  --du-bg-0:          #0b1a10;
+  --du-bg-1:          #12281a;
+  --du-bg-2:          #173521;
+  --du-bg-3:          #1f4229;
+
+  --du-ink-hi:        #eaf5ec;
+  --du-ink-mid:       #c8dccc;
+  --du-ink-lo:        #8faa96;
+  --du-ink-inv:       #0b1a10;
+
+  --du-accent:        #4caf50;
+  --du-accent-hover:  #3d9142;
+
+  --du-border:        rgba(140, 200, 150, 0.14);
+  --du-border-strong: rgba(140, 200, 150, 0.28);
+  --du-divider:       rgba(255, 255, 255, 0.06);
+
+  --du-header-bg:     rgba(11, 26, 16, 0.85);
+}
+html[data-bg-theme="forest"] body {
+  background:
+    radial-gradient(760px 620px at 88% -8%, rgba(76, 175, 80, 0.32), transparent 62%),
+    radial-gradient(560px 520px at 6% 42%, rgba(40, 120, 60, 0.28), transparent 66%),
+    radial-gradient(900px 620px at 50% 118%, rgba(20, 80, 40, 0.22), transparent 70%),
+    var(--du-bg-0);
+  background-attachment: fixed;
+}
