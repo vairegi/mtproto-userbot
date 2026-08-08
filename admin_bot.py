@@ -516,6 +516,40 @@ async def _broadcast_weekly_digest(app, body: str) -> tuple[int, int]:
     return ok, fail
 
 
+# ---------------------------------------------------------------------------
+# v11.8 (#8) — /addimp <text>
+# Records an admin-authored improvement note that surfaces in the mini-app
+# Settings tab ("What's new" panel). Backed by `miniapp_improvements`.
+# ---------------------------------------------------------------------------
+@only_admin
+async def cmd_addimp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    import uuid as _uuid
+    text = " ".join(ctx.args or []).strip()
+    if not text:
+        await update.effective_message.reply_text(
+            "Usage: /addimp <message>\n\nExample:\n"
+            "  /addimp Added 9 new theme palettes to the mini-app.")
+        return
+    if len(text) > 2000:
+        await update.effective_message.reply_text(
+            "❌ Too long — keep it under 2000 characters.")
+        return
+    conn = db.connect()
+    try:
+        u = update.effective_user
+        conn.db["miniapp_improvements"].insert_one({
+            "_id":         str(_uuid.uuid4()),
+            "text":        text,
+            "author_id":   int(u.id if u else 0),
+            "author_name": (u.first_name if u else "admin") or "admin",
+            "ts":          dt.datetime.utcnow(),
+        })
+    finally:
+        conn.close()
+    await update.effective_message.reply_text(
+        "✅ Improvement posted — users will see it in Settings → What's new.")
+
+
 @only_admin
 async def cmd_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually broadcast this week's top-5 saves right now."""
@@ -2494,6 +2528,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("topsave", cmd_topsave))
     app.add_handler(CommandHandler("weekly", cmd_weekly))   # v11.7
+    app.add_handler(CommandHandler("addimp", cmd_addimp))   # v11.8 (#8)
     app.add_handler(CommandHandler("allsaved", cmd_allsaved))
     app.add_handler(CommandHandler("coverpost", cmd_coverpost))
     app.add_handler(CommandHandler("verify", cmd_verify))
