@@ -136,7 +136,7 @@ export async function render(root, { me }) {
   function renderCard(g) {
     return make("card", {
       id: g.id, title: g.title, cover: g.cover, pages: g.pages,
-      badge: g.pages ? `${g.pages}p` : null,
+      badge: null,  // v11.9 (#5): removed "Np" badge — covers stay clean
       onOpen: () => openDetail(g),
     });
   }
@@ -270,29 +270,60 @@ export async function render(root, { me }) {
 
 function buildSearchBar(state, refetch) {
   const input = h("input", {
-    type: "search", enterkeyhint: "search",
+    type: "search", enterkeyhint: "search", inputmode: "search",
     placeholder: "Search galleries, tags, artists…",
     autocomplete: "off", autocapitalize: "off", spellcheck: "false",
+    name: "q",
   });
-  const clear = h("button", { class: "search-clear u-hide", "aria-label": "Clear" }, "✕");
+  const clear = h("button", { type: "button", class: "search-clear u-hide", "aria-label": "Clear" }, "✕");
   const bar = h("div", { class: "search-bar" },
     h("span", { class: "search-icon" }, "🔎"),
     input, clear,
   );
+  // v11.9 (#2): wrap in a REAL <form> so the on-screen keyboard's
+  // Search/Go/Enter key triggers a submit. IME compositionend handled
+  // too (Android sometimes swallows the final input event).
+  const form = h("form", {
+    style: { display: "contents" },
+    action: "javascript:void(0)",
+  }, bar);
+
   let timer = null;
-  input.addEventListener("input", () => {
+  let composing = false;
+
+  function commit(immediate = false) {
     state.query = input.value;
     state.parsed = parseSearch(state.query);
-    toggleHomeRows();  // v11.7: hide trending + recs while a query is active
+    toggleHomeRows();
     clear.classList.toggle("u-hide", !state.query);
     clearTimeout(timer);
-    timer = setTimeout(() => { haptic("select"); refetch(); }, 350);
+    if (immediate) { haptic("select"); refetch(); }
+    else timer = setTimeout(() => { haptic("select"); refetch(); }, 350);
+  }
+
+  input.addEventListener("compositionstart", () => { composing = true; });
+  input.addEventListener("compositionend",   () => { composing = false; commit(false); });
+  input.addEventListener("input", () => { if (!composing) commit(false); });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === "Go" || e.keyCode === 13) {
+      e.preventDefault();
+      commit(true);            // fire NOW — no 350ms debounce on Enter
+      input.blur();            // dismiss the keyboard
+    }
   });
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    commit(true);
+    input.blur();
+  });
+  // iOS fires 'search' on the native clear affordance / IME search key.
+  input.addEventListener("search", () => commit(true));
+
   clear.addEventListener("click", () => {
     input.value = ""; state.query = ""; state.parsed = parseSearch("");
     clear.classList.add("u-hide"); refetch();
   });
-  return bar;
+  return form;
 }
 
 function buildChipRow(state, refetch) {

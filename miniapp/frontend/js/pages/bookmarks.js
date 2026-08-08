@@ -10,6 +10,7 @@ import { api } from "core/api.js";
 import { make, h } from "core/components.js";
 import { store } from "core/state.js";
 import { cardActions } from "plugins/card-actions.js";
+import { prefetchGallery } from "plugins/detail-sheet.js";  // v11.9 (#3)
 
 export async function render(root, { me }) {
   // v11.8 (#6b): compact 3-per-row grid on mobile, 4-per-row on ≥720px.
@@ -31,9 +32,14 @@ export async function render(root, { me }) {
       return;
     }
     for (const g of items) {
+      // v11.9 (#3): warm the detail cache so tap-to-open is instant here too.
+      if (g && g.id) {
+        setTimeout(() => { try { prefetchGallery(g.id); } catch (_) {} },
+                   30 + Math.random() * 300);
+      }
       $grid.appendChild(make("card", {
         id: g.id, title: g.title, cover: g.cover, pages: g.pages,
-        badge: g.pages ? `${g.pages}p` : null,
+        badge: null,  // v11.9 (#5): removed "Np" badge
         onOpen: () => openDetail(g, me),
       }));
     }

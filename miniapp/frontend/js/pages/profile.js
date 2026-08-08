@@ -10,6 +10,7 @@
 import { api } from "core/api.js";
 import { h, make } from "core/components.js";
 import { store } from "core/state.js";
+import { openGalleryDetail, prefetchGallery } from "plugins/detail-sheet.js";  // v11.9
 
 export async function render(root, { me }) {
   const $hero   = h("div", { class: "profile-hero" });
@@ -181,10 +182,16 @@ export async function render(root, { me }) {
     }
     const grid = h("div", { class: "card-grid" });
     for (const g of items.slice(0, 12)) {
+      // v11.9 (#3): warm the detail cache + open the sheet directly
+      // instead of bouncing the user to the Saved tab.
+      if (g && g.id) {
+        setTimeout(() => { try { prefetchGallery(g.id); } catch (_) {} },
+                   30 + Math.random() * 300);
+      }
       grid.appendChild(make("card", {
         id: g.id, title: g.title, cover: g.cover, pages: g.pages,
-        badge: g.pages ? `${g.pages}p` : null,
-        onOpen: () => { location.hash = "#bookmarks"; },
+        badge: null,  // v11.9 (#5): removed "Np" badge
+        onOpen: () => openGalleryDetail(g, store.get("me")),
       }));
     }
     $saved.appendChild(grid);

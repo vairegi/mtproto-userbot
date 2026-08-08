@@ -544,22 +544,34 @@ def search(q: str, page: int, sort: str, lang: str,
     return [_normalize(r) for r in window]
 
 
+def _detail_rate_limited(gallery_id: str) -> bool:
+    """v11.9: True when this gallery_id is currently inside the 429 backoff
+    window. Used by the route to return 503 + Retry-After instead of the
+    misleading 404 that left the frontend stuck on 'Loading details…'."""
+    cache_key = ("detail", str(gallery_id))
+    now = _time.time()
+    ban = _RATE_LIMIT_CACHE.get(cache_key)
+    return bool(ban and ban > now)
+
+
+def _detail_rate_limit_wait_sec(gallery_id: str) -> int:
+    """Seconds until the current backoff expires (0 if not rate-limited)."""
+    cache_key = ("detail", str(gallery_id))
+    now = _time.time()
+    ban = _RATE_LIMIT_CACHE.get(cache_key)
+    if not ban or ban <= now:
+        return 0
+    return max(1, int(ban - now))
+
+
 def gallery_detail(gallery_id: str) -> dict:
     """Return the full detail dict for one gallery.
-
-    BUG FIX (detail sheet only showed title): the frontend `detail-sheet.js`
-    renders `d.groups`, `d.title_english`, `d.title_japanese`,
-    `d.favorites`, and `d.upload_date`. hf_scraper's `GalleryMeta` doesn't
-    carry those fields — only the direct nhentai v2 detail call does.
 
     Strategy: ALWAYS call the direct nhentai v2 endpoint for the rich
     fields. If that succeeds, return it. Only fall back to hf_scraper when
     the direct call fails (network/rate-limit), so the sheet at least gets
     a title + cover instead of nothing.
     """
-    # Prefer the direct nhentai v2 detail — it's the only source that
-    # returns title_english, title_japanese, favorites, upload_date and
-    # grouped tags.
     try:
         direct = _direct_nhentai_detail(str(gallery_id))
     except Exception as e:  # noqa: BLE001

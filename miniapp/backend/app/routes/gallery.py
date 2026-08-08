@@ -29,6 +29,22 @@ router = APIRouter(prefix="/api/gallery", tags=["gallery"])
 def get_gallery(gallery_id: str, _user: dict = Depends(get_current_user)) -> dict:
     detail = scraper_bridge.gallery_detail(gallery_id)
     if not detail or not detail.get("id"):
+        # v11.9: distinguish "really doesn't exist" from "we're rate-limited
+        # right now". When the scraper's 429 backoff is active for this id,
+        # tell the client to retry in N seconds instead of pretending the
+        # gallery vanished.
+        wait = 0
+        try:
+            if scraper_bridge._detail_rate_limited(gallery_id):
+                wait = scraper_bridge._detail_rate_limit_wait_sec(gallery_id)
+        except Exception:  # noqa: BLE001
+            wait = 0
+        if wait > 0:
+            raise HTTPException(
+                503,
+                detail="upstream rate-limited; retry soon",
+                headers={"Retry-After": str(wait)},
+            )
         raise HTTPException(404, "Gallery not found")
 
     # Best-effort: enrich the detail payload with V2 status so the frontend

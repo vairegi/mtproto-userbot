@@ -108,34 +108,68 @@ function renderBase(root, g) {
 
 async function enrich(root, g) {
   const key = String(g.id || "");
-  // v11.8 (#2): instant render from the prefetch cache when available.
+  // v11.9 (#3): ALWAYS kick off a prefetch — even if the card wasn't in
+  // the viewport yet. This makes "tapped → details appear" the default.
+  if (!_detailCache.has(key) && !_detailInflight.has(key)) {
+    prefetchGallery(key);
+  }
+
+  // v11.9 (#3): instant render from the prefetch cache when available.
   let d = _detailCache.get(key) || null;
   if (d) {
     paintFull(root, d);
+  } else {
+    // No cache — swap the "Loading details…" line for a skeleton block so
+    // the sheet doesn't feel frozen. We still refresh in the background.
+    const l = root.querySelector(".d-loading");
+    if (l) l.textContent = "Loading…";
   }
-  // Always refresh in the background (fresh tags / ratings / upload date).
-  try {
-    const inflight = _detailInflight.get(key);
-    const fresh = inflight ? await inflight
-                           : await api.get(`/api/gallery/${g.id}`);
-    if (fresh && fresh.id) {
-      _detailCache.set(key, fresh);
-      d = fresh;
-      // Only re-paint if the user hasn't navigated away (root still mounted).
-      if (root.isConnected) paintFull(root, d);
-    } else if (!d) {
-      const l = root.querySelector(".d-loading");
-      if (l) l.remove();
-      return;
+
+  // Wait for the in-flight prefetch (or fetch fresh) — whichever completes
+  // first. This avoids double-fetching the same gallery.
+  // v11.9: on a 503 (upstream rate-limited), wait the Retry-After window
+  // (capped at 65s) and retry ONCE — that's what turns the old
+  // "Loading details… forever" failure into a slow-but-working load.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const inflight = _detailInflight.get(key);
+      const fresh = inflight ? await inflight
+                             : await api.get(`/api/gallery/${g.id}`);
+      if (fresh && fresh.id) {
+        if (_detailCache.size >= _DETAIL_CACHE_MAX) {
+          _detailCache.delete(_detailCache.keys().next().value);
+        }
+        _detailCache.set(key, fresh);
+        d = fresh;
+        if (root.isConnected) paintFull(root, d);
+        return;
+      }
+    } catch (e) {
+      const status = e && (e.status || (e.response && e.response.status));
+      if (status === 503 && attempt === 0) {
+        const ra = parseInt(
+          (e.headers && (e.headers.get ? e.headers.get("Retry-After") : e.headers["Retry-After"]))
+          || "10", 10);
+        const waitMs = Math.min(65000, Math.max(2000, (isNaN(ra) ? 10 : ra) * 1000));
+        const l = root.querySelector(".d-loading");
+        if (l) l.textContent = "Server busy — retrying…";
+        await new Promise(r => setTimeout(r, waitMs));
+        if (!root.isConnected) return;
+        continue;  // second (final) attempt
+      }
+      break;
     }
-  } catch (_) {
+    break;
+  }
+
+  // If we got here and there's still nothing cached, hide the loader so
+  // the user isn't staring at it forever.
+  if (!d) {
     const l = root.querySelector(".d-loading");
     if (l) l.remove();
-    if (!d) return;
+    return;
   }
-  if (!d || !d.id) return;
-
-  paintFull(root, d);
+  if (root.isConnected) paintFull(root, d);
 }
 
 /* v11.8 (#2 + #3): single paint function — the full detail body is rebuilt
@@ -226,6 +260,21 @@ function paintFull(root, d) {
         fmtDate(d.upload_date)),
     );
   }
+  // v11.9 (#4): Saves row — live count from /api/bookmarks/count/{id}.
+  // Renders "…" immediately, then fills in when the count arrives.
+  const savesVal = h("span", {
+    style: { fontSize: "13px", color: "var(--du-ink-mid)", fontWeight: "600" },
+  }, "…");
+  addRow("Saves", savesVal);
+  (async () => {
+    try {
+      const r = await api.get(`/api/bookmarks/count/${encodeURIComponent(d.id)}`);
+      const n = Number(r && r.saves) || 0;
+      savesVal.textContent = (n >= 1000)
+        ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k"
+        : String(n);
+    } catch (_) { savesVal.textContent = "0"; }
+  })();
   if (!firstRow) root.appendChild(card);   // only render when it has content
 }
 

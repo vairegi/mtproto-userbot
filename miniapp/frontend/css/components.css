@@ -130,27 +130,28 @@
    ============================================================ */
 .card-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: var(--du-space-3);
-}
-/* v11.8 (#6b): Saved-tab compact grid — 3 columns on narrow screens so
-   more items fit per screen. Other pages keep the roomier 2-col default. */
-.card-grid.card-grid-compact {
+  /* v11.9 (#1): 3 columns on narrow screens, 4 on ≥720px. Applies to
+     every grid (search, saved, home-rows) — no opt-in class needed. */
   grid-template-columns: repeat(3, 1fr);
   gap: var(--du-space-2);
 }
-.card-grid.card-grid-compact .gallery-card .meta {
+.card-grid .gallery-card .meta {
   padding: var(--du-space-2);
 }
-.card-grid.card-grid-compact .gallery-card .title {
+.card-grid .gallery-card .title {
   font-size: 12px;
   -webkit-line-clamp: 1;
 }
 @media (min-width: 720px) {
-  .card-grid.card-grid-compact {
+  .card-grid {
     grid-template-columns: repeat(4, 1fr);
+    gap: var(--du-space-3);
   }
+  .card-grid .gallery-card .meta  { padding: var(--du-space-3); }
+  .card-grid .gallery-card .title { font-size: var(--du-fs-sm); -webkit-line-clamp: 2; }
 }
+/* Back-compat: the old opt-in class still works (no-op now, all grids are compact). */
+.card-grid.card-grid-compact { /* no-op in v11.9 */ }
 .gallery-card {
   position: relative;
   background: var(--du-bg-1);
@@ -538,13 +539,18 @@
 .d-loading { font-size: 12px; color: var(--du-ink-lo); margin-top: 10px;
              animation: du-pulse 1.2s ease-in-out infinite; }
 @keyframes du-pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
+/* v11.9 (#4): metadata rows are now content-only — the unified
+   .d-meta-card container (added in v11.8) owns the background, border,
+   and radius. Individual rows must NOT paint their own boxes, otherwise
+   they still look like floating cards. */
 .d-meta-row { display: flex; align-items: flex-start; gap: 8px; width: 100%;
-              margin-top: 10px; padding: 9px 10px; border-radius: 12px;
-              background: var(--du-bg-1); border: 1px solid var(--du-border); }
+              margin-top: 0; padding: 0; border-radius: 0;
+              background: transparent; border: 0; }
+.d-meta-card { box-shadow: none; }
 .d-meta-label { flex: 0 0 auto; font-size: 11px; font-weight: 600;
                 letter-spacing: 0.06em; text-transform: uppercase;
                 color: var(--du-accent, #ff3b5c); margin-top: 2px; min-width: 66px; }
 .d-meta-tags { display: flex; flex-wrap: wrap; gap: 6px; }
 .d-tag { font-size: 11.5px; padding: 3px 9px; border-radius: 999px;
-         background: rgba(255,255,255,0.05);
+         background: var(--du-bg-2);
          border: 1px solid var(--du-border); color: var(--du-ink-mid); }
