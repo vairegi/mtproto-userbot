@@ -59,10 +59,78 @@ export async function render(root, { me }) {
   ]));
   root.appendChild(section("Support", [ contactAdminRow() ]));
 
+  // v11.8 (#8): What's new panel — renders admin-authored improvements.
+  root.appendChild(improvementsSection());
+
   root.appendChild(h("div", {
     style: { textAlign: "center", padding: "16px",
              color: "var(--du-ink-lo)", fontSize: "12px" },
   }, "Doujinshi Universe · v0.1.0"));
+}
+
+/* ---------------------------------------------------------------
+   v11.8 (#8) — What's new / Improvements panel
+   Reads /api/improvements. Hidden when there's nothing to show.
+   --------------------------------------------------------------- */
+function improvementsSection() {
+  const wrap = h("div", { class: "admin-section", style: { display: "none" }});
+  wrap.appendChild(h("h3", {}, "🆕 What's new"));
+  const list = h("div", {
+    style: { display: "flex", flexDirection: "column", gap: "0" },
+  });
+  wrap.appendChild(list);
+
+  (async () => {
+    let items = [];
+    try {
+      const r = await fetch("/api/improvements?limit=30", { credentials: "include" });
+      if (r.ok) items = (await r.json()).items || [];
+    } catch (_) { items = []; }
+    // Fallback: use core/api.js when direct fetch fails on the auth header.
+    if (!items.length) {
+      try {
+        const mod = await import("core/api.js");
+        const r = await mod.api.get("/api/improvements?limit=30");
+        items = r.items || [];
+      } catch (_) {}
+    }
+    if (!items.length) return;
+    wrap.style.display = "";
+    let first = true;
+    for (const it of items) {
+      const row = h("div", {
+        style: {
+          padding: "10px 2px",
+          borderTop: first ? "0" : "1px solid var(--du-divider, rgba(255,255,255,0.06))",
+        },
+      });
+      first = false;
+      row.appendChild(h("div", {
+        style: { fontSize: "13px", color: "var(--du-ink-hi)", lineHeight: "1.4",
+                 whiteSpace: "pre-wrap", overflowWrap: "anywhere" },
+      }, it.text || ""));
+      const meta = [];
+      if (it.author) meta.push(it.author);
+      if (it.ts) meta.push(fmtImpDate(it.ts));
+      if (meta.length) {
+        row.appendChild(h("div", {
+          style: { fontSize: "10px", color: "var(--du-ink-lo)",
+                   marginTop: "4px", letterSpacing: "0.2px" },
+        }, meta.join(" · ")));
+      }
+      list.appendChild(row);
+    }
+  })();
+
+  return wrap;
+}
+
+function fmtImpDate(iso) {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString(undefined,
+      { year: "numeric", month: "short", day: "numeric" });
+  } catch (_) { return ""; }
 }
 
 function section(title, rows) {
@@ -138,30 +206,31 @@ function paletteRow() {
     style: {
       position: "absolute", zIndex: "1000",
       right: "0", marginTop: "6px",
-      minWidth: "220px", maxHeight: "320px", overflowY: "auto",
+      minWidth: "240px", maxHeight: "360px", overflowY: "auto",
       background: "var(--du-bg-1)",
       border: "1px solid var(--du-border-strong)",
-      borderRadius: "12px",
+      borderRadius: "14px",
       boxShadow: "var(--du-shadow-lg, 0 12px 32px rgba(0,0,0,0.45))",
-      padding: "6px",
+      padding: "8px",
       display: "none",
     },
     role: "listbox",
   });
 
+  // v11.8 (#9): single BIG circle per palette (like the reference
+  // screenshot) — background fill with an accent-coloured ring so even
+  // near-white / near-black palettes are unmistakable at a glance.
   function swatchDots(sw) {
-    const g = h("span", { style: { display: "inline-flex", gap: "3px" }});
-    for (const c of sw) {
-      g.appendChild(h("span", {
-        style: {
-          width: "12px", height: "12px", borderRadius: "50%",
-          background: c,
-          border: "1px solid rgba(0,0,0,0.20)",
-          display: "inline-block",
-        },
-      }));
-    }
-    return g;
+    const bg = sw[0], accent = sw[1];
+    return h("span", {
+      style: {
+        width: "18px", height: "18px", borderRadius: "50%",
+        background: bg,
+        border: `2.5px solid ${accent}`,
+        boxShadow: "0 0 0 1px rgba(0,0,0,0.15)",
+        display: "inline-block", flex: "0 0 auto",
+      },
+    });
   }
 
   function paletteFor(value) {
@@ -194,22 +263,24 @@ function paletteRow() {
     const active = prefs.get("background_theme") || "auto";
     for (const p of PALETTES) {
       const isActive = (p.value === active);
+      const sw = currentSwatch(p.value);
       const item = h("button", {
         class: "palette-item",
         role: "option",
         "aria-selected": isActive ? "true" : "false",
         style: {
-          display: "flex", alignItems: "center", gap: "10px",
-          width: "100%", padding: "8px 10px",
-          background: isActive ? "var(--du-bg-3)" : "transparent",
-          color: "var(--du-ink-hi)",
+          display: "flex", alignItems: "center", gap: "12px",
+          width: "100%", padding: "10px 12px",
+          background: isActive ? "var(--du-bg-2)" : "transparent",
+          color: isActive ? "var(--du-accent)" : "var(--du-ink-hi)",
+          fontWeight: isActive ? "600" : "500",
           border: "0", borderRadius: "8px",
-          cursor: "pointer", textAlign: "left", fontSize: "13px",
+          cursor: "pointer", textAlign: "left", fontSize: "14px",
         },
       });
-      item.appendChild(swatchDots(currentSwatch(p.value)));
+      item.appendChild(swatchDots(sw));
       item.appendChild(h("span", { style: { flex: "1" } }, p.label));
-      if (isActive) item.appendChild(h("span", { style: { opacity: "0.7" } }, "✓"));
+      if (isActive) item.appendChild(h("span", { style: { opacity: "0.85" } }, "✓"));
       item.addEventListener("click", () => {
         prefs.set("background_theme", p.value);
         haptic("select");

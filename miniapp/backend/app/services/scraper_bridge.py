@@ -499,38 +499,49 @@ def search(q: str, page: int, sort: str, lang: str,
            pages_min: int | None = None,
            pages_max: int | None = None,
            per_page: int = 25) -> list[dict]:
-    """Return a list of normalized gallery dicts."""
+    """Return a list of normalized gallery dicts.
+
+    v11.8 (#10): the English-only tag filter drops most of a typical 25-row
+    upstream page for niche queries, which used to leave users with only
+    8-9 results. Now we loop upstream pages until we've collected enough
+    post-filter rows to satisfy `per_page` (or hit _MAX_UPSTREAM_PAGES).
+    """
     include_tags = include_tags or []
     exclude_tags = exclude_tags or []
     q_clean = (q or "").strip()
+    per_page = int(per_page) if per_page and per_page > 0 else 25
 
-    rows: list[dict] = []
+    _MAX_UPSTREAM_PAGES = 8
+    start_offset = (max(1, int(page or 1)) - 1) * per_page
+    want_total   = start_offset + per_page
 
-    # Path A: real query + hf_scraper available → prefer hf_scraper
-    # (uses its cache + English-only filter + dedup).
-    if q_clean and HAVE_HF and hasattr(_hf, "search"):
-        try:
-            page_obj = _run_async(_hf.search(query=q_clean, page=int(page or 1)))
-            if page_obj is not None:
-                hits = getattr(page_obj, "hits", None) or []
-                rows = [_hit_to_dict(h) for h in hits]
-        except Exception as e:  # noqa: BLE001
-            log.exception("hf_scraper.search failed for q=%r page=%s: %s",
-                          q_clean, page, e)
-            rows = []
+    collected: list[dict] = []
+    upstream_page = 1
 
-    # Path B: empty query OR hf_scraper returned nothing → direct nhentai.
-    # This is what powers the Popular / Popular Week / Popular Today chips
-    # on the default Discover view.
-    if not rows:
-        rows = _direct_nhentai_search(q_clean, int(page or 1), sort or "popular")
+    while len(collected) < want_total and upstream_page <= _MAX_UPSTREAM_PAGES:
+        rows: list[dict] = []
+        if q_clean and HAVE_HF and hasattr(_hf, "search"):
+            try:
+                page_obj = _run_async(_hf.search(query=q_clean, page=upstream_page))
+                if page_obj is not None:
+                    hits = getattr(page_obj, "hits", None) or []
+                    rows = [_hit_to_dict(h) for h in hits]
+            except Exception as e:  # noqa: BLE001
+                log.exception("hf_scraper.search failed for q=%r page=%s: %s",
+                              q_clean, upstream_page, e)
+                rows = []
 
-    # Filters + normalize
-    rows = _apply_filters(rows, include_tags, exclude_tags, pages_min, pages_max)
-    # Cap to per_page just in case upstream returned more.
-    if per_page and per_page > 0:
-        rows = rows[:per_page]
-    return [_normalize(r) for r in rows]
+        if not rows:
+            rows = _direct_nhentai_search(q_clean, upstream_page, sort or "popular")
+
+        rows = _apply_filters(rows, include_tags, exclude_tags, pages_min, pages_max)
+        if not rows:
+            break
+        collected.extend(rows)
+        upstream_page += 1
+
+    window = collected[start_offset:start_offset + per_page]
+    return [_normalize(r) for r in window]
 
 
 def gallery_detail(gallery_id: str) -> dict:

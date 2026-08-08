@@ -80,6 +80,11 @@
   font-size: var(--du-fs-xs);
   color: var(--du-ink-lo);
   padding-inline: var(--du-space-3);
+  /* v11.8 (#1): allow wrap on narrow screens instead of forcing overflow. */
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 100%;
 }
 .search-hint code {
   background: var(--du-bg-1);
@@ -94,9 +99,12 @@
    ============================================================ */
 .chip-row {
   display: flex; gap: var(--du-space-2);
-  overflow-x: auto; scrollbar-width: none;
+  overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
   padding: var(--du-space-3) 0;
   scroll-snap-type: x mandatory;
+  /* v11.8 (#1): keep the chip row confined to the viewport width. */
+  max-width: 100%;
+  -webkit-overflow-scrolling: touch;
 }
 .chip-row::-webkit-scrollbar { display: none; }
 .chip {
@@ -124,6 +132,24 @@
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   gap: var(--du-space-3);
+}
+/* v11.8 (#6b): Saved-tab compact grid — 3 columns on narrow screens so
+   more items fit per screen. Other pages keep the roomier 2-col default. */
+.card-grid.card-grid-compact {
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--du-space-2);
+}
+.card-grid.card-grid-compact .gallery-card .meta {
+  padding: var(--du-space-2);
+}
+.card-grid.card-grid-compact .gallery-card .title {
+  font-size: 12px;
+  -webkit-line-clamp: 1;
+}
+@media (min-width: 720px) {
+  .card-grid.card-grid-compact {
+    grid-template-columns: repeat(4, 1fr);
+  }
 }
 .gallery-card {
   position: relative;

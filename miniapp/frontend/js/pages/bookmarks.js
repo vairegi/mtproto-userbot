@@ -12,7 +12,8 @@ import { store } from "core/state.js";
 import { cardActions } from "plugins/card-actions.js";
 
 export async function render(root, { me }) {
-  const $grid = h("div", { class: "card-grid" });
+  // v11.8 (#6b): compact 3-per-row grid on mobile, 4-per-row on ≥720px.
+  const $grid = h("div", { class: "card-grid card-grid-compact" });
   root.appendChild($grid);
   $grid.appendChild(make("skeleton", { variant: "card-grid", count: 4 }));
 
@@ -24,7 +25,7 @@ export async function render(root, { me }) {
     if (items.length === 0) {
       $grid.appendChild(h("div", { class: "empty", style: { gridColumn: "1 / -1" } },
         h("div", { class: "icon" }, "⭐"),
-        h("div", { class: "title" }, "No bookmarks yet"),
+        h("div", { class: "title" }, "Nothing saved yet"),   // v11.8 (#6a)
         h("div", {}, "Tap ⭐ on any gallery to save it here."),
       ));
       return;
@@ -74,5 +75,5 @@ function openDetail(g, me) {
                margin: "0 auto", display: "block" } }) : null,
     h("div", { style: { marginTop: "12px", fontWeight: "600" } }, g.title || `#${g.id}`),
   );
-  make("sheet", { title: "Bookmark", body, actions }).open();
+  make("sheet", { title: "Saved", body, actions }).open();  // v11.8 (#6a)
 }

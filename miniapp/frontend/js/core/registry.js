@@ -27,7 +27,7 @@ export const pages = [
   },
   {
     id: "bookmarks",
-    title: "Bookmarks",
+    title: "Saved",     // v11.8 (#6a): was "Bookmarks"
     icon: "⭐",
     label: "Saved",
     module: () => import("pages/bookmarks.js"),

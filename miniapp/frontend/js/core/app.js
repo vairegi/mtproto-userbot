@@ -78,8 +78,24 @@ async function boot() {
   renderHeader(me);
   renderTabbar(me);
 
-  window.addEventListener("hashchange", () => routeTo(hashPageId()));
+  // v11.8 (#4): deep-link handling. Supports BOTH:
+  //   * Telegram start_param: t.me/<bot>/app?startapp=g_<id>
+  //   * Hash route:           #/gallery/<id>  (for external browsers)
+  window.addEventListener("hashchange", () => {
+    const gid = _galleryHashId();
+    if (gid) _openGalleryFromDeepLink(gid, store.get("me"));
+    else     routeTo(hashPageId());
+  });
   routeTo(hashPageId());
+  try {
+    const startParam = window.Telegram?.WebApp?.initDataUnsafe?.start_param;
+    if (startParam && /^g_\d+$/.test(startParam)) {
+      _openGalleryFromDeepLink(startParam.slice(2), me);
+    } else {
+      const gid = _galleryHashId();
+      if (gid) _openGalleryFromDeepLink(gid, me);
+    }
+  } catch (_) { /* deep-linking is best-effort */ }
 
   // Signal to index.html's error-surface script that boot succeeded so it
   // doesn't overwrite the app with a "still loading" fallback message.
@@ -89,6 +105,27 @@ async function boot() {
 function hashPageId() {
   const h = (location.hash || "").replace(/^#/, "").split("/")[0];
   return h || pages[0].id;
+}
+
+/* v11.8 (#4): deep-link helpers ----------------------------------------- */
+function _galleryHashId() {
+  const m = (location.hash || "").match(/^#\/?gallery\/(\d+)/i);
+  return m ? m[1] : "";
+}
+
+async function _openGalleryFromDeepLink(gid, me) {
+  if (!gid) return;
+  try {
+    const m = await import("plugins/detail-sheet.js");
+    let g = { id: gid, title: `#${gid}` };
+    try {
+      const d = await api.get(`/api/gallery/${encodeURIComponent(gid)}`);
+      if (d && d.id) g = d;
+    } catch (_) { /* sheet will load details on its own */ }
+    m.openGalleryDetail(g, me);
+  } catch (e) {
+    console.warn("deep-link open failed:", e);
+  }
 }
 
 function renderHeader(me) {

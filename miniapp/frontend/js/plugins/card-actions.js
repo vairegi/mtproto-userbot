@@ -57,6 +57,26 @@ function openLinkOf(gallery) {
   return v2Of(gallery).open_link || "";
 }
 
+// -- v11.8 (#5): shared save-count cache + pretty formatter ----------------
+const _saveCountCache = new Map();
+
+function _fmtCount(n) {
+  n = Number(n) || 0;
+  if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k";
+  return String(n);
+}
+
+// Fire-and-forget warmer — called from the sheet-open path so by the time
+// the user reads the action row the count is already cached.
+export async function warmSaveCount(galleryId) {
+  const key = String(galleryId || "");
+  if (!key || _saveCountCache.has(key)) return;
+  try {
+    const r = await api.get(`/api/bookmarks/count/${encodeURIComponent(key)}`);
+    _saveCountCache.set(key, Number(r.saves) || 0);
+  } catch (_) { /* ignore — label will render without count */ }
+}
+
 // -- Actions -----------------------------------------------------------------
 
 export const cardActions = [
@@ -231,14 +251,18 @@ export const cardActions = [
   {
     id: "bookmark",
     // UI text v9: was "Bookmark" — now "Save", flipping to "Saved Already"
-    // when the gallery is already in the user's bookmarks. The toggle
-    // behaviour is unchanged (tap again = remove from bookmarks), only
-    // the label reflects the current state.
+    // when the gallery is already in the user's bookmarks.
+    // v11.8 (#5): label ALSO shows the global save count from the backend,
+    // fetched on-demand when the action is rendered. Reads from a tiny
+    // module-level cache so re-renders don't re-hit the API.
     label: ({ gallery }) => {
       const cur = store.get("bookmarks", []);
-      return cur.some(b => String(b.id) === String(gallery.id))
-        ? "Saved Already"
-        : "Save";
+      const mine = cur.some(b => String(b.id) === String(gallery.id));
+      const cached = _saveCountCache.get(String(gallery.id));
+      const suffix = (cached != null && cached > 0)
+        ? ` · ${_fmtCount(cached)}`
+        : "";
+      return (mine ? "Saved Already" : "Save") + suffix;
     },
     icon: "⭐",
     kind: "secondary",

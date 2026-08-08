@@ -16,6 +16,7 @@ import { store } from "core/state.js";
 import { parseSearch } from "plugins/search-operators.js";
 import { cardActions } from "plugins/card-actions.js";
 import { renderTrendingTags, renderRecommendations } from "plugins/home-rows.js";  // v11.7
+import { prefetchGallery } from "plugins/detail-sheet.js";  // v11.8 (#2)
 
 const PAGE_SIZE = 25;
 
@@ -106,7 +107,17 @@ export async function render(root, { me }) {
       });
       const items = rows.items || [];
       if (state.page === 1) $grid.innerHTML = "";
-      for (const g of items) $grid.appendChild(renderCard(g));
+      for (const g of items) {
+        $grid.appendChild(renderCard(g));
+        // v11.8 (#2): warm the detail cache so tapping a card feels instant.
+        // Stagger prefetches slightly to avoid a burst on page 1.
+        const gid = g && g.id;
+        if (gid) {
+          setTimeout(() => {
+            try { prefetchGallery(gid); } catch (_) { /* ignore */ }
+          }, 50 + Math.random() * 400);
+        }
+      }
       state.page += 1;
       state.done = items.length < PAGE_SIZE;
       $footer.textContent = state.done ? "— end —" : "Scroll for more";
@@ -286,11 +297,12 @@ function buildSearchBar(state, refetch) {
 
 function buildChipRow(state, refetch) {
   const row = h("div", { class: "chip-row" });
+  // v11.8 (#7): new order — Popular → Recent → Popular Today → Popular Week
   const opts = [
     { label: "🔥 Popular",       sort: "popular" },
-    { label: "📅 Popular Week",  sort: "popular-week" },
-    { label: "⭐ Popular Today", sort: "popular-today" },
     { label: "🆕 Recent",        sort: "date" },
+    { label: "⭐ Popular Today", sort: "popular-today" },
+    { label: "📅 Popular Week",  sort: "popular-week" },
   ];
   for (const o of opts) {
     const chip = make("chip", {

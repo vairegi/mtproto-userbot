@@ -10,7 +10,7 @@
 
 import { api } from "core/api.js";
 import { h, make } from "core/components.js";
-import { cardActions } from "plugins/card-actions.js";
+import { cardActions, warmSaveCount } from "plugins/card-actions.js";
 import { renderStarRating } from "plugins/star-rating.js";  // v11.7
 
 const GROUP_LABELS = {
@@ -24,6 +24,34 @@ const GROUP_LABELS = {
 };
 const GROUP_ORDER = ["parody", "character", "tag", "artist", "group",
                      "language", "category"];
+
+/* v11.8 (#2): detail prefetch cache. search.js warms this as cards render,
+   so opening a detail sheet feels instant — the enrich() path reads from
+   the cache first and refreshes in the background. */
+const _detailCache = new Map();          // gid -> detail dict
+const _detailInflight = new Map();       // gid -> Promise
+const _DETAIL_CACHE_MAX = 60;            // LRU-ish cap
+
+export function prefetchGallery(gid) {
+  if (!gid) return;
+  const key = String(gid);
+  if (_detailCache.has(key) || _detailInflight.has(key)) return;
+  const p = api.get(`/api/gallery/${encodeURIComponent(key)}`)
+    .then(d => {
+      _detailInflight.delete(key);
+      if (d && d.id) {
+        if (_detailCache.size >= _DETAIL_CACHE_MAX) {
+          // Evict oldest key (Map preserves insertion order).
+          _detailCache.delete(_detailCache.keys().next().value);
+        }
+        _detailCache.set(key, d);
+      }
+      return d;
+    })
+    .catch(() => { _detailInflight.delete(key); return null; });
+  _detailInflight.set(key, p);
+  return p;
+}
 
 export function openGalleryDetail(g, me) {
   const body = h("div", { class: "d-root" });
@@ -60,6 +88,9 @@ export function openGalleryDetail(g, me) {
   renderBase(body, g);
   sheet.open();
   enrich(body, g);
+  // v11.8 (#5): pre-fetch the global save count so the Save button label
+  // shows "Save · 312" on the next render. Fire-and-forget.
+  try { warmSaveCount(g.id); } catch (_) {}
   return sheet;
 }
 
@@ -76,20 +107,42 @@ function renderBase(root, g) {
 }
 
 async function enrich(root, g) {
-  let d;
+  const key = String(g.id || "");
+  // v11.8 (#2): instant render from the prefetch cache when available.
+  let d = _detailCache.get(key) || null;
+  if (d) {
+    paintFull(root, d);
+  }
+  // Always refresh in the background (fresh tags / ratings / upload date).
   try {
-    d = await api.get(`/api/gallery/${g.id}`);
+    const inflight = _detailInflight.get(key);
+    const fresh = inflight ? await inflight
+                           : await api.get(`/api/gallery/${g.id}`);
+    if (fresh && fresh.id) {
+      _detailCache.set(key, fresh);
+      d = fresh;
+      // Only re-paint if the user hasn't navigated away (root still mounted).
+      if (root.isConnected) paintFull(root, d);
+    } else if (!d) {
+      const l = root.querySelector(".d-loading");
+      if (l) l.remove();
+      return;
+    }
   } catch (_) {
     const l = root.querySelector(".d-loading");
     if (l) l.remove();
-    return;
+    if (!d) return;
   }
-  if (!d || !d.id) {
-    const l = root.querySelector(".d-loading");
-    if (l) l.remove();
-    return;
-  }
+  if (!d || !d.id) return;
 
+  paintFull(root, d);
+}
+
+/* v11.8 (#2 + #3): single paint function — the full detail body is rebuilt
+   from scratch each time, so cache-hit renders and background refreshes
+   share one code path. All metadata (incl. Uploaded) lives in ONE unified
+   card per #3. */
+function paintFull(root, d) {
   root.innerHTML = "";
   root.append(
     d.cover
@@ -109,27 +162,71 @@ async function enrich(root, g) {
       `#${d.id}`
       + (d.pages ? ` · ${d.pages} pages` : "")
       + (d.favorites != null ? ` · ♥ ${fmtNum(d.favorites)}` : "")
-      + (d.upload_date ? ` · ${fmtDate(d.upload_date)}` : "")),
+      + (d.upload_date ? ` · 📅 ${fmtDate(d.upload_date)}` : "")),
   );
 
-  // v11.7: interactive star-rating widget between header and tag rows.
+  // v11.7: interactive star-rating widget between header and metadata card.
   root.appendChild(renderStarRating(d.id));
 
+  /* v11.8 (#3): ONE unified metadata card. Parodies/Characters/Artists/
+     Groups/Languages/Categories/Tags/Uploaded all stack inside a single
+     container with faint dividers — no more floating per-category boxes. */
   const groups = d.groups || {};
+  const card = h("div", {
+    class: "d-meta-card",
+    style: {
+      background: "var(--du-bg-1)",
+      border: "1px solid var(--du-border)",
+      borderRadius: "12px",
+      padding: "4px 12px",
+      marginTop: "10px",
+    },
+  });
+  let firstRow = true;
+  const addRow = (labelText, valueNode) => {
+    const rowStyle = {
+      display: "flex", gap: "10px", alignItems: "baseline",
+      padding: "8px 0",
+      flexWrap: "wrap",
+    };
+    if (!firstRow) {
+      rowStyle.borderTop = "1px solid var(--du-divider, rgba(255,255,255,0.06))";
+    }
+    firstRow = false;
+    card.appendChild(h("div", { class: "d-meta-row", style: rowStyle },
+      h("span", {
+        class: "d-meta-label",
+        style: {
+          fontSize: "11px", fontWeight: "700", minWidth: "86px",
+          color: "var(--du-ink-lo)", textTransform: "uppercase",
+          letterSpacing: "0.4px", flexShrink: "0",
+        },
+      }, labelText),
+      valueNode,
+    ));
+  };
+
   for (const key of GROUP_ORDER) {
     const arr = groups[key];
     if (!arr || !arr.length) continue;
-    root.appendChild(
-      h("div", { class: "d-meta-row" },
-        h("span", { class: "d-meta-label" }, (GROUP_LABELS[key] || key) + ":"),
-        h("span", { class: "d-meta-tags" },
-          ...arr.slice(0, 12).map(t =>
-            h("span", { class: "d-tag" },
-              t.name,
-              t.count ? h("span", { class: "cnt" }, " " + fmtNum(t.count)) : null))),
-      )
+    addRow((GROUP_LABELS[key] || key),
+      h("span", { class: "d-meta-tags", style: {
+        display: "flex", flexWrap: "wrap", gap: "4px", flex: "1",
+      }},
+        ...arr.slice(0, 12).map(t =>
+          h("span", { class: "d-tag" },
+            t.name,
+            t.count ? h("span", { class: "cnt" }, " " + fmtNum(t.count)) : null))),
     );
   }
+  // v11.8 (#2): Uploaded row — matches nhentai's "Uploaded: <date>" line.
+  if (d.upload_date) {
+    addRow("Uploaded",
+      h("span", { style: { fontSize: "13px", color: "var(--du-ink-mid)" } },
+        fmtDate(d.upload_date)),
+    );
+  }
+  if (!firstRow) root.appendChild(card);   // only render when it has content
 }
 
 function fmtNum(n) {
