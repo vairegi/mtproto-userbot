@@ -493,32 +493,74 @@ def _meta_to_dict(meta) -> dict:
 # ---------------------------------------------------------------------------
 # Public API — called by routes/search.py and routes/gallery.py
 # ---------------------------------------------------------------------------
+# v12.1 (B): the "only 11 results for 'incest'" bug — the English-only tag
+# filter drops most of an upstream page, and when upstream page 2 gets
+# 429'd the loop used to bail because _direct_nhentai_search returns [] on
+# 429 (indistinguishable from "real end of results"). Two fixes:
+#   1. Bump _MAX_UPSTREAM_PAGES to 20 so we can actually reach page 50k+.
+#   2. Distinguish "soft empty" (429 backoff active) from "hard empty"
+#      (upstream really has no more rows) via _direct_nhentai_soft_empty,
+#      and on soft-empty SKIP that upstream page instead of stopping.
+_MAX_UPSTREAM_PAGES_DEFAULT = 20
+_MAX_CONSECUTIVE_SOFT_EMPTY = 3
+
+
+def _direct_nhentai_soft_empty(q_clean: str, upstream_page: int, sort: str) -> bool:
+    """True iff the (query, sort, page) cell is currently rate-limited.
+    Lets search() skip a temporarily-banned upstream page and keep going
+    instead of bailing at the first 429."""
+    sort_map = {"popular": "popular", "popular-week": "popular-week",
+                "popular-today": "popular-today", "date": "date",
+                "recent": "date", "": "popular", None: "popular"}
+    real_sort = sort_map.get((sort or "").lower(), "popular")
+    query = q_clean.strip() if q_clean else "english"
+    cache_key = ("search", query, real_sort, int(upstream_page or 1))
+    ban = _RATE_LIMIT_CACHE.get(cache_key)
+    return bool(ban and ban > _time.time())
+
+
 def search(q: str, page: int, sort: str, lang: str,
            include_tags: list[str] | None = None,
            exclude_tags: list[str] | None = None,
            pages_min: int | None = None,
            pages_max: int | None = None,
-           per_page: int = 25) -> list[dict]:
-    """Return a list of normalized gallery dicts.
+           per_page: int = 25,
+           _return_meta: bool = False):
+    """Return a list of normalized gallery dicts (or dict when _return_meta).
 
     v11.8 (#10): the English-only tag filter drops most of a typical 25-row
     upstream page for niche queries, which used to leave users with only
-    8-9 results. Now we loop upstream pages until we've collected enough
+    8-9 results. Loops upstream pages until we've collected enough
     post-filter rows to satisfy `per_page` (or hit _MAX_UPSTREAM_PAGES).
+
+    v12.1 (B):
+      * Survives 429s on individual upstream pages (skip, don't bail).
+      * Bumped upstream-page ceiling from 8 → 20 (env-tunable via
+        MINIAPP_SEARCH_MAX_UPSTREAM_PAGES).
+      * When _return_meta=True, returns a dict
+        {items, has_more, upstream_pages_scanned, upstream_rate_limited}
+        so the route can drive a Next-Page button honestly.
     """
     include_tags = include_tags or []
     exclude_tags = exclude_tags or []
     q_clean = (q or "").strip()
     per_page = int(per_page) if per_page and per_page > 0 else 25
 
-    _MAX_UPSTREAM_PAGES = 8
+    try:
+        max_upstream = int(os.environ.get(
+            "MINIAPP_SEARCH_MAX_UPSTREAM_PAGES", _MAX_UPSTREAM_PAGES_DEFAULT))
+    except (TypeError, ValueError):
+        max_upstream = _MAX_UPSTREAM_PAGES_DEFAULT
+
     start_offset = (max(1, int(page or 1)) - 1) * per_page
     want_total   = start_offset + per_page
 
     collected: list[dict] = []
     upstream_page = 1
+    consecutive_empty = 0
+    rate_limited_pages: list[int] = []
 
-    while len(collected) < want_total and upstream_page <= _MAX_UPSTREAM_PAGES:
+    while len(collected) < want_total and upstream_page <= max_upstream:
         rows: list[dict] = []
         if q_clean and HAVE_HF and hasattr(_hf, "search"):
             try:
@@ -535,13 +577,44 @@ def search(q: str, page: int, sort: str, lang: str,
             rows = _direct_nhentai_search(q_clean, upstream_page, sort or "popular")
 
         rows = _apply_filters(rows, include_tags, exclude_tags, pages_min, pages_max)
+
         if not rows:
-            break
+            # v12.1 (B): distinguish 429-backoff empty from real end-of-results.
+            if _direct_nhentai_soft_empty(q_clean, upstream_page, sort or "popular"):
+                rate_limited_pages.append(upstream_page)
+                consecutive_empty += 1
+            else:
+                # A hard-empty upstream page still might not be the true end
+                # (English filter can zero-out a page). Only bail after a
+                # small run of them.
+                consecutive_empty += 1
+            if consecutive_empty >= _MAX_CONSECUTIVE_SOFT_EMPTY:
+                break
+            upstream_page += 1
+            continue
+
+        consecutive_empty = 0
         collected.extend(rows)
         upstream_page += 1
 
     window = collected[start_offset:start_offset + per_page]
-    return [_normalize(r) for r in window]
+    items = [_normalize(r) for r in window]
+
+    if not _return_meta:
+        return items
+    return {
+        "items": items,
+        # has_more: we EITHER filled the window AND some upstream cushion
+        # remains, OR we didn't fill it but had to give up early due to
+        # 429s (client can retry). Both signals produce a truthful button.
+        "has_more": (
+            len(collected) > start_offset + per_page
+            or bool(rate_limited_pages)
+            or (upstream_page > max_upstream and len(items) == per_page)
+        ),
+        "upstream_pages_scanned": upstream_page - 1,
+        "upstream_rate_limited_pages": rate_limited_pages,
+    }
 
 
 def _detail_rate_limited(gallery_id: str) -> bool:

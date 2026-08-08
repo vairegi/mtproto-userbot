@@ -27,30 +27,98 @@ const GROUP_ORDER = ["parody", "character", "tag", "artist", "group",
 
 /* v11.8 (#2): detail prefetch cache. search.js warms this as cards render,
    so opening a detail sheet feels instant — the enrich() path reads from
-   the cache first and refreshes in the background. */
+   the cache first and refreshes in the background.
+
+   v12.1 (A): the render log showed a 429 STORM — 25 back-to-back
+   /api/gallery/<id> hits from prefetching a single grid page. Now:
+     - MAX_INFLIGHT = 2 concurrent prefetches; extra requests queue.
+     - Any 503 (upstream rate-limited) trips a 60s CIRCUIT BREAKER: the
+       queue is dropped and NEW prefetch requests are silently ignored
+       until the breaker resets. User-initiated openGalleryDetail() still
+       goes through unconditionally — only opportunistic prefetches pause.
+     - Retry-After from the 503 response tunes the breaker duration. */
 const _detailCache = new Map();          // gid -> detail dict
 const _detailInflight = new Map();       // gid -> Promise
 const _DETAIL_CACHE_MAX = 60;            // LRU-ish cap
+const _PREFETCH_MAX_INFLIGHT = 2;
+const _prefetchQueue = [];               // [{ key, resolve }]
+let   _prefetchActive = 0;
+let   _circuitOpenUntil = 0;             // epoch ms; 0 = closed
+
+function _circuitOpen() { return Date.now() < _circuitOpenUntil; }
+
+function _tripCircuit(retryAfterSec) {
+  const secs = Number(retryAfterSec) > 0 ? Number(retryAfterSec) : 60;
+  _circuitOpenUntil = Date.now() + secs * 1000;
+  // Drop everything queued — they'll be re-prefetched next time the grid
+  // paints. Silent by design so we don't spam the console.
+  while (_prefetchQueue.length) {
+    const q = _prefetchQueue.shift();
+    q.resolve(null);
+  }
+}
+
+function _drainQueue() {
+  while (_prefetchActive < _PREFETCH_MAX_INFLIGHT && _prefetchQueue.length) {
+    if (_circuitOpen()) {
+      // Breaker tripped mid-drain; drop the rest.
+      while (_prefetchQueue.length) _prefetchQueue.shift().resolve(null);
+      return;
+    }
+    const { key, resolve } = _prefetchQueue.shift();
+    if (_detailCache.has(key)) { resolve(_detailCache.get(key)); continue; }
+    _prefetchActive += 1;
+    api.get(`/api/gallery/${encodeURIComponent(key)}`)
+      .then(d => {
+        if (d && d.id) {
+          if (_detailCache.size >= _DETAIL_CACHE_MAX) {
+            _detailCache.delete(_detailCache.keys().next().value);
+          }
+          _detailCache.set(key, d);
+        }
+        resolve(d);
+      })
+      .catch(err => {
+        // api.get surfaces the HTTP status on err.status when available.
+        const status = err && (err.status || err.code);
+        if (status === 503 || status === 429) {
+          const retryAfter = err && (err.retry_after || err.retryAfter);
+          _tripCircuit(retryAfter || 60);
+        }
+        resolve(null);
+      })
+      .finally(() => {
+        _prefetchActive -= 1;
+        _detailInflight.delete(key);
+        // Yield a microtask so we don't recurse hot.
+        Promise.resolve().then(_drainQueue);
+      });
+  }
+}
 
 export function prefetchGallery(gid) {
-  if (!gid) return;
+  if (!gid) return null;
   const key = String(gid);
-  if (_detailCache.has(key) || _detailInflight.has(key)) return;
-  const p = api.get(`/api/gallery/${encodeURIComponent(key)}`)
-    .then(d => {
-      _detailInflight.delete(key);
-      if (d && d.id) {
-        if (_detailCache.size >= _DETAIL_CACHE_MAX) {
-          // Evict oldest key (Map preserves insertion order).
-          _detailCache.delete(_detailCache.keys().next().value);
-        }
-        _detailCache.set(key, d);
-      }
-      return d;
-    })
-    .catch(() => { _detailInflight.delete(key); return null; });
+  if (_detailCache.has(key)) return Promise.resolve(_detailCache.get(key));
+  if (_detailInflight.has(key)) return _detailInflight.get(key);
+  // v12.1: skip opportunistic prefetch entirely when the breaker is open.
+  if (_circuitOpen()) return null;
+  const p = new Promise(resolve => {
+    _prefetchQueue.push({ key, resolve });
+  });
   _detailInflight.set(key, p);
+  _drainQueue();
   return p;
+}
+
+// v12.1: expose for tests / diagnostics.
+export function _prefetchStats() {
+  return {
+    active:  _prefetchActive,
+    queued:  _prefetchQueue.length,
+    breaker: _circuitOpen() ? Math.ceil((_circuitOpenUntil - Date.now()) / 1000) : 0,
+    cached:  _detailCache.size,
+  };
 }
 
 export function openGalleryDetail(g, me) {

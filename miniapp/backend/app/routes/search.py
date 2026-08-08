@@ -40,10 +40,28 @@ def search(
     exclude = _csv(exclude_tags)
     if artist:
         include.append(f"artist:{artist.lower()}")
-    items = scraper_bridge.search(
+    # v12.1 (B/C): request meta so the frontend can render a truthful
+    # Next-Page button (has_more) and — when useful — surface the fact that
+    # some upstream pages were rate-limited (so the user knows retrying may
+    # yield more results).
+    result = scraper_bridge.search(
         q=q, page=page, sort=sort, lang=lang,
         include_tags=include, exclude_tags=exclude,
         pages_min=pages_min, pages_max=pages_max,
-        per_page=per_page,
+        per_page=per_page, _return_meta=True,
     )
-    return {"items": items, "page": page, "per_page": per_page}
+    if isinstance(result, dict):
+        items = result.get("items") or []
+        has_more = bool(result.get("has_more"))
+        rate_limited_pages = result.get("upstream_rate_limited_pages") or []
+    else:  # defensive: older bridge returned a list
+        items = result
+        has_more = len(items) >= per_page
+        rate_limited_pages = []
+    return {
+        "items": items,
+        "page": page,
+        "per_page": per_page,
+        "has_more": has_more,
+        "upstream_rate_limited": bool(rate_limited_pages),
+    }

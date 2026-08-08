@@ -21,6 +21,13 @@ import { prefetchGallery } from "plugins/detail-sheet.js";  // v11.8 (#2)
 const PAGE_SIZE = 25;
 
 export async function render(root, { me }) {
+  // v12.1 (C): paginated mode uses a "Load next page" button on narrow
+  // viewports (mobile — where the 429 storm was worst). Infinite scroll
+  // stays on wide viewports. The user's manual chip-tap acknowledges each
+  // new page, which naturally caps upstream load. Env-neutral: no build step.
+  const PAGINATED = (typeof window !== "undefined")
+    && !!(window.matchMedia && window.matchMedia("(max-width: 768px)").matches);
+
   const state = {
     query: "",
     parsed: parseSearch(""),
@@ -31,6 +38,9 @@ export async function render(root, { me }) {
     results: [],
     token: 0,     // v12 (#1): bumped on every refetch — stale responses drop
     rerun: false, // v12 (#1): queued re-entry when load() is busy
+    hasMore: false, // v12.1 (C): server-reported has_more; drives the button
+    rateLimited: false, // v12.1 (C): last page hit upstream 429 — offer retry
+    paginated: PAGINATED,
   };
 
   // v12 (#1): buildSearchBar needs toggleHomeRows — it was called from
@@ -71,13 +81,37 @@ export async function render(root, { me }) {
   showSkeleton();
   await load();
 
-  // Infinite scroll — grow when user hits the bottom.
-  const io = new IntersectionObserver((entries) => {
-    for (const e of entries) {
-      if (e.isIntersecting && !state.loading && !state.done) load();
+  // v12.1 (C): infinite scroll ONLY on wide viewports. On mobile we use a
+  // "Load next page" button (rendered by renderFooter()) so each page is a
+  // deliberate user action — that naturally caps prefetch storms.
+  let io = null;
+  if (!state.paginated) {
+    io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting && !state.loading && !state.done && state.hasMore) load();
+      }
+    }, { rootMargin: "600px 0px" });
+    io.observe($footer);
+  }
+
+  function renderFooter() {
+    $footer.innerHTML = "";
+    if (state.loading) { $footer.textContent = "Loading…"; return; }
+    if (!state.hasMore && state.results.length > 0) { $footer.textContent = "— end —"; return; }
+    if (!state.hasMore && state.results.length === 0) { $footer.textContent = ""; return; }
+    if (state.paginated) {
+      const btn = h("button", { class: "btn btn-primary next-page-btn",
+        style: { padding: "12px 24px", fontWeight: "600", fontSize: "var(--du-fs-md)" },
+      }, state.rateLimited ? "⚠ Rate-limited — tap to retry"
+                            : `Load next page (→ page ${state.page})`);
+      btn.addEventListener("click", () => { haptic("medium"); load(); });
+      $footer.appendChild(btn);
+    } else {
+      $footer.textContent = state.rateLimited
+        ? "Upstream rate-limited — scroll to retry"
+        : "Scroll for more";
     }
-  }, { rootMargin: "600px 0px" });
-  io.observe($footer);
+  }
 
   function showSkeleton() {
     $grid.innerHTML = "";
@@ -106,7 +140,7 @@ export async function render(root, { me }) {
       do {
         state.rerun = false;
         const token = state.token;
-        $footer.textContent = "Loading…";
+        renderFooter();  // v12.1 (C): unified "Loading…" via renderFooter
         let rows = null;
         try {
           const p = state.parsed;
@@ -125,17 +159,26 @@ export async function render(root, { me }) {
         } catch (e) {
           if (token === state.token) {
             console.error("search load:", e);
+            $footer.innerHTML = "";
             $footer.textContent = "Error: " + (e.message || "unknown");
           }
           continue;  // stale error → ignore; queued rerun re-loops fresh
         }
         if (token !== state.token) continue;  // stale response → never paint
         const items = rows.items || [];
+        // v12.1 (B/C): use server-reported has_more instead of guessing from
+        // items.length < PAGE_SIZE (which lied when the English filter dropped
+        // most of an upstream page).
+        state.hasMore = !!rows.has_more;
+        state.rateLimited = !!rows.upstream_rate_limited;
         if (state.page === 1) $grid.innerHTML = "";
         for (const g of items) {
           $grid.appendChild(renderCard(g));
           // v11.8 (#2): warm the detail cache so tapping a card feels instant.
           // Stagger prefetches slightly to avoid a burst on page 1.
+          // v12.1 (A): prefetchGallery() now enforces a 2-inflight cap and a
+          // 60s circuit breaker on upstream 429/503 — setTimeout stagger kept
+          // for the visual "cards drop in" feel, not for load control.
           const gid = g && g.id;
           if (gid) {
             setTimeout(() => {
@@ -144,8 +187,8 @@ export async function render(root, { me }) {
           }
         }
         state.page += 1;
-        state.done = items.length < PAGE_SIZE;
-        $footer.textContent = state.done ? "— end —" : "Scroll for more";
+        state.done = !state.hasMore;
+        renderFooter();
         if (state.results.length === 0 && items.length === 0) {
           $grid.appendChild(emptyState());
         }
@@ -153,6 +196,10 @@ export async function render(root, { me }) {
       } while (state.rerun && !state.done);
     } finally {
       state.loading = false;
+      // v12.1 (C): the in-loop renderFooter() calls run while loading=true
+      // and early-return with "Loading…". Re-render NOW so the paginated
+      // "Load next page" button (or "— end —") actually replaces it.
+      try { renderFooter(); } catch (_) { /* footer cosmetics only */ }
     }
   }
 

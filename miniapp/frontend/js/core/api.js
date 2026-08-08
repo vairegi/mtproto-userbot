@@ -43,6 +43,14 @@ async function request(method, path, { params, body, headers } = {}) {
     const err = new Error((payload && payload.detail) || `HTTP ${res.status}`);
     err.status = res.status;
     err.payload = payload;
+    // v12.1: expose Retry-After so callers (prefetch circuit breaker in
+    // plugins/detail-sheet.js) can honour upstream backoff without
+    // re-fetching or racing another 503.
+    const ra = res.headers.get("Retry-After");
+    if (ra != null && ra !== "") {
+      const n = Number(ra);
+      err.retry_after = Number.isFinite(n) && n > 0 ? n : 60;
+    }
     throw err;
   }
   return payload;
