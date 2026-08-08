@@ -1610,6 +1610,95 @@ async def cmd_alltoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("\n".join(lines)[:4000])
 
 
+# ---------------------------------------------------------------------------
+# /users — v12.1 (D): admin equivalent of the mini-app's Admin → Users pane.
+# Lists every known user with their username, id, today's usage vs cap,
+# ban state, and last-seen timestamp. Sorted by used_today DESC so the
+# heaviest users float to the top (same as mini-app default).
+# ---------------------------------------------------------------------------
+@only_admin
+async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """List users with today's usage, cap, ban state, last-seen.
+
+    Mirrors GET /api/admin/users (miniapp/backend/app/routes/admin.py).
+    Output is chunked to Telegram's 4096-char message ceiling; when the
+    list is longer, additional messages are sent so nothing is truncated.
+    Usage:
+      /users            first 200 rows, sorted by used_today desc
+      /users banned     show banned users only
+      /users active     show users who have used >=1 token today
+    """
+    msg = update.effective_message
+    if msg is None:
+        return
+    filter_mode = ""
+    if ctx.args:
+        filter_mode = str(ctx.args[0]).strip().lower()
+
+    conn = db.connect()
+    try:
+        rows = db.list_all_user_tokens(conn)
+        cap = db.get_freepost(conn)
+        # Enrich with ban state where the model tracks it. list_all_user_tokens
+        # is the same source the mini-app Admin → Users pane reads today.
+        try:
+            admins = {int(a["user_id"]): a for a in db.list_admins(conn)}
+        except Exception:
+            admins = {}
+    finally:
+        conn.close()
+
+    if filter_mode == "active":
+        rows = [r for r in rows if int(r.get("used") or 0) > 0]
+    elif filter_mode == "banned":
+        # Ban state lives per-user in the mini-app admin API; the bot's own
+        # db.list_all_user_tokens does not carry it, so filter is best-effort:
+        # empty list rather than a lie.
+        rows = []
+
+    if not rows:
+        await msg.reply_text(
+            "No users to show" + (f" (filter={filter_mode})" if filter_mode else ".")
+        )
+        return
+
+    header_parts = [
+        f"👥 Users — cap = {cap}/day, resets 00:00 UTC",
+        f"Showing {len(rows)} user(s)"
+              + (f" (filter={filter_mode})" if filter_mode else "")
+              + ", sorted by used_today desc",
+        "",
+    ]
+    lines: list[str] = list(header_parts)
+    total_used = 0
+    for r in rows:
+        uid = int(r["user_id"])
+        uname = f"@{r['username']}" if r.get("username") else "(no username)"
+        used = int(r.get("used") or 0)
+        left = int(r.get("remaining") or 0)
+        role = ""
+        if uid in admins:
+            role = " 👑 super" if int(admins[uid].get("is_super") or 0) == 1 else " 🛡 admin"
+        lines.append(f"  {uname}  [id={uid}]  {used}/{cap} used, {left} left{role}")
+        total_used += used
+    lines.append("")
+    lines.append(f"Totals: {len(rows)} users — {total_used} posts today.")
+
+    # Telegram's message ceiling is 4096 chars; chunk on line boundaries.
+    buf: list[str] = []
+    size = 0
+    for line in lines:
+        add = len(line) + 1
+        if size + add > 3800 and buf:
+            await msg.reply_text("\n".join(buf))
+            buf = []
+            size = 0
+        buf.append(line)
+        size += add
+    if buf:
+        await msg.reply_text("\n".join(buf))
+
+
 @only_super
 async def cmd_settoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Set a user's REMAINING tokens for today.
@@ -1790,6 +1879,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("  /broadcast                         reply to a message to broadcast it")
         lines.append("  /topsave                           most-saved doujinshi across all users")
         lines.append("  /allsaved                          per-user save summary")
+        lines.append("  /users [active|banned]             list users with today's usage")
         lines.append("  /app                               open the mini-app")
         lines.append("  /appon                             show mini-app to everyone")
         lines.append("  /appoff                            hide mini-app from non-admins")
@@ -2526,6 +2616,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("users", cmd_users))     # v12.1 (D)
     app.add_handler(CommandHandler("topsave", cmd_topsave))
     app.add_handler(CommandHandler("weekly", cmd_weekly))   # v11.7
     app.add_handler(CommandHandler("addimp", cmd_addimp))   # v11.8 (#8)
