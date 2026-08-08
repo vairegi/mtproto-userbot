@@ -29,9 +29,14 @@ export async function render(root, { me }) {
     loading: false,
     done: false,
     results: [],
+    token: 0,     // v12 (#1): bumped on every refetch — stale responses drop
+    rerun: false, // v12 (#1): queued re-entry when load() is busy
   };
 
-  const $bar = buildSearchBar(state, refetch);
+  // v12 (#1): buildSearchBar needs toggleHomeRows — it was called from
+  // commit() in v11.9 without being in scope, so EVERY typing/Enter event
+  // threw ReferenceError before refetch() could fire. Pass it in.
+  const $bar = buildSearchBar(state, refetch, toggleHomeRows);
   const $chips = buildChipRow(state, refetch);
   const $hint = h("div", { class: "search-hint" },
     "Try: ", h("code", {}, "tag:vanilla"), " ",
@@ -80,6 +85,7 @@ export async function render(root, { me }) {
   }
 
   async function refetch() {
+    state.token = (state.token || 0) + 1;  // v12: invalidate in-flight loads
     state.page = 1;
     state.done = false;
     state.results = [];
@@ -87,47 +93,64 @@ export async function render(root, { me }) {
     await load();
   }
 
+  // v12 (#1): load() used to early-return when state.loading was true,
+  // silently DROPPING the refetch that Enter/chips had just asked for
+  // (grid stuck on skeletons forever). Now a busy load() queues one
+  // re-entry instead, and every awaited response is dropped if its token
+  // no longer matches — so the latest request always owns the grid.
   async function load() {
-    if (state.loading || state.done) return;
+    if (state.done) return;
+    if (state.loading) { state.rerun = true; return; }
     state.loading = true;
-    $footer.textContent = "Loading…";
     try {
-      const p = state.parsed;
-      const rows = await api.get("/api/search", {
-        q: p.q,
-        include_tags: p.include_tags.join(","),
-        exclude_tags: p.exclude_tags.join(","),
-        artist: p.artist || "",
-        pages_min: p.pages_min || "",
-        pages_max: p.pages_max || "",
-        sort: p.sort || state.sort,
-        lang: p.lang || "english",
-        page: state.page,
-        per_page: PAGE_SIZE,
-      });
-      const items = rows.items || [];
-      if (state.page === 1) $grid.innerHTML = "";
-      for (const g of items) {
-        $grid.appendChild(renderCard(g));
-        // v11.8 (#2): warm the detail cache so tapping a card feels instant.
-        // Stagger prefetches slightly to avoid a burst on page 1.
-        const gid = g && g.id;
-        if (gid) {
-          setTimeout(() => {
-            try { prefetchGallery(gid); } catch (_) { /* ignore */ }
-          }, 50 + Math.random() * 400);
+      do {
+        state.rerun = false;
+        const token = state.token;
+        $footer.textContent = "Loading…";
+        let rows = null;
+        try {
+          const p = state.parsed;
+          rows = await api.get("/api/search", {
+            q: p.q,
+            include_tags: p.include_tags.join(","),
+            exclude_tags: p.exclude_tags.join(","),
+            artist: p.artist || "",
+            pages_min: p.pages_min || "",
+            pages_max: p.pages_max || "",
+            sort: p.sort || state.sort,
+            lang: p.lang || "english",
+            page: state.page,
+            per_page: PAGE_SIZE,
+          });
+        } catch (e) {
+          if (token === state.token) {
+            console.error("search load:", e);
+            $footer.textContent = "Error: " + (e.message || "unknown");
+          }
+          continue;  // stale error → ignore; queued rerun re-loops fresh
         }
-      }
-      state.page += 1;
-      state.done = items.length < PAGE_SIZE;
-      $footer.textContent = state.done ? "— end —" : "Scroll for more";
-      if (state.results.length === 0 && items.length === 0) {
-        $grid.appendChild(emptyState());
-      }
-      state.results.push(...items);
-    } catch (e) {
-      console.error("search load:", e);
-      $footer.textContent = "Error: " + (e.message || "unknown");
+        if (token !== state.token) continue;  // stale response → never paint
+        const items = rows.items || [];
+        if (state.page === 1) $grid.innerHTML = "";
+        for (const g of items) {
+          $grid.appendChild(renderCard(g));
+          // v11.8 (#2): warm the detail cache so tapping a card feels instant.
+          // Stagger prefetches slightly to avoid a burst on page 1.
+          const gid = g && g.id;
+          if (gid) {
+            setTimeout(() => {
+              try { prefetchGallery(gid); } catch (_) { /* ignore */ }
+            }, 50 + Math.random() * 400);
+          }
+        }
+        state.page += 1;
+        state.done = items.length < PAGE_SIZE;
+        $footer.textContent = state.done ? "— end —" : "Scroll for more";
+        if (state.results.length === 0 && items.length === 0) {
+          $grid.appendChild(emptyState());
+        }
+        state.results.push(...items);
+      } while (state.rerun && !state.done);
     } finally {
       state.loading = false;
     }
@@ -268,7 +291,7 @@ export async function render(root, { me }) {
   return () => io.disconnect();
 }
 
-function buildSearchBar(state, refetch) {
+function buildSearchBar(state, refetch, toggleHomeRows) {
   const input = h("input", {
     type: "search", enterkeyhint: "search", inputmode: "search",
     placeholder: "Search galleries, tags, artists…",
@@ -276,41 +299,64 @@ function buildSearchBar(state, refetch) {
     name: "q",
   });
   const clear = h("button", { type: "button", class: "search-clear u-hide", "aria-label": "Clear" }, "✕");
-  const bar = h("div", { class: "search-bar" },
+  // v12 (#1): the <form> IS the search bar now — a real block-level flex
+  // container (same .search-bar CSS) instead of a `display: contents`
+  // wrapper around an inner div. Telegram's Android WebView + several
+  // IMEs never deliver a submit event to a display:contents form, which
+  // is one reason the on-screen Search/Go key appeared dead.
+  const form = h("form", {
+    class: "search-bar",
+    novalidate: "novalidate",
+  },
     h("span", { class: "search-icon" }, "🔎"),
     input, clear,
   );
-  // v11.9 (#2): wrap in a REAL <form> so the on-screen keyboard's
-  // Search/Go/Enter key triggers a submit. IME compositionend handled
-  // too (Android sometimes swallows the final input event).
-  const form = h("form", {
-    style: { display: "contents" },
-    action: "javascript:void(0)",
-  }, bar);
 
   let timer = null;
   let composing = false;
+  let lastCommitted = null;  // v12: dedupe keydown+keyup+submit+change bursts
 
   function commit(immediate = false) {
+    // v12: read input.value VERBATIM at commit time — never a cached
+    // state.query (Android fires compositionend AFTER the Enter keydown).
     state.query = input.value;
     state.parsed = parseSearch(state.query);
-    toggleHomeRows();
+    if (typeof toggleHomeRows === "function") toggleHomeRows();
     clear.classList.toggle("u-hide", !state.query);
     clearTimeout(timer);
-    if (immediate) { haptic("select"); refetch(); }
-    else timer = setTimeout(() => { haptic("select"); refetch(); }, 350);
+    if (immediate) {
+      // Identical Enter already committed and painted → no-op (this is
+      // what makes the keydown/keyup/submit/change quadruple-fire safe).
+      if (state.query === lastCommitted && (state.results.length || state.loading)) return;
+      lastCommitted = state.query;
+      haptic("select"); refetch();
+    } else {
+      timer = setTimeout(() => {
+        lastCommitted = state.query;
+        haptic("select"); refetch();
+      }, 350);
+    }
   }
 
   input.addEventListener("compositionstart", () => { composing = true; });
   input.addEventListener("compositionend",   () => { composing = false; commit(false); });
   input.addEventListener("input", () => { if (!composing) commit(false); });
+  const enterHit = (e) => {
+    e.preventDefault();
+    commit(true);            // fire NOW — no 350ms debounce on Enter
+    input.blur();            // dismiss the keyboard
+  };
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" || e.key === "Go" || e.keyCode === 13) {
-      e.preventDefault();
-      commit(true);            // fire NOW — no 350ms debounce on Enter
-      input.blur();            // dismiss the keyboard
-    }
+    if (e.key === "Enter" || e.key === "Go" || e.keyCode === 13) enterHit(e);
   });
+  // v12: Gboard/SwiftKey often swallow the action-key keydown entirely but
+  // still deliver keyup — catch it there (deduped via lastCommitted).
+  input.addEventListener("keyup", (e) => {
+    if (e.key === "Enter" || e.key === "Go" || e.keyCode === 13) enterHit(e);
+  });
+  // v12: last-ditch fallback — some IMEs only fire `change` when the
+  // search key commits/blurs the field.
+  input.addEventListener("change", () => { if (!composing) commit(true); });
   form.addEventListener("submit", (e) => {
     e.preventDefault();
     commit(true);
@@ -321,6 +367,7 @@ function buildSearchBar(state, refetch) {
 
   clear.addEventListener("click", () => {
     input.value = ""; state.query = ""; state.parsed = parseSearch("");
+    lastCommitted = "";
     clear.classList.add("u-hide"); refetch();
   });
   return form;

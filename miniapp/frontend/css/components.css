@@ -59,6 +59,9 @@
   transition: border-color var(--du-dur-fast) var(--du-ease),
               box-shadow var(--du-dur-fast) var(--du-ease);
 }
+/* v12 (#1): the <form> IS the search bar now (no display:contents wrapper).
+   Neutralise UA form defaults so layout matches the old inner-div version. */
+form.search-bar { margin: 0; width: 100%; }
 .search-bar:focus-within {
   border-color: var(--du-accent);
   box-shadow: var(--du-glow-accent);
