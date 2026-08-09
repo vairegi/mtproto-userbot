@@ -40,6 +40,7 @@ The mini-app UI must NEVER go down because Turso is unreachable.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import threading
@@ -47,6 +48,27 @@ import time as _time
 from typing import Any, Optional
 
 log = logging.getLogger("miniapp.turso")
+
+# v12.5: dedicated single-thread executor used only when the calling
+# thread already has a running asyncio loop (e.g. inside the worker's
+# prefetch_cron sweep). A single reusable worker thread avoids the
+# per-call thread-spawn overhead while still giving each libsql
+# coroutine its own fresh event loop. Lazy-init so import-time does no
+# work in short-lived tools (compileall, tests_v2_smoke).
+_bridge_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_bridge_lock = threading.Lock()
+
+
+def _get_bridge_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _bridge_executor
+    if _bridge_executor is not None:
+        return _bridge_executor
+    with _bridge_lock:
+        if _bridge_executor is None:
+            _bridge_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="turso-bridge",
+            )
+        return _bridge_executor
 
 # ---------------------------------------------------------------------------
 # Env + client acquisition (lazy)
@@ -72,13 +94,13 @@ def turso_available() -> bool:
     return bool(_HAVE_LIBSQL and _TURSO_URL and _TURSO_TOKEN)
 
 
-def _run(coro):
-    """Run a libsql coroutine on a fresh event loop and dispose it.
+def _run_in_fresh_loop(coro):
+    """Execute ``coro`` on a brand-new event loop bound to *this* thread.
 
-    libsql_client.Client is bound to whatever loop first used it. Reusing
-    a persistent loop across a threadpool leaks connections; creating a
-    fresh loop per call is cheap (µs) and matches how FastAPI's sync
-    handlers already work.
+    ONLY safe to call from a thread with no running loop. Kept as a
+    private helper so both the sync-fast-path (``_run``) and the
+    thread-bridge (``_run_via_bridge``) can share exactly the same
+    close/cleanup semantics.
     """
     loop = asyncio.new_event_loop()
     try:
@@ -89,6 +111,67 @@ def _run(coro):
             loop.close()
         finally:
             asyncio.set_event_loop(None)
+
+
+def _run_via_bridge(coro_factory):
+    """Run a libsql coroutine on a background thread with its own loop.
+
+    The caller passes a **coroutine factory** (a zero-arg callable that
+    RETURNS the coroutine) rather than a coroutine object, because a
+    coroutine object cannot cross threads safely — it's bound to whatever
+    loop first awaited it. Building the coroutine INSIDE the bridge
+    thread guarantees the libsql client + its awaited call live entirely
+    on the bridge thread's fresh loop.
+
+    Returns the coroutine's result, or raises whatever the coroutine
+    raised (caller’s try/except is what turns those into log warnings).
+    """
+    ex = _get_bridge_executor()
+    fut = ex.submit(_run_in_fresh_loop, coro_factory())
+    return fut.result()
+
+
+def _run(coro_factory):
+    """Public dispatcher. Accepts a zero-arg **coroutine factory** and:
+
+    * If the calling thread has NO running asyncio loop (FastAPI sync
+      handlers, tests, compileall workers) — run the coroutine inline on
+      a fresh loop in this thread. Same as v12.4 behaviour, zero cost.
+
+    * If the calling thread has a RUNNING loop (e.g. prefetch_cron
+      running inside the worker's asyncio loop) — hand the factory to
+      the ``turso-bridge`` worker thread, which owns its own fresh loop
+      and can call ``loop.run_until_complete`` legally.
+
+    Historic callers passed a coroutine object directly. To keep that
+    working, we detect a coroutine here and wrap it in a trivial factory
+    — BUT only the sync fast-path can safely consume that pre-built
+    coroutine (a coroutine bound to a different thread's loop cannot be
+    driven from the bridge thread). If we're on the bridge branch and
+    the caller passed a plain coroutine, we raise a clear error rather
+    than silently deadlock.
+    """
+    is_factory = callable(coro_factory) and not asyncio.iscoroutine(coro_factory)
+
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+
+    if running is None:
+        # Fast path — same behaviour as v12.4. Works for both a factory
+        # and a pre-built coroutine.
+        coro = coro_factory() if is_factory else coro_factory
+        return _run_in_fresh_loop(coro)
+
+    # Bridge path — we're inside somebody else's running loop.
+    if not is_factory:
+        raise RuntimeError(
+            "turso._run: cannot marshal a pre-built coroutine across threads. "
+            "Pass a zero-arg factory (lambda: my_async(...)) when called from an "
+            "async context."
+        )
+    return _run_via_bridge(coro_factory)
 
 
 def _make_client():
@@ -158,7 +241,7 @@ def ensure_schema() -> bool:
         if _schema_ready:
             return True
         try:
-            ok = _run(_ensure_schema_async())
+            ok = _run(_ensure_schema_async)   # pass FACTORY, not coroutine
         except Exception as e:  # noqa: BLE001
             log.warning("turso: ensure_schema failed: %s", e)
             return False
@@ -195,7 +278,7 @@ def health() -> dict:
     if not turso_available():
         return {"available": False, "reason": "TURSO_DATABASE_URL/TURSO_AUTH_TOKEN not set"}
     try:
-        return _run(_health_async())
+        return _run(_health_async)   # pass FACTORY, not coroutine
     except Exception as e:  # noqa: BLE001
         return {"available": False, "reason": str(e)[:120]}
 
@@ -229,8 +312,13 @@ def execute(sql: str, args: Optional[list] = None):
         return None
     if not _schema_ready:
         ensure_schema()
+    # Factory closure captures sql+args so the coroutine is built inside
+    # the bridge thread when we're on the bridge branch. v12.5 fix for
+    # "Cannot run the event loop while another loop is running".
+    def _factory():
+        return _execute_async(sql, args)
     try:
-        return _run(_execute_async(sql, args))
+        return _run(_factory)
     except Exception as e:  # noqa: BLE001
         log.warning("turso: execute failed (%s): %s", sql.split(None, 1)[0], e)
         return None
