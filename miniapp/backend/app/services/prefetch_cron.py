@@ -48,6 +48,11 @@ from typing import Dict, Any, List, Tuple, Optional
 
 log = logging.getLogger("miniapp.prefetch")
 
+# v12.8: emoji-tagged sweep telemetry, greppable in Render logs.
+_LOG_SWEEP_WRITE = "📝 [TURSO WRITE] prefetch sweep uploaded  key=%s  bytes=%s"
+_LOG_SWEEP_SKIP  = "⏭  [PREFETCH SKIP] bucket exhausted      key=%s"
+_LOG_SWEEP_429   = "🚫 [PREFETCH 429] upstream rate-limited  key=%s"
+
 # Upstream endpoint + UA mirror what scraper_bridge already uses at request
 # time. Kept in sync intentionally: if the user rotates UAs later they can
 # grep for a single string.
@@ -432,6 +437,12 @@ async def prefetch_once() -> Dict[str, Any]:
                 ok = False
             if ok:
                 _last_run["pages_ok"] += 1
+                try:
+                    import json as _json
+                    _bytes = len(_json.dumps(payload, default=str))
+                except Exception:  # noqa: BLE001
+                    _bytes = -1
+                log.info(_LOG_SWEEP_WRITE, key, _bytes)
             else:
                 _last_run["pages_failed"] += 1
                 _last_run["last_error"] = f"cache put failed for {key}"

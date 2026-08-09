@@ -20,7 +20,9 @@ bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fail=$((fail+1)); }
 
 echo "==> Required files"
 REQUIRED=(
-  README.md CHANGELOG.md start_patch.sh
+  # v12.8 hygiene: README.md / CHANGELOG.md / docs/ removed from the
+  # production tree — operator docs, never imported at runtime.
+  start_patch.sh
   frontend/index.html
   frontend/css/theme.css frontend/css/base.css frontend/css/components.css
   frontend/js/core/app.js frontend/js/core/registry.js
@@ -47,7 +49,6 @@ REQUIRED=(
   backend/app/services/scraper_bridge.py
   backend/app/services/queue_bridge.py
   backend/tests/smoke_test.py
-  docs/INTEGRATION.md docs/PLUGIN_GUIDE.md docs/API.md
   integration/admin_bot_patch.py
 )
 for f in "${REQUIRED[@]}"; do
