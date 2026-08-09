@@ -110,6 +110,15 @@ _SEARCH_CACHE_TTL_SEC = 90
 _GALLERY_CACHE_TTL_SEC = 30 * 60
 _CACHE_MAX_ENTRIES = 128
 
+# v12.8: emoji-tagged log lines so the operator can grep Render logs
+# for one glance-friendly signal per cache event.
+_LOG_HIT    = "⚡ [TURSO CACHE HIT] Served data from Turso  key=%s  ttl=%ss"
+_LOG_STALE  = "⚠ [TURSO STALE HIT] Served STALE data (upstream 429/down)  key=%s"
+_LOG_MISS   = "🌐 [CACHE MISS] Fetched from upstream API and cached to Turso  key=%s  ttl=%ss"
+_LOG_WRITE  = "📝 [TURSO WRITE] Uploaded payload to Turso  key=%s  ttl=%ss  bytes=%s"
+_LOG_LOCAL  = "💾 [LOCAL CACHE HIT] Served from in-process dict (sub-90s window)  key=%s"
+_LOG_BUCKET = "🚫 [BUCKET BLOCK] anon quota exhausted for %s — refusing upstream call"
+
 
 # ---------------------------------------------------------------------------
 # Response cache + in-flight dedup
@@ -332,10 +341,7 @@ async def _http_get_json(path: str, params: Optional[dict] = None) -> Optional[d
     try:
         from miniapp.backend.app.services import nhentai_cache as _nhc
         if not _nhc.try_consume(_bucket_id_for_path(path)):
-            log.warning(
-                "nhentai bucket EXHAUSTED for %s params=%s — refusing upstream call",
-                path, params,
-            )
+            log.warning(_LOG_BUCKET, path)
             return None
     except Exception:  # noqa: BLE001
         # Cache module import failure: fail open, log once at DEBUG so the
@@ -388,17 +394,59 @@ async def _http_get_json(path: str, params: Optional[dict] = None) -> Optional[d
         return None
 
 
+def _turso_key_for(cache_key: str) -> str:
+    """Map an hf_scraper cache_key to the Turso key convention so
+    nhentai_cache.ttl_for_key picks the right TTL:
+        gallery|123        -> gallery:123          (30 days)
+        search|q=xxx|...   -> search:<cache_key>   (3 days)
+    """
+    if cache_key.startswith("gallery|"):
+        return "gallery:" + cache_key.split("|", 1)[1]
+    return "search:" + cache_key
+
+
+def _turso_cache_module():
+    """Lazy import of nhentai_cache; None if not importable (test envs)."""
+    try:
+        from miniapp.backend.app.services import nhentai_cache as _nhc
+        return _nhc
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def _fetch_json_cached(cache_key: str, path: str,
                              params: Optional[dict], ttl_sec: int) -> Optional[dict]:
     """
-    JSON fetch with:
-      - response cache (ttl_sec)
-      - in-flight dedup (two concurrent identical requests share one call)
+    JSON fetch with a THREE-TIER cache:
+        L1 : in-process dict (_cache)      — sub-second, 90s TTL
+        L2 : Turso (nhentai_cache)         — 3-day TTL for searches
+        L3 : nhentai.net/api/v2            — actual upstream call
+
+    Every hop that answers prints ONE emoji-tagged log line so Render
+    logs are greppable. v12.8 adds L2 (Turso) — earlier this was only
+    written to by prefetch_cron, never read at request time.
     """
+    # ---- L1: local dict -----------------------------------------------
     cached = _cache_get(cache_key)
     if cached is not None:
+        log.info(_LOG_LOCAL, cache_key)
         return cached
 
+    # ---- L2: Turso ----------------------------------------------------
+    nhc = _turso_cache_module()
+    turso_key = _turso_key_for(cache_key)
+    if nhc is not None:
+        try:
+            payload = nhc.get(turso_key, allow_stale=False)
+        except Exception:  # noqa: BLE001
+            payload = None
+        if payload is not None:
+            ttl_remain = getattr(nhc, "ttl_for_key", lambda _k: 0)(turso_key)
+            log.info(_LOG_HIT, turso_key, ttl_remain)
+            _cache_put(cache_key, payload, ttl_sec)   # re-warm L1
+            return payload
+
+    # ---- In-flight dedup ----------------------------------------------
     loop = asyncio.get_running_loop()
     with _inflight_lock:
         existing = _inflight.get(cache_key)
@@ -416,10 +464,39 @@ async def _fetch_json_cached(cache_key: str, path: str,
         except Exception:  # noqa: BLE001
             return None
 
+    # ---- L3: upstream -------------------------------------------------
     try:
         data = await _http_get_json(path, params)
+
         if data is not None:
-            _cache_put(cache_key, data, ttl_sec)
+            try:
+                payload_bytes = len(json.dumps(data, default=str))
+            except Exception:  # noqa: BLE001
+                payload_bytes = -1
+            log.info(_LOG_MISS, turso_key, ttl_sec)
+            _cache_put(cache_key, data, ttl_sec)                    # L1
+            if nhc is not None:
+                try:
+                    ok = bool(nhc.put(turso_key, data))             # L2 write
+                    if ok:
+                        applied_ttl = getattr(nhc, "ttl_for_key",
+                                              lambda _k: ttl_sec)(turso_key)
+                        log.info(_LOG_WRITE, turso_key, applied_ttl, payload_bytes)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("turso write failed for %s: %s", turso_key, e)
+        else:
+            # Upstream failed (429/network) — serve stale from Turso.
+            if nhc is not None:
+                try:
+                    stale = nhc.get(turso_key, allow_stale=True)
+                except Exception:  # noqa: BLE001
+                    stale = None
+                if stale is not None:
+                    log.info(_LOG_STALE, turso_key)
+                    _cache_put(cache_key, stale, ttl_sec)
+                    future.set_result(stale)
+                    return stale
+
         future.set_result(data)
         return data
     except Exception as e:  # noqa: BLE001

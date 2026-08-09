@@ -22,9 +22,11 @@ hr()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
 hr "==> 1. V2 required files"
 V2_REQUIRED=(
-  # Docs
-  docs/ARCHITECTURE_V2.md
-  docs/MIGRATION_V2.md
+  # v12.8 hygiene: docs/ removed from the production tree (they were
+  # operator-facing reading, never imported by any running code — only
+  # mentioned in comments). References in config.py / worker.py /
+  # relay_v2.py / gallery_state.py comments are historical pointers
+  # and do not affect runtime.
   # Root modules (V2)
   gallery_state.py
   cover_poster.py
@@ -44,7 +46,6 @@ V2_REQUIRED=(
   miniapp/frontend/js/pages/search.js
   miniapp/frontend/js/pages/bookmarks.js
   miniapp/frontend/js/pages/queue.js
-  miniapp/docs/INTEGRATION.md
 )
 for f in "${V2_REQUIRED[@]}"; do
   if [ ! -s "$f" ]; then bad "$f missing or empty"
