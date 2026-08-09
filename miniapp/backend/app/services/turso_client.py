@@ -72,9 +72,62 @@ def _get_bridge_executor() -> concurrent.futures.ThreadPoolExecutor:
 
 # ---------------------------------------------------------------------------
 # Env + client acquisition (lazy)
+#
+# v12.6: TURSO_DATABASE_URL scheme self-heal.
+#
+# libsql-client only accepts URLs starting with libsql://, https://,
+# http://, wss:// or ws://. But the Turso web dashboard sometimes SHOWS
+# the hostname as `turso://<db>-<user>.turso.io` or lets you copy just
+# `<db>-<user>.turso.io`. If either lands in the Render env, libsql
+# raises 'URL_SCHEME_NOT_SUPPORTED: Unsupported URL scheme "turso"' on
+# every call and the cache is silently disabled. We normalise here
+# rather than force the operator to fix the env value.
 # ---------------------------------------------------------------------------
-_TURSO_URL   = os.environ.get("TURSO_DATABASE_URL", "").strip()
-_TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN",   "").strip()
+_TURSO_URL_RAW = os.environ.get("TURSO_DATABASE_URL", "").strip()
+_TURSO_TOKEN   = os.environ.get("TURSO_AUTH_TOKEN",   "").strip()
+
+
+def _normalize_turso_url(raw: str) -> tuple[str, Optional[str]]:
+    """Return (fixed_url, note).
+
+    * note is None when the URL was already valid.
+    * note is a short human string when we had to fix or reject it.
+
+    Accepts every URL a normal user would paste from the Turso UI:
+      - libsql://xxx.turso.io          -> unchanged (canonical)
+      - https://xxx.turso.io           -> unchanged (HTTP mode, libsql supports this)
+      - turso://xxx.turso.io           -> rewritten to libsql://
+      - xxx.turso.io                   -> rewritten to libsql://xxx.turso.io
+      - libsql://xxx.turso.io/         -> trailing / stripped
+      - '  libsql://xxx.turso.io '     -> whitespace stripped (already .strip()-ed by caller,
+                                          but we guard again for safety)
+    Empty string returns ("", None) — the caller treats that as "not configured".
+    """
+    if not raw:
+        return "", None
+    url = raw.strip().rstrip("/")
+    lower = url.lower()
+    note: Optional[str] = None
+
+    if lower.startswith("turso://"):
+        url = "libsql://" + url[len("turso://"):]
+        note = "rewrote scheme turso:// -> libsql://"
+    elif lower.startswith(("libsql://", "https://", "http://", "wss://", "ws://")):
+        pass  # canonical
+    elif "://" in url:
+        # Some other scheme entirely (ftp://, etc.) — refuse loudly.
+        return url, f"unsupported scheme in TURSO_DATABASE_URL: {url.split('://', 1)[0]}://"
+    else:
+        # Bare host like 'my-db-user.turso.io' — assume libsql://.
+        url = "libsql://" + url
+        note = "prepended missing scheme libsql://"
+    return url, note
+
+
+_TURSO_URL, _TURSO_URL_NOTE = _normalize_turso_url(_TURSO_URL_RAW)
+if _TURSO_URL_NOTE:
+    # Log ONCE at import so ops sees the auto-heal in the boot log.
+    log.warning("turso: TURSO_DATABASE_URL auto-normalised (%s)", _TURSO_URL_NOTE)
 
 _schema_ready = False
 _schema_lock = threading.Lock()
@@ -273,14 +326,65 @@ async def _health_async() -> dict:
             pass
 
 
+def _url_diag() -> dict:
+    """Return an operator-friendly, TOKEN-FREE view of the current env.
+
+    Never leaks the auth token. `raw` is the value from the env with
+    the userinfo (if any) redacted. `scheme_ok` tells the operator
+    whether libsql-client will accept this URL at all.
+    """
+    raw = _TURSO_URL_RAW
+    fixed = _TURSO_URL
+    def _mask(u: str) -> str:
+        if not u:
+            return "(unset)"
+        # Drop any embedded userinfo (u:p@host) just in case.
+        if "@" in u and "://" in u:
+            head, tail = u.split("://", 1)
+            if "@" in tail:
+                tail = tail.split("@", 1)[1]
+            u = f"{head}://{tail}"
+        return u
+    scheme = fixed.split("://", 1)[0].lower() if "://" in fixed else ""
+    return {
+        "raw_masked":   _mask(raw),
+        "fixed_masked": _mask(fixed),
+        "scheme":       scheme,
+        "scheme_ok":    scheme in ("libsql", "https", "http", "wss", "ws"),
+        "auto_note":    _TURSO_URL_NOTE,
+        "token_set":    bool(_TURSO_TOKEN),
+        "libsql_installed": _HAVE_LIBSQL,
+    }
+
+
 def health() -> dict:
-    """Diagnostic: is Turso reachable, and how fast? Used by /diag."""
-    if not turso_available():
-        return {"available": False, "reason": "TURSO_DATABASE_URL/TURSO_AUTH_TOKEN not set"}
+    """Diagnostic: is Turso reachable, and how fast? Used by /diag.
+
+    v12.6: when the URL scheme is invalid or the module is misconfigured
+    the returned dict now carries a machine-readable ``url`` sub-dict so
+    /diag can render a specific reason (e.g. 'scheme turso not supported')
+    instead of the useless generic 'no client'.
+    """
+    url = _url_diag()
+    if not _HAVE_LIBSQL:
+        return {"available": False, "reason": "libsql_client not installed", "url": url}
+    if not _TURSO_URL_RAW:
+        return {"available": False, "reason": "TURSO_DATABASE_URL not set", "url": url}
+    if not _TURSO_TOKEN:
+        return {"available": False, "reason": "TURSO_AUTH_TOKEN not set", "url": url}
+    if not url["scheme_ok"]:
+        return {
+            "available": False,
+            "reason": f"URL scheme {url['scheme']!r} not supported (need libsql:// or https://)",
+            "url": url,
+        }
     try:
-        return _run(_health_async)   # pass FACTORY, not coroutine
+        res = _run(_health_async)   # pass FACTORY, not coroutine
     except Exception as e:  # noqa: BLE001
-        return {"available": False, "reason": str(e)[:120]}
+        return {"available": False, "reason": str(e)[:120], "url": url}
+    if isinstance(res, dict):
+        res.setdefault("url", url)
+    return res
 
 
 # ---------------------------------------------------------------------------
