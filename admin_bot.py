@@ -2107,7 +2107,10 @@ async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"   ERROR: {e!s}")
     lines.append("")
 
-    # ---- Test 4 (v12.5): Turso cache backend probe ----
+    # ---- Test 4 (v12.5 + v12.6): Turso cache backend probe ----
+    # v12.6: prints the parsed URL scheme + auto-heal note so an ops
+    # operator can see AT A GLANCE whether TURSO_DATABASE_URL is malformed
+    # (the exact failure the render log showed on 2026-08-09).
     lines.append("④ Turso cache backend")
     if _turso_admin is None:
         lines.append(f"   status  : ❌ import failed ({_turso_admin_err})")
@@ -2116,8 +2119,31 @@ async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             h = _turso_admin.health()
         except Exception as e:  # noqa: BLE001
             h = {"available": False, "reason": f"health raised: {e}"[:120]}
+
+        # v12.6: always show the URL diagnostics block, regardless of
+        # up/down state. When the DB is down this is what the operator
+        # needs to fix; when it's up it's a quick sanity check.
+        u = h.get("url") or {}
+        if u:
+            lines.append(f"   env url : {u.get('raw_masked', '(unset)')}")
+            if u.get("auto_note"):
+                lines.append(f"   auto-fix: {u['auto_note']}")
+            if u.get("fixed_masked") and u.get("fixed_masked") != u.get("raw_masked"):
+                lines.append(f"   used url: {u['fixed_masked']}")
+            lines.append(
+                f"   scheme  : {u.get('scheme') or '(none)'}"
+                f"  {'✅' if u.get('scheme_ok') else '❌ need libsql:// or https://'}"
+            )
+            lines.append(f"   token   : {'set' if u.get('token_set') else '❌ NOT SET'}")
+            lines.append(f"   libsql  : {'installed' if u.get('libsql_installed') else '❌ NOT installed'}")
+
         if not h.get("available"):
             lines.append(f"   status  : ❌ down ({h.get('reason', '?')})")
+            # Add a targeted operator hint for the exact bug caught today.
+            if u and not u.get("scheme_ok"):
+                lines.append(
+                    "   fix     : set TURSO_DATABASE_URL to libsql://<db>-<user>.turso.io"
+                )
         else:
             lines.append(f"   status  : ✅ up ({h.get('latency_ms', '?')} ms)")
             # Row-count probe — proves writes ARE landing in Turso, not
