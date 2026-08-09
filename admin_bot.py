@@ -1880,6 +1880,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("  /topsave                           most-saved doujinshi across all users")
         lines.append("  /allsaved                          per-user save summary")
         lines.append("  /users [active|banned]             list users with today's usage")
+        lines.append("  /popupmsg <text> [+photo]          set the mini-app popup message/image")
+        lines.append("  /popuptime <hours>                 popup cooldown per user (default 2)")
+        lines.append("  /popupon  /popupoff  /popupstatus  toggle + inspect the popup")
         lines.append("  /app                               open the mini-app")
         lines.append("  /appon                             show mini-app to everyone")
         lines.append("  /appoff                            hide mini-app from non-admins")
@@ -2536,6 +2539,152 @@ async def cmd_autostatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     ]
     await update.effective_message.reply_text("\n".join(l for l in lines if l))
 
+# ---------------------------------------------------------------------------
+# v12.3 — Mini-app popup commands.
+#
+#   /popupmsg <text>     set the popup body copy (pass "clear" to wipe)
+#                        attach a photo to the SAME message to also set image
+#   /popuptime <hours>   min hours between shows per user (default 2, 0 = every open)
+#   /popupon             enable the popup
+#   /popupoff            disable the popup
+#   /popupstatus         show current config
+#
+# All state lives in control_flags; the mini-app polls GET /api/popup on open.
+# ---------------------------------------------------------------------------
+
+@only_admin
+async def cmd_popupmsg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the popup message (and optional image when a photo is attached)."""
+    msg = update.effective_message
+    if msg is None:
+        return
+    # Photo attached to the SAME message carrying /popupmsg → store its file_id.
+    photo_file_id = ""
+    if msg.photo:
+        photo_file_id = msg.photo[-1].file_id  # largest size
+    text = ""
+    if ctx.args:
+        text = " ".join(ctx.args).strip()
+    elif msg.caption:
+        # /popupmsg sent as a photo caption — ctx.args is empty, use caption body.
+        parts = msg.caption.split(maxsplit=1)
+        if len(parts) > 1:
+            text = parts[1].strip()
+    conn = db.connect()
+    try:
+        if text.lower() == "clear":
+            db.set_flag(conn, "popup_message", "")
+            db.set_flag(conn, "popup_image_file_id", "")
+            await msg.reply_text("🧹 Popup message and image cleared.")
+            return
+        if text:
+            db.set_flag(conn, "popup_message", text)
+        if photo_file_id:
+            db.set_flag(conn, "popup_image_file_id", photo_file_id)
+    finally:
+        conn.close()
+    if not text and not photo_file_id:
+        await msg.reply_text(
+            "Usage: /popupmsg <text>\n"
+            "Attach a photo to the same message to also set the popup image.\n"
+            "Use /popupmsg clear to wipe both."
+        )
+        return
+    bits = []
+    if text:
+        bits.append(f"📝 message set ({len(text)} chars)")
+    if photo_file_id:
+        bits.append("🖼 image set")
+    conn = db.connect()
+    try:
+        enabled = db.get_flag(conn, "popup_enabled", "0") == "1"
+    finally:
+        conn.close()
+    await msg.reply_text(
+        "✅ Popup updated — " + ", ".join(bits)
+        + ("" if enabled else "\n(Popup is currently OFF — /popupon to enable.)")
+    )
+
+
+@only_admin
+async def cmd_popuptime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the per-user cooldown between popup shows, in hours."""
+    msg = update.effective_message
+    if msg is None:
+        return
+    if not ctx.args:
+        conn = db.connect()
+        try:
+            cur = db.get_flag(conn, "popup_freq_hours", "2")
+        finally:
+            conn.close()
+        await msg.reply_text(
+            f"Usage: /popuptime <hours>\n"
+            f"Current: every {cur} hour(s) per user (0 = show every open)."
+        )
+        return
+    try:
+        hours = int(str(ctx.args[0]).strip())
+        if hours < 0:
+            raise ValueError
+    except ValueError:
+        await msg.reply_text("Hours must be a whole number ≥ 0 (0 = show on every open).")
+        return
+    conn = db.connect()
+    try:
+        db.set_flag(conn, "popup_freq_hours", str(hours))
+    finally:
+        conn.close()
+    label = "on every mini-app open" if hours == 0 else f"every {hours} hour(s) per user"
+    await msg.reply_text(f"⏱ Popup frequency: {label}.")
+
+
+@only_admin
+async def cmd_popupon(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = db.connect()
+    try:
+        db.set_flag(conn, "popup_enabled", "1")
+        has_content = bool(
+            db.get_flag(conn, "popup_message", "").strip()
+            or db.get_flag(conn, "popup_image_file_id", "").strip()
+        )
+    finally:
+        conn.close()
+    note = "" if has_content else "\n⚠ No message/image set yet — use /popupmsg first."
+    await update.effective_message.reply_text("🔔 Popup ON." + note)
+
+
+@only_admin
+async def cmd_popupoff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = db.connect()
+    try:
+        db.set_flag(conn, "popup_enabled", "0")
+    finally:
+        conn.close()
+    await update.effective_message.reply_text("🔕 Popup OFF.")
+
+
+@only_admin
+async def cmd_popupstatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quick sanity-check of the current popup config."""
+    conn = db.connect()
+    try:
+        enabled = db.get_flag(conn, "popup_enabled", "0") == "1"
+        message = db.get_flag(conn, "popup_message", "")
+        image = db.get_flag(conn, "popup_image_file_id", "")
+        freq = db.get_flag(conn, "popup_freq_hours", "2")
+    finally:
+        conn.close()
+    preview = (message[:80] + "…") if len(message) > 80 else message
+    lines = [
+        f"🔔 Popup status: {'ON' if enabled else 'OFF'}",
+        f"  frequency: every {freq} hour(s) per user",
+        f"  message:   {preview if preview else '(none)'}",
+        f"  image:     {'set' if image else '(none)'}",
+    ]
+    await update.effective_message.reply_text("\n".join(lines))
+
+
 MINIAPP_URL = os.environ.get("MINIAPP_URL", "").rstrip("/") + "/"
 
 @only_public
@@ -2657,6 +2806,12 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("app", cmd_app))
     app.add_handler(CommandHandler("appon", cmd_appon))
     app.add_handler(CommandHandler("appoff", cmd_appoff))
+    # v12.3 — mini-app popup admin commands
+    app.add_handler(CommandHandler("popupmsg", cmd_popupmsg))
+    app.add_handler(CommandHandler("popuptime", cmd_popuptime))
+    app.add_handler(CommandHandler("popupon", cmd_popupon))
+    app.add_handler(CommandHandler("popupoff", cmd_popupoff))
+    app.add_handler(CommandHandler("popupstatus", cmd_popupstatus))
 
     # Absorb everything else silently (Yeh ALWAYS bilkul LAST mein hona chahiye)
     app.add_handler(MessageHandler(filters.ALL, swallow))

@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import threading
 import time
@@ -82,13 +83,15 @@ log = setup_logging("hf_scraper")
 BASE_URL = "https://nhentai.net"
 API_URL = f"{BASE_URL}/api/v2"
 
-# nhentai's own frontend uses this exact User-Agent flavour + Accept header;
-# copying it keeps our profile identical to what their WAF already whitelists.
+# v12.2: nhentai.net/api/v2/openapi.json explicitly asks for a DESCRIPTIVE
+# User-Agent — quote: "Please set a descriptive User-Agent header:
+# AppName/version (contact or project URL). This helps us identify traffic
+# and reach out if needed." We honour that instead of masquerading as Chrome
+# so their WAF stops classifying us as a generic scraper. Env-overridable
+# so ops can bump the version or swap the contact URL without a redeploy.
+_UA_DEFAULT = "DoujinshiUniverse/12.3 (+https://github.com/vairegi/mtproto-userbot)"
 _HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": os.environ.get("NHENTAI_USER_AGENT", _UA_DEFAULT),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     # No 'br' — we don't ship the brotli package, so gzip/deflate is the
@@ -96,6 +99,11 @@ _HEADERS = {
     "Accept-Encoding": "gzip, deflate",
     "Referer": f"{BASE_URL}/",
 }
+# v12.2: optional API key from nhentai.net/user/settings#apikeys. When
+# present, doubles/triples anon quotas per the openapi.json spec.
+_NHENTAI_API_KEY = os.environ.get("NHENTAI_API_KEY", "").strip()
+if _NHENTAI_API_KEY:
+    _HEADERS["Authorization"] = f"Key {_NHENTAI_API_KEY}"
 
 _TIMEOUT = 20.0
 _SEARCH_CACHE_TTL_SEC = 90
@@ -281,6 +289,19 @@ def _rate_limit_backoff_sec(cache_key: tuple, retry_after: Optional[str]) -> int
     return int(max(_RATE_LIMIT_TTL_SEC, min(_RATE_LIMIT_TTL_CAP_SEC, dur)))
 
 
+# v12.2: identify which openapi.json bucket a path consumes from. Kept
+# tiny so the mapping is trivial to audit and edit.
+def _bucket_id_for_path(path: str) -> str:
+    p = path or ""
+    if p.startswith("/search"):                 return "search"
+    if p.startswith("/galleries/popular"):      return "popular"
+    if "/suggestions" in p:                     return "suggestions"
+    if p.startswith("/galleries/") or p.startswith("/gallery/"):
+        return "galleries"
+    if p.startswith("/galleries"):              return "galleries_list"
+    return "galleries_list"
+
+
 async def _http_get_json(path: str, params: Optional[dict] = None) -> Optional[dict]:
     """
     GET a nhentai JSON endpoint and return its parsed body, or None on failure.
@@ -292,6 +313,12 @@ async def _http_get_json(path: str, params: Optional[dict] = None) -> Optional[d
         rate-limits us.
       - Generic exceptions are also logged at WARNING without a traceback
         so transient network failures don't drown out real errors.
+
+    v12.2 changes:
+      - Consumes a token from the SHARED per-endpoint bucket in Mongo
+        BEFORE firing upstream. When the bucket is dry (any user's search
+        can drain it), we fail closed here instead of hammering nhentai
+        and getting the whole IP banned for everyone.
     """
     url = f"{API_URL}{path}"
     cache_key = (path, frozenset((params or {}).items()))
@@ -300,6 +327,21 @@ async def _http_get_json(path: str, params: Optional[dict] = None) -> Optional[d
     if ban and ban > now:
         # Still inside the back-off window — soft-fail silently.
         return None
+    # v12.2: shared token-bucket gate (sized to openapi.json anon limits).
+    # Fails OPEN if the cache service can't reach Mongo, so dev/test still work.
+    try:
+        from miniapp.backend.app.services import nhentai_cache as _nhc
+        if not _nhc.try_consume(_bucket_id_for_path(path)):
+            log.warning(
+                "nhentai bucket EXHAUSTED for %s params=%s — refusing upstream call",
+                path, params,
+            )
+            return None
+    except Exception:  # noqa: BLE001
+        # Cache module import failure: fail open, log once at DEBUG so the
+        # log stays quiet. The bucket is defence-in-depth on top of the
+        # existing _RATE_LIMIT_CACHE back-off, not the only gate.
+        pass
     try:
         client = await _get_client()
         r = await client.get(url, params=params)

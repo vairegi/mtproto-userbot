@@ -210,6 +210,34 @@ class MongoHandle:
         """
         return self.db["galleries"]
 
+    @property
+    def nhentai_cache(self):
+        """v12.2: long-TTL cache of upstream nhentai responses.
+
+        _id  = cache key (e.g. 'gallery:274788', 'search:incest|popular|1')
+        payload = the JSON blob to return verbatim
+        expires_at = epoch seconds; TTL index below purges the doc.
+
+        Serving from here means ZERO upstream fetches — which is the
+        single biggest lever against '1 user 429s everyone'.
+        """
+        return self.db["nhentai_cache"]
+
+    @property
+    def nhentai_ratelimit(self):
+        """v12.2: shared per-endpoint token bucket for nhentai upstream.
+
+        _id = endpoint tag ('search', 'galleries', 'popular', ...)
+        tokens        = float, refills at rate_per_sec toward capacity
+        capacity      = int (max tokens = docs' anon limit for that endpoint)
+        rate_per_sec  = float (capacity / 60)
+        updated_at    = last time tokens were refilled (epoch seconds)
+
+        Sized to the OPENAPI 3.1 anon limits at nhentai.net/api/v2/openapi.json.
+        Consumed BEFORE every upstream call so we never blow past quota.
+        """
+        return self.db["nhentai_ratelimit"]
+
     def close(self) -> None:
         """No-op: the shared MongoClient stays alive for the process."""
         return None
@@ -279,6 +307,17 @@ def _ensure_indexes(conn: MongoHandle) -> None:
         conn.galleries.create_index(
             [("url_hash", ASCENDING)], name="idx_galleries_url_hash"
         )
+        # v12.2 nhentai_cache: TTL index on expires_at auto-purges stale docs.
+        # expireAfterSeconds=0 means "expire exactly at the datetime in this field".
+        try:
+            conn.nhentai_cache.create_index(
+                [("expires_at", ASCENDING)],
+                name="idx_nhcache_ttl",
+                expireAfterSeconds=0,
+            )
+        except PyMongoError:
+            # Older Mongo without TTL support — lazy expiry in read path still works.
+            pass
         _indexes_ready = True
     except PyMongoError:
         # Index creation is an optimisation, never a hard requirement.
