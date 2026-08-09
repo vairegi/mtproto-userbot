@@ -1879,6 +1879,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("  /broadcast                         reply to a message to broadcast it")
         lines.append("  /topsave                           most-saved doujinshi across all users")
         lines.append("  /allsaved                          per-user save summary")
+        lines.append("  /weekly                            broadcast this week's top-5 saves now (v11.7)")
+        lines.append("  /addimp <text>                     post a 'What's new' note into the mini-app (v11.8)")
         lines.append("  /users [active|banned]             list users with today's usage")
         lines.append("  /popupmsg <text> [+photo]          set the mini-app popup message/image")
         lines.append("  /popuptime <hours>                 popup cooldown per user (default 2)")
@@ -2103,6 +2105,47 @@ async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             lines.append("   skipped (no search hits to look up)")
     except Exception as e:  # noqa: BLE001
         lines.append(f"   ERROR: {e!s}")
+    lines.append("")
+
+    # ---- Test 4 (v12.5): Turso cache backend probe ----
+    lines.append("④ Turso cache backend")
+    if _turso_admin is None:
+        lines.append(f"   status  : ❌ import failed ({_turso_admin_err})")
+    else:
+        try:
+            h = _turso_admin.health()
+        except Exception as e:  # noqa: BLE001
+            h = {"available": False, "reason": f"health raised: {e}"[:120]}
+        if not h.get("available"):
+            lines.append(f"   status  : ❌ down ({h.get('reason', '?')})")
+        else:
+            lines.append(f"   status  : ✅ up ({h.get('latency_ms', '?')} ms)")
+            # Row-count probe — proves writes ARE landing in Turso, not
+            # just being masked by the Mongo fallback in cache.put().
+            try:
+                rs = _turso_admin.execute(
+                    "SELECT COUNT(*) AS n, "
+                    "SUM(CASE WHEN expires_at > CAST(strftime('%s','now') AS INTEGER) THEN 1 ELSE 0 END) AS live "
+                    "FROM nhentai_cache"
+                )
+                if rs and rs.rows:
+                    row = rs.rows[0]
+                    lines.append(f"   rows    : {row[0]} total, {row[1] or 0} live (unexpired)")
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"   rows    : (count failed: {e})"[:80])
+            try:
+                rs = _turso_admin.execute(
+                    "SELECT key, ttl_sec, expires_at - CAST(strftime('%s','now') AS INTEGER) AS remain "
+                    "FROM nhentai_cache ORDER BY cached_at DESC LIMIT 3"
+                )
+                if rs and rs.rows:
+                    lines.append("   newest  :")
+                    for r in rs.rows:
+                        lines.append(f"     {r[0][:36]:<36} ttl={r[1]}s remain={r[2]}s")
+                else:
+                    lines.append("   newest  : (no rows yet — wait for first sweep)")
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"   newest  : (query failed: {e})"[:80])
     lines.append("")
 
     # ---- Environment ----
