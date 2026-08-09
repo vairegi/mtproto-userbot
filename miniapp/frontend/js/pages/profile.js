@@ -10,7 +10,8 @@
 import { api } from "core/api.js";
 import { h, make } from "core/components.js";
 import { store } from "core/state.js";
-import { openGalleryDetail, prefetchGallery } from "plugins/detail-sheet.js";  // v11.9
+import { openGalleryDetail } from "plugins/detail-sheet.js";  // v11.9
+// v12.3: prefetchGallery import removed — no more background warming storm.
 
 export async function render(root, { me }) {
   const $hero   = h("div", { class: "profile-hero" });
@@ -182,12 +183,7 @@ export async function render(root, { me }) {
     }
     const grid = h("div", { class: "card-grid" });
     for (const g of items.slice(0, 12)) {
-      // v11.9 (#3): warm the detail cache + open the sheet directly
-      // instead of bouncing the user to the Saved tab.
-      if (g && g.id) {
-        setTimeout(() => { try { prefetchGallery(g.id); } catch (_) {} },
-                   30 + Math.random() * 300);
-      }
+      // v12.3: prefetch removed — sheet fetches detail on tap.
       grid.appendChild(make("card", {
         id: g.id, title: g.title, cover: g.cover, pages: g.pages,
         badge: null,  // v11.9 (#5): removed "Np" badge

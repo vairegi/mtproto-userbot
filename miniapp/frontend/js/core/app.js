@@ -53,6 +53,11 @@ async function boot() {
   }
   store.set("me", me);
 
+  // v12.3: admin-configurable popup. Runs ONCE per mini-app open,
+  // throttled server-side per user by /popuptime (default 2 hours).
+  // Fire-and-forget — never block boot on a popup fetch failure.
+  try { _maybeShowPopup(); } catch (_) { /* popup is best-effort */ }
+
   // v11.6: apply the server-side default background theme, but ONLY when
   // the user has never touched the Theme selector. "Never touched" means
   // the local pref still equals a factory default: v11.6's "dark", or the
@@ -100,6 +105,55 @@ async function boot() {
   // Signal to index.html's error-surface script that boot succeeded so it
   // doesn't overwrite the app with a "still loading" fallback message.
   if ($main) $main.dataset.booted = "1";
+}
+
+/* v12.3 — admin popup modal ---------------------------------------------
+   Fetches GET /api/popup on boot. When show=true, renders a modal with:
+     - the admin's message (from /popupmsg)
+     - the admin's image (from /popupmsg with photo attached)
+     - a × close button top-right
+   Records the view via POST /api/popup/ack so the per-user throttle
+   (/popuptime) is honoured. No z-index games — the modal is fixed,
+   full-viewport, and sits above everything else by construction.
+*/
+async function _maybeShowPopup() {
+  let cfg;
+  try {
+    cfg = await api.get("/api/popup");
+  } catch (_) {
+    return;  // popup endpoint down → skip silently, boot unaffected
+  }
+  if (!cfg || cfg.show !== true) return;
+
+  // Ack immediately so a crash mid-modal still counts as "shown" and the
+  // user doesn't get re-prompted on their very next open.
+  try { api.post("/api/popup/ack", {}); } catch (_) { /* ignore */ }
+
+  const overlay = h("div", { class: "popup-overlay", role: "dialog",
+                             "aria-modal": "true", "aria-label": "Announcement" });
+  const card = h("div", { class: "popup-card" });
+  const closeBtn = h("button", {
+    class: "popup-close", "aria-label": "Close", type: "button",
+  }, "×");
+
+  const dismiss = () => {
+    try { haptic("light"); } catch (_) {}
+    overlay.remove();
+  };
+  closeBtn.addEventListener("click", dismiss);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) dismiss(); });
+
+  if (cfg.has_image) {
+    const img = h("img", { class: "popup-image", src: "/api/popup/image",
+                           alt: "", loading: "eager" });
+    card.appendChild(img);
+  }
+  if (cfg.message && cfg.message.trim()) {
+    card.appendChild(h("div", { class: "popup-message" }, cfg.message));
+  }
+  card.appendChild(closeBtn);
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
 }
 
 function hashPageId() {

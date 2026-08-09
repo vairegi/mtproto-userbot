@@ -16,7 +16,9 @@ import { store } from "core/state.js";
 import { parseSearch } from "plugins/search-operators.js";
 import { cardActions } from "plugins/card-actions.js";
 import { renderTrendingTags, renderRecommendations } from "plugins/home-rows.js";  // v11.7
-import { prefetchGallery } from "plugins/detail-sheet.js";  // v11.8 (#2)
+// v12.3: prefetchGallery import REMOVED — no more background detail warming.
+// Card taps open a minimal sheet whose actions (Download/Save/Share) need no
+// extra upstream fetches; detail data only loads when the sheet is open.
 
 const PAGE_SIZE = 25;
 
@@ -174,17 +176,8 @@ export async function render(root, { me }) {
         if (state.page === 1) $grid.innerHTML = "";
         for (const g of items) {
           $grid.appendChild(renderCard(g));
-          // v11.8 (#2): warm the detail cache so tapping a card feels instant.
-          // Stagger prefetches slightly to avoid a burst on page 1.
-          // v12.1 (A): prefetchGallery() now enforces a 2-inflight cap and a
-          // 60s circuit breaker on upstream 429/503 — setTimeout stagger kept
-          // for the visual "cards drop in" feel, not for load control.
-          const gid = g && g.id;
-          if (gid) {
-            setTimeout(() => {
-              try { prefetchGallery(gid); } catch (_) { /* ignore */ }
-            }, 50 + Math.random() * 400);
-          }
+          // v12.3: prefetchGallery storm REMOVED entirely — the single
+          // biggest contributor to the 429 flood in the Render log.
         }
         state.page += 1;
         state.done = !state.hasMore;

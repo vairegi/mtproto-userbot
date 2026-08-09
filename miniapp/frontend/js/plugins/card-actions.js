@@ -29,7 +29,8 @@ import { api } from "core/api.js";
 import { make } from "core/components.js";
 import { openLink } from "core/telegram.js";
 import { store } from "core/state.js";
-import { openPreview } from "plugins/preview-modal.js";
+// v12.3: preview-modal import REMOVED — the Preview action is gone entirely
+// (admin decision: preview + its thumbnail fetches fed the 429 storm).
 // v11 hotfix (v11.1): this import was dropped in the v11 100% ship, which
 // made every "Download Now" click throw ReferenceError: showActionLoader is
 // not defined — silently swallowed by the async run() so nothing at all
@@ -241,14 +242,8 @@ export const cardActions = [
     },
   },
   {
-    id: "preview",
-    // UI text v9: was "Preview First Pages" — shortened per admin request.
-    label: "Preview",
-    icon: "👁️",
-    kind: "secondary",
-    run({ gallery }) { openPreview(gallery); },
-  },
-  {
+    // v12.3: the "preview" action that used to live here is removed
+    // entirely. Sheet actions are now: Download Now, Save, Share.
     id: "bookmark",
     // UI text v9: was "Bookmark" — now "Save", flipping to "Saved Already"
     // when the gallery is already in the user's bookmarks.

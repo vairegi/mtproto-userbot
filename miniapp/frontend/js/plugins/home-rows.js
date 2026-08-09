@@ -18,7 +18,8 @@
 import { api } from "core/api.js";
 import { h, make } from "core/components.js";
 import { haptic } from "core/telegram.js";
-import { openGalleryDetail, prefetchGallery } from "plugins/detail-sheet.js";
+import { openGalleryDetail } from "plugins/detail-sheet.js";
+// v12.3: prefetchGallery import removed — no more background warming storm.
 
 /* ---- Trending Tags ------------------------------------------------- */
 export function renderTrendingTags(onPick) {
@@ -126,11 +127,7 @@ export function renderRecommendations(me) {
       sub.textContent = "Because you like: " + payload.seed_tags.join(", ");
     }
     for (const g of payload.items) {
-      // v11.9 (#3): prefetch details for the recommendations grid as well.
-      if (g && g.id) {
-        setTimeout(() => { try { prefetchGallery(g.id); } catch (_) {} },
-                   30 + Math.random() * 300);
-      }
+      // v12.3: prefetch removed — sheet fetches detail on tap.
       const card = make("card", {
         id: g.id, title: g.title, cover: g.cover, pages: g.pages,
         badge: null,  // v11.9 (#5): removed "Np" badge
