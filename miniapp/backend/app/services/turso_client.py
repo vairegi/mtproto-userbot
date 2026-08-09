@@ -88,19 +88,33 @@ _TURSO_TOKEN   = os.environ.get("TURSO_AUTH_TOKEN",   "").strip()
 
 
 def _normalize_turso_url(raw: str) -> tuple[str, Optional[str]]:
-    """Return (fixed_url, note).
+    """Return (fixed_url, note) — ALWAYS an https:// URL (HTTP mode).
 
-    * note is None when the URL was already valid.
-    * note is a short human string when we had to fix or reject it.
+    v12.7: libsql-client picks its transport from the URL scheme.
+    ``libsql://`` and ``wss://`` route through the native Hrana
+    WebSocket transport, which some hosting environments (Render, in
+    particular) reject with:
+
+        400, message='Invalid response status',
+        url='wss://<db>.turso.io'
+
+    HTTP mode (Hrana over HTTP) does not have that failure mode: it's
+    plain ``POST https://<db>.turso.io/v2/pipeline`` with an
+    ``Authorization: Bearer <token>`` header on every request, which
+    every Render/Fly/Railway container handles fine. We therefore
+    NORMALISE EVERY SCHEME DOWN TO https:// here — the operator no
+    longer has to think about this.
 
     Accepts every URL a normal user would paste from the Turso UI:
-      - libsql://xxx.turso.io          -> unchanged (canonical)
-      - https://xxx.turso.io           -> unchanged (HTTP mode, libsql supports this)
-      - turso://xxx.turso.io           -> rewritten to libsql://
-      - xxx.turso.io                   -> rewritten to libsql://xxx.turso.io
-      - libsql://xxx.turso.io/         -> trailing / stripped
-      - '  libsql://xxx.turso.io '     -> whitespace stripped (already .strip()-ed by caller,
-                                          but we guard again for safety)
+      - libsql://xxx.turso.io   -> https://xxx.turso.io    (force HTTP)
+      - wss://xxx.turso.io      -> https://xxx.turso.io    (force HTTP)
+      - ws://xxx.turso.io       -> http://xxx.turso.io
+      - turso://xxx.turso.io    -> https://xxx.turso.io
+      - https://xxx.turso.io    -> unchanged
+      - http://xxx.turso.io     -> unchanged (local dev)
+      - xxx.turso.io            -> https://xxx.turso.io
+      - trailing '/'            -> stripped
+      - surrounding whitespace  -> stripped
     Empty string returns ("", None) — the caller treats that as "not configured".
     """
     if not raw:
@@ -109,18 +123,30 @@ def _normalize_turso_url(raw: str) -> tuple[str, Optional[str]]:
     lower = url.lower()
     note: Optional[str] = None
 
+    # Rewrite every WS-flavoured scheme to its HTTP counterpart. This is
+    # the whole v12.7 fix in one place: libsql-client with an https://
+    # URL uses Hrana-over-HTTP and never opens a WebSocket.
     if lower.startswith("turso://"):
-        url = "libsql://" + url[len("turso://"):]
-        note = "rewrote scheme turso:// -> libsql://"
-    elif lower.startswith(("libsql://", "https://", "http://", "wss://", "ws://")):
-        pass  # canonical
+        url = "https://" + url[len("turso://"):]
+        note = "rewrote scheme turso:// -> https:// (force HTTP mode)"
+    elif lower.startswith("libsql://"):
+        url = "https://" + url[len("libsql://"):]
+        note = "rewrote scheme libsql:// -> https:// (force HTTP mode)"
+    elif lower.startswith("wss://"):
+        url = "https://" + url[len("wss://"):]
+        note = "rewrote scheme wss:// -> https:// (force HTTP mode)"
+    elif lower.startswith("ws://"):
+        url = "http://" + url[len("ws://"):]
+        note = "rewrote scheme ws:// -> http:// (force HTTP mode)"
+    elif lower.startswith(("https://", "http://")):
+        pass  # already HTTP mode
     elif "://" in url:
         # Some other scheme entirely (ftp://, etc.) — refuse loudly.
         return url, f"unsupported scheme in TURSO_DATABASE_URL: {url.split('://', 1)[0]}://"
     else:
-        # Bare host like 'my-db-user.turso.io' — assume libsql://.
-        url = "libsql://" + url
-        note = "prepended missing scheme libsql://"
+        # Bare host like 'my-db-user.turso.io' — assume https://.
+        url = "https://" + url
+        note = "prepended missing scheme https:// (force HTTP mode)"
     return url, note
 
 
@@ -128,6 +154,18 @@ _TURSO_URL, _TURSO_URL_NOTE = _normalize_turso_url(_TURSO_URL_RAW)
 if _TURSO_URL_NOTE:
     # Log ONCE at import so ops sees the auto-heal in the boot log.
     log.warning("turso: TURSO_DATABASE_URL auto-normalised (%s)", _TURSO_URL_NOTE)
+
+# v12.7: explicit, token-free startup breadcrumb. This is the FIRST
+# thing the operator sees in the Render log and answers 'is the env
+# actually loaded?' without needing to hit /diag.
+_masked_url_for_boot = _TURSO_URL if _TURSO_URL else "(unset)"
+log.info(
+    "Turso Client initialized. Token present: %s | URL: %s | mode: %s",
+    bool(_TURSO_TOKEN),
+    _masked_url_for_boot,
+    "HTTP (https/http)" if _TURSO_URL.lower().startswith(("https://", "http://"))
+        else ("unconfigured" if not _TURSO_URL else "other"),
+)
 
 _schema_ready = False
 _schema_lock = threading.Lock()
@@ -228,10 +266,32 @@ def _run(coro_factory):
 
 
 def _make_client():
-    """Build a fresh libsql_client for one call. Cheap — it's HTTP under
-    the hood, no long-lived TCP socket. Returning a NEW client per call
-    also side-steps the 'client bound to closed loop' failure mode."""
+    """Build a fresh libsql_client for one call.
+
+    v12.7: We pass an ``https://`` URL (guaranteed by
+    ``_normalize_turso_url`` above) so libsql-client uses the Hrana
+    HTTP transport, NOT the Hrana WebSocket transport. The
+    ``auth_token`` kwarg is what libsql-client turns into the
+    ``Authorization: Bearer <token>`` header on every request —
+    there's no separate step, and no way to send the auth token as
+    part of the URL. Every request is a fresh ``POST /v2/pipeline``
+    with the bearer header attached.
+
+    Returning a NEW client per call is deliberate: libsql-client's
+    Client object is bound to whatever event loop first awaited it,
+    and our bridge-thread model builds a fresh loop per bridge call
+    (see ``_run_in_fresh_loop``). Cheap — no long-lived socket to open.
+    """
     if not turso_available():
+        return None
+    # Belt + suspenders: if for any reason a non-HTTP URL slipped past
+    # the normaliser, refuse to open a websocket. This is what caused
+    # the 400 "Invalid response status" errors on wss:// in v12.6.
+    if not _TURSO_URL.lower().startswith(("https://", "http://")):
+        log.warning(
+            "turso: refusing non-HTTP url %r — v12.7 requires https://",
+            _TURSO_URL,
+        )
         return None
     try:
         return libsql_client.create_client(url=_TURSO_URL, auth_token=_TURSO_TOKEN)
