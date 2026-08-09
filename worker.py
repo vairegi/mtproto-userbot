@@ -30,6 +30,18 @@ import relay_v2 as _relay_v2
 from startup_check import run_checks
 from userbot import build_client
 
+# v12.4: background prefetch cron. Import is guarded so a broken
+# mini-app tree (e.g. missing libsql-client in a stripped test env)
+# never blocks the worker from booting. If the import fails we simply
+# skip spawning the sweep — the mini-app fetches on-demand as before.
+try:
+    from miniapp.backend.app.services import prefetch_cron as _prefetch_cron
+except Exception as _e:  # noqa: BLE001
+    _prefetch_cron = None
+    _prefetch_cron_import_err = _e
+else:
+    _prefetch_cron_import_err = None
+
 
 def _v2_enabled() -> bool:
     """V2 relay is the default. Set SELF_COVER_POST_ENABLED=0 to fall back
@@ -117,6 +129,31 @@ async def _run_loop() -> int:
     batch_partial = 0
     batch_failed: list = []       # list[(url, reason)]
     batch_active = False
+
+    # v12.4: spawn the Turso cache warmer as a background task. It runs
+    # in the same event loop as the worker so a bucket-exhaustion event
+    # from user traffic is immediately visible to the sweep (no IPC).
+    # A crash inside run_forever() is swallowed by prefetch_cron itself
+    # — see rule set: the mini-app never goes down because Turso is off.
+    if _prefetch_cron is not None:
+        try:
+            asyncio.create_task(
+                _prefetch_cron.run_forever(),
+                name="prefetch_cron",
+            )
+            log.info(
+                "prefetch_cron: spawned (interval=%ss, max_pages=%s, enabled=%s)",
+                _prefetch_cron.PREFETCH_INTERVAL_SEC,
+                _prefetch_cron.PREFETCH_MAX_PAGES,
+                _prefetch_cron._enabled(),
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("prefetch_cron: spawn failed (%s) — continuing without warmer", e)
+    else:
+        log.warning(
+            "prefetch_cron: not spawned — import failed at boot (%s)",
+            _prefetch_cron_import_err,
+        )
 
     log.info("worker started, entering main loop")
     while not _stop.is_set():

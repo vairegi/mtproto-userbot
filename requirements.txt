@@ -43,6 +43,14 @@ uvicorn[standard]>=0.29
 pydantic>=2.5
 
 # ---------------------------------------------------------------------------
+# v12.4: Turso (libSQL) — dedicated cache-first layer alongside MongoDB.
+# Holds nhentai_cache + nhentai_ratelimit. 5 GB free tier is ~1.25M gallery
+# docs at ~4 KB each, i.e. far beyond anything we'll cache in practice.
+# The client is HTTP-based (no native SQLite build needed on Render).
+# ---------------------------------------------------------------------------
+libsql-client==0.3.1
+
+# ---------------------------------------------------------------------------
 # NOTE — dropped dependencies (paper trail so nobody re-adds them):
 #   cloudscraper : didn't help; nhentai has no CF challenge to solve
 #   curl_cffi    : TLS impersonation not needed once we switched off hentaifox

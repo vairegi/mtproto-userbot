@@ -1883,6 +1883,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("  /popupmsg <text> [+photo]          set the mini-app popup message/image")
         lines.append("  /popuptime <hours>                 popup cooldown per user (default 2)")
         lines.append("  /popupon  /popupoff  /popupstatus  toggle + inspect the popup")
+        lines.append("  /prefetch [status|now]             v12.4 cache warmer status / manual sweep")
         lines.append("  /app                               open the mini-app")
         lines.append("  /appon                             show mini-app to everyone")
         lines.append("  /appoff                            hide mini-app from non-admins")
@@ -2685,6 +2686,154 @@ async def cmd_popupstatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     await update.effective_message.reply_text("\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# v12.4 — /prefetch admin command.
+#
+# Subcommands (72 % ships "status" only; 78 % adds "now"):
+#   /prefetch                → alias for /prefetch status
+#   /prefetch status         → last_run_summary() + turso_client.health()
+#   /prefetch now            → fire one sweep immediately (78 %)
+#
+# The mini-app tree may not be importable in every deployment (e.g. a bot-only
+# Render service without libsql-client). Both imports are guarded and the
+# handler degrades gracefully rather than 500ing on the admin.
+# ---------------------------------------------------------------------------
+try:
+    from miniapp.backend.app.services import prefetch_cron as _prefetch_cron_admin  # noqa: WPS433
+except Exception as _e_pref:  # noqa: BLE001
+    _prefetch_cron_admin = None
+    _prefetch_cron_admin_err = _e_pref
+else:
+    _prefetch_cron_admin_err = None
+
+try:
+    from miniapp.backend.app.services import turso_client as _turso_admin  # noqa: WPS433
+except Exception as _e_turso:  # noqa: BLE001
+    _turso_admin = None
+    _turso_admin_err = _e_turso
+else:
+    _turso_admin_err = None
+
+
+def _fmt_epoch(ts) -> str:
+    if not ts:
+        return "never"
+    try:
+        import datetime as _dt
+        return _dt.datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:  # noqa: BLE001
+        return str(ts)
+
+
+def _fmt_seconds(sec) -> str:
+    if sec is None:
+        return "—"
+    try:
+        sec = int(sec)
+    except (TypeError, ValueError):
+        return str(sec)
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m {sec % 60}s"
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    return f"{h}h {m}m"
+
+
+def _render_prefetch_status() -> str:
+    if _prefetch_cron_admin is None:
+        return (
+            "🔄 Prefetch status\n"
+            f"  module:  import FAILED ({_prefetch_cron_admin_err})\n"
+            "  ↳ the worker booted without the mini-app tree — sweep disabled."
+        )
+
+    try:
+        snap = _prefetch_cron_admin.last_run_summary()
+    except Exception as e:  # noqa: BLE001
+        return f"🔄 Prefetch status\n  ⚠ last_run_summary() raised: {e}"
+
+    if _turso_admin is not None:
+        try:
+            turso = _turso_admin.health()
+        except Exception as e:  # noqa: BLE001
+            turso = {"available": False, "reason": f"health raised: {e}"[:120]}
+    else:
+        turso = {"available": False, "reason": f"import failed: {_turso_admin_err}"}
+
+    now = snap.get("now") or 0
+    started = snap.get("started_at")
+    finished = snap.get("finished_at")
+    since_finish = (now - finished) if (now and finished) else None
+
+    lines = [
+        "🔄 Prefetch status",
+        f"  enabled:      {'ON' if snap.get('enabled') else 'OFF'}",
+        f"  interval:     every {_fmt_seconds(snap.get('interval_sec'))}",
+        f"  max pages:    {snap.get('max_pages')} per sort",
+        f"  delay:        {snap.get('delay_sec')}s between pages",
+        f"  sorts:        {', '.join(snap.get('sorts') or [])}",
+        "",
+        f"  sweeps done:  {snap.get('sweep_count')}",
+        f"  last start:   {_fmt_epoch(started)}",
+        f"  last finish:  {_fmt_epoch(finished)}"
+        + (f"  ({_fmt_seconds(since_finish)} ago)" if since_finish is not None else ""),
+        f"  last dur:     {_fmt_seconds(snap.get('duration_sec'))}",
+        f"  pages ok:     {snap.get('pages_ok')} / {snap.get('pages_planned')}",
+        f"  skipped:      {snap.get('pages_skipped')}  (bucket / 429)",
+        f"  failed:       {snap.get('pages_failed')}",
+        f"  last error:   {snap.get('last_error') or '—'}",
+        "",
+        f"  turso:        {'✅ up' if turso.get('available') else '❌ down'}"
+        + (f"  ({turso.get('latency_ms')}ms)" if turso.get('latency_ms') is not None else "")
+        + (f"  reason: {turso.get('reason')}" if turso.get('reason') else ""),
+    ]
+    return "\n".join(lines)
+
+
+@only_admin
+async def cmd_prefetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/prefetch [status|now]  — v12.4 cache-warmer inspector."""
+    args = (ctx.args or [])
+    sub = (args[0].strip().lower() if args else "status")
+
+    if sub in ("", "status"):
+        await update.effective_message.reply_text(_render_prefetch_status())
+        return
+
+    # "now" subcommand — fire one sweep immediately, then reply with fresh status.
+    if sub == "now":
+        if _prefetch_cron_admin is None:
+            await update.effective_message.reply_text(
+                "⚠ Prefetch module is not importable in this deployment — nothing to run.\n"
+                f"reason: {_prefetch_cron_admin_err}"
+            )
+            return
+        try:
+            enabled = bool(_prefetch_cron_admin._enabled())
+        except Exception:  # noqa: BLE001
+            enabled = False
+        if not enabled:
+            await update.effective_message.reply_text(
+                "⚠ Prefetch is disabled (PREFETCH_ENABLED=0 or empty _SORTS). "
+                "Set PREFETCH_ENABLED=1 in Render and restart the worker to re-enable."
+            )
+            return
+        await update.effective_message.reply_text("⏳ Kicking off a manual sweep…")
+        try:
+            await _prefetch_cron_admin.trigger_now()
+        except Exception as e:  # noqa: BLE001
+            await update.effective_message.reply_text(f"❌ trigger_now() raised: {e}")
+            return
+        await update.effective_message.reply_text(_render_prefetch_status())
+        return
+
+    await update.effective_message.reply_text(
+        "Usage: /prefetch [status|now]"
+    )
+
+
 MINIAPP_URL = os.environ.get("MINIAPP_URL", "").rstrip("/") + "/"
 
 @only_public
@@ -2812,6 +2961,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("popupon", cmd_popupon))
     app.add_handler(CommandHandler("popupoff", cmd_popupoff))
     app.add_handler(CommandHandler("popupstatus", cmd_popupstatus))
+    app.add_handler(CommandHandler("prefetch", cmd_prefetch))   # v12.4
 
     # Absorb everything else silently (Yeh ALWAYS bilkul LAST mein hona chahiye)
     app.add_handler(MessageHandler(filters.ALL, swallow))
