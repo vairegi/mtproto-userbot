@@ -36,6 +36,13 @@ from typing import Any, Optional
 
 log = logging.getLogger("miniapp.nhentai_cache")
 
+# v12.4: Turso-first cache layer. Import lazily so a missing package can
+# never crash the mini-app; turso_client.turso_available() gates all use.
+try:
+    from . import turso_client as _turso
+except Exception:  # noqa: BLE001
+    _turso = None
+
 # ---------------------------------------------------------------------------
 # TTL config (seconds). Env-overridable so ops can tune without a redeploy.
 # ---------------------------------------------------------------------------
@@ -136,13 +143,53 @@ def ttl_for_key(key: str) -> int:
 # ---------------------------------------------------------------------------
 # Cache API
 # ---------------------------------------------------------------------------
-def get(key: str, allow_stale: bool = False) -> Optional[dict]:
-    """Return the cached payload for `key`, or None.
+# ---------------------------------------------------------------------------
+# v12.4: Turso-first read/write path. Same public signatures as before.
+#
+# Read order:  Turso → (miss/error) → Mongo → (miss/error) → None
+# Write order: Turso (best-effort) → Mongo (best-effort)
+#
+# Turso holds fresh reads; Mongo remains as the last-known-good fallback
+# so a Turso outage cannot break the mini-app. Both stores use unix-epoch
+# seconds for expires_at to keep comparisons trivial across backends.
+# ---------------------------------------------------------------------------
+def _now_epoch() -> int:
+    import time as _t
+    return int(_t.time())
 
-    `allow_stale=True` lets the caller pull a doc that's past its expires_at
-    but still within TTL_STALE_GRACE_SEC. This is what powers
-    'upstream 429 → serve stale-if-error' semantics.
-    """
+
+def _turso_get(key: str, allow_stale: bool) -> Optional[dict]:
+    if _turso is None or not _turso.turso_available():
+        return None
+    try:
+        rs = _turso.execute(
+            "SELECT payload, expires_at FROM nhentai_cache WHERE key = ?",
+            [key],
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not rs or not getattr(rs, "rows", None):
+        return None
+    row = rs.rows[0]
+    payload_json = row[0]
+    try:
+        expires_at = int(row[1])
+    except (TypeError, ValueError):
+        return None
+    now = _now_epoch()
+    if expires_at > now:
+        pass  # fresh
+    elif allow_stale and (now - expires_at) < TTL_STALE_GRACE_SEC:
+        pass  # stale-but-servable
+    else:
+        return None
+    try:
+        return json.loads(payload_json)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mongo_get(key: str, allow_stale: bool) -> Optional[dict]:
     conn = _handle()
     if conn is None:
         return None
@@ -163,17 +210,41 @@ def get(key: str, allow_stale: bool = False) -> Optional[dict]:
     return None
 
 
-def put(key: str, payload: Any, ttl_sec: Optional[int] = None) -> bool:
-    """Write a cache entry. `payload` must be JSON-serialisable."""
+def get(key: str, allow_stale: bool = False) -> Optional[dict]:
+    """Return the cached payload for `key`, or None.
+
+    `allow_stale=True` lets the caller pull a doc that's past its expires_at
+    but still within TTL_STALE_GRACE_SEC — powers 'upstream 429 → serve
+    stale-if-error'. v12.4: reads Turso first, Mongo as fallback.
+    """
+    payload = _turso_get(key, allow_stale)
+    if payload is not None:
+        return payload
+    return _mongo_get(key, allow_stale)
+
+
+def _turso_put(key: str, payload_json: str, ttl: int) -> bool:
+    if _turso is None or not _turso.turso_available():
+        return False
+    now = _now_epoch()
+    try:
+        rs = _turso.execute(
+            "INSERT INTO nhentai_cache (key, payload, cached_at, expires_at, ttl_sec) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "payload=excluded.payload, cached_at=excluded.cached_at, "
+            "expires_at=excluded.expires_at, ttl_sec=excluded.ttl_sec",
+            [key, payload_json, now, now + ttl, ttl],
+        )
+        return rs is not None
+    except Exception as e:  # noqa: BLE001
+        log.debug("turso put(%s) failed: %s", key, e)
+        return False
+
+
+def _mongo_put(key: str, payload: Any, ttl: int) -> bool:
     conn = _handle()
     if conn is None:
-        return False
-    ttl = int(ttl_sec if ttl_sec is not None else ttl_for_key(key))
-    # Guard against garbage payloads that would poison the cache.
-    try:
-        json.dumps(payload, default=str)
-    except (TypeError, ValueError):
-        log.warning("nhentai_cache.put(%s): payload not JSON-serialisable — skipped", key)
         return False
     doc = {
         "_id":        key,
@@ -186,12 +257,33 @@ def put(key: str, payload: Any, ttl_sec: Optional[int] = None) -> bool:
         conn.nhentai_cache.replace_one({"_id": key}, doc, upsert=True)
         return True
     except Exception as e:  # noqa: BLE001
-        log.warning("nhentai_cache.put(%s) failed: %s", key, e)
+        log.warning("mongo put(%s) failed: %s", key, e)
         return False
 
 
+def put(key: str, payload: Any, ttl_sec: Optional[int] = None) -> bool:
+    """Write a cache entry. Best-effort to BOTH backends so a Turso outage
+    still leaves a Mongo copy for the fallback read path (and vice versa).
+    Returns True if AT LEAST ONE write succeeded."""
+    ttl = int(ttl_sec if ttl_sec is not None else ttl_for_key(key))
+    # Guard against garbage payloads that would poison the cache.
+    try:
+        payload_json = json.dumps(payload, default=str)
+    except (TypeError, ValueError):
+        log.warning("nhentai_cache.put(%s): payload not JSON-serialisable — skipped", key)
+        return False
+    ok_turso = _turso_put(key, payload_json, ttl)
+    ok_mongo = _mongo_put(key, payload, ttl)
+    return ok_turso or ok_mongo
+
+
 def invalidate(key: str) -> None:
-    """Force-delete a cache entry (used by admin /force-rescrape)."""
+    """Force-delete a cache entry from BOTH backends (admin /force-rescrape)."""
+    if _turso is not None and _turso.turso_available():
+        try:
+            _turso.execute("DELETE FROM nhentai_cache WHERE key = ?", [key])
+        except Exception:  # noqa: BLE001
+            pass
     conn = _handle()
     if conn is None:
         return
@@ -204,20 +296,77 @@ def invalidate(key: str) -> None:
 # ---------------------------------------------------------------------------
 # Token bucket — SHARED across users. Prevents any single search from
 # blowing past the openapi.json quota and 429ing everyone.
+#
+# v12.4: Turso-first. The refill+spend happens in ONE atomic SQL statement
+# ('UPDATE ... SET tokens = min(cap, tokens + elapsed*rate) - cost WHERE
+# tokens_after_refill >= cost'), which closes the read-modify-write race
+# that plagued the Mongo path when two concurrent searches consumed the
+# same bucket. Mongo remains as fallback for a Turso outage.
 # ---------------------------------------------------------------------------
-def try_consume(bucket_id: str, cost: float = 1.0) -> bool:
-    """Consume `cost` tokens from `bucket_id`. Return True on success.
+def _turso_try_consume(bucket_id: str, cap: int, cost: float) -> Optional[bool]:
+    """Turso-backed atomic consume. Returns True/False on success, None if
+    Turso is unavailable or errored (caller falls through to Mongo)."""
+    if _turso is None or not _turso.turso_available():
+        return None
+    rate_per_sec = cap / 60.0
+    now = time.time()
+    # Ensure row exists. INSERT OR IGNORE is atomic; no-op if already there.
+    try:
+        _turso.execute(
+            "INSERT OR IGNORE INTO nhentai_ratelimit "
+            "(bucket_id, tokens, capacity, rate_per_sec, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [bucket_id, float(cap), cap, rate_per_sec, now],
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    # Atomic refill-and-spend. The SQL:
+    #   1. computes refilled tokens: min(capacity, tokens + max(0, now-updated_at) * rate_per_sec)
+    #   2. guards WHERE that value >= cost
+    #   3. subtracts cost and stamps updated_at = now
+    # If the WHERE clause fails, zero rows are affected → we treat that as
+    # "bucket exhausted" and return False WITHOUT bumping updated_at, so
+    # the next caller still gets the full refill they earned.
+    try:
+        rs = _turso.execute(
+            "UPDATE nhentai_ratelimit SET "
+            "  tokens = MIN(CAST(capacity AS REAL), tokens + MAX(0, ? - updated_at) * rate_per_sec) - ?, "
+            "  updated_at = ? "
+            "WHERE bucket_id = ? "
+            "  AND MIN(CAST(capacity AS REAL), tokens + MAX(0, ? - updated_at) * rate_per_sec) >= ?",
+            [now, cost, now, bucket_id, now, cost],
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("turso try_consume(%s) failed: %s", bucket_id, e)
+        return None
+    if rs is None:
+        return None
+    # libsql exposes affected rows via .rows_affected on newer clients.
+    affected = getattr(rs, "rows_affected", None)
+    if affected is None:
+        # Older clients: no reliable affected-rows count. Read back tokens
+        # to determine success — if tokens < 0 we accidentally over-spent
+        # (should be impossible with the WHERE guard, but handle it).
+        try:
+            probe = _turso.execute(
+                "SELECT tokens FROM nhentai_ratelimit WHERE bucket_id = ?",
+                [bucket_id],
+            )
+            if probe and probe.rows and float(probe.rows[0][0]) >= 0:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    return bool(affected)
 
-    On failure the CALLER must serve from cache (allow_stale=True) instead
-    of firing the upstream call. This is the mechanism that keeps one heavy
-    search from starving everyone else.
-    """
+
+def _mongo_try_consume(bucket_id: str, cap: int, cost: float) -> bool:
+    """Mongo-backed consume. Not atomic across processes but the ONLY
+    consumer of nhentai_ratelimit is the mini-app backend, and each
+    process serialises on its own event loop."""
     conn = _handle()
     if conn is None:
-        # No mongo → no bucket enforcement. Fail open so the app still works
-        # in dev / test setups. In production Mongo is always available.
-        return True
-    cap, _label = BUCKETS.get(bucket_id, (10, bucket_id))
+        return True  # dev/test without Mongo: fail open
     rate_per_sec = cap / 60.0
     now = time.time()
     try:
@@ -228,12 +377,9 @@ def try_consume(bucket_id: str, cost: float = 1.0) -> bool:
                 "capacity": cap, "rate_per_sec": rate_per_sec,
                 "updated_at": now,
             }
-        # Refill: elapsed seconds × rate, clamped to capacity.
         elapsed = max(0.0, now - float(doc.get("updated_at") or now))
         tokens = min(float(cap), float(doc.get("tokens") or cap) + elapsed * rate_per_sec)
         if tokens < cost:
-            # Persist the refill even on refusal so the next caller sees the
-            # correct remaining count.
             conn.nhentai_ratelimit.update_one(
                 {"_id": bucket_id},
                 {"$set": {"tokens": tokens, "updated_at": now,
@@ -250,17 +396,58 @@ def try_consume(bucket_id: str, cost: float = 1.0) -> bool:
         )
         return True
     except Exception as e:  # noqa: BLE001
-        log.warning("token bucket %s failed (%s) — failing open", bucket_id, e)
+        log.warning("mongo token bucket %s failed (%s) — failing open", bucket_id, e)
         return True
 
 
+def try_consume(bucket_id: str, cost: float = 1.0) -> bool:
+    """Consume `cost` tokens from `bucket_id`. Return True on success.
+
+    v12.4: Turso first (atomic), Mongo fallback (per-process), fail-open
+    when neither is available.
+    """
+    cap, _label = BUCKETS.get(bucket_id, (10, bucket_id))
+    turso_result = _turso_try_consume(bucket_id, cap, cost)
+    if turso_result is not None:
+        return turso_result
+    return _mongo_try_consume(bucket_id, cap, cost)
+
+
+def _turso_bucket_state(bucket_id: str, cap: int, label: str) -> Optional[dict]:
+    if _turso is None or not _turso.turso_available():
+        return None
+    try:
+        rs = _turso.execute(
+            "SELECT tokens, updated_at FROM nhentai_ratelimit WHERE bucket_id = ?",
+            [bucket_id],
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if rs is None:
+        return None
+    now = time.time()
+    if not rs.rows:
+        return {"bucket": bucket_id, "label": label, "capacity": cap,
+                "tokens": float(cap), "available": True, "backend": "turso"}
+    tokens = float(rs.rows[0][0])
+    updated_at = float(rs.rows[0][1])
+    elapsed = max(0.0, now - updated_at)
+    tokens = min(float(cap), tokens + elapsed * (cap / 60.0))
+    return {"bucket": bucket_id, "label": label, "capacity": cap,
+            "tokens": tokens, "available": tokens >= 1.0, "backend": "turso"}
+
+
 def bucket_state(bucket_id: str) -> dict:
-    """Diagnostic: current tokens / capacity for a bucket. Cheap read."""
-    conn = _handle()
+    """Diagnostic: current tokens / capacity for a bucket. Cheap read.
+    v12.4: Turso first, Mongo fallback."""
     cap, label = BUCKETS.get(bucket_id, (0, bucket_id))
+    ts = _turso_bucket_state(bucket_id, cap, label)
+    if ts is not None:
+        return ts
+    conn = _handle()
     if conn is None:
         return {"bucket": bucket_id, "label": label, "capacity": cap,
-                "tokens": cap, "available": True, "backend": "no-mongo"}
+                "tokens": cap, "available": True, "backend": "no-store"}
     try:
         doc = conn.nhentai_ratelimit.find_one({"_id": bucket_id})
         tokens = float(doc.get("tokens") if doc else cap)
