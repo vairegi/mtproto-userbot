@@ -410,7 +410,9 @@ def get_details_scraper(_a: dict = Depends(require_admin)) -> dict:
 
 @router.post("/details-scraper")
 def set_details_scraper(body: DetailsScraperBody, _a: dict = Depends(require_admin)) -> dict:
+    # v12.12 (autoscraper fix): the flag lives in Mongo ONLY. The cron in
+    # the WORKER process re-reads it every tick via _read_enabled(), so
+    # this single write reaches it — no cross-process in-memory flip
+    # needed (and none would work anyway: separate Render services).
     db.set_setting(_DPC_FLAG_KEY, bool(body.enabled))
-    if _dpc is not None:
-        _dpc.ENABLED = bool(body.enabled)
     return {"ok": True, "enabled": bool(body.enabled)}

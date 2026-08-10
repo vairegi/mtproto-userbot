@@ -25,33 +25,45 @@ register("card", (props) => {
   // v12.10 (#8): grid shows the cleaned English title when present.
   const gridTitle = (props.title_en_clean || "").trim() || title || "";
 
+  // v12.12 (#3): TDZ fix. v12.10's wide-card IIFE ran INSIDE the h(...)
+  // children arguments, and its closure captured `card` — a const whose
+  // initialization only completes AFTER h() returns. If the cover probe
+  // fired synchronously (cached image), it touched the binding while it
+  // was still in the temporal dead zone, throwing
+  // "Cannot access 'card' before initialization" and killing the whole
+  // page render. Fix: build the img first, then the article, and attach
+  // the probe AFTER `card` is assigned.
+  const imgEl = cover
+    ? h("img", { class: "cover", src: cover, loading: "lazy", alt: title || "cover" })
+    : h("div", { class: "cover skeleton" });
+
   const card = h("article", {
     class: "gallery-card",
     dataset: { galleryId: id },
     onclick: () => { haptic("light"); onOpen && onOpen(props); },
   },
-    cover
-      ? (() => {
-          // v12.10 (#9, option A): landscape covers get .wide-card so the
-          // card spans the full grid row (see components.css). The probe
-          // runs on load AND immediately for cached images (complete flag),
-          // so the class lands before first paint whenever possible.
-          const img = h("img", { class: "cover", src: cover, loading: "lazy", alt: title || "cover" });
-          const probe = () => {
-            if (img.naturalWidth > 0 && img.naturalWidth > img.naturalHeight) {
-              card.classList.add("wide-card");
-            }
-          };
-          img.addEventListener("load", probe);
-          if (img.complete && img.naturalWidth > 0) probe();
-          return img;
-        })()
-      : h("div", { class: "cover skeleton" }),
+    imgEl,
     badge ? h("span", { class: "badge" }, badge) : null,
     h("div", { class: "meta" },
       h("div", { class: "title", title: title || gridTitle }, gridTitle || `#${id}`),
       h("div", { class: "sub" }, pageCount ? `${pageCount} pages` : "—"),
     ),
   );
+
+  // v12.10 (#9, option A): landscape covers get .wide-card so the card
+  // spans the full grid row (see components.css). The probe runs on load
+  // AND immediately for cached images (complete flag), so the class lands
+  // before first paint whenever possible. v12.12: safe now — `card` is
+  // fully initialized by the time any of these run.
+  if (cover && imgEl instanceof HTMLImageElement) {
+    const probe = () => {
+      if (imgEl.naturalWidth > 0 && imgEl.naturalWidth > imgEl.naturalHeight) {
+        card.classList.add("wide-card");
+      }
+    };
+    imgEl.addEventListener("load", probe);
+    if (imgEl.complete && imgEl.naturalWidth > 0) probe();
+  }
+
   return card;
 });

@@ -148,6 +148,13 @@ form.search-bar { margin: 0; width: 100%; }
      the admin sets the gap to 0 (nhentai-style flush grid). */
   overflow: hidden;
   box-sizing: border-box;
+  /* v12.12 (#2): symmetric horizontal inset on the GRID ITSELF, not just
+     the page shell. In v12.11 the --du-app-pad-x padding only sat on
+     .app-main; on grid pages (search / home rows) the grid's 100% width
+     plus its own box-sizing ate the parent's right padding, so only the
+     left side showed the inset. Putting padding-inline on the grid
+     guarantees left == right on every page that renders cards. */
+  padding-inline: var(--du-app-pad-x, 0px);
 }
 .card-grid .gallery-card .meta {
   padding: var(--du-space-2);

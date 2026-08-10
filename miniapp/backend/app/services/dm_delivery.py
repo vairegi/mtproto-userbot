@@ -292,15 +292,21 @@ def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
         # "📨 Sent to your DM" confirmation that the auto-DM path in
         # relay_v2 already sends. Send it here too, from the admin bot,
         # so the user actually gets a Telegram DM (not just an in-app
-        # toast). Merge share_guard.payload() so protect_content sticks
-        # when the admin toggled Disable-sharing. Wrap in a try/except
-        # that only logs on failure (never blocks the response).
+        # toast). Wrap in a try/except that only logs on failure (never
+        # blocks the response).
+        #
+        # v12.12 (#1): do NOT protect this plain-text confirmation.
+        # protect_content=true marks the WHOLE DM chat as protected in
+        # Telegram clients, and that chat-level protected state blocks
+        # screenshots of everything in the chat — including the mini-app
+        # WebView the user opened from it. Media deliveries (cover + PDF)
+        # keep their protection via _copy_or_forward(); the confirmation
+        # carries no content worth protecting anyway.
         try:
             with httpx.Client() as _client:
                 _confirm = _api_call(token, "sendMessage", {
                     "chat_id": int(uid),
                     "text":    "📨 Sent to your DM",
-                    **share_guard.payload(),
                 }, _client)
             if _confirm.get("ok"):
                 _mid = int((_confirm.get("result") or {}).get("message_id") or 0)

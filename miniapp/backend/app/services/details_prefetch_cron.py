@@ -86,11 +86,37 @@ _SORTS: List[str] = ["popular-today", "date", "popular-week", "popular"]
 
 # v12.11 (#1b): search-time opportunistic hydration. When the search path
 # serves a page, scraper_bridge calls notify_page() and the (sort, page)
-# tuple lands here. The next scrape tick drains these FIRST (a user is
-# literally looking at this page RIGHT NOW), then falls back to the
-# round-robin walk. A set is enough — dedup is free and order within a
-# tick doesn't matter much.
-_priority_pages: set = set()
+# tuple lands in the priority queue. The next scrape tick drains these
+# FIRST (a user is literally looking at this page RIGHT NOW), then falls
+# back to the round-robin walk.
+#
+# v12.12 (autoscraper fix): the priority queue is persisted to Mongo, NOT
+# held in memory — notify_page() runs in the BACKEND process (it serves
+# /api/search) while the cron loop runs in the WORKER process (separate
+# Render service). An in-memory set would never cross the process
+# boundary. Same reason the enable-flag and status snapshot live in
+# Mongo (see _persist_state / _read_enabled below).
+_FLAG_KEY = "details_scraper_enabled"
+_STATE_KEY = "details_scraper_state"
+_PRIO_KEY = "details_scraper_priority"
+_PRIO_CAP = 50
+
+
+def _db_set(key: str, value: Any) -> None:
+    try:
+        from .. import db as _midb
+        _midb.set_setting(key, value)
+    except Exception as e:  # noqa: BLE001
+        log.debug("details_scraper: db_set(%s) failed: %s", key, e)
+
+
+def _db_get(key: str, default: Any = None) -> Any:
+    try:
+        from .. import db as _midb
+        return _midb.get_setting(key, default)
+    except Exception as e:  # noqa: BLE001
+        log.debug("details_scraper: db_get(%s) failed: %s", key, e)
+        return default
 
 
 def notify_page(sort: str, page: int) -> None:
@@ -99,9 +125,40 @@ def notify_page(sort: str, page: int) -> None:
     waiting for the round-robin walk to reach them. Never raises."""
     try:
         if sort in _SORTS and 1 <= int(page) <= PAGE_CAP:
-            _priority_pages.add((sort, int(page)))
+            lst = _db_get(_PRIO_KEY, []) or []
+            if not isinstance(lst, list):
+                lst = []
+            entry = [sort, int(page)]
+            if entry not in lst:
+                lst.append(entry)
+            _db_set(_PRIO_KEY, lst[-_PRIO_CAP:])  # cap: keep freshest
     except Exception:  # noqa: BLE001
         pass
+
+
+def _drain_priority_pages() -> List[Tuple[str, int]]:
+    """Pop every queued (sort, page) tuple from the shared Mongo queue."""
+    lst = _db_get(_PRIO_KEY, []) or []
+    if not isinstance(lst, list) or not lst:
+        return []
+    _db_set(_PRIO_KEY, [])
+    out: List[Tuple[str, int]] = []
+    for e in lst:
+        try:
+            s, p = e[0], int(e[1])
+            if s in _SORTS and 1 <= p <= PAGE_CAP:
+                out.append((s, p))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _read_enabled() -> bool:
+    """Runtime toggle: DB flag wins over the env default so the admin
+    Enable/Disable button (which lives in the backend process) actually
+    reaches this worker process."""
+    flag = _db_get(_FLAG_KEY, None)
+    return bool(flag) if flag is not None else bool(ENABLED)
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +182,23 @@ _state: Dict[str, Any] = {
 }
 
 
+def _persist_state() -> None:
+    """v12.12 (autoscraper fix): write the live state snapshot to Mongo so
+    the admin panel (backend process) can read what the worker process is
+    doing. Cheap — one upsert per tick."""
+    try:
+        _db_set(_STATE_KEY, dict(_state))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def last_run_summary() -> Dict[str, Any]:
-    snap = dict(_state)
+    # v12.12: prefer the persisted snapshot — in the backend process the
+    # in-memory _state is empty (the cron lives in the worker process).
+    persisted = _db_get(_STATE_KEY, None)
+    snap = dict(persisted) if isinstance(persisted, dict) else dict(_state)
+    if not snap:
+        snap = dict(_state)
     snap["now"] = int(time.time())
     snap["config"] = {
         "night_start_ist": NIGHT_START,
@@ -140,6 +212,8 @@ def last_run_summary() -> Dict[str, Any]:
         "pages_per_tick":  PAGES_PER_TICK,
         "sorts":           list(_SORTS),
     }
+    # v12.12: reflect the DB-backed runtime toggle, not the import-time env.
+    snap["enabled"] = _read_enabled()
     return snap
 
 
@@ -330,9 +404,12 @@ async def _scrape_page_details(sort: str, page: int) -> Dict[str, int]:
 
 async def scrape_once() -> Dict[str, Any]:
     """Run one tick. Never raises. Returns last_run_summary() at the end."""
-    if not ENABLED:
+    # v12.12: read the toggle from Mongo every tick so the admin panel's
+    # Enable/Disable (backend process) actually reaches this worker.
+    if not _read_enabled():
         _state["enabled"] = False
         _state["phase"] = "idle"
+        _persist_state()
         return last_run_summary()
 
     _state["enabled"] = True
@@ -351,6 +428,7 @@ async def scrape_once() -> Dict[str, Any]:
             _state["phase"] = "paused"
             _state["paused_reason"] = "day-active-users"
             _state["finished_at"] = int(time.time())
+            _persist_state()
             return last_run_summary()
     else:
         # Night window — user pause does NOT apply (they're asleep).
@@ -365,13 +443,15 @@ async def scrape_once() -> Dict[str, Any]:
         _state["phase"] = "paused"
         _state["paused_reason"] = "cache-module-unavailable"
         _state["finished_at"] = int(time.time())
+        _persist_state()
         return last_run_summary()
 
-    # v12.11 (#1b): drain user-visible pages FIRST. A page the user just
-    # opened is hydrated before any round-robin work this tick.
+    # v12.12: drain user-visible pages FIRST from the SHARED Mongo queue
+    # (the in-memory set never crossed the backend→worker process boundary).
     walked = 0
-    while _priority_pages and walked < PAGES_PER_TICK:
-        sort, page = _priority_pages.pop()
+    for sort, page in _drain_priority_pages():
+        if walked >= PAGES_PER_TICK:
+            break
         _state["current_sort"] = sort
         _state["current_page"] = page
         try:
@@ -407,6 +487,7 @@ async def scrape_once() -> Dict[str, Any]:
 
     _state["finished_at"] = int(time.time())
     _state["phase"] = "idle"
+    _persist_state()
     log.info(
         "details_scraper: tick end sort=%s page=%s done=%d skipped=%d failed=%d",
         _state["current_sort"], _state["current_page"],
@@ -425,10 +506,14 @@ async def run_forever() -> None:
     )
     while True:
         try:
-            if ENABLED:
+            # v12.12: DB-backed toggle so the admin button reaches us.
+            if _read_enabled():
                 await scrape_once()
             else:
-                log.debug("details_scraper: disabled by env — idle tick")
+                log.debug("details_scraper: disabled — idle tick")
+                _state["enabled"] = False
+                _state["phase"] = "idle"
+                _persist_state()
         except asyncio.CancelledError:
             log.info("details_scraper: run_forever cancelled — stopping")
             raise
