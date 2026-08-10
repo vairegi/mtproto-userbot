@@ -346,6 +346,21 @@ async def _auto_dm_requester(
             return
 
     # -------- 2) Fallback: userbot forward_messages ------------------------
+    # v12.12 (#1): Telethon forward_messages CANNOT carry protect_content.
+    # When the admin's Disable-sharing toggle is on, delivering via this
+    # path would hand the user a FORWARDABLE copy — defeating the toggle
+    # entirely. Gate the fallback off in that case; the user can retry
+    # once the Bot API path recovers (or after they /start the bot).
+    try:
+        if feature_flags.share_disabled(conn):
+            log.info(
+                "auto-DM: userbot fallback suppressed for uid=%s — "
+                "share_disabled is ON and userbot forwards are unprotectable",
+                user_id,
+            )
+            return
+    except Exception:  # noqa: BLE001
+        pass  # never let a settings read failure block delivery
     try:
         target = await _with_flood(
             lambda: client.get_input_entity(int(user_id)),
