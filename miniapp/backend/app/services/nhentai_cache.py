@@ -261,10 +261,23 @@ def _mongo_put(key: str, payload: Any, ttl: int) -> bool:
         return False
 
 
-def put(key: str, payload: Any, ttl_sec: Optional[int] = None) -> bool:
+def put(key: str, payload: Any, ttl_sec: Optional[int] = None):
     """Write a cache entry. Best-effort to BOTH backends so a Turso outage
     still leaves a Mongo copy for the fallback read path (and vice versa).
-    Returns True if AT LEAST ONE write succeeded."""
+
+    v12.9: DEDUP GUARD — before writing, read the existing FRESH row from
+    Turso. If the stored payload is byte-identical to the new one, skip
+    the rewrite entirely and return the string "unchanged" (callers that
+    do `bool(put(...))` still see a truthy value, so semantics are
+    preserved; only the Turso row's expires_at is NOT extended, which is
+    correct — unchanged data doesn't need a freshness bump, and the
+    prefetch cron will rewrite it when content actually changes).
+
+    This stops the "user reopened popular page 5 minutes later and I saw
+    another write in the log" flood: same upstream payload = no write.
+
+    Returns True if AT LEAST ONE write succeeded, "unchanged" if the
+    existing payload matched byte-for-byte, False on hard failure."""
     ttl = int(ttl_sec if ttl_sec is not None else ttl_for_key(key))
     # Guard against garbage payloads that would poison the cache.
     try:
@@ -272,6 +285,22 @@ def put(key: str, payload: Any, ttl_sec: Optional[int] = None) -> bool:
     except (TypeError, ValueError):
         log.warning("nhentai_cache.put(%s): payload not JSON-serialisable — skipped", key)
         return False
+
+    # v12.9 dedup: compare against the existing fresh Turso row (if any).
+    if _turso is not None and _turso.turso_available():
+        try:
+            rs = _turso.execute(
+                "SELECT payload, expires_at FROM nhentai_cache WHERE key = ?",
+                [key],
+            )
+            if rs is not None and getattr(rs, "rows", None):
+                existing_json, existing_exp = rs.rows[0]
+                if (existing_json == payload_json
+                        and int(existing_exp or 0) > _now_epoch()):
+                    return "unchanged"
+        except Exception:  # noqa: BLE001
+            pass  # dedup is best-effort; never block the write path
+
     ok_turso = _turso_put(key, payload_json, ttl)
     ok_mongo = _mongo_put(key, payload, ttl)
     return ok_turso or ok_mongo

@@ -36,6 +36,28 @@ from typing import Any, Optional
 
 log = logging.getLogger("miniapp.scraper")
 
+# v12.9: emoji-tagged cache telemetry, mirrors hf_scraper's lines so a
+# `grep '[TURSO CACHE HIT]'` catches BOTH the sync (scraper_bridge) and
+# async (hf_scraper) paths in the same Render log window.
+_LOG_HIT    = "⚡ [TURSO CACHE HIT] Served data from Turso  key=%s"
+_LOG_STALE  = "⚠ [TURSO STALE HIT] Served STALE data (upstream 429/down)  key=%s"
+_LOG_MISS   = "🌐 [CACHE MISS] Fetched from upstream nhentai and cached to Turso  key=%s"
+_LOG_WRITE  = "📝 [TURSO WRITE] Uploaded payload to Turso  key=%s  bytes=%s"
+_LOG_DEDUP  = "🤝 [TURSO DEDUP] payload unchanged — skipped rewrite  key=%s"
+
+
+def _sb_turso_cache():
+    """Lazy import of nhentai_cache; None if not importable.
+
+    scraper_bridge is imported by workers, tests, and FastAPI routes;
+    a cache import failure must never break request handling.
+    """
+    try:
+        from . import nhentai_cache as _nhc
+        return _nhc
+    except Exception:  # noqa: BLE001
+        return None
+
 # Add the parent project on sys.path so `import hf_scraper` works when the
 # Mini App is deployed alongside admin_bot.py.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -237,6 +259,24 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
     if ban and ban > now:
         return []
 
+    # v12.9 Turso READ. Empty-query sort chips use the short
+    # `search:<sort>:pageN` form that prefetch_cron already writes, so a
+    # user hit lands DIRECTLY on the row the prefetch warmed. User-typed
+    # queries use a distinct but still-deterministic tail.
+    if query == "english":
+        _turso_key = f"search:{real_sort}:page{int(page or 1)}"
+    else:
+        _turso_key = f"search:q={query}|sort={real_sort}|page={int(page or 1)}"
+    _nhc = _sb_turso_cache()
+    if _nhc is not None:
+        try:
+            _hit = _nhc.get(_turso_key, allow_stale=False)
+        except Exception:  # noqa: BLE001
+            _hit = None
+        if isinstance(_hit, list):
+            log.info(_LOG_HIT, _turso_key)
+            return _hit
+
     try:
         # v2 endpoint: /api/v2/search (params: query, sort, page)
         r = httpx.get(
@@ -293,6 +333,39 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
             "tags":  [{"name": t.get("name"), "type": t.get("type")}
                       for t in item.get("tags") or []],
         })
+
+    # v12.9 Turso WRITE. best-effort; nhentai_cache.put() writes to BOTH
+    # Turso and Mongo (v12.4 semantics), so a Turso outage still leaves a
+    # Mongo copy. We only cache non-empty results so a transient 0-row
+    # nhentai response never poisons the cache.
+    if out and _nhc is not None:
+        try:
+            import json as _json
+            _bytes = len(_json.dumps(out, default=str))
+        except Exception:  # noqa: BLE001
+            _bytes = -1
+        log.info(_LOG_MISS, _turso_key)
+        try:
+            _ok = _nhc.put(_turso_key, out)
+            if _ok == "unchanged":
+                log.info(_LOG_DEDUP, _turso_key)
+            elif _ok:
+                log.info(_LOG_WRITE, _turso_key, _bytes)
+        except Exception as e:  # noqa: BLE001
+            log.debug("turso write failed for %s: %s", _turso_key, e)
+
+    # v12.9: if upstream returned nothing (transient failure) AND Turso
+    # has a stale copy, serve the stale copy so users aren't left with a
+    # blank grid. TTL_STALE_GRACE_SEC (7 days) governs how old that copy
+    # can be — see nhentai_cache.py.
+    if not out and _nhc is not None:
+        try:
+            _stale = _nhc.get(_turso_key, allow_stale=True)
+        except Exception:  # noqa: BLE001
+            _stale = None
+        if isinstance(_stale, list) and _stale:
+            log.info(_LOG_STALE, _turso_key)
+            return _stale
     return out
 
 
@@ -349,6 +422,22 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
     ban = _RATE_LIMIT_CACHE.get(cache_key)
     if ban and ban > now:
         return {}
+
+    # v12.9 Turso READ for gallery detail. Cache-key format triggers
+    # nhentai_cache.ttl_for_key -> TTL_GALLERY_SEC (30 days). We cache
+    # the NORMALISED dict this function returns (not raw upstream JSON),
+    # so a hit skips network + parsing + tag grouping in one shot.
+    _detail_turso_key = f"gallery:{gallery_id}"
+    _nhc = _sb_turso_cache()
+    if _nhc is not None:
+        try:
+            _hit = _nhc.get(_detail_turso_key, allow_stale=False)
+        except Exception:  # noqa: BLE001
+            _hit = None
+        if isinstance(_hit, dict) and _hit.get("id"):
+            log.info(_LOG_HIT, _detail_turso_key)
+            return _hit
+
     try:
         # v2 endpoint for a single gallery: /api/v2/galleries/<id>
         r = httpx.get(
@@ -402,7 +491,7 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
     groups = _group_tags(item)
     flat_tags = [{"name": n, "type": typ} for typ, names in groups.items() for n in names]
 
-    return {
+    _detail_out = {
         "id":       item.get("id"),
         "title":    clean_title(pretty) if pretty else _title_from_item(item),
         "title_english":  english_full,
@@ -417,6 +506,26 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
         "tags":     flat_tags,
         "tag_groups": groups,
     }
+
+    # v12.9 Turso WRITE for gallery detail. 30-day TTL (ttl_for_key
+    # matches the `gallery:` prefix). `_nhc` resolved at top of this fn.
+    if _detail_out.get("id") and _nhc is not None:
+        try:
+            import json as _json
+            _bytes = len(_json.dumps(_detail_out, default=str))
+        except Exception:  # noqa: BLE001
+            _bytes = -1
+        log.info(_LOG_MISS, _detail_turso_key)
+        try:
+            _ok = _nhc.put(_detail_turso_key, _detail_out)
+            if _ok == "unchanged":
+                log.info(_LOG_DEDUP, _detail_turso_key)
+            elif _ok:
+                log.info(_LOG_WRITE, _detail_turso_key, _bytes)
+        except Exception as e:  # noqa: BLE001
+            log.debug("turso write failed for %s: %s", _detail_turso_key, e)
+
+    return _detail_out
 
 
 # ---------------------------------------------------------------------------
