@@ -68,20 +68,27 @@ def set_rl_defaults(body: RLDefaultsBody, _a: dict = Depends(require_admin)) -> 
     return {"ok": True, **body.model_dump()}
 
 
-# ---- Card-grid layout (v12.10 #6+#7) ----
+# ---- Card-grid layout (v12.10 #6+#7, v12.11 #4) ----
 # Admin-only toggles stored in the miniapp_settings singleton:
-#   layout_cards_per_row : 1..4   (default 2)
-#   layout_card_gap      : 0 / 0.1 / 0.25 / 0.5 / 1  (default 0)
+#   layout_cards_per_row : 1..4        (default 2)
+#   layout_card_gap      : 0/0.1/0.25/0.5/1     (default 0)
+#   layout_app_pad_x     : 0/4/8/12/16/20/24 px (default 0) — v12.11 (#4)
 # The PUBLIC read endpoint lives in routes/layout.py (no auth — every
 # mini-app client needs these to paint the grid); only the WRITE side
 # is gated here behind require_admin.
 _ALLOWED_CARDS_PER_ROW = (1, 2, 3, 4)
 _ALLOWED_GAPS = (0, 0.1, 0.25, 0.5, 1)
+# v12.11 (#4): horizontal page padding, in pixels. 0 = flush against the
+# viewport edge (fixes the right-edge card clip reported in v12.10).
+_ALLOWED_APP_PAD_X = (0, 4, 8, 12, 16, 20, 24)
 
 
 class LayoutBody(BaseModel):
     cards_per_row: int = 2
     card_gap: float = 0
+    # v12.11 (#4): admin-controlled left/right breathing room. Optional so
+    # older clients that don't send it keep working.
+    app_pad_x: int = 0
 
 
 @router.get("/layout")
@@ -89,6 +96,7 @@ def get_layout_admin(_a: dict = Depends(require_admin)) -> dict:
     return {
         "cards_per_row": db.get_setting("layout_cards_per_row", 2),
         "card_gap":      db.get_setting("layout_card_gap", 0),
+        "app_pad_x":     db.get_setting("layout_app_pad_x", 0),
     }
 
 
@@ -100,9 +108,13 @@ def set_layout(body: LayoutBody, _a: dict = Depends(require_admin)) -> dict:
     gap = float(body.card_gap)
     # Snap to the nearest allowed step (floats make exact match fragile).
     gap = min(_ALLOWED_GAPS, key=lambda g: abs(g - gap))
+    # v12.11 (#4): snap horizontal padding to the nearest allowed step.
+    pad = int(body.app_pad_x or 0)
+    pad = min(_ALLOWED_APP_PAD_X, key=lambda p: abs(p - pad))
     db.set_setting("layout_cards_per_row", cpr)
     db.set_setting("layout_card_gap", gap)
-    return {"ok": True, "cards_per_row": cpr, "card_gap": gap}
+    db.set_setting("layout_app_pad_x", pad)
+    return {"ok": True, "cards_per_row": cpr, "card_gap": gap, "app_pad_x": pad}
 
 
 # ---- Users ----
@@ -359,3 +371,46 @@ def diag(_a: dict = Depends(require_admin)) -> dict:
             "default_cooldown_s": db.get_default_cooldown(),
         },
     }
+
+
+# ---- v12.11 (#1): Detail scraper (details_prefetch_cron) ----
+# Admin toggle + live status for the background gallery-detail scraper.
+# The cron module itself reads ENABLED at import time; the runtime toggle
+# lives in control_flags so the admin can flip it without a redeploy.
+try:
+    from ..services import details_prefetch_cron as _dpc  # noqa: WPS433
+except Exception as _e_dpc:  # noqa: BLE001
+    _dpc = None
+    _dpc_err = _e_dpc
+else:
+    _dpc_err = None
+
+_DPC_FLAG_KEY = "details_scraper_enabled"
+
+
+class DetailsScraperBody(BaseModel):
+    enabled: bool
+
+
+@router.get("/details-scraper")
+def get_details_scraper(_a: dict = Depends(require_admin)) -> dict:
+    if _dpc is None:
+        return {"ok": False, "import_error": str(_dpc_err)[:200], "enabled": False}
+    snap = _dpc.last_run_summary()
+    # Runtime override via control_flags wins over the env default.
+    try:
+        from .. import db as _midb
+        flag = _midb.get_setting(_DPC_FLAG_KEY, None)
+    except Exception:  # noqa: BLE001
+        flag = None
+    snap["enabled"] = bool(flag) if flag is not None else bool(_dpc.ENABLED)
+    snap["ok"] = True
+    return snap
+
+
+@router.post("/details-scraper")
+def set_details_scraper(body: DetailsScraperBody, _a: dict = Depends(require_admin)) -> dict:
+    db.set_setting(_DPC_FLAG_KEY, bool(body.enabled))
+    if _dpc is not None:
+        _dpc.ENABLED = bool(body.enabled)
+    return {"ok": True, "enabled": bool(body.enabled)}

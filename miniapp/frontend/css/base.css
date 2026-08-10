@@ -72,7 +72,10 @@ a { color: var(--du-accent); text-decoration: none; }
 }
 
 .app-main {
-  padding: var(--du-space-4);
+  /* v12.11 (#4): horizontal padding is now admin-controlled via
+     --du-app-pad-x (default 0px, nhentai-flush). Vertical padding stays
+     on --du-space-4 so the tabbar / status-bar clearance is untouched. */
+  padding: var(--du-space-4) var(--du-app-pad-x, 0px);
   padding-bottom: calc(var(--du-tabbar-h) + var(--du-safe-bot) + var(--du-space-4));
 }
 

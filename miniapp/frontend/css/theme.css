@@ -87,6 +87,14 @@
      endpoint via the settings-loader plugin (sets these on :root). */
   --du-cards-per-row:    2;
   --du-card-gap:         0;
+
+  /* v12.11 (#4): horizontal page padding. Wraps the entire .app-main
+     shell so the admin can dial the left/right breathing room without
+     touching the grid gap. Default 0 to match the nhentai-flush look
+     the user asked for (the current 16px .app-main padding is what was
+     clipping the 2nd card in the screenshot). Steps allowed by the
+     admin: 0 / 4 / 8 / 12 / 16 / 20 / 24 px. */
+  --du-app-pad-x:        0px;
   --du-space-3:          12px;
   --du-space-4:          16px;
   --du-space-5:          20px;

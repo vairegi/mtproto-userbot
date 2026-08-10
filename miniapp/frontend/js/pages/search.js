@@ -33,7 +33,11 @@ export async function render(root, { me }) {
   const state = {
     query: "",
     parsed: parseSearch(""),
-    sort: "popular",
+    // v12.11 (#2): default landing tab is "Popular Now" (popular-today),
+    // not the older "Popular" firehose. buildChipRow already lists
+    // Popular Now first (v12.10 #3), so activating this sort here makes
+    // the very first grid paint match the very first visible chip.
+    sort: "popular-today",
     page: 1,
     loading: false,
     done: false,
@@ -54,7 +58,7 @@ export async function render(root, { me }) {
     "Try: ", h("code", {}, "tag:vanilla"), " ",
     h("code", {}, "-tag:yaoi"), " ",
     h("code", {}, "pages:>30"), " ",
-    h("code", {}, "sort:popular"),
+    h("code", {}, "sort:popular-today"),
   );
   // v11.7: home widgets — visible only when there's no active query.
   const $trending = renderTrendingTags((tagExpr) => {
@@ -99,9 +103,26 @@ export async function render(root, { me }) {
   function renderFooter() {
     $footer.innerHTML = "";
     if (state.loading) { $footer.textContent = "Loading…"; return; }
-    if (!state.hasMore && state.results.length > 0) { $footer.textContent = "— end —"; return; }
+
+    // v12.11 (#3): the Next-Page button MUST render on every sort tab
+    // regardless of what has_more said, as long as the current page
+    // returned any rows and we're on a paginated viewport. In v12.10
+    // (mobile), a False has_more from the backend used to collapse the
+    // footer to '— end —' silently — which is exactly what the user
+    // reported: "no next page option on any pages". Trust the results:
+    // if we got a full-size page, we KNOW upstream has more.
+    const showNextBtn = state.paginated
+      && state.results.length > 0
+      && (state.hasMore || state.results.length >= PAGE_SIZE * state.page - PAGE_SIZE || state.rateLimited);
+
+    if (!state.hasMore && !showNextBtn && state.results.length > 0) {
+      $footer.textContent = "— end —"; return;
+    }
     if (!state.hasMore && state.results.length === 0) { $footer.textContent = ""; return; }
+
     if (state.paginated) {
+      // Always render the button when we have results on a paginated
+      // viewport. Label + haptic distinguish the two flavors.
       const btn = h("button", { class: "btn btn-primary next-page-btn",
         style: { padding: "12px 24px", fontWeight: "600", fontSize: "var(--du-fs-md)" },
       }, state.rateLimited ? "⚠ Rate-limited — tap to retry"
@@ -135,7 +156,10 @@ export async function render(root, { me }) {
   // re-entry instead, and every awaited response is dropped if its token
   // no longer matches — so the latest request always owns the grid.
   async function load() {
-    if (state.done) return;
+    // v12.11 (#3): honor state.done ONLY when we're sure it's end-of-results
+    // (state.hasMore was false AND we already have rows). A user tapping the
+    // Next-Page button must never no-op silently.
+    if (state.done && !state.paginated) return;
     if (state.loading) { state.rerun = true; return; }
     state.loading = true;
     try {

@@ -67,6 +67,10 @@ async function boot() {
     if (layout && Number.isFinite(+layout.card_gap)) {
       root.style.setProperty("--du-card-gap", String(+layout.card_gap));
     }
+    // v12.11 (#4): horizontal page padding (admin-controlled left/right).
+    if (layout && Number.isFinite(+layout.app_pad_x)) {
+      root.style.setProperty("--du-app-pad-x", String(+layout.app_pad_x) + "px");
+    }
     store.set("layout", layout || null);
   } catch (e) {
     console.warn("layout fetch failed (defaults apply):", e);

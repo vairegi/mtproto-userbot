@@ -34,6 +34,7 @@ export async function render(root, { me }) {
   // was retired in favour of a per-device Theme dropdown in Settings
   // (9 palettes). The function body has been deleted below as well.
   root.appendChild(sectionCardLayout()); // v12.10 (#6+#7): grid cols + gap
+  root.appendChild(sectionDetailsScraper()); // v12.11 (#1): detail scraper
   root.appendChild(sectionUsers());
   root.appendChild(sectionDiag());
 }
@@ -139,37 +140,133 @@ function sectionCardLayout() {
   );
   gapSel.value = "0";
 
-  function applyLive(cpr, gap) {
+  // --- v12.11 (#4): horizontal page padding (left/right) 0..24px ---
+  // This is the .app-main left+right padding; setting it to 0 fixes the
+  // right-edge card clip users saw in the v12.10 screenshot.
+  const padRow = h("div", { class: "kv-row" });
+  const padSel = h("select", {},
+    ["0", "4", "8", "12", "16", "20", "24"].map((p) =>
+      h("option", { value: p }, `${p}px side padding${p === "0" ? " (default)" : ""}`)),
+  );
+  padSel.value = "0";
+
+  function applyLive(cpr, gap, pad) {
     const root = document.documentElement;
     root.style.setProperty("--du-cards-per-row", String(cpr));
     root.style.setProperty("--du-card-gap", String(gap));
+    if (pad != null) root.style.setProperty("--du-app-pad-x", String(pad) + "px");
   }
 
   async function save() {
     const cpr = parseInt(cprSel.value || "2", 10) || 2;
     const gap = parseFloat(gapSel.value || "0") || 0;
+    const pad = parseInt(padSel.value || "0", 10) || 0;
     haptic("medium");
     try {
-      const r = await api.post("/api/admin/layout", { cards_per_row: cpr, card_gap: gap });
-      applyLive(r.cards_per_row ?? cpr, r.card_gap ?? gap);
-      toast(`Grid: ${r.cards_per_row ?? cpr}/row, gap ${r.card_gap ?? gap} — saved for everyone`, "success");
+      const r = await api.post("/api/admin/layout", { cards_per_row: cpr, card_gap: gap, app_pad_x: pad });
+      applyLive(r.cards_per_row ?? cpr, r.card_gap ?? gap, r.app_pad_x ?? pad);
+      toast(`Grid: ${r.cards_per_row ?? cpr}/row, gap ${r.card_gap ?? gap}, pad ${r.app_pad_x ?? pad}px — saved for everyone`, "success");
     } catch (e) { toast(e.message, "error"); }
   }
 
   cprSel.addEventListener("change", save);
   gapSel.addEventListener("change", save);
+  padSel.addEventListener("change", save);
 
   cprRow.append(h("span", { class: "k" }, "Cards per row"), cprSel);
   gapRow.append(h("span", { class: "k" }, "Gap between cards"), gapSel);
-  wrap.append(cprRow, gapRow);
+  padRow.append(h("span", { class: "k" }, "Left/right page padding"), padSel);
+  wrap.append(cprRow, gapRow, padRow);
 
   (async () => {
     try {
       const s = await api.get("/api/admin/layout");
       if (s.cards_per_row != null) cprSel.value = String(s.cards_per_row);
       if (s.card_gap != null) gapSel.value = String(s.card_gap);
+      if (s.app_pad_x != null) padSel.value = String(s.app_pad_x);
     } catch (e) { toast(e.message, "error"); }
   })();
+
+  return wrap;
+}
+
+// -------- v12.11 (#1): Detail scraper (details_prefetch_cron) --------
+// Background scraper that hydrates gallery DETAILS (artist, tags, pages,
+// ...) into Turso under the same `gallery:<id>` key the detail endpoint
+// reads. Night window (12am-5am IST by default) is aggressive; the day
+// window pauses whenever a non-admin user is active. Admin can toggle
+// and watch live status here.
+function sectionDetailsScraper() {
+  const wrap = h("div", { class: "admin-section" });
+  wrap.appendChild(h("h3", {}, "🔬 Detail scraper (Turso hydration)"));
+  wrap.appendChild(h("p", { class: "dim", style: { margin: "0 0 8px" } },
+    "Scrapes gallery details for every card on each sort page and " +
+    "uploads them to Turso. Night: 12am-5am IST (aggressive). Day: " +
+    "auto-pauses when a non-admin user is active. Admin activity never " +
+    "pauses the sweep."));
+
+  // --- Enable/Disable toggle ---
+  const toggleRow = h("div", { class: "kv-row" });
+  const toggle = makeToggle(false, async (on) => {
+    await api.post("/api/admin/details-scraper", { enabled: on });
+    toast(on ? "Detail scraper ON" : "Detail scraper OFF", on ? "success" : "");
+  });
+  toggleRow.append(
+    h("span", { class: "k" }, "Enable detail scraper"),
+    toggle,
+  );
+
+  // --- Live status block ---
+  const statusBox = h("pre", {
+    class: "dim",
+    style: {
+      fontSize: "11px",
+      lineHeight: "1.4",
+      background: "var(--du-bg-2)",
+      padding: "8px 10px",
+      borderRadius: "var(--du-radius-sm)",
+      overflowX: "auto",
+      margin: "8px 0 0",
+      whiteSpace: "pre-wrap",
+    },
+  }, "Loading…");
+
+  const refreshBtn = h("button", { class: "btn secondary btn-lift",
+    style: { marginTop: "8px" },
+    onclick: async () => { haptic("light"); await loadStatus(); },
+  }, "Refresh status");
+
+  async function loadStatus() {
+    try {
+      const s = await api.get("/api/admin/details-scraper");
+      if (!s.ok) {
+        statusBox.textContent = "⚠ module unavailable: " + (s.import_error || "unknown");
+        return;
+      }
+      toggle.setAttribute("aria-checked", s.enabled ? "true" : "false");
+      const cfg = s.config || {};
+      const fmt = (v) => (v == null ? "—" : String(v));
+      statusBox.textContent = [
+        `phase:        ${s.phase}`,
+        `paused:       ${s.paused_reason || "no"}`,
+        `current:      ${fmt(s.current_sort)} page ${fmt(s.current_page)} · gallery ${fmt(s.current_gallery_id)}`,
+        `this run:     done=${s.galleries_done_this_run}  skipped=${s.galleries_skipped_this_run}  failed=${s.galleries_failed_this_run}`,
+        `run count:    ${s.run_count}`,
+        `last error:   ${s.last_error || "—"}`,
+        `turso error:  ${s.turso_error || "—"}`,
+        `window:       night ${cfg.night_start_ist}–${cfg.night_end_ist} IST · day tick ${cfg.day_tick_sec}s · night tick ${cfg.night_tick_sec}s`,
+        `rest:         day ${cfg.day_rest_sec}s · night ${cfg.night_rest_sec}s`,
+        `active window:${cfg.active_window}s`,
+        `page cap:     ${cfg.page_cap} per sort · sorts: ${(cfg.sorts || []).join(", ")}`,
+      ].join("\n");
+    } catch (e) {
+      statusBox.textContent = "⚠ " + (e.message || e);
+    }
+  }
+
+  wrap.append(toggleRow, statusBox, refreshBtn);
+
+  (async () => { await loadStatus(); })();
 
   return wrap;
 }

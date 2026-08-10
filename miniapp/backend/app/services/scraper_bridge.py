@@ -208,6 +208,18 @@ def _title_from_item(item: dict) -> str:
     return ""
 
 
+def _notify_details_scraper(sort, page) -> None:
+    """v12.11 (#1b): best-effort ping to details_prefetch_cron so the page
+    the user just opened gets its cards' details hydrated on the very next
+    tick. No-op when the module is missing (older deploys) or the call
+    fails — the scraper is opportunistic, never load-bearing."""
+    try:
+        from . import details_prefetch_cron as _dpc  # noqa: WPS433
+        _dpc.notify_page(sort, page)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _title_en_clean_from_item(item: dict) -> str:
     """v12.10 (#8): cleaned English title for the card GRID only.
 
@@ -294,6 +306,11 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
             _hit = None
         if isinstance(_hit, list):
             log.info(_LOG_HIT, _turso_key)
+            # v12.11 (#1b): user is looking at this page NOW — hydrate its
+            # card details on the next scraper tick (empty-query chip pages
+            # only; those map 1:1 to the cron's sort/page walk).
+            if query == "english":
+                _notify_details_scraper(real_sort, int(page or 1))
             return _hit
 
     try:
@@ -387,7 +404,12 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
             _stale = None
         if isinstance(_stale, list) and _stale:
             log.info(_LOG_STALE, _turso_key)
+            if query == "english":
+                _notify_details_scraper(real_sort, int(page or 1))
             return _stale
+    # v12.11 (#1b): fresh fetch path — notify on a non-empty result too.
+    if out and query == "english":
+        _notify_details_scraper(real_sort, int(page or 1))
     return out
 
 
