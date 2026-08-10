@@ -81,6 +81,12 @@
   /* Spacing scale — 4px base grid */
   --du-space-1:          4px;
   --du-space-2:          8px;
+
+  /* v12.10 (#6+#7): card-grid layout knobs. Defaults = nhentai-like dense
+     grid (0 gap, 2 cards/row). Overridable at runtime by the admin layout
+     endpoint via the settings-loader plugin (sets these on :root). */
+  --du-cards-per-row:    2;
+  --du-card-gap:         0;
   --du-space-3:          12px;
   --du-space-4:          16px;
   --du-space-5:          20px;

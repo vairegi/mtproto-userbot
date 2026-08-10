@@ -33,6 +33,7 @@ export async function render(root, { me }) {
   // v11.6: sectionBackground() removed. The admin-wide default background
   // was retired in favour of a per-device Theme dropdown in Settings
   // (9 palettes). The function body has been deleted below as well.
+  root.appendChild(sectionCardLayout()); // v12.10 (#6+#7): grid cols + gap
   root.appendChild(sectionUsers());
   root.appendChild(sectionDiag());
 }
@@ -104,6 +105,69 @@ function sectionAutoDelete() {
       const s = await api.get("/api/admin/autodelete");
       toggle.setAttribute("aria-checked", s.enabled ? "true" : "false");
       hoursInput.value = String(s.hours || 24);
+    } catch (e) { toast(e.message, "error"); }
+  })();
+
+  return wrap;
+}
+
+// -------- v12.10 (#6+#7): Card-grid layout --------
+// Admin-only toggles for the mini-app grid. Stored server-side via
+// /api/admin/layout (require_admin); every client reads the public
+// /api/layout at boot (see core/app.js) and applies the values as the
+// --du-cards-per-row / --du-card-gap CSS custom properties on :root.
+function sectionCardLayout() {
+  const wrap = h("div", { class: "admin-section" });
+  wrap.appendChild(h("h3", {}, "🖼️ Card grid layout"));
+  wrap.appendChild(h("p", { class: "dim", style: { margin: "0 0 8px" } },
+    "Applies to EVERY user's mini-app on next open (or on save — the " +
+    "running session's :root vars are updated live)."));
+
+  // --- Cards per row: 1 / 2 / 3 / 4 (default 2) ---
+  const cprRow = h("div", { class: "kv-row" });
+  const cprSel = h("select", {},
+    [1, 2, 3, 4].map((n) =>
+      h("option", { value: String(n) }, `${n} per row${n === 2 ? " (default)" : ""}`)),
+  );
+  cprSel.value = "2";
+
+  // --- Gap: 0 / 0.1 / 0.25 / 0.5 / 1 (default 0, nhentai-style) ---
+  const gapRow = h("div", { class: "kv-row" });
+  const gapSel = h("select", {},
+    ["0", "0.1", "0.25", "0.5", "1"].map((g) =>
+      h("option", { value: g }, `gap ${g}${g === "0" ? " (default)" : ""}`)),
+  );
+  gapSel.value = "0";
+
+  function applyLive(cpr, gap) {
+    const root = document.documentElement;
+    root.style.setProperty("--du-cards-per-row", String(cpr));
+    root.style.setProperty("--du-card-gap", String(gap));
+  }
+
+  async function save() {
+    const cpr = parseInt(cprSel.value || "2", 10) || 2;
+    const gap = parseFloat(gapSel.value || "0") || 0;
+    haptic("medium");
+    try {
+      const r = await api.post("/api/admin/layout", { cards_per_row: cpr, card_gap: gap });
+      applyLive(r.cards_per_row ?? cpr, r.card_gap ?? gap);
+      toast(`Grid: ${r.cards_per_row ?? cpr}/row, gap ${r.card_gap ?? gap} — saved for everyone`, "success");
+    } catch (e) { toast(e.message, "error"); }
+  }
+
+  cprSel.addEventListener("change", save);
+  gapSel.addEventListener("change", save);
+
+  cprRow.append(h("span", { class: "k" }, "Cards per row"), cprSel);
+  gapRow.append(h("span", { class: "k" }, "Gap between cards"), gapSel);
+  wrap.append(cprRow, gapRow);
+
+  (async () => {
+    try {
+      const s = await api.get("/api/admin/layout");
+      if (s.cards_per_row != null) cprSel.value = String(s.cards_per_row);
+      if (s.card_gap != null) gapSel.value = String(s.card_gap);
     } catch (e) { toast(e.message, "error"); }
   })();
 

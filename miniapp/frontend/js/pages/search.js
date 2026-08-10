@@ -415,12 +415,13 @@ function buildSearchBar(state, refetch, toggleHomeRows) {
 
 function buildChipRow(state, refetch) {
   const row = h("div", { class: "chip-row" });
-  // v11.8 (#7): new order — Popular → Recent → Popular Today → Popular Week
+  // v12.10 (#3+#5): order — Popular Now → New Uploads → Popular Week → Popular
+  // Renamed: "Recent" → "New Uploads", "Popular Today" → "Popular Now".
   const opts = [
-    { label: "🔥 Popular",       sort: "popular" },
-    { label: "🆕 Recent",        sort: "date" },
-    { label: "⭐ Popular Today", sort: "popular-today" },
+    { label: "⭐ Popular Now",   sort: "popular-today" },
+    { label: "🆕 New Uploads",   sort: "date" },
     { label: "📅 Popular Week",  sort: "popular-week" },
+    { label: "🔥 Popular",       sort: "popular" },
   ];
   for (const o of opts) {
     const chip = make("chip", {

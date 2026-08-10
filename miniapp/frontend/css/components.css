@@ -135,12 +135,19 @@ form.search-bar { margin: 0; width: 100%; }
   display: grid;
   /* v12.3: 2 columns on narrow screens (mobile), 3 on ≥720px. Cards are
      larger and the tap targets are easier to hit. Grid never scrolls
-     horizontally — columns are fixed via 1fr fractions of the viewport. */
-  grid-template-columns: repeat(2, 1fr);
-  gap: var(--du-space-2);
+     horizontally — columns are fixed via 1fr fractions of the viewport.
+     v12.10 (#6+#7): column count and gap are now driven by the
+     --du-cards-per-row / --du-card-gap custom props (defaults 2 / 0),
+     which the admin layout settings-loader overrides on :root. */
+  grid-template-columns: repeat(var(--du-cards-per-row, 2), 1fr);
+  gap: calc(var(--du-card-gap, 0) * var(--du-space-2));
   width: 100%;
   max-width: 100%;
-  overflow-x: hidden;
+  /* v12.10 (#7): contain the grid's own paint so the 2nd card and its
+     📥 badge can never clip past the viewport's right edge, even when
+     the admin sets the gap to 0 (nhentai-style flush grid). */
+  overflow: hidden;
+  box-sizing: border-box;
 }
 .card-grid .gallery-card .meta {
   padding: var(--du-space-2);
@@ -151,8 +158,14 @@ form.search-bar { margin: 0; width: 100%; }
 }
 @media (min-width: 720px) {
   .card-grid {
-    grid-template-columns: repeat(3, 1fr);
-    gap: var(--du-space-3);
+    /* v12.10: on wide screens only BUMP the default when the admin
+       hasn't set an explicit value. The settings-loader writes the
+       admin's choice straight onto :root, so an explicit admin value
+       always wins over this media query (custom props are inherited,
+       and :root-level props beat selector-level re-declaration via
+       cascade order below). */
+    grid-template-columns: repeat(var(--du-cards-per-row, 3), 1fr);
+    gap: calc(var(--du-card-gap, 1) * var(--du-space-3));
   }
   .card-grid .gallery-card .meta  { padding: var(--du-space-3); }
   .card-grid .gallery-card .title { font-size: var(--du-fs-sm); -webkit-line-clamp: 2; }
@@ -177,6 +190,18 @@ form.search-bar { margin: 0; width: 100%; }
   background: var(--du-bg-2);
   object-fit: cover;
   display: block;
+}
+/* v12.10 (#9, option A): landscape (16:9-ish) covers become a WIDE card
+   that spans the whole row instead of letterboxing inside a 2/3 tile.
+   card.js adds .wide-card on <img> load when naturalWidth > naturalHeight.
+   Reflow is acceptable — wide covers are rare. */
+.card-grid > .gallery-card.wide-card {
+  grid-column: 1 / -1;   /* span all columns, whatever --du-cards-per-row is */
+}
+.gallery-card.wide-card .cover {
+  aspect-ratio: 16 / 9;  /* honor the original landscape framing */
+  object-fit: contain;
+  background: var(--du-bg-2);
 }
 .gallery-card .meta {
   padding: var(--du-space-3);

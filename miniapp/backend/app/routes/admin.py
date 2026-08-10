@@ -68,6 +68,43 @@ def set_rl_defaults(body: RLDefaultsBody, _a: dict = Depends(require_admin)) -> 
     return {"ok": True, **body.model_dump()}
 
 
+# ---- Card-grid layout (v12.10 #6+#7) ----
+# Admin-only toggles stored in the miniapp_settings singleton:
+#   layout_cards_per_row : 1..4   (default 2)
+#   layout_card_gap      : 0 / 0.1 / 0.25 / 0.5 / 1  (default 0)
+# The PUBLIC read endpoint lives in routes/layout.py (no auth — every
+# mini-app client needs these to paint the grid); only the WRITE side
+# is gated here behind require_admin.
+_ALLOWED_CARDS_PER_ROW = (1, 2, 3, 4)
+_ALLOWED_GAPS = (0, 0.1, 0.25, 0.5, 1)
+
+
+class LayoutBody(BaseModel):
+    cards_per_row: int = 2
+    card_gap: float = 0
+
+
+@router.get("/layout")
+def get_layout_admin(_a: dict = Depends(require_admin)) -> dict:
+    return {
+        "cards_per_row": db.get_setting("layout_cards_per_row", 2),
+        "card_gap":      db.get_setting("layout_card_gap", 0),
+    }
+
+
+@router.post("/layout")
+def set_layout(body: LayoutBody, _a: dict = Depends(require_admin)) -> dict:
+    cpr = int(body.cards_per_row)
+    if cpr not in _ALLOWED_CARDS_PER_ROW:
+        cpr = 2
+    gap = float(body.card_gap)
+    # Snap to the nearest allowed step (floats make exact match fragile).
+    gap = min(_ALLOWED_GAPS, key=lambda g: abs(g - gap))
+    db.set_setting("layout_cards_per_row", cpr)
+    db.set_setting("layout_card_gap", gap)
+    return {"ok": True, "cards_per_row": cpr, "card_gap": gap}
+
+
 # ---- Users ----
 @router.get("/users")
 def list_users(_a: dict = Depends(require_admin)) -> dict:

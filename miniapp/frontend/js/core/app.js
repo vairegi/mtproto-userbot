@@ -53,6 +53,25 @@ async function boot() {
   }
   store.set("me", me);
 
+  // v12.10 (#6+#7): fetch the admin-configured card-grid layout BEFORE the
+  // first page renders so the grid paints with the right columns/gap from
+  // frame one. Sets --du-cards-per-row / --du-card-gap on :root; the CSS
+  // (components.css .card-grid) reads them with sane fallbacks (2 / 0).
+  // Fire-and-forget-ish: a failed fetch leaves the theme.css defaults.
+  try {
+    const layout = await api.get("/api/layout");
+    const root = document.documentElement;
+    if (layout && Number.isFinite(+layout.cards_per_row)) {
+      root.style.setProperty("--du-cards-per-row", String(+layout.cards_per_row));
+    }
+    if (layout && Number.isFinite(+layout.card_gap)) {
+      root.style.setProperty("--du-card-gap", String(+layout.card_gap));
+    }
+    store.set("layout", layout || null);
+  } catch (e) {
+    console.warn("layout fetch failed (defaults apply):", e);
+  }
+
   // v12.3: admin-configurable popup. Runs ONCE per mini-app open,
   // throttled server-side per user by /popuptime (default 2 hours).
   // Fire-and-forget — never block boot on a popup fetch failure.

@@ -120,6 +120,32 @@ PREFETCH_MAX_PAGES:    int   = _env_int("PREFETCH_MAX_PAGES",    10)
 PREFETCH_DELAY_SEC:    float = _env_float("PREFETCH_DELAY_SEC",  1.0)
 PREFETCH_ENABLED:      bool  = _env_bool("PREFETCH_ENABLED",     True)
 
+# v12.10 (#2): per-sort stagger. Each sort has its own interval so the
+# hottest buckets (popular-today: 3 h) refresh more often than the slower
+# ones (popular: 6 h). run_forever() ticks at TICK_INTERVAL_SEC and only
+# sweeps a sort whose (now - last_run) >= its bucket. Env override:
+# PREFETCH_INTERVAL_<SORT-UPPER-UNDERSCORED>_SEC, e.g.
+# PREFETCH_INTERVAL_POPULAR_TODAY_SEC=1800.
+def _default_stagger_for(sort: str) -> int:
+    return {
+        "popular":       6 * 60 * 60,
+        "date":          5 * 60 * 60,
+        "popular-week":  4 * 60 * 60,
+        "popular-today": 3 * 60 * 60,
+    }.get(sort, PREFETCH_INTERVAL_SEC)
+
+
+def _env_stagger_for(sort: str) -> int:
+    key = "PREFETCH_INTERVAL_" + sort.upper().replace("-", "_") + "_SEC"
+    return _env_int(key, _default_stagger_for(sort))
+
+
+_STAGGER: Dict[str, int] = {s: _env_stagger_for(s) for s in _SORTS}
+
+# How often run_forever() wakes to check per-sort due-times. Small enough
+# to keep due-times reasonably honest, large enough to be a no-op on cost.
+TICK_INTERVAL_SEC: int = _env_int("PREFETCH_TICK_SEC", 5 * 60)  # 5 min
+
 
 def _enabled() -> bool:
     """Master switch: env flag AND at least one sort configured.
@@ -164,6 +190,11 @@ _last_run: Dict[str, Any] = {
     "enabled":        _enabled(),
 }
 
+# v12.10 (#2): per-sort last-run epoch (0 == never). run_forever() reads
+# this every tick to decide which sorts are due. prefetch_once(only_sorts=)
+# updates the entries it actually touches.
+_last_run_per_sort: Dict[str, int] = {s: 0 for s in _SORTS}
+
 
 def last_run_summary() -> Dict[str, Any]:
     """Return a defensive copy of _last_run for the admin /prefetch cmd.
@@ -181,6 +212,21 @@ def last_run_summary() -> Dict[str, Any]:
     snap["delay_sec"]    = PREFETCH_DELAY_SEC
     snap["sorts"]        = list(_SORTS)
     snap["now"]          = int(time.time())
+    # v12.10 (#2): per-sort schedule so /prefetch status can print each
+    # sort's own last-run + next-run-in.
+    now_i = snap["now"]
+    per_sort: Dict[str, Dict[str, Any]] = {}
+    for s in _SORTS:
+        interval = _STAGGER.get(s, PREFETCH_INTERVAL_SEC)
+        last = _last_run_per_sort.get(s, 0) or 0
+        next_due = (last + interval) if last else now_i
+        per_sort[s] = {
+            "interval_sec":  interval,
+            "last_run":      last or None,
+            "next_run_at":   next_due,
+            "next_run_in":   max(0, next_due - now_i),
+        }
+    snap["per_sort"] = per_sort
     return snap
 
 
@@ -359,19 +405,29 @@ def _get_cache_module():
     return _cache_mod
 
 
-async def prefetch_once() -> Dict[str, Any]:
-    """Run ONE full sweep across every (sort, page) tuple.
+async def prefetch_once(only_sorts: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Run ONE full sweep.
 
-    Never raises. Every fetch failure is counted in ``_last_run`` and
-    the sweep keeps going. Returns the fresh ``last_run_summary()``
-    dict at the end so ``/prefetch now`` can echo it back to the admin.
+    v12.10 (#2): when ``only_sorts`` is given, only those sorts are swept
+    (used by run_forever() to honor per-sort stagger). Default None keeps
+    the historical behavior — sweep every sort. /prefetch now still calls
+    this with no args so the admin "force everything" contract is intact.
     """
     if not _enabled():
         _last_run["enabled"] = False
         return last_run_summary()
 
     cache = _get_cache_module()
-    paths = _bootstrap_paths()
+    # v12.10 (#2): filter paths by ``only_sorts`` when the caller asked
+    # for a partial sweep. An unknown sort in only_sorts is dropped
+    # silently (fail-open — never let a bad env value stall the loop).
+    if only_sorts:
+        _requested = {s for s in only_sorts if s in _SORTS}
+        paths = [(s, p) for (s, p) in _bootstrap_paths() if s in _requested]
+        _swept = [s for s in _SORTS if s in _requested]
+    else:
+        paths = _bootstrap_paths()
+        _swept = list(_SORTS)
 
     _last_run["started_at"]    = int(time.time())
     _last_run["finished_at"]   = None
@@ -456,10 +512,16 @@ async def prefetch_once() -> Dict[str, Any]:
     _last_run["finished_at"]  = int(time.time())
     _last_run["duration_sec"] = _last_run["finished_at"] - _last_run["started_at"]
     _last_run["sweep_count"] += 1
+    # v12.10 (#2): stamp per-sort last-run for exactly the sorts we
+    # actually swept this pass. run_forever() uses these to schedule
+    # the next partial sweep per its per-sort stagger.
+    _now_i = _last_run["finished_at"]
+    for _s in _swept:
+        _last_run_per_sort[_s] = _now_i
     log.info(
-        "prefetch: sweep end ok=%d skipped=%d failed=%d dur=%ss",
+        "prefetch: sweep end ok=%d skipped=%d failed=%d dur=%ss sorts=%s",
         _last_run["pages_ok"], _last_run["pages_skipped"],
-        _last_run["pages_failed"], _last_run["duration_sec"],
+        _last_run["pages_failed"], _last_run["duration_sec"], _swept,
     )
     return last_run_summary()
 
@@ -486,20 +548,22 @@ def _get_run_lock() -> asyncio.Lock:
 
 
 async def run_forever() -> None:
-    """Sleep / sweep / sleep loop.
+    """Tick / stagger / sweep loop.
 
-    * Sleeps ``PREFETCH_INTERVAL_SEC`` between sweeps (default 6 h).
+    v12.10 (#2): wakes every ``TICK_INTERVAL_SEC`` (default 5 min) and
+    sweeps only the sorts whose per-sort stagger has elapsed since
+    ``_last_run_per_sort``. The old "one big 6 h sweep" behavior is
+    preserved when every sort's stagger elapses on the same tick, so
+    /prefetch now still works exactly the same.
+
     * ``trigger_now()`` can wake this loop early via ``_wake_event``.
     * Re-reads ``_enabled()`` each tick so ops can disable the sweep
-      without a code deploy — just flip ``PREFETCH_ENABLED=0`` in the
-      Render env and bounce the worker.
-    * NEVER raises to the caller. worker.py spawns this as a task and
-      isn't watching for exceptions; a crash here would just silently
-      stop the sweep, which is worse than logging + continuing.
+      without a code deploy.
+    * NEVER raises to the caller.
     """
     log.info(
-        "prefetch: run_forever start interval=%ss enabled=%s",
-        PREFETCH_INTERVAL_SEC, _enabled(),
+        "prefetch: run_forever start tick=%ss stagger=%s enabled=%s",
+        TICK_INTERVAL_SEC, _STAGGER, _enabled(),
     )
     wake = _get_wake_event()
     lock = _get_run_lock()
@@ -507,8 +571,24 @@ async def run_forever() -> None:
     while True:
         try:
             if _enabled():
-                async with lock:
-                    await prefetch_once()
+                now_i = int(time.time())
+                # v12.10 (#2): a sort is due when its last-run is 0 (never)
+                # OR when (now - last_run) >= its per-sort stagger.
+                due = [
+                    s for s in _SORTS
+                    if (_last_run_per_sort.get(s, 0) == 0)
+                    or (now_i - _last_run_per_sort[s] >= _STAGGER.get(s, PREFETCH_INTERVAL_SEC))
+                ]
+                # A manual /prefetch now trigger via _wake_event should
+                # sweep EVERYTHING, matching the pre-v12.10 contract.
+                if wake.is_set():
+                    due = list(_SORTS)
+                    wake.clear()
+                if due:
+                    async with lock:
+                        await prefetch_once(only_sorts=due)
+                else:
+                    log.debug("prefetch: no sorts due this tick")
             else:
                 log.debug("prefetch: disabled by env — idle tick")
         except asyncio.CancelledError:
@@ -518,13 +598,14 @@ async def run_forever() -> None:
             _last_run["last_error"] = f"sweep crashed: {e!s}"[:200]
             log.exception("prefetch: sweep crashed (continuing): %s", e)
 
-        # Sleep the interval, but wake early if trigger_now() set the event.
+        # v12.10 (#2): sleep ONE TICK, not the whole interval — per-sort
+        # due-times are what actually decide the next sweep. wake_event
+        # still shortcuts a manual /prefetch now.
         try:
-            await asyncio.wait_for(wake.wait(), timeout=PREFETCH_INTERVAL_SEC)
-            wake.clear()
+            await asyncio.wait_for(wake.wait(), timeout=TICK_INTERVAL_SEC)
             log.info("prefetch: woken early by trigger_now()")
         except asyncio.TimeoutError:
-            pass  # normal interval expiry
+            pass  # normal tick expiry
         except asyncio.CancelledError:
             log.info("prefetch: run_forever cancelled during sleep — stopping")
             raise

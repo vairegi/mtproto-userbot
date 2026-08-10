@@ -208,6 +208,25 @@ def _title_from_item(item: dict) -> str:
     return ""
 
 
+def _title_en_clean_from_item(item: dict) -> str:
+    """v12.10 (#8): cleaned English title for the card GRID only.
+
+    Source of truth is the upstream's own `title.english` (or the v2 row's
+    `english_title` plain string), run through clean_title() to strip
+    '[artist]' prefixes and '[English] [Scans]' tails. Falls back to the
+    general cleaned title so a card NEVER renders an empty caption.
+    """
+    t = item.get("title")
+    if isinstance(t, dict):
+        et = t.get("english")
+        if isinstance(et, str) and et.strip():
+            return clean_title(et)
+    et = item.get("english_title")
+    if isinstance(et, str) and et.strip():
+        return clean_title(et)
+    return _title_from_item(item)
+
+
 def _thumb_url_from_item(item: dict) -> str:
     """Build the cover/thumbnail URL. v2 search rows give `thumbnail` as a
     CDN-relative path like 'galleries/1200622/thumb.png' (extension varies)."""
@@ -328,6 +347,9 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
         out.append({
             "id":    item.get("id"),
             "title": _title_from_item(item),
+            # v12.10 (#8): grid-only cleaned English title. Frontend falls
+            # back to `title` when this is empty/missing.
+            "title_en_clean": _title_en_clean_from_item(item),
             "cover": _thumb_url_from_item(item),
             "pages": item.get("num_pages"),
             "tags":  [{"name": t.get("name"), "type": t.get("type")}
@@ -547,9 +569,13 @@ def _hit_to_dict(hit) -> dict:
             "url":        getattr(hit, "url", None),
             "thumb_url":  getattr(hit, "thumb_url", None),
         }
+    _title = d.get("title") or ""
     return {
         "id":    d.get("gallery_id") or d.get("id"),
-        "title": d.get("title") or "",
+        "title": _title,
+        # v12.10 (#8): hf path has no separate English title field, so the
+        # cleaned grid title IS the fallback (never empty when title isn't).
+        "title_en_clean": clean_title(_title) if _title else "",
         "cover": d.get("thumb_url") or d.get("cover") or d.get("cover_url") or "",
         "pages": d.get("pages") or d.get("num_pages"),
         "tags":  d.get("tags") or [],
@@ -681,6 +707,27 @@ def search(q: str, page: int, sort: str, lang: str,
                 log.exception("hf_scraper.search failed for q=%r page=%s: %s",
                               q_clean, upstream_page, e)
                 rows = []
+
+        # v12.10 (#4): when the hf path (or an hf failure) yielded nothing
+        # but the hf path was actually ATTEMPTED (non-empty q + hf available),
+        # check the upstream 429 back-off cache for this (q, page) BEFORE
+        # calling _direct_nhentai_search — otherwise the direct call's early
+        # `return []` (ban live) is indistinguishable from a hard-empty page
+        # and has_more turns False, hiding the Next-Page button on EVERY
+        # sort tab during a rate-limit storm. _direct_nhentai_soft_empty
+        # only probes the exact cache key the direct search uses, which the
+        # hf branch never populates — hence this extra probe.
+        if not rows and q_clean and HAVE_HF and hasattr(_hf, "search"):
+            try:
+                _sort_map = {"popular": "popular", "popular-week": "popular-week",
+                             "popular-today": "popular-today", "date": "date",
+                             "recent": "date"}
+                _rs = _sort_map.get((sort or "").lower(), "popular")
+                _ck = ("search", (q_clean or "english"), _rs, int(upstream_page))
+                if _RATE_LIMIT_CACHE.get(_ck, 0) > _time.time():
+                    rate_limited_pages.append(upstream_page)
+            except Exception:  # noqa: BLE001
+                pass
 
         if not rows:
             rows = _direct_nhentai_search(q_clean, upstream_page, sort or "popular")
