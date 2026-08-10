@@ -52,6 +52,17 @@ except Exception as _e_dd:  # noqa: BLE001
 else:
     _dedup_cron_import_err = None
 
+# v12.11 (#1): details_prefetch_cron — background scraper that hydrates
+# per-gallery DETAILS (artist, tags, pages, ...) into Turso under the
+# same `gallery:<id>` key the detail route reads. Same fail-open contract.
+try:
+    from miniapp.backend.app.services import details_prefetch_cron as _details_cron
+except Exception as _e_dp:  # noqa: BLE001
+    _details_cron = None
+    _details_cron_import_err = _e_dp
+else:
+    _details_cron_import_err = None
+
 
 def _v2_enabled() -> bool:
     """V2 relay is the default. Set SELF_COVER_POST_ENABLED=0 to fall back
@@ -187,6 +198,34 @@ async def _run_loop() -> int:
         log.warning(
             "dedup_cron: not spawned — import failed at boot (%s)",
             _dedup_cron_import_err,
+        )
+
+    # v12.11 (#1): details_prefetch_cron — walks every cached search page
+    # (popular-today first, then date / popular-week / popular) and
+    # scrapes DETAILS for each card into Turso under gallery:<id>. The
+    # detail endpoint then serves a straight cache hit instead of an
+    # upstream fetch. Pauses itself during the day window when a
+    # non-admin user is active; admin activity never pauses it.
+    if _details_cron is not None:
+        try:
+            asyncio.create_task(
+                _details_cron.run_forever(),
+                name="details_prefetch_cron",
+            )
+            log.info(
+                "details_prefetch_cron: spawned (night=%s-%s IST, day_tick=%ss, night_tick=%ss, enabled=%s)",
+                _details_cron.NIGHT_START,
+                _details_cron.NIGHT_END,
+                _details_cron.DAY_TICK_SEC,
+                _details_cron.NIGHT_TICK_SEC,
+                _details_cron.ENABLED,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("details_prefetch_cron: spawn failed (%s) — continuing without scraper", e)
+    else:
+        log.warning(
+            "details_prefetch_cron: not spawned — import failed at boot (%s)",
+            _details_cron_import_err,
         )
 
     log.info("worker started, entering main loop")
