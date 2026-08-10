@@ -2839,7 +2839,7 @@ def _render_prefetch_status() -> str:
     lines = [
         "🔄 Prefetch status",
         f"  enabled:      {'ON' if snap.get('enabled') else 'OFF'}",
-        f"  interval:     every {_fmt_seconds(snap.get('interval_sec'))}",
+        f"  interval:     every {_fmt_seconds(snap.get('interval_sec'))} (legacy default)",
         f"  max pages:    {snap.get('max_pages')} per sort",
         f"  delay:        {snap.get('delay_sec')}s between pages",
         f"  sorts:        {', '.join(snap.get('sorts') or [])}",
@@ -2853,11 +2853,31 @@ def _render_prefetch_status() -> str:
         f"  skipped:      {snap.get('pages_skipped')}  (bucket / 429)",
         f"  failed:       {snap.get('pages_failed')}",
         f"  last error:   {snap.get('last_error') or '—'}",
+    ]
+
+    # v12.10 (#2): per-sort schedule. Each sort now has its own stagger
+    # (popular 6h / date 5h / popular-week 4h / popular-today 3h by default),
+    # so surface last-run + next-run-in for every one of them.
+    per_sort = snap.get("per_sort") or {}
+    if per_sort:
+        lines.append("")
+        lines.append("  per-sort schedule (v12.10 #2):")
+        for _s in (snap.get("sorts") or []):
+            info = per_sort.get(_s) or {}
+            last = info.get("last_run")
+            nxt  = info.get("next_run_in")
+            lines.append(
+                f"    {_s:<14} every {_fmt_seconds(info.get('interval_sec'))}"
+                f"  last: {_fmt_epoch(last) if last else 'never'}"
+                f"  next in: {_fmt_seconds(nxt) if nxt is not None else '?'}"
+            )
+
+    lines.extend([
         "",
         f"  turso:        {'✅ up' if turso.get('available') else '❌ down'}"
         + (f"  ({turso.get('latency_ms')}ms)" if turso.get('latency_ms') is not None else "")
         + (f"  reason: {turso.get('reason')}" if turso.get('reason') else ""),
-    ]
+    ])
     return "\n".join(lines)
 
 

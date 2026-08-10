@@ -42,6 +42,16 @@ except Exception as _e:  # noqa: BLE001
 else:
     _prefetch_cron_import_err = None
 
+# v12.10 (#1): dedup_cron — same fail-open contract as prefetch_cron.
+# A broken dedup module must NEVER stop the worker from booting.
+try:
+    from miniapp.backend.app.services import dedup_cron as _dedup_cron
+except Exception as _e_dd:  # noqa: BLE001
+    _dedup_cron = None
+    _dedup_cron_import_err = _e_dd
+else:
+    _dedup_cron_import_err = None
+
 
 def _v2_enabled() -> bool:
     """V2 relay is the default. Set SELF_COVER_POST_ENABLED=0 to fall back
@@ -153,6 +163,30 @@ async def _run_loop() -> int:
         log.warning(
             "prefetch_cron: not spawned — import failed at boot (%s)",
             _prefetch_cron_import_err,
+        )
+
+    # v12.10 (#1): dedup_cron background sweep (every 12 h by default).
+    # Spawned right after prefetch_cron so a dedup import failure never
+    # affects the warmer. Alerts the admin via Telegram when duplicates
+    # were removed OR when a Turso failure needs to be disclosed.
+    if _dedup_cron is not None:
+        try:
+            asyncio.create_task(
+                _dedup_cron.run_forever(),
+                name="dedup_cron",
+            )
+            log.info(
+                "dedup_cron: spawned (interval=%ss, enabled=%s, alerts=%s)",
+                _dedup_cron.DEDUP_INTERVAL_SEC,
+                _dedup_cron.DEDUP_ENABLED,
+                _dedup_cron.DEDUP_ALERT_ENABLED,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("dedup_cron: spawn failed (%s) — continuing without dedup", e)
+    else:
+        log.warning(
+            "dedup_cron: not spawned — import failed at boot (%s)",
+            _dedup_cron_import_err,
         )
 
     log.info("worker started, entering main loop")
