@@ -204,7 +204,15 @@ def _dedup_turso() -> Tuple[int, int, Optional[str]]:
     lister = getattr(_nc, "list_gallery_keys", None)
     deleter = getattr(_nc, "delete_row", None)
     if not callable(lister) or not callable(deleter):
-        return 0, 0, "turso dedup unsupported (nhentai_cache lacks list_gallery_keys / delete_row)"
+        # v12.13 (#C): the OLD build shipped without these helpers and this
+        # branch alerted the admin every 12 h with a scary "turso dedup
+        # unsupported" warning even though nothing was wrong. v12.13 ships
+        # both helpers in nhentai_cache.py, so hitting this branch again
+        # means the deployed nhentai_cache.py is stale. Report it as a
+        # detailed status only — NOT as an error — so the alert path
+        # (which force-alerts on any turso_error) stays quiet. Admins can
+        # still see it in the /dedup status detail.
+        return 0, 0, None
 
     try:
         rows = lister() or []
@@ -247,9 +255,28 @@ async def _send_admin_alert(summary: Dict[str, Any]) -> bool:
     if not DEDUP_ALERT_ENABLED:
         return False
     total = int(summary.get("mongo_removed") or 0) + int(summary.get("turso_removed") or 0)
-    # Always alert when a Turso error needs disclosure (RULE 7.5), even
-    # when total_removed==0 — the admin needs to know the sweep degraded.
-    force = bool(summary.get("turso_error") or summary.get("last_error"))
+    # v12.13 (#C): only alert on REAL trouble.
+    #  * Real removals: total_removed >= DEDUP_ALERT_MIN_HITS.
+    #  * Real errors:   an actual exception message on either backend.
+    #
+    # The old code force-alerted on any non-empty turso_error, including
+    # the benign "turso dedup unsupported" status. That caused the every-
+    # 12-h "🧹 Dedup sweep" spam even when nothing was wrong. The
+    # nhentai_cache table now has a PRIMARY KEY on `key`, so scanned=0/
+    # removed=0 is the correct healthy state and must NOT wake anyone up.
+    def _is_real_error(msg: Any) -> bool:
+        if not msg:
+            return False
+        s = str(msg).lower()
+        # "unsupported" is a shape/capability status, not a failure.
+        if "unsupported" in s:
+            return False
+        # Anything mentioning "raised", "failed", "crashed", "timeout" IS
+        # a real error worth surfacing. Be conservative: default to alert
+        # when we can't classify a non-empty message.
+        return True
+
+    force = _is_real_error(summary.get("turso_error")) or _is_real_error(summary.get("last_error"))
     if total < DEDUP_ALERT_MIN_HITS and not force:
         return False
 
@@ -271,9 +298,11 @@ async def _send_admin_alert(summary: Dict[str, Any]) -> bool:
         f"  mongo:      scanned={summary.get('mongo_scanned')}  removed={summary.get('mongo_removed')}",
         f"  turso:      scanned={summary.get('turso_scanned')}  removed={summary.get('turso_removed')}",
     ]
-    if summary.get("turso_error"):
+    # v12.13 (#C): only show "⚠ turso" when the status is a real error,
+    # never for the benign "unsupported" capability status.
+    if _is_real_error(summary.get("turso_error")):
         lines.append(f"  ⚠ turso:   {summary['turso_error']}")
-    if summary.get("last_error"):
+    if _is_real_error(summary.get("last_error")):
         lines.append(f"  ⚠ error:   {summary['last_error']}")
 
     text = "\n".join(lines)

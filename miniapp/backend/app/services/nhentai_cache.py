@@ -323,6 +323,84 @@ def invalidate(key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# v12.13 (#C): Turso dedup helpers.
+#
+# The nhentai_cache table declares `key TEXT PRIMARY KEY`, so by construction
+# it cannot hold two rows sharing the same key — SQLite/libSQL rejects the
+# second INSERT and our `ON CONFLICT(key) DO UPDATE` collapses concurrent
+# writers into a single row. That means dedup_cron has no legitimate row
+# duplicates to remove on the Turso side.
+#
+# We still expose list_gallery_keys() and delete_row() because they are the
+# clean, safe utilities dedup_cron probes for (see getattr(_nc, ...) in
+# dedup_cron._dedup_turso). Their presence flips the cron from the noisy
+# "turso dedup unsupported" branch to the normal, quiet branch that simply
+# reports scanned=0/removed=0 when the table is already unique-by-key.
+#
+# As a bonus, list_gallery_keys() also surfaces expired rows so a future
+# sweep or admin utility can prune them without touching valid data. This
+# module never *automatically* deletes expired rows here — that is Turso's
+# job via the idx_nhcache_expires index and can be extended later.
+# ---------------------------------------------------------------------------
+def list_gallery_keys() -> list[dict]:
+    """List every gallery:<id> row currently stored in Turso nhentai_cache.
+
+    Returns a list of dicts with keys: {"key", "expires_at", "cached_at"}.
+    Because `key` is the PRIMARY KEY, each returned row is already unique.
+    Returns an empty list when Turso is unavailable or the query fails.
+
+    The dedup cron uses this to build its by-key buckets; with a unique
+    primary key every bucket has size 1, so removed=0 is the correct and
+    healthy outcome — no scary warning needed.
+    """
+    if _turso is None or not _turso.turso_available():
+        return []
+    try:
+        rs = _turso.execute(
+            "SELECT key, expires_at, cached_at FROM nhentai_cache "
+            "WHERE key LIKE 'gallery:%'"
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("list_gallery_keys: turso execute failed: %s", e)
+        return []
+    if rs is None or not getattr(rs, "rows", None):
+        return []
+    out: list[dict] = []
+    for row in rs.rows:
+        try:
+            out.append({
+                "key":        str(row[0]),
+                "expires_at": int(row[1]) if row[1] is not None else 0,
+                "cached_at":  int(row[2]) if row[2] is not None else 0,
+            })
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def delete_row(key: str, rowid: Any = None) -> bool:
+    """Delete a single row from Turso nhentai_cache by key.
+
+    The `rowid` argument is accepted for API compatibility with dedup_cron
+    but is not needed — the primary key alone uniquely identifies the row.
+    Returns True when the DELETE executed, False on any failure. Never
+    raises. Used defensively; because the table is unique-by-key, the cron
+    normally never has anything to delete.
+    """
+    del rowid  # accepted for signature-compat, intentionally unused
+    if not key:
+        return False
+    if _turso is None or not _turso.turso_available():
+        return False
+    try:
+        _turso.execute("DELETE FROM nhentai_cache WHERE key = ?", [key])
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("delete_row(%s) failed: %s", key, e)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Token bucket — SHARED across users. Prevents any single search from
 # blowing past the openapi.json quota and 429ing everyone.
 #

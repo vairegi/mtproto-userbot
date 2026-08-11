@@ -141,20 +141,32 @@ form.search-bar { margin: 0; width: 100%; }
      which the admin layout settings-loader overrides on :root. */
   grid-template-columns: repeat(var(--du-cards-per-row, 2), 1fr);
   gap: calc(var(--du-card-gap, 0) * var(--du-space-2));
+  /* v12.13 (#A): the grid used to be width:100% AND carry padding-inline.
+     Combined with the identical padding on .app-main (v12.11 #4), the
+     right side was double-counted on Discover / Search / Home rows and
+     the last column visibly clipped. Now .app-main no longer pads-x and
+     the grid alone owns the symmetric inset. We keep box-sizing:border-box
+     so the padding subtracts from the width instead of adding to it, and
+     we drop the max-width:100% (redundant with box-sizing:border-box and
+     was interacting badly with the ancestor pad). */
   width: 100%;
-  max-width: 100%;
+  box-sizing: border-box;
   /* v12.10 (#7): contain the grid's own paint so the 2nd card and its
      📥 badge can never clip past the viewport's right edge, even when
      the admin sets the gap to 0 (nhentai-style flush grid). */
   overflow: hidden;
-  box-sizing: border-box;
-  /* v12.12 (#2): symmetric horizontal inset on the GRID ITSELF, not just
-     the page shell. In v12.11 the --du-app-pad-x padding only sat on
-     .app-main; on grid pages (search / home rows) the grid's 100% width
-     plus its own box-sizing ate the parent's right padding, so only the
-     left side showed the inset. Putting padding-inline on the grid
-     guarantees left == right on every page that renders cards. */
+  /* v12.12 (#2) / v12.13 (#A): SINGLE authoritative horizontal inset.
+     Left == right on every grid page. */
   padding-inline: var(--du-app-pad-x, 0px);
+}
+/* v12.13 (#A): grid children MUST be allowed to shrink to their track,
+   otherwise a card's intrinsic min-content width (long titles, wide cover
+   img) forces the last column to overflow the padded grid on the right.
+   Without this, symmetric padding *looks* asymmetric because only the
+   right edge is being pushed under the inset. */
+.card-grid > .gallery-card {
+  min-width: 0;
+  max-width: 100%;
 }
 .card-grid .gallery-card .meta {
   padding: var(--du-space-2);
@@ -176,6 +188,14 @@ form.search-bar { margin: 0; width: 100%; }
   }
   .card-grid .gallery-card .meta  { padding: var(--du-space-3); }
   .card-grid .gallery-card .title { font-size: var(--du-fs-sm); -webkit-line-clamp: 2; }
+}
+/* v12.13 (#A): Home rows (Trending / For you) sit BETWEEN the shell and
+   their own inner .card-grid. Their outer wrappers should share the same
+   horizontal inset for the section titles, but their inner .card-grid
+   already carries the pad, so we only inset the wrapper's non-grid rows. */
+.home-rows { width: 100%; box-sizing: border-box; }
+.home-rows > *:not(.card-grid) {
+  padding-inline: var(--du-app-pad-x, 0px);
 }
 /* Back-compat: the old opt-in class still works (no-op now, all grids are compact). */
 .card-grid.card-grid-compact { /* no-op in v11.9 */ }

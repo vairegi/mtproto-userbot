@@ -164,6 +164,23 @@ def _read_enabled() -> bool:
 # ---------------------------------------------------------------------------
 # Cross-run state — read by /api/admin/details-scraper (admin.js panel).
 # ---------------------------------------------------------------------------
+# v12.13 (#D): per-tick skip-reason counters. Every one of these is a
+# concrete, mutually-exclusive reason a card was NOT hydrated in the last
+# tick. Zero-initialised each tick so the admin panel shows fresh numbers.
+_SKIP_REASONS: Tuple[str, ...] = (
+    "already_cached_fresh",     # gallery:<id> is fresh AND schema-complete
+    "no_search_page_cached",    # search:<sort>:page<N> not in cache yet
+    "missing_gallery_id",       # search page row has no id field
+    "token_bucket_denied",      # galleries bucket refused a token
+    "upstream_detail_empty",    # scraper returned None/empty dict
+    "cache_write_failed",       # detail fetched but nhentai_cache.put failed
+)
+
+
+def _fresh_skip_counters() -> Dict[str, int]:
+    return {r: 0 for r in _SKIP_REASONS}
+
+
 _state: Dict[str, Any] = {
     "enabled":            bool(ENABLED),
     "started_at":         None,   # epoch of the current run (or None)
@@ -179,7 +196,54 @@ _state: Dict[str, Any] = {
     "paused_reason":      None,   # 'night' / 'day-active-users' / None
     "phase":              "idle", # idle / running / paused
     "turso_error":        None,   # RULE 7.5 disclosure
+    # v12.13 (#D): per-tick skip breakdown — tells the admin WHY a tick
+    # showed skipped=25 done=0 instead of forcing them to guess.
+    "skip_reasons":       _fresh_skip_counters(),
+    # v12.13 (#D): plain-English one-liner surfaced in the admin panel.
+    "status_text":        "Idle — waiting for next tick.",
 }
+
+
+# ---------------------------------------------------------------------------
+# v12.13 (#D): schema-completeness test.
+#
+# The old code called cache.get("gallery:<id>") is-not-None the "fresh"
+# check. That's true even if the payload is an early v12.10 row that
+# only carries {id, title, cover, pages} — no artist / tags / uploaded /
+# num_favorites. Those rows LOOK fresh but are useless to the mini-app's
+# detail sheet, and the autoscraper would sit at skipped=25 forever
+# claiming everything was already cached.
+#
+# _is_schema_complete() defines the minimum shape a gallery:<id> row must
+# have to count as "actually cached". Anything short of that is treated as
+# a miss, so the autoscraper will re-fetch and rewrite the full detail.
+# ---------------------------------------------------------------------------
+_REQUIRED_DETAIL_FIELDS: Tuple[str, ...] = (
+    "id", "title", "tags", "num_pages",
+)
+_RECOMMENDED_DETAIL_FIELDS: Tuple[str, ...] = (
+    "artist", "uploaded", "num_favorites", "cover",
+)
+
+
+def _is_schema_complete(detail: Any) -> bool:
+    """Return True when a cached gallery:<id> payload has enough fields to
+    render the detail sheet without a re-fetch. Missing REQUIRED fields
+    fails the check; missing RECOMMENDED fields also fails so the sweep
+    upgrades early v12.10 rows over time. Never raises.
+    """
+    if not isinstance(detail, dict):
+        return False
+    for f in _REQUIRED_DETAIL_FIELDS:
+        if not detail.get(f):
+            return False
+    for f in _RECOMMENDED_DETAIL_FIELDS:
+        # `cover` may legitimately be empty for very old uploads; treat
+        # its absence (key not present) as incomplete, but its presence
+        # with a falsy value as acceptable to avoid infinite re-fetch.
+        if f not in detail:
+            return False
+    return True
 
 
 def _persist_state() -> None:
@@ -190,6 +254,46 @@ def _persist_state() -> None:
         _db_set(_STATE_KEY, dict(_state))
     except Exception:  # noqa: BLE001
         pass
+
+
+def _plain_english_status(state: Dict[str, Any]) -> str:
+    """v12.13 (#D): one-line human-readable status for the admin panel."""
+    if not state.get("enabled"):
+        return "Paused by admin."
+    phase = str(state.get("phase") or "idle")
+    reason = state.get("paused_reason")
+    if phase == "paused":
+        if reason == "day-active-users":
+            return "Waiting: users are active, will continue after they leave."
+        if reason == "cache-module-unavailable":
+            return "Paused: cache module unavailable — check nhentai_cache import."
+        return f"Paused ({reason or 'unknown reason'})."
+    sort = state.get("current_sort")
+    page = state.get("current_page")
+    skips = state.get("skip_reasons") or {}
+    done  = int(state.get("galleries_done_this_run") or 0)
+    if phase == "running":
+        pretty_sort = {
+            "popular-today": "Popular Now",
+            "popular-week":  "Popular Week",
+            "popular":       "Popular",
+            "date":          "New Uploads",
+        }.get(sort, sort or "?")
+        return f"Working: checking {pretty_sort}, page {page or '?'}."
+    if done > 0:
+        return f"Idle — last tick saved {done} new gallery detail(s)."
+    if int(skips.get("no_search_page_cached", 0)) > 0:
+        return "Waiting for search page cache to arrive."
+    if int(skips.get("token_bucket_denied", 0)) > 0:
+        return "Waiting: upstream token bucket is empty, will retry next tick."
+    if int(skips.get("already_cached_fresh", 0)) > 0:
+        n = int(skips.get("already_cached_fresh", 0))
+        return f"Nothing needed: all {n} galleries already have details saved."
+    if int(skips.get("missing_gallery_id", 0)) > 0:
+        return "Skipped: some search rows had no gallery id."
+    if int(skips.get("upstream_detail_empty", 0)) > 0:
+        return "Some detail fetches returned empty — will retry next tick."
+    return "Idle — waiting for next tick."
 
 
 def last_run_summary() -> Dict[str, Any]:
@@ -212,8 +316,35 @@ def last_run_summary() -> Dict[str, Any]:
         "pages_per_tick":  PAGES_PER_TICK,
         "sorts":           list(_SORTS),
     }
-    # v12.12: reflect the DB-backed runtime toggle, not the import-time env.
     snap["enabled"] = _read_enabled()
+    # v12.13 (#D): guarantee the skip_reasons dict + plain-English line
+    # are ALWAYS present in the response.
+    if not isinstance(snap.get("skip_reasons"), dict):
+        snap["skip_reasons"] = _fresh_skip_counters()
+    else:
+        for r in _SKIP_REASONS:
+            snap["skip_reasons"].setdefault(r, 0)
+    snap["status_text"] = _plain_english_status(snap)
+    snap["explainer"] = {
+        "night_day": (
+            f"NIGHT window is {NIGHT_START:02d}:00–{NIGHT_END:02d}:00 IST. "
+            f"During NIGHT the scraper works every {NIGHT_TICK_SEC}s regardless of "
+            f"user activity. During DAY it only works when no non-admin users have "
+            f"been active in the last {ACTIVE_WINDOW}s, tick every {DAY_TICK_SEC}s."
+        ),
+        "skipped": (
+            "'skipped' counts galleries the tick chose NOT to fetch. Broken "
+            "down under skip_reasons: already_cached_fresh (nothing to do), "
+            "no_search_page_cached (waiting for search cache), missing_gallery_id "
+            "(bad row), token_bucket_denied (users have priority), "
+            "upstream_detail_empty (fetch returned nothing), cache_write_failed "
+            "(Turso/Mongo rejected the write)."
+        ),
+        "next_action": (
+            f"Next check: {sorted(list(_SORTS))} — one page per tick, up to "
+            f"page {PAGE_CAP} per sort, then it loops back."
+        ),
+    }
     return snap
 
 
@@ -347,14 +478,21 @@ async def _scrape_page_details(sort: str, page: int) -> Dict[str, int]:
         items = None
 
     if not isinstance(items, list) or not items:
+        # v12.13 (#D): search page not cached yet — record a distinct reason.
+        skips = _state.get("skip_reasons") or _fresh_skip_counters()
+        skips["no_search_page_cached"] = int(skips.get("no_search_page_cached", 0)) + 1
+        _state["skip_reasons"] = skips
+        out["skipped"] += 1
         return out
 
     # Per-card detail loop. Consume the galleries bucket so user traffic
     # always wins; sleep between fetches per the night/day rest value.
     rest = NIGHT_REST_SEC if _is_night_window() else DAY_REST_SEC
+    skips = _state.get("skip_reasons") or _fresh_skip_counters()
     for item in items:
         gid = item.get("id") if isinstance(item, dict) else None
         if gid in (None, ""):
+            skips["missing_gallery_id"] = int(skips.get("missing_gallery_id", 0)) + 1
             out["skipped"] += 1
             continue
         gid = str(gid).strip()
@@ -362,14 +500,19 @@ async def _scrape_page_details(sort: str, page: int) -> Dict[str, int]:
 
         gkey = _gallery_cache_key(gid)
 
-        # Skip if already cached fresh — the 30-day TTL on gallery rows
-        # means most pages are a no-op on the second pass.
+        # v12.13 (#D): schema-completeness test. Old rows that only carry
+        # {id, title, cover, pages} used to satisfy the is-not-None probe
+        # and get skipped forever. Now we treat an incomplete row as a
+        # miss and let the fetch below upgrade it in place.
         try:
-            if cache.get(gkey, allow_stale=False) is not None:
-                out["skipped"] += 1
-                continue
+            existing = cache.get(gkey, allow_stale=False)
         except Exception as e:  # noqa: BLE001
             log.debug("details_scraper: cache.get(%s) probe raised: %s", gkey, e)
+            existing = None
+        if existing is not None and _is_schema_complete(existing):
+            skips["already_cached_fresh"] = int(skips.get("already_cached_fresh", 0)) + 1
+            out["skipped"] += 1
+            continue
 
         # Token-bucket guard — never starve users.
         try:
@@ -378,6 +521,7 @@ async def _scrape_page_details(sort: str, page: int) -> Dict[str, int]:
             log.debug("details_scraper: try_consume raised: %s", e)
             allowed = True
         if not allowed:
+            skips["token_bucket_denied"] = int(skips.get("token_bucket_denied", 0)) + 1
             out["skipped"] += 1
             await asyncio.sleep(rest)
             continue
@@ -392,13 +536,29 @@ async def _scrape_page_details(sort: str, page: int) -> Dict[str, int]:
             log.warning("details_scraper: detail fetch %s failed: %s", gid, e)
 
         if isinstance(detail, dict) and detail.get("id"):
-            out["done"] += 1
+            # v12.13 (#D): confirm schema-complete AND that the cache write
+            # actually landed (paranoid readback).
+            if not _is_schema_complete(detail):
+                skips["upstream_detail_empty"] = int(skips.get("upstream_detail_empty", 0)) + 1
+                out["skipped"] += 1
+            else:
+                try:
+                    readback = cache.get(gkey, allow_stale=False)
+                except Exception:  # noqa: BLE001
+                    readback = None
+                if readback is None:
+                    skips["cache_write_failed"] = int(skips.get("cache_write_failed", 0)) + 1
+                    out["failed"] += 1
+                else:
+                    out["done"] += 1
         else:
+            skips["upstream_detail_empty"] = int(skips.get("upstream_detail_empty", 0)) + 1
             out["failed"] += 1
 
         # Polite rest between gallery fetches (user-requested).
         await asyncio.sleep(rest)
 
+    _state["skip_reasons"] = skips
     return out
 
 
@@ -421,6 +581,8 @@ async def scrape_once() -> Dict[str, Any]:
     _state["galleries_failed_this_run"] = 0
     _state["last_error"] = None
     _state["turso_error"] = None
+    # v12.13 (#D): zero the per-tick skip breakdown.
+    _state["skip_reasons"] = _fresh_skip_counters()
 
     # Decide whether to run now.
     if not _is_night_window():

@@ -35,7 +35,8 @@ import { store } from "core/state.js";
 // made every "Download Now" click throw ReferenceError: showActionLoader is
 // not defined — silently swallowed by the async run() so nothing at all
 // happened on the UI and no POST /api/queue was ever fired. Restored here.
-import { showActionLoader, hideActionLoader } from "ui/action-loader.js";
+import { showActionLoader, hideActionLoader,
+         showInlineLoader, hideInlineLoader } from "ui/action-loader.js";
 
 const toast = (text, kind) => make("toast", { text, kind });
 
@@ -104,10 +105,17 @@ export const cardActions = [
     },
     disabled: ({ gallery }) => isProcessing(gallery),
     async run({ gallery, close }) {
-      // v11: paint the hourglass overlay IMMEDIATELY so the click feels
-      // accepted in <50 ms. Every code path below releases the token via
-      // the outer try/finally (both primary and swap tokens).
-      const _ldr = showActionLoader(
+      // v12.13 (#B): no more full-screen hourglass on the fast DB→DM path.
+      // For an already-COMPLETED gallery the admin bot copies cover+PDF from
+      // the DATABASE CHANNEL to the user's DM — that's typically <1s, so a
+      // full-screen overlay obscures the page for essentially no reason.
+      // We now use a small non-blocking inline pill for both fast and slow
+      // paths; the label swaps if we drop through to the /api/queue leg.
+      //
+      // NOTE: showActionLoader / hideActionLoader remain imported so the
+      // API contract is unchanged for any future action that wants the
+      // big overlay (e.g. a long-running admin-only op).
+      const _ldr = showInlineLoader(
         isCompleted(gallery) ? "Sending to your DM…" : "Queuing…"
       );
       // Secondary token used only to swap the label between phases.
@@ -154,10 +162,12 @@ export const cardActions = [
         return;
       }
 
-      // v11: swap the overlay label — we're about to hit /api/queue,
-      // which is the slow leg (3–4 s in the field).
-      hideActionLoader(_ldr_swap);
-      _ldr_swap = showActionLoader("Queuing your download…");
+      // v12.13 (#B): swap the inline pill label — we're about to hit
+      // /api/queue, which is the slow leg (3–4 s in the field). This is
+      // the ONLY path where we might want more visible feedback; keep it
+      // inline (non-blocking) instead of the old full-screen overlay.
+      hideInlineLoader(_ldr_swap);
+      _ldr_swap = showInlineLoader("Queuing your download…");
 
       // --- Normal enqueue path (relay_v2 will de-dup at the server too).
       try {
@@ -233,11 +243,12 @@ export const cardActions = [
         }
       }
       } finally {
-        // v11: always release the loader — both primary and swap tokens.
-        // hideActionLoader() is a no-op on unknown / already-released ids,
-        // so releasing both is safe even when they refer to the same overlay.
-        hideActionLoader(_ldr_swap);
-        hideActionLoader(_ldr);
+        // v12.13 (#B): always release the inline pill — both primary and
+        // swap tokens. hideInlineLoader() is a no-op on unknown / already-
+        // released ids, so releasing both is safe even when they refer to
+        // the same overlay.
+        hideInlineLoader(_ldr_swap);
+        hideInlineLoader(_ldr);
       }
     },
   },

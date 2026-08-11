@@ -246,11 +246,26 @@ function sectionDetailsScraper() {
       toggle.setAttribute("aria-checked", s.enabled ? "true" : "false");
       const cfg = s.config || {};
       const fmt = (v) => (v == null ? "—" : String(v));
+      // v12.13 (#D): render skip_reasons breakdown + plain-English status.
+      const sr = s.skip_reasons || {};
+      const ex = s.explainer || {};
+      const srLines = [
+        `  already_cached_fresh:  ${sr.already_cached_fresh || 0}`,
+        `  no_search_page_cached: ${sr.no_search_page_cached || 0}`,
+        `  missing_gallery_id:    ${sr.missing_gallery_id || 0}`,
+        `  token_bucket_denied:   ${sr.token_bucket_denied || 0}`,
+        `  upstream_detail_empty: ${sr.upstream_detail_empty || 0}`,
+        `  cache_write_failed:    ${sr.cache_write_failed || 0}`,
+      ];
       statusBox.textContent = [
+        `STATUS:       ${s.status_text || "—"}`,
+        "",
         `phase:        ${s.phase}`,
         `paused:       ${s.paused_reason || "no"}`,
         `current:      ${fmt(s.current_sort)} page ${fmt(s.current_page)} · gallery ${fmt(s.current_gallery_id)}`,
         `this run:     done=${s.galleries_done_this_run}  skipped=${s.galleries_skipped_this_run}  failed=${s.galleries_failed_this_run}`,
+        `skip reasons:`,
+        ...srLines,
         `run count:    ${s.run_count}`,
         `last error:   ${s.last_error || "—"}`,
         `turso error:  ${s.turso_error || "—"}`,
@@ -258,7 +273,12 @@ function sectionDetailsScraper() {
         `rest:         day ${cfg.day_rest_sec}s · night ${cfg.night_rest_sec}s`,
         `active window:${cfg.active_window}s`,
         `page cap:     ${cfg.page_cap} per sort · sorts: ${(cfg.sorts || []).join(", ")}`,
-      ].join("\n");
+        "",
+        `— What does this mean? —`,
+        ex.night_day   ? `• ${ex.night_day}`   : "",
+        ex.skipped     ? `• ${ex.skipped}`     : "",
+        ex.next_action ? `• ${ex.next_action}` : "",
+      ].filter(Boolean).join("\n");
     } catch (e) {
       statusBox.textContent = "⚠ " + (e.message || e);
     }

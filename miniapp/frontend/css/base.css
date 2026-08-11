@@ -72,11 +72,25 @@ a { color: var(--du-accent); text-decoration: none; }
 }
 
 .app-main {
-  /* v12.11 (#4): horizontal padding is now admin-controlled via
-     --du-app-pad-x (default 0px, nhentai-flush). Vertical padding stays
-     on --du-space-4 so the tabbar / status-bar clearance is untouched. */
-  padding: var(--du-space-4) var(--du-app-pad-x, 0px);
+  /* v12.13 (#A): SINGLE source of --du-app-pad-x is now the grid itself
+     (.card-grid) and page-level containers. Applying it here AS WELL as
+     on .card-grid double-counted the inset on Discover/Search/Home rows —
+     the parent inset shrunk the available width, then the grid's own
+     padding-inline pushed the RIGHT column past the visible edge because
+     grid children didn't have min-width:0 to shrink cleanly. Keep pad-x
+     off the shell; keep it on the grid + on any non-grid page-level
+     wrappers that need it. Non-grid pages (Saved/Settings) already look
+     correct with pad-x=0 on the shell. */
+  padding: var(--du-space-4) 0;
   padding-bottom: calc(var(--du-tabbar-h) + var(--du-safe-bot) + var(--du-space-4));
+  /* v12.13 (#A): hard-cap width so a grid child can never widen the
+     viewport. Combined with html/body overflow-x:hidden + max-width:100vw
+     from the reset above, this guarantees no horizontal scroll. */
+  width: 100%;
+  max-width: 100vw;
+  min-width: 0;
+  box-sizing: border-box;
+  overflow-x: clip;
 }
 
 .app-tabbar {

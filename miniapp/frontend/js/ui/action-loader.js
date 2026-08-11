@@ -139,8 +139,81 @@ export function hideActionLoader(token) {
   }, 160);
 }
 
+/* ============================================================================
+ * v12.13 (#B): compact inline indicator
+ * ----------------------------------------------------------------------------
+ * The full-screen hourglass is heavy for the fast DB→DM path (usually <1s).
+ * showInlineLoader() paints a small, non-blocking pill in the corner of the
+ * viewport instead. It shares no state with the full-screen overlay so both
+ * can coexist during transitions. Token API mirrors show/hideActionLoader.
+ * ==========================================================================*/
+const _inlineTokens = new Map();
+let   _inlineNextId = 1;
+let   _inlineEl     = null;
+let   _inlineLabel  = null;
+let   _inlineLeave  = null;
+
+function _ensureInline() {
+  if (_inlineEl && document.body.contains(_inlineEl)) return _inlineEl;
+  const el = document.createElement("div");
+  el.className = "inline-loader";
+  el.setAttribute("role", "status");
+  el.setAttribute("aria-live", "polite");
+  el.innerHTML = `
+    <span class="inline-loader__spinner" aria-hidden="true"></span>
+    <span class="inline-loader__label"></span>`;
+  document.body.appendChild(el);
+  _inlineEl    = el;
+  _inlineLabel = el.querySelector(".inline-loader__label");
+  return el;
+}
+
+function _refreshInlineLabel() {
+  if (!_inlineLabel) return;
+  let last = "";
+  for (const v of _inlineTokens.values()) last = v;
+  _inlineLabel.textContent = last || "";
+}
+
+/**
+ * Paint a compact inline indicator (bottom-right pill, non-blocking).
+ * @param {string} [label]
+ * @returns {number} token — pass to hideInlineLoader() when done.
+ */
+export function showInlineLoader(label = "Working…") {
+  if (_inlineLeave) { clearTimeout(_inlineLeave); _inlineLeave = null; }
+  if (_inlineEl) _inlineEl.classList.remove("is-leaving");
+  const id = _inlineNextId++;
+  _inlineTokens.set(id, String(label || ""));
+  _ensureInline();
+  _refreshInlineLabel();
+  return id;
+}
+
+export function hideInlineLoader(token) {
+  if (token == null) return;
+  _inlineTokens.delete(token);
+  if (_inlineTokens.size > 0) { _refreshInlineLabel(); return; }
+  if (!_inlineEl) return;
+  _inlineEl.classList.add("is-leaving");
+  const el = _inlineEl;
+  _inlineLeave = setTimeout(() => {
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+    if (_inlineEl === el) { _inlineEl = null; _inlineLabel = null; }
+    _inlineLeave = null;
+  }, 160);
+}
+
 /** Force-clear (used by page-teardown / router navigations). */
 export function resetActionLoader() {
+  // v12.13 (#B): also clear the inline indicator on route change.
+  _inlineTokens.clear();
+  if (_inlineLeave) { clearTimeout(_inlineLeave); _inlineLeave = null; }
+  if (_inlineEl && _inlineEl.parentNode) {
+    _inlineEl.parentNode.removeChild(_inlineEl);
+  }
+  _inlineEl = null;
+  _inlineLabel = null;
   _tokens.clear();
   if (_leaveTimer) { clearTimeout(_leaveTimer); _leaveTimer = null; }
   if (_overlayEl && _overlayEl.parentNode) {
@@ -149,3 +222,4 @@ export function resetActionLoader() {
   _overlayEl = null;
   _labelEl   = null;
 }
+

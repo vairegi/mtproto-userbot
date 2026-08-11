@@ -235,3 +235,64 @@
   .loader,
   .loader * { animation: none !important; }
 }
+
+/* ============================================================================
+ * v12.13 (#B): compact inline loader pill
+ * ---------------------------------------------------------------------------
+ * Non-blocking status indicator for the Download-Now fast path. Sits in the
+ * bottom-right corner, above the tabbar, so it never covers the card grid.
+ * The full-screen hourglass overlay above still ships for callers that opt
+ * into showActionLoader(); card-actions.js now uses this smaller pill for
+ * the DB->DM and /api/queue paths.
+ * =========================================================================*/
+.inline-loader {
+  position: fixed;
+  right: max(12px, env(safe-area-inset-right, 0px));
+  bottom: calc(var(--du-tabbar-h, 56px) + var(--du-safe-bot, 0px) + 12px);
+  z-index: calc(var(--du-z-tabbar, 40) + 5);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--du-bg-1, rgba(20, 22, 30, 0.92));
+  color: var(--du-ink-hi, #fff);
+  border: 1px solid var(--du-border, rgba(255,255,255,0.12));
+  box-shadow: var(--du-shadow-md, 0 8px 24px rgba(0,0,0,0.35));
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  max-width: min(78vw, 320px);
+  pointer-events: none;         /* never blocks card taps */
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 160ms var(--du-ease, cubic-bezier(.2,.8,.2,1)),
+              transform 160ms var(--du-ease, cubic-bezier(.2,.8,.2,1));
+}
+.inline-loader.is-leaving {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.inline-loader__spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,0.22);
+  border-top-color: var(--du-accent, #ff3b5c);
+  animation: du-inline-spin 720ms linear infinite;
+  flex: 0 0 auto;
+}
+.inline-loader__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@keyframes du-inline-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .inline-loader__spinner { animation: none; }
+}
