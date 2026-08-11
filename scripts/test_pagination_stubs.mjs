@@ -184,6 +184,7 @@ export function make(name, props = {}) {
 }
 
 export const haptic = () => {};
+export const openLink = () => {};
 export const store = { get: () => null, set: () => {} };
 
 export function parseSearch(q) {
