@@ -264,6 +264,7 @@ function sectionDetailsScraper() {
       // to work').
       const simpleLines = [
         ex2.phase, ex2.paused, ex2.current, ex2.this_run, ex2.run_count,
+        ex2.sweep, ex2.sweeps,                      // v12.15: sweep position rows
         "",
         ex2.skip_help,
         ex2.already   && `  • ${ex2.already}`,
@@ -299,6 +300,12 @@ function sectionDetailsScraper() {
         `rest:         day ${cfg.day_rest_sec}s · night ${cfg.night_rest_sec}s`,
         `active window:${cfg.active_window}s`,
         `page cap:     ${cfg.page_cap} per sort · sorts: ${(cfg.sorts || []).join(", ")}`,
+        // v12.15: sweep position line (Phase 1 sorts sweep / Phase 2 tag sweep).
+        `sweep:        Phase ${s.sweep_phase || 1} · ${
+            (s.sweep_phase || 1) === 1
+              ? `page ${fmt(s.sweep_page)}/${cfg.page_cap} (sort #${(s.sweep_sort_idx || 0) + 1}/4)`
+              : `tag #${(s.sweep_tag_idx || 0) + 1} page ${fmt(s.sweep_tag_page)}/${cfg.tag_page_cap}`
+          } · sweeps done=${s.sweep_sweeps_completed || 0}`,
         "",
         ...explainerBlock,
       ].filter(x => x !== undefined && x !== null).join("\n");

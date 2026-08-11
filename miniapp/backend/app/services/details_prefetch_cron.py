@@ -78,8 +78,22 @@ DAY_TICK_SEC:   int  = _env_int ("DETAILS_SCRAPER_DAY_TICK_SEC",       60)
 NIGHT_REST_SEC: int  = _env_int ("DETAILS_SCRAPER_NIGHT_REST_SEC",     2)
 DAY_REST_SEC:   int  = _env_int ("DETAILS_SCRAPER_DAY_REST_SEC",       5)
 ACTIVE_WINDOW:  int  = _env_int ("DETAILS_SCRAPER_ACTIVE_WINDOW_SEC",  300)
-PAGE_CAP:       int  = _env_int ("DETAILS_SCRAPER_PAGE_CAP",           20)
+PAGE_CAP:       int  = _env_int ("DETAILS_SCRAPER_PAGE_CAP",           30)   # v12.15: raised 20 -> 30 per user request
 PAGES_PER_TICK: int  = _env_int ("DETAILS_SCRAPER_MAX_PAGES_PER_TICK", 1)
+# v12.15: Phase 2 tag-search depth (user picked "first 5 pages per tag").
+TAG_PAGE_CAP:   int  = _env_int ("DETAILS_SCRAPER_TAG_PAGE_CAP",       5)
+# v12.15: how many (sort,page) pairs to advance per tick when the current
+# pair is already fully cached. Each advance costs one cache probe; 8 is
+# a sane upper bound that lets the walker sprint past fully-cached pages
+# without hogging the worker.
+SKIP_FAST_CAP:  int  = _env_int ("DETAILS_SCRAPER_SKIP_FAST_CAP",      8)
+# v12.15: hard-coded popular tags the user asked for. Phase 2 sweeps these
+# first, then auto-extends from nhentai's trending-tags list when the
+# hard-coded queue is exhausted (hybrid mode).
+DEFAULT_TAGS: Tuple[str, ...] = (
+    "incest", "mother", "sister", "milf",
+    "big-breasts", "schoolgirl", "ahegao", "anal",
+)
 
 # Sorts we walk, in priority order. "date" is the mini-app's New Uploads.
 _SORTS: List[str] = ["popular-today", "date", "popular-week", "popular"]
@@ -99,6 +113,10 @@ _SORTS: List[str] = ["popular-today", "date", "popular-week", "popular"]
 _FLAG_KEY = "details_scraper_enabled"
 _STATE_KEY = "details_scraper_state"
 _PRIO_KEY = "details_scraper_priority"
+# v12.15: durable sweep position so a Render restart doesn't reset the
+# walker back to (popular-today, page 1). This is the single source of
+# truth for where the breadth-first sweep currently is.
+_SWEEP_KEY = "details_scraper_sweep"
 _PRIO_CAP = 50
 
 
@@ -153,6 +171,224 @@ def _drain_priority_pages() -> List[Tuple[str, int]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# v12.15: BREADTH-FIRST SWEEP STATE MACHINE
+# ---------------------------------------------------------------------------
+# What the user actually wants (paraphrased from the v12.14 feedback):
+#
+#   Phase 1 — Sorts sweep (BREADTH-FIRST, not depth-first)
+#     Tick N:   popular-today page 1
+#     Tick N+1: date (New Uploads) page 1
+#     Tick N+2: popular-week page 1
+#     Tick N+3: popular page 1
+#     Tick N+4: popular-today page 2
+#     Tick N+5: date page 2
+#     ... and so on until every sort has been walked through page 30
+#     (i.e. 4 sorts × 30 pages = 120 pairs per sweep).
+#
+#   Phase 2 — Tag sweep (only after Phase 1 is complete)
+#     For each tag in the hard-coded DEFAULT_TAGS list, then any tags
+#     nhentai's trending-tags endpoint surfaces (hybrid mode), scrape the
+#     first 5 pages of search results for that tag and hydrate every card.
+#
+#   On full-sweep completion (Phase 1 + Phase 2 both done):
+#     Send a Telegram alert to the admin ONCE, then loop back to Phase 1
+#     and start a fresh sweep (per user's choice — nhentai uploads new
+#     content daily).
+#
+# Persistence contract:
+#   The sweep position lives in Mongo under _SWEEP_KEY. It MUST be durable
+#   across Render restarts — otherwise the walker resets to (popular-today,
+#   page 1) on every recycle and never advances, which is exactly the bug
+#   the user reported in the v12.14 screenshot.
+#
+# Skip-fast advance:
+#   When the walker lands on a page whose 25 cards are ALL already schema-
+#   complete, it advances to the NEXT pair in the SAME tick instead of
+#   wasting the whole tick. Cap: SKIP_FAST_CAP advances per tick so the
+#   worker still has head-room for real user traffic.
+# ---------------------------------------------------------------------------
+
+
+def _default_sweep_state() -> Dict[str, Any]:
+    """Fresh sweep position. Page index is 1-based; sort_idx/tag_idx are
+    0-based indexes into _SORTS / the active tag list."""
+    return {
+        "phase":            1,            # 1 = sorts sweep, 2 = tag sweep
+        "sort_idx":         0,
+        "page":             1,
+        "tag_idx":          0,
+        "tag_page":         1,
+        "tags_done":        [],           # tags fully swept in this pass
+        "tags_active":      list(DEFAULT_TAGS),
+        "alert_sent":       False,        # fire-once flag for the admin alert
+        "sweeps_completed": 0,            # how many full sweeps we've done
+        "last_advanced_at": None,
+    }
+
+
+def _load_sweep() -> Dict[str, Any]:
+    """Read the durable sweep position from Mongo; fall back to a fresh
+    state on any error. Never raises — a corrupt sweep doc just means we
+    start the sweep over, which is safe (the schema gate makes pages
+    idempotent)."""
+    try:
+        raw = _db_get(_SWEEP_KEY, None)
+    except Exception as e:  # noqa: BLE001
+        log.debug("🔍🐞 autoscraper: sweep load failed: %s", e)
+        raw = None
+    if not isinstance(raw, dict):
+        return _default_sweep_state()
+    base = _default_sweep_state()
+    for k, v in raw.items():
+        if k in base:
+            base[k] = v
+    return base
+
+
+def _save_sweep(sw: Dict[str, Any]) -> None:
+    """Persist the sweep position to Mongo. Never raises."""
+    try:
+        sw["last_advanced_at"] = int(time.time())
+        _db_set(_SWEEP_KEY, dict(sw))
+    except Exception as e:  # noqa: BLE001
+        log.debug("🔍🐞 autoscraper: sweep save failed: %s", e)
+
+
+def _next_sort_pair(sw: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+    """Breadth-first (sort, page) walker for Phase 1.
+
+    Returns the CURRENT (sort, page) tuple, then mutates `sw` to point at
+    the NEXT one. Returns None when every sort × page combination has
+    been visited (the caller should transition to Phase 2).
+
+    Order: page 1 of every sort, then page 2 of every sort, ... up to
+    PAGE_CAP. This is what the user explicitly asked for — not the old
+    depth-first walk that finished all 30 pages of popular-today before
+    touching 'date'.
+    """
+    if sw["phase"] != 1:
+        return None
+    # v12.15 fix (was a real bug): the bounds check must happen BEFORE we
+    # return the pair. The old code returned (sort, page) even after page
+    # had already advanced past PAGE_CAP, so Phase 1 never ended and the
+    # walker kept re-serving pages past the cap. New order: roll sort_idx
+    # over to 0 and bump page when sort_idx wraps, THEN check page cap,
+    # THEN return the pair.
+    if sw["sort_idx"] >= len(_SORTS):
+        sw["sort_idx"] = 0
+        sw["page"] += 1
+    if sw["page"] > PAGE_CAP:
+        return None
+    sort = _SORTS[sw["sort_idx"]]
+    page = sw["page"]
+    # Advance: sort_idx walks INNER (fastest), page walks OUTER (slowest).
+    # That's what makes it breadth-first across sorts.
+    sw["sort_idx"] += 1
+    return (sort, page)
+
+
+def _phase1_complete(sw: Dict[str, Any]) -> bool:
+    """True when every sort has been walked through PAGE_CAP pages."""
+    return sw["phase"] == 1 and sw["page"] > PAGE_CAP
+
+
+def _fetch_trending_tags(scraper) -> List[str]:
+    """Auto-extend the tag list from nhentai's trending-tags endpoint.
+    Returns an empty list on any failure (we never let this break the
+    sweep — the hard-coded DEFAULT_TAGS still cover the common cases)."""
+    try:
+        import httpx
+        from . import scraper_bridge as _sb  # noqa: WPS433
+        r = httpx.get(
+            "https://nhentai.net/api/v2/tags/popular",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        payload = r.json() or {}
+        tags = payload.get("tags") if isinstance(payload, dict) else None
+        if not isinstance(tags, list):
+            return []
+        out = []
+        for t in tags:
+            if isinstance(t, dict) and t.get("name"):
+                out.append(str(t["name"]).strip().lower().replace(" ", "-"))
+        return [t for t in out if t and t not in DEFAULT_TAGS]
+    except Exception as e:  # noqa: BLE001
+        log.warning("🔍⚠️ autoscraper: trending-tags fetch failed: %s", e)
+        return []
+
+
+def _next_tag_pair(sw: Dict[str, Any], scraper) -> Optional[Tuple[str, int]]:
+    """Breadth-first (tag, page) walker for Phase 2.
+
+    Returns the CURRENT (tag, page) tuple, then mutates `sw` to point at
+    the NEXT one. Returns None when every tag has been walked through
+    TAG_PAGE_CAP pages (the caller should send the admin alert and loop
+    back to Phase 1).
+
+    Hybrid mode: when the hard-coded tags run out, we extend the active
+    tag list from nhentai's trending-tags endpoint ONCE per sweep.
+    """
+    if sw["phase"] != 2:
+        return None
+    # Auto-extend tags if the hard-coded list is exhausted and we haven't
+    # yet pulled trending tags this sweep.
+    if sw["tag_idx"] >= len(sw["tags_active"]):
+        new_tags = _fetch_trending_tags(scraper)
+        if new_tags:
+            sw["tags_active"] = list(sw["tags_active"]) + new_tags
+            log.info("🔍🏷️ autoscraper: extended tag list with %d trending tags", len(new_tags))
+        else:
+            return None  # truly nothing left to sweep
+    if sw["tag_idx"] >= len(sw["tags_active"]):
+        return None
+    tag = sw["tags_active"][sw["tag_idx"]]
+    page = sw["tag_page"]
+    # Advance: page walks INNER (fastest), tag walks OUTER (slowest).
+    # We fully sweep one tag's 5 pages before moving to the next tag.
+    sw["tag_page"] += 1
+    if sw["tag_page"] > TAG_PAGE_CAP:
+        sw["tags_done"] = list(sw.get("tags_done", [])) + [tag]
+        sw["tag_idx"] += 1
+        sw["tag_page"] = 1
+    return (tag, page)
+
+
+def _phase2_complete(sw: Dict[str, Any]) -> bool:
+    """True when every active tag has been walked through TAG_PAGE_CAP pages."""
+    if sw["phase"] != 2:
+        return False
+    return sw["tag_idx"] >= len(sw["tags_active"])
+
+
+async def _send_admin_alert(text: str) -> bool:
+    """Fire-once Telegram alert to the admin. Same transport as the dedup
+    cron's alert — best-effort, never raises."""
+    try:
+        import os
+        import httpx
+        bot_token = os.getenv("ADMIN_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
+        admin_chat = os.getenv("ADMIN_CHAT_ID") or os.getenv("ADMIN_USER_ID") or ""
+        if not (bot_token and admin_chat):
+            log.warning("🔍📣 autoscraper: alert skipped — ADMIN_BOT_TOKEN or ADMIN_CHAT_ID missing")
+            return False
+        r = httpx.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": admin_chat, "text": text},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            log.info("🔍📣 autoscraper: admin alert sent")
+            return True
+        log.warning("🔍⚠️ autoscraper: alert HTTP %s: %s", r.status_code, r.text[:200])
+        return False
+    except Exception as e:  # noqa: BLE001
+        log.warning("🔍⚠️ autoscraper: alert raised: %s", e)
+        return False
+
+
 def _read_enabled() -> bool:
     """Runtime toggle: DB flag wins over the env default so the admin
     Enable/Disable button (which lives in the backend process) actually
@@ -201,6 +437,15 @@ _state: Dict[str, Any] = {
     "skip_reasons":       _fresh_skip_counters(),
     # v12.13 (#D): plain-English one-liner surfaced in the admin panel.
     "status_text":        "Idle — waiting for next tick.",
+    # v12.15: durable sweep position mirrored into _state so the admin
+    # panel can show it. The authoritative copy lives in Mongo under
+    # _SWEEP_KEY; these fields are just the last-loaded snapshot.
+    "sweep_phase":            1,     # 1 = sorts sweep, 2 = tag sweep
+    "sweep_sort_idx":         0,
+    "sweep_page":             1,
+    "sweep_tag_idx":          0,
+    "sweep_tag_page":         1,
+    "sweep_sweeps_completed": 0,
 }
 
 
@@ -272,7 +517,8 @@ def _persist_state() -> None:
 
 
 def _plain_english_status(state: Dict[str, Any]) -> str:
-    """v12.14: one-line status in truly simple English, emoji-prefixed."""
+    """v12.15: one-line status in truly simple English, emoji-prefixed.
+    Now includes the current sweep phase and position."""
     if not state.get("enabled"):
         return "⏸️ Turned off by admin."
     phase = str(state.get("phase") or "idle")
@@ -287,6 +533,20 @@ def _plain_english_status(state: Dict[str, Any]) -> str:
     page = state.get("current_page")
     skips = state.get("skip_reasons") or {}
     done  = int(state.get("galleries_done_this_run") or 0)
+    sweep_phase = int(state.get("sweep_phase") or 1)
+    sweep_page  = int(state.get("sweep_page") or 1)
+    sweep_tag_idx = int(state.get("sweep_tag_idx") or 0)
+    sweep_tag_page = int(state.get("sweep_tag_page") or 1)
+    sweeps_done = int(state.get("sweep_sweeps_completed") or 0)
+
+    # v12.15: if the sweep is currently in Phase 2, surface the tag sweep.
+    if sweep_phase == 2:
+        tag = (state.get("current_sort") or "").replace("tag:", "") or "—"
+        return (
+            f"🏷️ Phase 2 (tag sweep): working on tag '{tag}' page {sweep_tag_page} — "
+            f"this is tag #{sweep_tag_idx + 1} of the popular-tag list."
+        )
+
     if phase == "running":
         pretty_sort = {
             "popular-today": "Popular Now",
@@ -294,7 +554,7 @@ def _plain_english_status(state: Dict[str, Any]) -> str:
             "popular":       "Popular",
             "date":          "New Uploads",
         }.get(sort, sort or "?")
-        return f"🔍 Working on {pretty_sort}, page {page or '?'}."
+        return f"🔍 Working on {pretty_sort}, page {page or '?'} (Phase 1 — sorts sweep)."
     if done > 0:
         return f"✅ Just saved {done} new gallery detail(s). Idle until next tick."
     if int(skips.get("no_search_page_cached", 0)) > 0:
@@ -303,23 +563,23 @@ def _plain_english_status(state: Dict[str, Any]) -> str:
         return "🚦 Waiting: nhentai has no tokens left — real users get priority."
     if int(skips.get("already_cached_fresh", 0)) > 0:
         n = int(skips.get("already_cached_fresh", 0))
-        return f"💾 Nothing to do — all {n} galleries on this page are already saved."
+        return (
+            f"💾 All {n} galleries on this page are already saved — "
+            f"the scraper will jump to the next page on its next tick."
+        )
     if int(skips.get("missing_gallery_id", 0)) > 0:
         return "⚠️ Some search rows had no gallery id — they were skipped."
     if int(skips.get("upstream_detail_empty", 0)) > 0:
         return "⚠️ nhentai returned empty details — will retry next tick."
+    if sweeps_done > 0:
+        return f"💤 Idle — sweep #{sweeps_done} complete, waiting for next tick."
     return "💤 Idle — waiting for next tick."
 
 
 def _friendly_explainer_lines(state: Dict[str, Any]) -> Dict[str, str]:
-    """v12.14: super-simple sentence per row of the admin panel.
-    Follows the user's exact pattern from the v12.14 feedback:
-      'phase = idle — it means open to work'
-      'paused = no — it means it's working'
-      'current = popular-today page 1 · gallery 671700 — popular today
-       page 1, the scraper is looking at gallery id 671700'
-    Every returned string is one short human sentence.
-    """
+    """v12.15: super-simple sentence per row of the admin panel, now with
+    Phase 1 / Phase 2 awareness so the admin can tell at a glance which
+    part of the sweep the scraper is in."""
     phase   = str(state.get("phase") or "idle")
     paused  = state.get("paused_reason")
     sort    = state.get("current_sort") or "—"
@@ -327,6 +587,11 @@ def _friendly_explainer_lines(state: Dict[str, Any]) -> Dict[str, str]:
     gid     = state.get("current_gallery_id") or "—"
     done    = int(state.get("galleries_done_this_run") or 0)
     skipped = int(state.get("galleries_skipped_this_run") or 0)
+    sweep_phase  = int(state.get("sweep_phase") or 1)
+    sweep_page   = int(state.get("sweep_page") or 1)
+    sweep_tag_idx = int(state.get("sweep_tag_idx") or 0)
+    sweep_tag_page = int(state.get("sweep_tag_page") or 1)
+    sweeps_done  = int(state.get("sweep_sweeps_completed") or 0)
     failed  = int(state.get("galleries_failed_this_run") or 0)
     runs    = int(state.get("run_count") or 0)
     return {
@@ -362,8 +627,17 @@ def _friendly_explainer_lines(state: Dict[str, Any]) -> Dict[str, str]:
                      "rate-limit us",
         "active":    "active window — a user counts as 'active' if they touched the app in "
                      "the last 5 minutes",
-        "page_cap":  "page cap — the scraper walks up to page 20 of each sort, then loops "
-                     "back to page 1",
+        "page_cap":  f"page cap — Phase 1 walks up to page {PAGE_CAP} of each sort "
+                     f"(4 sorts × {PAGE_CAP} pages = {4 * PAGE_CAP} pages total per sweep)",
+        # v12.15: sweep-position rows.
+        "sweep":     (f"sweep = Phase {sweep_phase} — "
+                      + (f"sorts sweep, currently on page {sweep_page} of {PAGE_CAP} "
+                         f"(sort #{int(state.get('sweep_sort_idx') or 0) + 1} of 4)"
+                         if sweep_phase == 1
+                         else f"tag sweep, currently on tag #{sweep_tag_idx + 1} page "
+                              f"{sweep_tag_page} of {TAG_PAGE_CAP}")),
+        "sweeps":    f"sweeps completed = {sweeps_done} — how many FULL sweeps "
+                     f"(Phase 1 + Phase 2) the scraper has finished since the process started",
     }
 
 
@@ -384,8 +658,11 @@ def last_run_summary() -> Dict[str, Any]:
         "day_rest_sec":    DAY_REST_SEC,
         "active_window":   ACTIVE_WINDOW,
         "page_cap":        PAGE_CAP,
+        "tag_page_cap":    TAG_PAGE_CAP,        # v12.15
+        "skip_fast_cap":   SKIP_FAST_CAP,       # v12.15
         "pages_per_tick":  PAGES_PER_TICK,
         "sorts":           list(_SORTS),
+        "default_tags":    list(DEFAULT_TAGS),  # v12.15
     }
     snap["enabled"] = _read_enabled()
     # v12.13 (#D): guarantee the skip_reasons dict + plain-English line
@@ -665,6 +942,104 @@ async def _scrape_page_details(sort: str, page: int) -> Dict[str, int]:
     return out
 
 
+async def _scrape_tag_page_details(tag: str, page: int) -> Dict[str, int]:
+    """v12.15 (Phase 2): hydrate details for every card on a TAG search page.
+
+    Mirrors _scrape_page_details but sources the card list from a live
+    nhentai tag search (`_direct_nhentai_search`) instead of the cached
+    sort-page. Consumes the `search` bucket for the list call and the
+    `galleries` bucket for each detail fetch, so user traffic still wins.
+    Never raises.
+    """
+    cache = _get_cache()
+    scraper = _get_scraper()
+    out = {"done": 0, "skipped": 0, "failed": 0}
+    if cache is None or scraper is None:
+        return out
+
+    _state["current_sort"] = f"tag:{tag}"
+    _state["current_page"] = page
+
+    # Token-bucket guard for the SEARCH list call itself.
+    try:
+        allowed = bool(cache.try_consume("search", cost=1.0))
+    except Exception:  # noqa: BLE001
+        allowed = True
+    if not allowed:
+        skips = _state.get("skip_reasons") or _fresh_skip_counters()
+        skips["token_bucket_denied"] = int(skips.get("token_bucket_denied", 0)) + 1
+        _state["skip_reasons"] = skips
+        out["skipped"] += 1
+        log.info("🔍🚦 autoscraper: search tokens empty, tag '%s' p%s deferred", tag, page)
+        return out
+
+    try:
+        items = scraper._direct_nhentai_search(tag, page, "popular")  # noqa: SLF001
+    except Exception as e:  # noqa: BLE001
+        items = None
+        _state["last_error"] = f"tag search {tag}:{page}: {e}"[:200]
+        log.warning("🔍⚠️ autoscraper: tag '%s' p%s search failed: %s", tag, page, e)
+
+    if not isinstance(items, list) or not items:
+        skips = _state.get("skip_reasons") or _fresh_skip_counters()
+        skips["no_search_page_cached"] = int(skips.get("no_search_page_cached", 0)) + 1
+        _state["skip_reasons"] = skips
+        out["skipped"] += 1
+        log.info("🔍⏳ autoscraper: tag '%s' p%s returned no cards", tag, page)
+        return out
+
+    log.info("🔍📄 autoscraper: scanning tag '%s' page %s (%d cards)", tag, page, len(items))
+
+    rest = NIGHT_REST_SEC if _is_night_window() else DAY_REST_SEC
+    skips = _state.get("skip_reasons") or _fresh_skip_counters()
+    for item in items:
+        gid = item.get("id") if isinstance(item, dict) else None
+        if gid in (None, ""):
+            skips["missing_gallery_id"] = int(skips.get("missing_gallery_id", 0)) + 1
+            out["skipped"] += 1
+            continue
+        gid = str(gid).strip()
+        _state["current_gallery_id"] = gid
+        gkey = _gallery_cache_key(gid)
+        try:
+            existing = cache.get(gkey, allow_stale=False)
+        except Exception:  # noqa: BLE001
+            existing = None
+        if existing is not None and _is_schema_complete(existing):
+            skips["already_cached_fresh"] = int(skips.get("already_cached_fresh", 0)) + 1
+            out["skipped"] += 1
+            continue
+        try:
+            allowed = bool(cache.try_consume("galleries", cost=1.0))
+        except Exception:  # noqa: BLE001
+            allowed = True
+        if not allowed:
+            skips["token_bucket_denied"] = int(skips.get("token_bucket_denied", 0)) + 1
+            out["skipped"] += 1
+            await asyncio.sleep(rest)
+            continue
+        try:
+            detail = scraper._direct_nhentai_detail(gid)  # noqa: SLF001
+        except Exception as e:  # noqa: BLE001
+            detail = None
+            _state["last_error"] = f"detail fetch {gid}: {e}"[:200]
+            log.warning("🔍⚠️ autoscraper: fetch id=%s crashed: %s", gid, e)
+        if isinstance(detail, dict) and detail.get("id") and _is_schema_complete(detail):
+            out["done"] += 1
+            log.info("🔍✅ autoscraper: id=%s saved to Turso (tag '%s')", gid, tag)
+        else:
+            skips["upstream_detail_empty"] = int(skips.get("upstream_detail_empty", 0)) + 1
+            out["failed"] += 1
+        await asyncio.sleep(rest)
+
+    _state["skip_reasons"] = skips
+    log.info(
+        "🔍📊 autoscraper: tag '%s' p%s summary done=%d skipped=%d failed=%d",
+        tag, page, out["done"], out["skipped"], out["failed"],
+    )
+    return out
+
+
 async def scrape_once() -> Dict[str, Any]:
     """Run one tick. Never raises. Returns last_run_summary() at the end."""
     # v12.12: read the toggle from Mongo every tick so the admin panel's
@@ -724,19 +1099,43 @@ async def scrape_once() -> Dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             res = {"done": 0, "skipped": 0, "failed": 0}
             _state["last_error"] = f"priority page {sort}:{page} raised: {e}"[:200]
-            log.exception("details_scraper: priority page %s:%s crashed: %s", sort, page, e)
+            log.exception("🔍⚠️ autoscraper: priority page %s:%s crashed: %s", sort, page, e)
         _state["galleries_done_this_run"]    += int(res.get("done", 0))
         _state["galleries_skipped_this_run"] += int(res.get("skipped", 0))
         _state["galleries_failed_this_run"]  += int(res.get("failed", 0))
         walked += 1
 
-    # Walk the sort × page grid in priority order, one page per tick.
-    for sort in _SORTS:
-        if walked >= PAGES_PER_TICK:
-            break
-        for page in range(1, PAGE_CAP + 1):
-            if walked >= PAGES_PER_TICK:
-                break
+    # v12.15: TWO-PHASE BREADTH-FIRST SWEEP.
+    # Load the durable sweep position (Mongo) so a Render restart doesn't
+    # reset the walker to (popular-today, page 1). Phase 1 walks the 4
+    # sorts × 30 pages breadth-first; Phase 2 walks the popular-tag list
+    # × 5 pages each; on full completion the admin gets ONE Telegram
+    # alert and the sweep loops back to Phase 1.
+    sweep = _load_sweep()
+    _state["sweep_phase"] = sweep["phase"]
+    _state["sweep_sort_idx"] = sweep["sort_idx"]
+    _state["sweep_page"] = sweep["page"]
+    _state["sweep_tag_idx"] = sweep["tag_idx"]
+    _state["sweep_tag_page"] = sweep["tag_page"]
+    _state["sweep_sweeps_completed"] = sweep["sweeps_completed"]
+
+    # Skip-fast advance: if the walker lands on a fully-cached page,
+    # advance to the next pair in the SAME tick instead of burning the
+    # whole tick. Bounded by SKIP_FAST_CAP so the worker still has head-
+    # room for real user traffic.
+    advances = 0
+    while walked < PAGES_PER_TICK and advances < SKIP_FAST_CAP:
+        if sweep["phase"] == 1:
+            pair = _next_sort_pair(sweep)
+            if pair is None:
+                # Phase 1 done → transition to Phase 2.
+                sweep["phase"] = 2
+                sweep["tag_idx"] = 0
+                sweep["tag_page"] = 1
+                log.info("🔍🎯 autoscraper: Phase 1 complete, switching to Phase 2 (tag sweep)")
+                _save_sweep(sweep)
+                continue
+            sort, page = pair
             _state["current_sort"] = sort
             _state["current_page"] = page
             try:
@@ -744,21 +1143,104 @@ async def scrape_once() -> Dict[str, Any]:
             except Exception as e:  # noqa: BLE001
                 res = {"done": 0, "skipped": 0, "failed": 0}
                 _state["last_error"] = f"page {sort}:{page} raised: {e}"[:200]
-                log.exception("details_scraper: page %s:%s crashed: %s", sort, page, e)
+                log.exception("🔍⚠️ autoscraper: page %s:%s crashed: %s", sort, page, e)
             _state["galleries_done_this_run"]    += int(res.get("done", 0))
             _state["galleries_skipped_this_run"] += int(res.get("skipped", 0))
             _state["galleries_failed_this_run"]  += int(res.get("failed", 0))
             walked += 1
+            advances += 1
+            _save_sweep(sweep)
+            # Skip-fast: if everything on the page was already cached,
+            # advance again in this same tick instead of idling.
+            skip_reasons = _state.get("skip_reasons") or {}
+            if (
+                int(res.get("done", 0)) == 0
+                and int(res.get("failed", 0)) == 0
+                and int(skip_reasons.get("already_cached_fresh", 0)) > 0
+                and int(skip_reasons.get("no_search_page_cached", 0)) == 0
+            ):
+                log.info("🔍⏭️ autoscraper: %s p%s fully cached — advancing to next pair", sort, page)
+                continue  # loop back and pick the next pair
+            break  # real work happened — end the tick
+        else:
+            # Phase 2 — tag sweep.
+            scraper = _get_scraper()
+            pair = _next_tag_pair(sweep, scraper)
+            if pair is None:
+                # Phase 2 done — fire admin alert ONCE, then loop back
+                # to Phase 1 for a fresh sweep (user's choice).
+                if not sweep.get("alert_sent"):
+                    alert_text = (
+                        "🔍🎉 Autoscraper finished the full sweep!\n\n"
+                        f"Phase 1: 4 sorts × {PAGE_CAP} pages — done.\n"
+                        f"Phase 2: {len(sweep.get('tags_active', []))} tags × {TAG_PAGE_CAP} pages — done.\n\n"
+                        "Looping back to Phase 1 for a fresh sweep now."
+                    )
+                    sent = await _send_admin_alert(alert_text)
+                    sweep["alert_sent"] = True
+                    if not sent:
+                        log.warning("🔍⚠️ autoscraper: full-sweep alert failed to send")
+                # Reset for the next sweep.
+                sweep["phase"] = 1
+                sweep["sort_idx"] = 0
+                sweep["page"] = 1
+                sweep["tag_idx"] = 0
+                sweep["tag_page"] = 1
+                sweep["tags_done"] = []
+                sweep["tags_active"] = list(DEFAULT_TAGS)
+                sweep["sweeps_completed"] = int(sweep.get("sweeps_completed", 0)) + 1
+                sweep["alert_sent"] = False
+                log.info("🔍🔄 autoscraper: sweep #%d starting fresh from Phase 1",
+                         sweep["sweeps_completed"])
+                _save_sweep(sweep)
+                continue
+            tag, page = pair
+            _state["current_sort"] = f"tag:{tag}"
+            _state["current_page"] = page
+            try:
+                res = await _scrape_tag_page_details(tag, page)
+            except Exception as e:  # noqa: BLE001
+                res = {"done": 0, "skipped": 0, "failed": 0}
+                _state["last_error"] = f"tag page {tag}:{page} raised: {e}"[:200]
+                log.exception("🔍⚠️ autoscraper: tag %s:%s crashed: %s", tag, page, e)
+            _state["galleries_done_this_run"]    += int(res.get("done", 0))
+            _state["galleries_skipped_this_run"] += int(res.get("skipped", 0))
+            _state["galleries_failed_this_run"]  += int(res.get("failed", 0))
+            walked += 1
+            advances += 1
+            _save_sweep(sweep)
+            # Skip-fast: same logic as Phase 1.
+            skip_reasons = _state.get("skip_reasons") or {}
+            if (
+                int(res.get("done", 0)) == 0
+                and int(res.get("failed", 0)) == 0
+                and int(skip_reasons.get("already_cached_fresh", 0)) > 0
+                and int(skip_reasons.get("no_search_page_cached", 0)) == 0
+            ):
+                log.info("🔍⏭️ autoscraper: tag '%s' p%s fully cached — advancing", tag, page)
+                continue
+            break
+
+    # Update the live-state dict so the admin panel shows the CURRENT
+    # sweep position (not the position at the start of the tick).
+    _state["sweep_phase"] = sweep["phase"]
+    _state["sweep_sort_idx"] = sweep["sort_idx"]
+    _state["sweep_page"] = sweep["page"]
+    _state["sweep_tag_idx"] = sweep["tag_idx"]
+    _state["sweep_tag_page"] = sweep["tag_page"]
+    _state["sweep_sweeps_completed"] = sweep["sweeps_completed"]
 
     _state["finished_at"] = int(time.time())
     _state["phase"] = "idle"
     _persist_state()
+    _done   = _state["galleries_done_this_run"]
+    _skip   = _state["galleries_skipped_this_run"]
+    _fail   = _state["galleries_failed_this_run"]
+    _emoji  = "🎉" if _done > 0 else ("💤" if _fail == 0 else "⚠️")
     log.info(
-        "details_scraper: tick end sort=%s page=%s done=%d skipped=%d failed=%d",
-        _state["current_sort"], _state["current_page"],
-        _state["galleries_done_this_run"],
-        _state["galleries_skipped_this_run"],
-        _state["galleries_failed_this_run"],
+        "🔍%s autoscraper: tick end phase=%s current=%s p%s done=%d skipped=%d failed=%d advances=%d",
+        _emoji, sweep["phase"], _state["current_sort"], _state["current_page"],
+        _done, _skip, _fail, advances,
     )
     return last_run_summary()
 
