@@ -129,6 +129,72 @@ form.search-bar { margin: 0; width: 100%; }
 }
 
 /* ============================================================
+   PAGINATION BAR (v12.16) — strict page-by-page navigation
+   Compact dark bar: « ‹ 1 2 3 4 5 6 7 › » with a circular
+   accent highlight on the active page (nhentai-style).
+   ============================================================ */
+.du-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 8px;
+  margin-top: 4px;
+  border-radius: var(--du-radius-lg, 18px);
+  background: var(--du-bg-1, #0c0e14);
+}
+.du-page-btn {
+  min-width: 38px;
+  height: 38px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--du-border, rgba(255, 82, 82, 0.12));
+  border-radius: var(--du-radius-pill, 999px);
+  background: transparent;
+  color: var(--du-ink-mid, #b9bec8);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.du-page-btn:hover:not(:disabled) {
+  background: var(--du-bg-2, #12151d);
+  color: var(--du-ink-hi, #f2f4f8);
+}
+.du-page-btn:active:not(:disabled) {
+  transform: scale(0.94);
+}
+.du-page-btn.active {
+  background: var(--du-accent, #ff3b3b);
+  border-color: var(--du-accent, #ff3b3b);
+  color: var(--du-ink-inv, #0b0d12);
+  font-weight: 700;
+}
+.du-page-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.du-page-nav {
+  font-size: 17px;
+  font-weight: 700;
+}
+.du-rate-note {
+  font-size: 13px;
+  color: var(--du-accent-3, #ffcf5c);
+}
+/* Narrow viewports: slightly smaller buttons so 7 numbers + 4 nav fit. */
+@media (max-width: 420px) {
+  .du-page-btn { min-width: 32px; height: 32px; padding: 0 8px; font-size: 14px; }
+  .du-pagination { gap: 4px; }
+}
+
+/* ============================================================
    GALLERY CARD
    ============================================================ */
 .card-grid {

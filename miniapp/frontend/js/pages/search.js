@@ -5,8 +5,13 @@
     - smart search bar (uses plugins/search-operators.js)
     - filter chip row (English is baked in; chips just toggle sort presets)
     - grid of cards (uses components/card.js via components registry)
-    - infinite scroll on the grid
+    - strict nhentai-style page picker (« ‹ 1..7 › ») — v12.16
     - tap a card → detail sheet whose buttons come from plugins/card-actions.js
+
+  v12.16: accumulation (infinite scroll / "Load next page" append) REMOVED.
+  Every navigation goes through goToPage(n), which fetches ONLY page n,
+  clears the grid, and REPLACES state.results. This keeps DOM + memory flat
+  no matter how deep the user pages — critical on 512 MB Render + WebViews.
 */
 
 import { api } from "core/api.js";
@@ -21,38 +26,48 @@ import { renderTrendingTags, renderRecommendations } from "plugins/home-rows.js"
 // extra upstream fetches; detail data only loads when the sheet is open.
 
 const PAGE_SIZE = 25;
+// v12.16: max numbered buttons in the pagination window (nhentai uses 7).
+const PAGE_WINDOW = 7;
 
 export async function render(root, { me }) {
-  // v12.1 (C): paginated mode uses a "Load next page" button on narrow
-  // viewports (mobile — where the 429 storm was worst). Infinite scroll
-  // stays on wide viewports. The user's manual chip-tap acknowledges each
-  // new page, which naturally caps upstream load. Env-neutral: no build step.
-  const PAGINATED = (typeof window !== "undefined")
-    && !!(window.matchMedia && window.matchMedia("(max-width: 768px)").matches);
-
   const state = {
     query: "",
     parsed: parseSearch(""),
-    // v12.11 (#2): default landing tab is "Popular Now" (popular-today),
-    // not the older "Popular" firehose. buildChipRow already lists
-    // Popular Now first (v12.10 #3), so activating this sort here makes
-    // the very first grid paint match the very first visible chip.
+    // v12.11 (#2): default landing tab is "Popular Now" (popular-today).
     sort: "popular-today",
     page: 1,
     loading: false,
-    done: false,
     results: [],
-    token: 0,     // v12 (#1): bumped on every refetch — stale responses drop
-    rerun: false, // v12 (#1): queued re-entry when load() is busy
-    hasMore: false, // v12.1 (C): server-reported has_more; drives the button
-    rateLimited: false, // v12.1 (C): last page hit upstream 429 — offer retry
-    paginated: PAGINATED,
+    token: 0,            // v12 (#1): bumped on every refetch — stale responses drop
+    rerun: false,        // v12 (#1): queued re-entry when load() is busy
+    hasMore: false,      // server-reported has_more for the CURRENT page
+    rateLimited: false,  // last page hit upstream 429 — offer retry
+    // v12.16: two DISTINCT learned bounds (do NOT conflate — v12.16 bug):
+    //   highestKnownPage — highest page number we have POSITIVE evidence
+    //                      exists (grows whenever has_more=true or a page
+    //                      loads). Used to size the numbered window.
+    //   knownLastPage    — the actual LAST page, learned ONLY when a fetch
+    //                      returns has_more === false. » jumps here; it is
+    //                      disabled until this is honestly known.
+    highestKnownPage: 0,
+    knownLastPage: 0,
   };
+
+  // v12.16: hash restore — parse page/sort/q out of location.hash so a
+  // back-button or a pasted link lands on the exact page the user left.
+  // Format: #search?page=4&sort=popular-week&q=tag:vanilla
+  _applyHashState(state);
 
   // v12 (#1): buildSearchBar needs toggleHomeRows — it was called from
   // commit() in v11.9 without being in scope, so EVERY typing/Enter event
   // threw ReferenceError before refetch() could fire. Pass it in.
   const $bar = buildSearchBar(state, refetch, toggleHomeRows);
+  // v12.16: if the hash carried a query, prefill the input so the visible
+  // search box matches the restored results.
+  if (state.query) {
+    const inp = $bar.querySelector("input");
+    if (inp) { inp.value = state.query; }
+  }
   const $chips = buildChipRow(state, refetch);
   const $hint = h("div", { class: "search-hint" },
     "Try: ", h("code", {}, "tag:vanilla"), " ",
@@ -73,7 +88,7 @@ export async function render(root, { me }) {
   const $recs = renderRecommendations(me);
   const $home = h("div", { class: "home-rows" }, $trending, $recs);
   const $grid = h("div", { class: "card-grid" });
-  const $footer = h("div", { class: "u-center", style: { padding: "24px 0" } });
+  const $footer = h("div", { class: "u-center", style: { padding: "16px 0 24px" } });
 
   root.append($bar, $hint, $chips, $home, $grid, $footer);
 
@@ -83,70 +98,133 @@ export async function render(root, { me }) {
   }
   toggleHomeRows();
 
+  // v12.16: react to back/forward hash changes that target the search page.
+  // The router re-renders the whole page on hashchange (routeTo), which
+  // already restores state via _applyHashState — so this listener only
+  // matters when the hash changes WITHOUT a routeTo re-render (defensive).
+  // The returned teardown unregisters it.
+  const onHashChange = () => {
+    const h0 = (location.hash || "");
+    if (!/^#?\/?search/i.test(h0)) return;  // not our page
+    const before = state.page;
+    _applyHashState(state);
+    if (state.page !== before) goToPage(state.page);
+  };
+  window.addEventListener("hashchange", onHashChange);
+
   // Initial load with a skeleton grid.
   showSkeleton();
   await load();
 
-  // v12.1 (C): infinite scroll ONLY on wide viewports. On mobile we use a
-  // "Load next page" button (rendered by renderFooter()) so each page is a
-  // deliberate user action — that naturally caps prefetch storms.
-  let io = null;
-  if (!state.paginated) {
-    io = new IntersectionObserver((entries) => {
-      for (const e of entries) {
-        if (e.isIntersecting && !state.loading && !state.done && state.hasMore) load();
-      }
-    }, { rootMargin: "600px 0px" });
-    io.observe($footer);
-  }
+  // v12.16: IntersectionObserver infinite scroll REMOVED entirely.
+  // v12.16: mobile "Load next page" button REMOVED — pagination bar below
+  // replaces both accumulation modes on every viewport.
+
+  /* ------------------------------------------------------------------ */
+  /* Pagination bar (v12.16)                                             */
+  /* ------------------------------------------------------------------ */
 
   function renderFooter() {
     $footer.innerHTML = "";
     if (state.loading) { $footer.textContent = "Loading…"; return; }
 
-    // v12.11 (#3): the Next-Page button MUST render on every sort tab
-    // regardless of what has_more said, as long as the current page
-    // returned any rows and we're on a paginated viewport. In v12.10
-    // (mobile), a False has_more from the backend used to collapse the
-    // footer to '— end —' silently — which is exactly what the user
-    // reported: "no next page option on any pages". Trust the results:
-    // if we got a full-size page, we KNOW upstream has more.
-    const showNextBtn = state.paginated
-      && state.results.length > 0
-      && (state.hasMore || state.results.length >= PAGE_SIZE * state.page - PAGE_SIZE || state.rateLimited);
-
-    if (!state.hasMore && !showNextBtn && state.results.length > 0) {
-      $footer.textContent = "— end —"; return;
+    // No results at all → no bar, just the empty state (grid shows it).
+    if (state.results.length === 0 && !state.hasMore && state.page === 1) {
+      $footer.textContent = "";
+      return;
     }
-    if (!state.hasMore && state.results.length === 0) { $footer.textContent = ""; return; }
 
-    if (state.paginated) {
-      // Always render the button when we have results on a paginated
-      // viewport. Label + haptic distinguish the two flavors.
-      const btn = h("button", { class: "btn btn-primary next-page-btn",
-        style: { padding: "12px 24px", fontWeight: "600", fontSize: "var(--du-fs-md)" },
-      }, state.rateLimited ? "⚠ Rate-limited — tap to retry"
-                            : `Load next page (→ page ${state.page})`);
-      btn.addEventListener("click", () => { haptic("medium"); load(); });
-      $footer.appendChild(btn);
-    } else {
-      $footer.textContent = state.rateLimited
-        ? "Upstream rate-limited — scroll to retry"
-        : "Scroll for more";
+    // Rate-limit note rides above the bar when present.
+    if (state.rateLimited) {
+      $footer.appendChild(h("div", {
+        class: "du-rate-note",
+        style: { marginBottom: "8px" },
+      }, "⚠ Upstream rate-limited — some results may be missing. Retry the page."));
     }
+
+    $footer.appendChild(buildPaginationBar());
   }
+
+  function buildPaginationBar() {
+    const cur = state.page;
+    // Highest page we can offer a numbered button for: when has_more is
+    // true at least cur+1 exists; otherwise cur is the end. Fold in the
+    // learned high-water mark and (if known) the real last page.
+    let lastKnown = state.hasMore ? cur + 1 : cur;
+    if (state.highestKnownPage > lastKnown) lastKnown = state.highestKnownPage;
+    if (state.knownLastPage > lastKnown) lastKnown = state.knownLastPage;
+
+    // Numbered window: ≤ PAGE_WINDOW buttons, centered on current page,
+    // clamped to [1, lastKnown].
+    let start = Math.max(1, cur - Math.floor(PAGE_WINDOW / 2));
+    let end = Math.min(lastKnown, start + PAGE_WINDOW - 1);
+    start = Math.max(1, end - PAGE_WINDOW + 1);
+
+    const bar = h("nav", {
+      class: "du-pagination",
+      role: "navigation",
+      "aria-label": "Pages",
+    });
+
+    const navBtn = (label, target, disabled, ariaLabel) => {
+      const b = h("button", {
+        class: "du-page-btn du-page-nav",
+        type: "button",
+        "aria-label": ariaLabel,
+      }, label);
+      if (disabled) b.disabled = true;
+      else b.addEventListener("click", () => { haptic("light"); goToPage(target); });
+      return b;
+    };
+
+    bar.appendChild(navBtn("«", 1, cur === 1, "First page"));
+    bar.appendChild(navBtn("‹", cur - 1, cur === 1, "Previous page"));
+
+    for (let p = start; p <= end; p++) {
+      const b = h("button", {
+        class: "du-page-btn" + (p === cur ? " active" : ""),
+        type: "button",
+        "aria-label": "Page " + p,
+      }, String(p));
+      if (p === cur) b.setAttribute("aria-current", "page");
+      else b.addEventListener("click", () => { haptic("light"); goToPage(p); });
+      bar.appendChild(b);
+    }
+
+    // › next: disabled only when we KNOW there is no next page
+    // (has_more false on the current page).
+    bar.appendChild(navBtn("›", cur + 1, !state.hasMore, "Next page"));
+    // » last: enabled ONLY once a real end has been observed
+    // (knownLastPage > 0) and the user is not already on it.
+    const lastBtnDisabled = !state.knownLastPage || cur >= state.knownLastPage;
+    bar.appendChild(navBtn("»", state.knownLastPage || cur, lastBtnDisabled, "Last page"));
+
+    return bar;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Loading                                                             */
+  /* ------------------------------------------------------------------ */
 
   function showSkeleton() {
     $grid.innerHTML = "";
     $grid.appendChild(make("skeleton", { variant: "card-grid", count: 6 }));
   }
 
+  // v12.16: query/sort changes reset to page 1 — a strict page replace.
   async function refetch() {
-    state.token = (state.token || 0) + 1;  // v12: invalidate in-flight loads
-    state.page = 1;
-    state.done = false;
-    state.results = [];
+    await goToPage(1);
+  }
+
+  // v12.16: THE single navigation entry point. Fetches ONLY page n,
+  // clears the grid, REPLACES state.results (never pushes), updates the
+  // hash, re-renders the pagination bar.
+  async function goToPage(n) {
+    n = Math.max(1, n | 0);
+    state.token = (state.token || 0) + 1;   // invalidate in-flight loads
+    state.page = n;
     showSkeleton();
+    _writeHashState(state);
     await load();
   }
 
@@ -156,17 +234,13 @@ export async function render(root, { me }) {
   // re-entry instead, and every awaited response is dropped if its token
   // no longer matches — so the latest request always owns the grid.
   async function load() {
-    // v12.11 (#3): honor state.done ONLY when we're sure it's end-of-results
-    // (state.hasMore was false AND we already have rows). A user tapping the
-    // Next-Page button must never no-op silently.
-    if (state.done && !state.paginated) return;
     if (state.loading) { state.rerun = true; return; }
     state.loading = true;
     try {
       do {
         state.rerun = false;
         const token = state.token;
-        renderFooter();  // v12.1 (C): unified "Loading…" via renderFooter
+        renderFooter();  // "Loading…" while in flight
         let rows = null;
         try {
           const p = state.parsed;
@@ -192,30 +266,41 @@ export async function render(root, { me }) {
         }
         if (token !== state.token) continue;  // stale response → never paint
         const items = rows.items || [];
-        // v12.1 (B/C): use server-reported has_more instead of guessing from
-        // items.length < PAGE_SIZE (which lied when the English filter dropped
-        // most of an upstream page).
         state.hasMore = !!rows.has_more;
         state.rateLimited = !!rows.upstream_rate_limited;
-        if (state.page === 1) $grid.innerHTML = "";
+
+        // v12.16 STRICT REPLACEMENT — the core of the whole task:
+        //   1. ALWAYS clear the grid (not just on page 1).
+        //   2. state.results is ASSIGNED, never pushed into.
+        //   3. state.page is NEVER incremented here — goToPage owns it.
+        $grid.innerHTML = "";
         for (const g of items) {
           $grid.appendChild(renderCard(g));
-          // v12.3: prefetchGallery storm REMOVED entirely — the single
-          // biggest contributor to the 429 flood in the Render log.
         }
-        state.page += 1;
-        state.done = !state.hasMore;
-        renderFooter();
-        if (state.results.length === 0 && items.length === 0) {
+        state.results = items;
+
+        // v12.16: update the two learned bounds.
+        //  - has_more=true  → page+1 provably exists → bump high-water mark.
+        //  - has_more=false → this page IS the honest last page → record it.
+        if (state.hasMore) {
+          if (state.page + 1 > state.highestKnownPage) {
+            state.highestKnownPage = state.page + 1;
+          }
+        } else if (state.page > 0) {
+          state.knownLastPage = state.page;
+          if (state.page > state.highestKnownPage) {
+            state.highestKnownPage = state.page;
+          }
+        }
+
+        if (items.length === 0) {
           $grid.appendChild(emptyState());
         }
-        state.results.push(...items);
-      } while (state.rerun && !state.done);
+        renderFooter();
+      } while (state.rerun);
     } finally {
       state.loading = false;
-      // v12.1 (C): the in-loop renderFooter() calls run while loading=true
-      // and early-return with "Loading…". Re-render NOW so the paginated
-      // "Load next page" button (or "— end —") actually replaces it.
+      // Re-render so the real bar replaces "Loading…".
       try { renderFooter(); } catch (_) { /* footer cosmetics only */ }
     }
   }
@@ -231,7 +316,6 @@ export async function render(root, { me }) {
   function openDetail(g) {
     // Fetch V2 dedup status once, in the background, so the sheet re-renders
     // its primary button as "Open Post" / "Downloading…" / "Queue to Channel".
-    // The sheet appears immediately; the status update follows within one RTT.
     if (!g.v2_status) {
       api.get(`/api/gallery/${g.id}/status`)
         .then(s => { g.v2_status = s || { known: false }; })
@@ -255,9 +339,6 @@ export async function render(root, { me }) {
       });
 
     // ---- detail-sheet body --------------------------------------------------
-    // Shows cover + clean title immediately, then swaps in the full caption
-    // (titles, grouped tags, favorites, upload date) when /api/gallery/{id}
-    // returns. The sheet content is rebuilt in place so there's no flash.
     const GROUP_ORDER = ["parody", "character", "artist", "group", "language", "category", "tag"];
     const GROUP_LABEL = {
       parody: "Parody", character: "Characters", artist: "Artist",
@@ -352,8 +433,61 @@ export async function render(root, { me }) {
     );
   }
 
-  return () => io.disconnect();
+  return () => {
+    // v12.16: no IntersectionObserver to disconnect anymore.
+    window.removeEventListener("hashchange", onHashChange);
+  };
 }
+
+/* ---------------------------------------------------------------------- */
+/* Hash persistence (v12.16)                                               */
+/* ---------------------------------------------------------------------- */
+
+// Parse #search?page=N&sort=S&q=Q into state. Called on mount and on
+// hashchange. Unknown / missing params fall back to current defaults.
+function _applyHashState(state) {
+  const raw = (typeof location !== "undefined" ? location.hash : "") || "";
+  const qIdx = raw.indexOf("?");
+  if (qIdx < 0) return;
+  let params;
+  try { params = new URLSearchParams(raw.slice(qIdx + 1)); }
+  catch (_) { return; }
+
+  const p = parseInt(params.get("page") || "", 10);
+  if (Number.isFinite(p) && p >= 1) state.page = p;
+
+  const s = params.get("sort");
+  if (s && typeof s === "string") {
+    state.sort = s;
+    if (state.parsed) state.parsed.sort = s;
+  }
+
+  const q = params.get("q");
+  if (q !== null && q !== undefined) {
+    state.query = q;
+    state.parsed = parseSearch(q);
+    // An explicit q in the hash wins over a bare sort param.
+    if (state.parsed && state.parsed.sort) state.sort = state.parsed.sort;
+  }
+}
+
+// Write state back into the hash WITHOUT triggering a router re-render:
+// use history.replaceState so the URL updates silently (no hashchange
+// event, no routeTo, no page teardown).
+function _writeHashState(state) {
+  if (typeof history === "undefined" || !history.replaceState) return;
+  const params = new URLSearchParams();
+  params.set("page", String(state.page));
+  params.set("sort", (state.parsed && state.parsed.sort) || state.sort || "popular-today");
+  const q = (state.query || "").trim();
+  if (q) params.set("q", q);
+  const url = "#search?" + params.toString();
+  try { history.replaceState(null, "", url); } catch (_) { /* best-effort */ }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Search bar (unchanged from v12.15 except refetch → page-1 reset)        */
+/* ---------------------------------------------------------------------- */
 
 function buildSearchBar(state, refetch, toggleHomeRows) {
   const input = h("input", {
@@ -440,7 +574,6 @@ function buildSearchBar(state, refetch, toggleHomeRows) {
 function buildChipRow(state, refetch) {
   const row = h("div", { class: "chip-row" });
   // v12.10 (#3+#5): order — Popular Now → New Uploads → Popular Week → Popular
-  // Renamed: "Recent" → "New Uploads", "Popular Today" → "Popular Now".
   const opts = [
     { label: "⭐ Popular Now",   sort: "popular-today" },
     { label: "🆕 New Uploads",   sort: "date" },
@@ -455,6 +588,8 @@ function buildChipRow(state, refetch) {
         for (const c of row.querySelectorAll(".chip")) c.setAttribute("aria-pressed", "false");
         chip.setAttribute("aria-pressed", "true");
         state.sort = o.sort;
+        // v12.16: a sort change is a new result set → reset to page 1.
+        // refetch() routes through goToPage(1).
         refetch();
       },
     });
