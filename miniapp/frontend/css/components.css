@@ -129,25 +129,27 @@ form.search-bar { margin: 0; width: 100%; }
 }
 
 /* ============================================================
-   PAGINATION BAR (v12.16) — strict page-by-page navigation
-   Compact dark bar: « ‹ 1 2 3 4 5 6 7 › » with a circular
-   accent highlight on the active page (nhentai-style).
+   PAGINATION BAR (v12.16 / bumped v12.17) — strict page-by-page.
+   Bar: « ‹ ❶ 2 3 4 5 › » where the active page uses the ❶..❾
+   Unicode dingbats so the current position is unmistakable at a
+   glance. v12.17 bumps the button size for easier tapping on
+   Telegram WebView (44px hit target follows WCAG 2.5.5).
    ============================================================ */
 .du-pagination {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
   align-items: center;
-  gap: 6px;
-  padding: 10px 8px;
+  gap: 8px;
+  padding: 12px 10px;
   margin-top: 4px;
   border-radius: var(--du-radius-lg, 18px);
   background: var(--du-bg-1, #0c0e14);
 }
 .du-page-btn {
-  min-width: 38px;
-  height: 38px;
-  padding: 0 10px;
+  min-width: 44px;
+  height: 44px;
+  padding: 0 12px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -155,7 +157,7 @@ form.search-bar { margin: 0; width: 100%; }
   border-radius: var(--du-radius-pill, 999px);
   background: transparent;
   color: var(--du-ink-mid, #b9bec8);
-  font-size: 15px;
+  font-size: 17px;
   font-weight: 600;
   line-height: 1;
   cursor: pointer;
@@ -171,27 +173,34 @@ form.search-bar { margin: 0; width: 100%; }
   transform: scale(0.94);
 }
 .du-page-btn.active {
-  background: var(--du-accent, #ff3b3b);
+  /* v12.17: the ❶..❾ glyph carries its own weight; a bg-1 tint plus
+     accent ring + accent color gives a clean highlight without hiding
+     the glyph inside a solid pill. */
+  background: var(--du-bg-1, #0c0e14);
   border-color: var(--du-accent, #ff3b3b);
-  color: var(--du-ink-inv, #0b0d12);
-  font-weight: 700;
+  color: var(--du-accent, #ff3b3b);
+  font-weight: 800;
+  font-size: 22px;
+  box-shadow: 0 0 0 2px rgba(var(--du-accent-rgb, 255, 59, 59), 0.18);
 }
 .du-page-btn:disabled {
   opacity: 0.35;
   cursor: default;
 }
 .du-page-nav {
-  font-size: 17px;
+  font-size: 20px;
   font-weight: 700;
 }
 .du-rate-note {
   font-size: 13px;
   color: var(--du-accent-3, #ffcf5c);
 }
-/* Narrow viewports: slightly smaller buttons so 7 numbers + 4 nav fit. */
+/* Narrow viewports: still-generous tap targets, tighter spacing. */
 @media (max-width: 420px) {
-  .du-page-btn { min-width: 32px; height: 32px; padding: 0 8px; font-size: 14px; }
-  .du-pagination { gap: 4px; }
+  .du-page-btn { min-width: 38px; height: 38px; padding: 0 8px; font-size: 15px; }
+  .du-page-btn.active { font-size: 20px; }
+  .du-page-nav { font-size: 18px; }
+  .du-pagination { gap: 6px; padding: 10px 8px; }
 }
 
 /* ============================================================

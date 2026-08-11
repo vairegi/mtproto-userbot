@@ -40,7 +40,8 @@ export async function render(root, { me }) {
       { value: "dark",  label: "Always Dark" },
       { value: "light", label: "Always Light" },
     ]),
-    paletteRow(),                                   // v11.7: swatch dropdown
+    paletteRow(),                                   // v12.17: flat list
+    toggleRow("Reset theme on close", "reset_theme_on_close"),
     toggleRow("Reduce motion",    "reduced_motion"),
   ]));
   root.appendChild(section("Interaction", [
@@ -180,46 +181,20 @@ function selectRow(label, key, opts) {
 }
 
 /* ---------------------------------------------------------------
-   paletteRow — v11.7 custom picker with 3-color swatch preview.
-   The visible chip shows the currently active palette's swatch;
-   the dropdown lists all palettes with their own mini swatches.
-   Auto option's swatch adapts to whatever resolvePalette() returns.
+   paletteRow — v12.17 flat vertical picker, matching the reference
+   screenshot: colored dot + label per row, active row highlighted in
+   accent color with a ✓ on the right. No chip+popover. The "auto"
+   option mirrors whatever resolvePalette() returns.
    --------------------------------------------------------------- */
 function paletteRow() {
-  const row  = h("div", { class: "kv-row", style: { alignItems: "center" } });
-  const cur  = prefs.get("background_theme") || "auto";
-
-  // Chip button — the visible current value
-  const chip = h("button", {
-    class: "btn secondary",
-    style: {
-      display: "inline-flex", alignItems: "center", gap: "8px",
-      padding: "6px 10px", fontSize: "13px", borderRadius: "10px",
-    },
-    "aria-haspopup": "listbox",
-    "aria-expanded": "false",
-  });
-
-  // Popover (hidden until opened)
-  const pop = h("div", {
-    class: "palette-pop",
-    style: {
-      position: "absolute", zIndex: "1000",
-      right: "0", marginTop: "6px",
-      minWidth: "240px", maxHeight: "360px", overflowY: "auto",
-      background: "var(--du-bg-1)",
-      border: "1px solid var(--du-border-strong)",
-      borderRadius: "14px",
-      boxShadow: "var(--du-shadow-lg, 0 12px 32px rgba(0,0,0,0.45))",
-      padding: "8px",
-      display: "none",
-    },
+  const wrap = h("div", { class: "kv-row", style: { flexDirection: "column", alignItems: "stretch" } });
+  wrap.appendChild(h("span", { class: "k" }, "Palette"));
+  const list = h("div", {
+    style: { display: "flex", flexDirection: "column", gap: "0" },
     role: "listbox",
   });
+  wrap.appendChild(list);
 
-  // v11.8 (#9): single BIG circle per palette (like the reference
-  // screenshot) — background fill with an accent-coloured ring so even
-  // near-white / near-black palettes are unmistakable at a glance.
   function swatchDots(sw) {
     const bg = sw[0], accent = sw[1];
     return h("span", {
@@ -240,77 +215,47 @@ function paletteRow() {
   function currentSwatch(value) {
     const p = paletteFor(value);
     if (p.swatch) return p.swatch;
-    // "auto" → mirror the resolved palette's swatch
     const resolved = paletteFor(resolvePalette("auto")) || paletteFor("dark");
     return resolved.swatch;
   }
 
-  function renderChip(value) {
-    chip.innerHTML = "";
-    const p = paletteFor(value);
-    chip.appendChild(swatchDots(currentSwatch(value)));
-    let text = p.label;
-    if (value === "auto") {
-      const r = resolvePalette("auto");
-      text += ` (${r})`;
-    }
-    chip.appendChild(h("span", {}, text));
-    chip.appendChild(h("span", { style: { opacity: "0.5" } }, "▾"));
-  }
-
   function renderList() {
-    pop.innerHTML = "";
+    list.innerHTML = "";
     const active = prefs.get("background_theme") || "auto";
     for (const p of PALETTES) {
       const isActive = (p.value === active);
       const sw = currentSwatch(p.value);
+      let label = p.label;
+      if (p.value === "auto") label += ` (${resolvePalette("auto")})`;
       const item = h("button", {
         class: "palette-item",
         role: "option",
         "aria-selected": isActive ? "true" : "false",
         style: {
           display: "flex", alignItems: "center", gap: "12px",
-          width: "100%", padding: "10px 12px",
-          background: isActive ? "var(--du-bg-2)" : "transparent",
+          width: "100%", padding: "12px 10px",
+          background: "transparent",
           color: isActive ? "var(--du-accent)" : "var(--du-ink-hi)",
           fontWeight: isActive ? "600" : "500",
           border: "0", borderRadius: "8px",
-          cursor: "pointer", textAlign: "left", fontSize: "14px",
+          cursor: "pointer", textAlign: "left", fontSize: "15px",
+          borderTop: isActive ? "0" : "1px solid var(--du-divider, rgba(255,255,255,0.06))",
         },
       });
       item.appendChild(swatchDots(sw));
-      item.appendChild(h("span", { style: { flex: "1" } }, p.label));
+      item.appendChild(h("span", { style: { flex: "1" } }, label));
       if (isActive) item.appendChild(h("span", { style: { opacity: "0.85" } }, "✓"));
       item.addEventListener("click", () => {
         prefs.set("background_theme", p.value);
         haptic("select");
-        renderChip(p.value);
-        close();
+        renderList();  // repaint the whole list so the ✓ moves
       });
-      pop.appendChild(item);
+      list.appendChild(item);
     }
   }
 
-  function open()  { pop.style.display = "block"; chip.setAttribute("aria-expanded", "true");  renderList(); }
-  function close() { pop.style.display = "none";  chip.setAttribute("aria-expanded", "false"); }
-
-  chip.addEventListener("click", (e) => {
-    e.stopPropagation();
-    (pop.style.display === "block") ? close() : open();
-  });
-  // Close on outside click
-  document.addEventListener("click", (e) => {
-    if (!wrap.contains(e.target)) close();
-  });
-
-  const wrap = h("div", {
-    style: { position: "relative", display: "inline-block" },
-  }, chip, pop);
-
-  renderChip(cur);
-
-  row.append(h("span", { class: "k" }, "Palette"), wrap);
-  return row;
+  renderList();
+  return wrap;
 }
 
 function buttonRow(label, onClick, kind = "secondary") {

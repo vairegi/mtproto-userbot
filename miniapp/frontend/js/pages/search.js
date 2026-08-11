@@ -30,6 +30,12 @@ const PAGE_SIZE = 25;
 const PAGE_WINDOW = 7;
 
 export async function render(root, { me }) {
+  // v12.17: Unicode enclosed-circle glyphs for the ACTIVE page 1..9.
+  // Pages 10+ keep a plain numeric label (there is no ordered set beyond
+  // ❾ in these dingbats). Declared BEFORE state/renderFooter so it is
+  // reachable from buildPaginationBar (which is a hoisted function).
+  const ACTIVE_GLYPH = ["", "❶", "❷", "❸", "❹", "❺", "❻", "❼", "❽", "❾"];
+
   const state = {
     query: "",
     parsed: parseSearch(""),
@@ -147,10 +153,15 @@ export async function render(root, { me }) {
 
   function buildPaginationBar() {
     const cur = state.page;
-    // Highest page we can offer a numbered button for: when has_more is
-    // true at least cur+1 exists; otherwise cur is the end. Fold in the
-    // learned high-water mark and (if known) the real last page.
-    let lastKnown = state.hasMore ? cur + 1 : cur;
+    // v12.17: › was unreachable when the backend returned has_more=false
+    // after the English filter culled a page below per_page. Trust the
+    // server's has_more when present, otherwise treat a FULL page
+    // (>= PAGE_SIZE items) as a signal that a next page probably exists.
+    // If the user taps and page N+1 turns out empty, emptyState() renders.
+    const probableHasMore = state.hasMore
+      || (Array.isArray(state.results) && state.results.length >= PAGE_SIZE);
+
+    let lastKnown = probableHasMore ? cur + 1 : cur;
     if (state.highestKnownPage > lastKnown) lastKnown = state.highestKnownPage;
     if (state.knownLastPage > lastKnown) lastKnown = state.knownLastPage;
 
@@ -181,19 +192,26 @@ export async function render(root, { me }) {
     bar.appendChild(navBtn("‹", cur - 1, cur === 1, "Previous page"));
 
     for (let p = start; p <= end; p++) {
+      const isActive = (p === cur);
+      // v12.17: the ACTIVE page uses the ❶..❾ glyph so the user's
+      // current position is immediately readable at a glance.
+      const label = isActive && p >= 1 && p <= 9
+        ? ACTIVE_GLYPH[p]
+        : String(p);
       const b = h("button", {
-        class: "du-page-btn" + (p === cur ? " active" : ""),
+        class: "du-page-btn" + (isActive ? " active" : ""),
         type: "button",
         "aria-label": "Page " + p,
-      }, String(p));
-      if (p === cur) b.setAttribute("aria-current", "page");
+      }, label);
+      if (isActive) b.setAttribute("aria-current", "page");
       else b.addEventListener("click", () => { haptic("light"); goToPage(p); });
       bar.appendChild(b);
     }
 
-    // › next: disabled only when we KNOW there is no next page
-    // (has_more false on the current page).
-    bar.appendChild(navBtn("›", cur + 1, !state.hasMore, "Next page"));
+    // v12.17: › follows probableHasMore — unreachable ONLY when we have
+    // positive evidence there is no next page (returned < PAGE_SIZE items
+    // AND the server said has_more=false).
+    bar.appendChild(navBtn("›", cur + 1, !probableHasMore, "Next page"));
     // » last: enabled ONLY once a real end has been observed
     // (knownLastPage > 0) and the user is not already on it.
     const lastBtnDisabled = !state.knownLastPage || cur >= state.knownLastPage;

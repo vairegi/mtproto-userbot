@@ -27,6 +27,14 @@ const DEFAULTS = {
   infinite_scroll: true,
   reduced_motion: false,
   show_hint_bar: true,
+  // v12.17: when true, the palette choice is SESSION-ONLY — closing /
+  // hiding the mini-app reverts background_theme to "auto" so the next
+  // open follows Telegram's own color scheme again. Default ON per the
+  // v12.17 user request ("theme automatically resets to default when
+  // the mini app closes"). This is purely client-side; it has no
+  // bearing on Render RAM (localStorage lives in the WebView, not the
+  // server).
+  reset_theme_on_close: true,
 };
 
 function load() {
@@ -91,4 +99,27 @@ if (window.matchMedia) {
   // Chrome / Firefox / Safari 14+
   if (mq.addEventListener) mq.addEventListener("change", rerun);
   else if (mq.addListener) mq.addListener(rerun);  // legacy Safari
+}
+
+// v12.17: session-only palette. When the mini-app is hidden (user closed
+// it / switched away) AND reset_theme_on_close is on, persist
+// background_theme back to "auto" so the NEXT open starts fresh on the
+// Telegram/OS scheme. We write the key without calling apply() — the
+// current screen keeps its look until the app is actually torn down.
+if (typeof document !== "undefined" && document.addEventListener) {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "hidden") return;
+    if (!cache.reset_theme_on_close) return;
+    if (cache.background_theme === "auto") return;  // already default
+    cache.background_theme = "auto";
+    persist();
+  });
+  // iOS Telegram WebView sometimes skips visibilitychange on kill —
+  // pagehide is the harder guarantee.
+  window.addEventListener?.("pagehide", () => {
+    if (!cache.reset_theme_on_close) return;
+    if (cache.background_theme === "auto") return;
+    cache.background_theme = "auto";
+    persist();
+  });
 }
