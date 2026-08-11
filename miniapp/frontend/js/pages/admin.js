@@ -246,9 +246,11 @@ function sectionDetailsScraper() {
       toggle.setAttribute("aria-checked", s.enabled ? "true" : "false");
       const cfg = s.config || {};
       const fmt = (v) => (v == null ? "—" : String(v));
-      // v12.13 (#D): render skip_reasons breakdown + plain-English status.
-      const sr = s.skip_reasons || {};
-      const ex = s.explainer || {};
+      // v12.14: prefer the new line-by-line simple explainer; fall back
+      // to the old 3-line explainer when the backend predates v12.14.
+      const sr  = s.skip_reasons || {};
+      const ex2 = s.explainer_v2 || {};
+      const ex  = s.explainer     || {};
       const srLines = [
         `  already_cached_fresh:  ${sr.already_cached_fresh || 0}`,
         `  no_search_page_cached: ${sr.no_search_page_cached || 0}`,
@@ -257,6 +259,30 @@ function sectionDetailsScraper() {
         `  upstream_detail_empty: ${sr.upstream_detail_empty || 0}`,
         `  cache_write_failed:    ${sr.cache_write_failed || 0}`,
       ];
+      // v12.14: one simple sentence per row, exactly the pattern the user
+      // asked for in the v12.14 feedback ('phase = idle — it means open
+      // to work').
+      const simpleLines = [
+        ex2.phase, ex2.paused, ex2.current, ex2.this_run, ex2.run_count,
+        "",
+        ex2.skip_help,
+        ex2.already   && `  • ${ex2.already}`,
+        ex2.nosearch  && `  • ${ex2.nosearch}`,
+        ex2.missingid && `  • ${ex2.missingid}`,
+        ex2.token     && `  • ${ex2.token}`,
+        ex2.empty     && `  • ${ex2.empty}`,
+        ex2.writefail && `  • ${ex2.writefail}`,
+        "",
+        ex2.window, ex2.rest, ex2.active, ex2.page_cap,
+      ].filter(Boolean);
+      const explainerBlock = simpleLines.length
+        ? [`— What does this mean? (simple English) —`, ...simpleLines]
+        : [
+            `— What does this mean? —`,
+            ex.night_day   ? `• ${ex.night_day}`   : "",
+            ex.skipped     ? `• ${ex.skipped}`     : "",
+            ex.next_action ? `• ${ex.next_action}` : "",
+          ].filter(Boolean);
       statusBox.textContent = [
         `STATUS:       ${s.status_text || "—"}`,
         "",
@@ -274,11 +300,8 @@ function sectionDetailsScraper() {
         `active window:${cfg.active_window}s`,
         `page cap:     ${cfg.page_cap} per sort · sorts: ${(cfg.sorts || []).join(", ")}`,
         "",
-        `— What does this mean? —`,
-        ex.night_day   ? `• ${ex.night_day}`   : "",
-        ex.skipped     ? `• ${ex.skipped}`     : "",
-        ex.next_action ? `• ${ex.next_action}` : "",
-      ].filter(Boolean).join("\n");
+        ...explainerBlock,
+      ].filter(x => x !== undefined && x !== null).join("\n");
     } catch (e) {
       statusBox.textContent = "⚠ " + (e.message || e);
     }
