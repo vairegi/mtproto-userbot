@@ -25,12 +25,28 @@ That makes the very first thing your logs show a clear yes/no answer to
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from config import settings
+
+# v12.18 (audit fix 3b): Telethon client safeguards for the 512 MB Render
+# plan. During multi-MB PDF relays a FloodWait longer than the default
+# 60 s makes Telethon RAISE instead of sleep; the worker's exception path
+# then retains references to in-flight upload buffers until GC, which is
+# a slow RAM leak under sustained flood. Sleeping inside Telethon keeps
+# buffers bounded. Both knobs are env-overridable without a redeploy.
+try:
+    _FLOOD_SLEEP_THRESHOLD = int(os.getenv("TELETHON_FLOOD_SLEEP_SEC", "300"))
+except (TypeError, ValueError):
+    _FLOOD_SLEEP_THRESHOLD = 300
+try:
+    _REQUEST_RETRIES = int(os.getenv("TELETHON_REQUEST_RETRIES", "3"))
+except (TypeError, ValueError):
+    _REQUEST_RETRIES = 3
 
 
 def build_client() -> TelegramClient:
@@ -39,6 +55,8 @@ def build_client() -> TelegramClient:
         StringSession(settings.session_string),
         settings.api_id,
         settings.api_hash,
+        flood_sleep_threshold=_FLOOD_SLEEP_THRESHOLD,  # v12.18
+        request_retries=_REQUEST_RETRIES,              # v12.18
     )
 
 
