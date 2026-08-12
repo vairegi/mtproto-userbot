@@ -116,9 +116,24 @@ _SORTS: Tuple[str, ...] = (
 )
 
 PREFETCH_INTERVAL_SEC: int   = _env_int("PREFETCH_INTERVAL_SEC", 6 * 60 * 60)  # 6 h
-PREFETCH_MAX_PAGES:    int   = _env_int("PREFETCH_MAX_PAGES",    10)
+# v12.18: default raised 10 → 20 pages per sort. The user observed
+# "Popular page 5 still misses after 2 sweeps". Root cause was NOT the
+# cache itself — pages 1..10 were warm, but the DETAILS scraper (which
+# the admin status screen reports on) writes `gallery:<id>` rows, not
+# `search:<sort>:page<N>` rows, so "sweeps done=2" there proves nothing
+# about the list-page bucket. Raising the LIST warmer's depth gives the
+# real fix. 4 sorts × 20 pages × ~10 KB payload ≈ 800 KB in Turso,
+# zero extra Render RAM (payloads are never held beyond one page fetch).
+PREFETCH_MAX_PAGES:    int   = _env_int("PREFETCH_MAX_PAGES",    20)
 PREFETCH_DELAY_SEC:    float = _env_float("PREFETCH_DELAY_SEC",  1.0)
 PREFETCH_ENABLED:      bool  = _env_bool("PREFETCH_ENABLED",     True)
+
+# v12.18: Mongo-backed priority queue for 429-skipped (sort, page) tuples.
+# Before this fix, a page that hit a 429 during a sweep was silently
+# stranded until the sort's next staggered interval (up to 6 hours for
+# "popular"). Now the sweep re-enqueues the tuple so the NEXT 5-minute
+# tick retries it FIRST, before walking the regular (sort, page) walk.
+_PERSIST_KEY = "prefetch_priority_v1"
 
 # v12.10 (#2): per-sort stagger. Each sort has its own interval so the
 # hottest buckets (popular-today: 3 h) refresh more often than the slower
@@ -155,6 +170,71 @@ def _enabled() -> bool:
     disable the sweep without a code deploy.
     """
     return bool(PREFETCH_ENABLED and _SORTS and PREFETCH_MAX_PAGES > 0)
+
+
+# ---------------------------------------------------------------------------
+# v12.18: Mongo-backed priority queue for 429-skipped / bucket-starved pages.
+# Persisted via miniapp db settings (same pattern as details_prefetch_cron)
+# so the queue survives Render restarts. Fail-open: any Mongo hiccup means
+# the sweep just behaves like v12.17 (no re-enqueue) — never fatal.
+# ---------------------------------------------------------------------------
+_PRIORITY_CAP = 40
+
+
+def _db_set(key: str, value: Any) -> None:
+    try:
+        from .. import db as _midb
+        _midb.set_setting(key, value)
+    except Exception as e:  # noqa: BLE001
+        log.debug("prefetch: db_set(%s) failed: %s", key, e)
+
+
+def _db_get(key: str, default: Any = None) -> Any:
+    try:
+        from .. import db as _midb
+        return _midb.get_setting(key, default)
+    except Exception as e:  # noqa: BLE001
+        log.debug("prefetch: db_get(%s) failed: %s", key, e)
+        return default
+
+
+def _priority_push(sort: str, page: int) -> None:
+    """Re-enqueue a (sort, page) tuple that was skipped (429 / dry bucket)
+    so the next tick retries it first. Deduped + capped."""
+    try:
+        lst = _db_get(_PERSIST_KEY, []) or []
+        if not isinstance(lst, list):
+            lst = []
+        entry = [str(sort), int(page)]
+        if entry in lst:
+            return
+        if len(lst) >= _PRIORITY_CAP:
+            lst = lst[-(_PRIORITY_CAP - 1):]   # keep the freshest entries
+        lst.append(entry)
+        _db_set(_PERSIST_KEY, lst)
+    except Exception as e:  # noqa: BLE001
+        log.debug("prefetch: priority_push failed: %s", e)
+
+
+def _priority_pop_all() -> List[Tuple[str, int]]:
+    """Drain the priority queue (read + clear). Returns [] on any error."""
+    try:
+        lst = _db_get(_PERSIST_KEY, []) or []
+        if not lst:
+            return []
+        _db_set(_PERSIST_KEY, [])
+        out: List[Tuple[str, int]] = []
+        for e in lst:
+            try:
+                s, p = str(e[0]), int(e[1])
+                if s in _SORTS and 1 <= p <= max(PREFETCH_MAX_PAGES, 1):
+                    out.append((s, p))
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.debug("prefetch: priority_pop_all failed: %s", e)
+        return []
 
 
 def _bootstrap_paths() -> List[Tuple[str, int]]:
@@ -429,6 +509,20 @@ async def prefetch_once(only_sorts: Optional[List[str]] = None) -> Dict[str, Any
         paths = _bootstrap_paths()
         _swept = list(_SORTS)
 
+    # v12.18: drain the Mongo-backed priority queue FIRST — these are
+    # (sort, page) tuples that hit a 429 or a dry bucket on a previous
+    # tick. Retrying them before the regular walk means a skipped page
+    # is re-attempted within ~5 minutes instead of waiting out the
+    # sort's full staggered interval (up to 6 h for "popular").
+    priority_paths = _priority_pop_all()
+    if priority_paths:
+        log.info("prefetch: draining %d priority entries before regular walk",
+                 len(priority_paths))
+    # Priority entries go first, then the regular bootstrap paths minus
+    # any tuple already covered by the priority drain (no double-fetch).
+    prio_set = set(priority_paths)
+    paths = priority_paths + [p for p in paths if p not in prio_set]
+
     _last_run["started_at"]    = int(time.time())
     _last_run["finished_at"]   = None
     _last_run["duration_sec"]  = None
@@ -465,6 +559,7 @@ async def prefetch_once(only_sorts: Optional[List[str]] = None) -> Dict[str, Any
                 "prefetch: bucket said no (sort=%s page=%s) — yielding to users",
                 sort, page,
             )
+            _priority_push(sort, page)   # v12.18: re-enqueue for next tick
             # Still sleep the polite interval so we don't spin the bucket.
             await asyncio.sleep(PREFETCH_DELAY_SEC)
             continue
@@ -477,6 +572,7 @@ async def prefetch_once(only_sorts: Optional[List[str]] = None) -> Dict[str, Any
             err = _last_run.get("last_error") or ""
             if err.startswith("429"):
                 _last_run["pages_skipped"] += 1
+                _priority_push(sort, page)   # v12.18: re-enqueue for next tick
             else:
                 _last_run["pages_failed"] += 1
             await asyncio.sleep(PREFETCH_DELAY_SEC)

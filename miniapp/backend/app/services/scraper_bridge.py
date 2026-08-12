@@ -152,6 +152,66 @@ try:
 except (TypeError, ValueError):
     _RATE_LIMIT_RAMP = 2.0
 
+# v12.18 (audit fix 3a): bound the two rate-limit dicts so a long-lived
+# backend process can never accumulate unbounded search keys. Both dicts
+# used to prune ONLY on the specific read paths that checked ban expiry;
+# keys that were never looked up again lived forever.
+try:
+    _RL_CACHE_MAX_ENTRIES = int(_os_rl.environ.get("NH_RATE_LIMIT_CACHE_MAX", "512"))
+except (TypeError, ValueError):
+    _RL_CACHE_MAX_ENTRIES = 512
+try:
+    _RL_CACHE_SWEEP_EVERY = int(_os_rl.environ.get("NH_RATE_LIMIT_CACHE_SWEEP_EVERY", "100"))
+except (TypeError, ValueError):
+    _RL_CACHE_SWEEP_EVERY = 100
+_rl_writes_since_sweep = 0
+
+
+def _rl_sweep_expired():
+    """Drop every _RATE_LIMIT_CACHE entry whose ban is already in the past,
+    and any orphan _RATE_LIMIT_STRIKES entry whose paired ban is gone.
+    Cheap: both dicts are capped at 512 entries."""
+    now = _time.time()
+    dead = [k for k, v in _RATE_LIMIT_CACHE.items() if not (v and v > now)]
+    for k in dead:
+        _RATE_LIMIT_CACHE.pop(k, None)
+        _RATE_LIMIT_STRIKES.pop(k, None)
+    # Also drop any strike entries whose ban has fully expired — those are
+    # only useful while the ban is live for the exponential ramp.
+    stale_strikes = [k for k in list(_RATE_LIMIT_STRIKES.keys())
+                     if k not in _RATE_LIMIT_CACHE]
+    for k in stale_strikes:
+        _RATE_LIMIT_STRIKES.pop(k, None)
+
+
+def _rl_enforce_caps():
+    """If either dict is over the cap, drop the OLDEST entries first.
+    Called immediately after every write."""
+    while len(_RATE_LIMIT_CACHE) > _RL_CACHE_MAX_ENTRIES:
+        k = next(iter(_RATE_LIMIT_CACHE))   # dicts preserve insertion order
+        _RATE_LIMIT_CACHE.pop(k, None)
+        _RATE_LIMIT_STRIKES.pop(k, None)
+    while len(_RATE_LIMIT_STRIKES) > _RL_CACHE_MAX_ENTRIES:
+        k = next(iter(_RATE_LIMIT_STRIKES))
+        _RATE_LIMIT_STRIKES.pop(k, None)
+
+
+def _rl_cache_set(cache_key, expires_at):
+    """Write a ban timestamp; run the periodic sweep + hard cap."""
+    global _rl_writes_since_sweep
+    _RATE_LIMIT_CACHE[cache_key] = expires_at
+    _rl_writes_since_sweep += 1
+    if _rl_writes_since_sweep >= _RL_CACHE_SWEEP_EVERY:
+        _rl_writes_since_sweep = 0
+        _rl_sweep_expired()
+    _rl_enforce_caps()
+
+
+def _rl_strikes_set(cache_key, value):
+    """Write a strike counter; enforce the hard cap."""
+    _RATE_LIMIT_STRIKES[cache_key] = value
+    _rl_enforce_caps()
+
 
 def _rate_limit_backoff_sec(cache_key, retry_after):
     """Compute the next back-off duration for a rate-limited key. See
@@ -164,7 +224,7 @@ def _rate_limit_backoff_sec(cache_key, retry_after):
             pass
     strikes = _RATE_LIMIT_STRIKES.get(cache_key, 0)
     dur = _RATE_LIMIT_TTL_SEC * (_RATE_LIMIT_RAMP ** strikes)
-    _RATE_LIMIT_STRIKES[cache_key] = strikes + 1
+    _rl_strikes_set(cache_key, strikes + 1)
     return int(max(_RATE_LIMIT_TTL_SEC, min(_RATE_LIMIT_TTL_CAP_SEC, dur)))
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
@@ -330,7 +390,7 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
         if r.status_code == 429:
             retry_after = r.headers.get("Retry-After") if hasattr(r, "headers") else None
             dur = _rate_limit_backoff_sec(cache_key, retry_after)
-            _RATE_LIMIT_CACHE[cache_key] = now + dur
+            _rl_cache_set(cache_key, now + dur)   # v12.18: bounded write
             log.warning(
                 "nhentai HTTP 429 for /search q=%r sort=%r page=%s — "
                 "backing off for %ss%s", q, real_sort, page, dur,
@@ -497,7 +557,7 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
         if r.status_code == 429:
             retry_after = r.headers.get("Retry-After") if hasattr(r, "headers") else None
             dur = _rate_limit_backoff_sec(cache_key, retry_after)
-            _RATE_LIMIT_CACHE[cache_key] = now + dur
+            _rl_cache_set(cache_key, now + dur)   # v12.18: bounded write
             log.warning(
                 "nhentai HTTP 429 for /galleries/%s — backing off for %ss%s",
                 gallery_id, dur,

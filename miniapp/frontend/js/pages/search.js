@@ -237,13 +237,22 @@ export async function render(root, { me }) {
   // v12.16: THE single navigation entry point. Fetches ONLY page n,
   // clears the grid, REPLACES state.results (never pushes), updates the
   // hash, re-renders the pagination bar.
+  // v12.18: also resets the scroll position so the user lands on ITEM 1
+  // of the new page instead of on whatever offset the OLD page left them
+  // (bug repro: tap › while at the bottom of page 2 — page 3 paints,
+  // but the viewport stays near the pagination bar and you have to
+  // scroll up to see item 1).
   async function goToPage(n) {
     n = Math.max(1, n | 0);
     state.token = (state.token || 0) + 1;   // invalidate in-flight loads
     state.page = n;
     showSkeleton();
     _writeHashState(state);
+    _scrollToTop();
     await load();
+    // Re-assert scroll after paint — some WebViews restore the previous
+    // offset once new content settles. Cheap and idempotent.
+    _scrollToTop();
   }
 
   // v12 (#1): load() used to early-return when state.loading was true,
@@ -501,6 +510,35 @@ function _writeHashState(state) {
   if (q) params.set("q", q);
   const url = "#search?" + params.toString();
   try { history.replaceState(null, "", url); } catch (_) { /* best-effort */ }
+}
+
+// v12.18: reset the scroll position on page change so the user lands
+// on item 1 of the new page. Telegram WebView wraps the app inside
+// #app-main, so the true scroll container is that element (not window)
+// on Android. Best-effort — every branch is wrapped in try/catch so
+// the browserless test harness (no scrollTo) never throws.
+export function _scrollToTop() {
+  try { window.scrollTo?.({ top: 0, left: 0, behavior: "auto" }); } catch (_) {}
+  try {
+    const main = (typeof document !== "undefined")
+      ? document.getElementById("app-main")
+      : null;
+    if (main && main.scrollTo) main.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    else if (main) main.scrollTop = 0;
+  } catch (_) {}
+  try {
+    if (typeof document !== "undefined") {
+      if (document.documentElement) document.documentElement.scrollTop = 0;
+      if (document.body) document.body.scrollTop = 0;
+    }
+  } catch (_) {}
+  // v12.18: record the call so tests can assert it fired without
+  // needing a real DOM/viewport.
+  try {
+    if (typeof globalThis !== "undefined") {
+      globalThis.__du_scrollToTop_calls = (globalThis.__du_scrollToTop_calls || 0) + 1;
+    }
+  } catch (_) {}
 }
 
 /* ---------------------------------------------------------------------- */
