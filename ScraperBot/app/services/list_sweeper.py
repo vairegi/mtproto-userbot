@@ -217,6 +217,12 @@ async def sweep_once() -> Dict[str, Any]:
              len(sorts_this_phase), len(settings.list_sorts),
              len(trending), len(settings.extra_tag_sorts))
 
+    # v1.8: resume cursor — if Render restarted us mid-phase, continue from
+    # the saved (sort_idx, page) instead of restarting from page 1.
+    cur = channel_dashboard.cursor_get()
+    resume_sort_idx = int(cur.get("sort_idx", 0) or 0)
+    resume_page = int(cur.get("page", 1) or 1)
+
     client = await hf_scraper_lite.make_client()
     try:
         # Priority queue first — pages that failed last tick.
@@ -233,9 +239,20 @@ async def sweep_once() -> Dict[str, Any]:
         # Regular sweep — column-major so no sort starves.
         max_pages = max(1, int(settings.list_max_pages))
         for page in range(1, max_pages + 1):
-            for sort in sorts_this_phase:
+            for sidx, sort in enumerate(sorts_this_phase):
+                # Resume: skip combos strictly before the saved cursor.
+                if page < resume_page:
+                    continue
+                if page == resume_page and sidx < resume_sort_idx:
+                    continue
                 if mongo_client.is_paused():
                     break
+                channel_dashboard.cursor_set(sidx, page)
+                # Reflect live cursor in the activity fields so the single
+                # dashboard message shows the current position.
+                channel_dashboard.record_activity(
+                    sweeping=f"{sort} · page {page}",
+                )
                 res = await _fetch_and_cache(client, sort, page)
                 if res == "ok":     ok += 1
                 elif res == "skip": skip += 1
