@@ -140,6 +140,14 @@ async def _fetch_and_cache(
         _priority_push(sort, page)
         _stats_bump(skips=1)
         channel_dashboard.record_bucket_skip()
+        # Update activity so the user sees the skip on Message B.
+        channel_dashboard.record_activity(
+            sweeping=f"{sort} · page {page} (skipped, retry later)",
+        )
+        # Longer sleep on skip — keeps us from burning the loop when
+        # the bucket is dry (the phase pacing is what protects us, not
+        # this sleep, but slowing the skip loop makes Message B readable).
+        await asyncio.sleep(settings.list_skip_sleep_sec)
         return "skip"
 
     try:
@@ -179,21 +187,35 @@ async def sweep_once() -> Dict[str, Any]:
     if mongo_client.is_paused():
         return {"skipped": "paused"}
 
-    from . import channel_dashboard
+    from . import channel_dashboard, trending_tags
     await channel_dashboard.start_phase()
 
     _stats_reset_current()
     started = time.time()
     ok = skip = rate = err = 0
 
-    # Build the full sort list = configured sorts + one 'tag:<name>' pseudo
-    # sort per extra tag. This is what makes tags auto-appear in the
-    # dashboard: every tag becomes a first-class sort key.
+    # Refresh trending tags from nhentai.net/tags/popular (24h cached).
+    trending = []
+    try:
+        trending = await trending_tags.refresh_if_needed()
+    except Exception as e:  # noqa: BLE001
+        log.warning("trending_tags refresh failed (non-fatal): %s", e)
+
+    # Build the full sort list = configured core sorts + trending tags +
+    # manual EXTRA_TAG_SORTS. Every tag becomes its own sort key, and
+    # auto-appears as a `➥ New in "tag: <name>"` line in Message A.
     sorts_this_phase = list(settings.list_sorts)
+    for slug in trending:
+        entry = f"tag:{slug}"
+        if entry not in sorts_this_phase:
+            sorts_this_phase.append(entry)
     for t in settings.extra_tag_sorts:
         t = (t or "").strip()
         if t and f"tag:{t}" not in sorts_this_phase:
             sorts_this_phase.append(f"tag:{t}")
+    log.info("phase sort plan: %d entries (core=%d, trending=%d, manual=%d)",
+             len(sorts_this_phase), len(settings.list_sorts),
+             len(trending), len(settings.extra_tag_sorts))
 
     client = await hf_scraper_lite.make_client()
     try:

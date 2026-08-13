@@ -272,8 +272,27 @@ def _label_for(sort_or_tag: str) -> str:
     return _SORT_LABEL.get(sort_or_tag, sort_or_tag)
 
 
-def _fmt_hm_utc(ts: float) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M UTC")
+def _fmt_hm_local(ts: float) -> str:
+    """Format `ts` (epoch seconds) as HH:MM in the configured display TZ.
+    Default: IST (UTC+05:30). Configurable via BOT1_DISPLAY_TZ_OFFSET_MIN."""
+    from datetime import timedelta
+    off_min = int(settings.display_tz_offset_min or 0)
+    tz = timezone(timedelta(minutes=off_min))
+    label = settings.display_tz_label or "IST"
+    return datetime.fromtimestamp(ts, tz=tz).strftime(f"%H:%M {label}")
+
+
+def _html_escape(s: str) -> str:
+    """Minimal HTML escaper for Telegram parse_mode=HTML."""
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;"))
+
+
+def _blockquote(body: str) -> str:
+    """Wrap body in an expandable Telegram blockquote (vertical accent
+    line + native Collapse/Expand). Requires parse_mode=HTML."""
+    return f"<blockquote expandable>{_html_escape(body)}</blockquote>"
 
 
 def _render_summary(phase: int) -> str:
@@ -291,7 +310,7 @@ def _render_summary(phase: int) -> str:
                   and now - ts < 86400)
 
     lines: List[str] = [f"[{phase}]"]
-    lines.append(f"➥ Total written galleries [{_fmt_hm_utc(now)}]: {total_written}")
+    lines.append(f"➥ Total written galleries [{_fmt_hm_local(now)}]: {total_written}")
 
     # "New today" = last 24h rolling.
     if new_24h == 0:
@@ -360,7 +379,8 @@ async def _send_message(text: str) -> Optional[int]:
         return None
     r = await _tg_api("sendMessage", {
         "chat_id": settings.log_channel_id,
-        "text": text,
+        "text": _blockquote(text),
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
         "disable_notification": True,
     })
@@ -376,7 +396,8 @@ async def _edit_message(msg_id: int, text: str) -> bool:
     r = await _tg_api("editMessageText", {
         "chat_id": settings.log_channel_id,
         "message_id": int(msg_id),
-        "text": text,
+        "text": _blockquote(text),
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     })
     if not r or not r.get("ok"):

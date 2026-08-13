@@ -84,12 +84,18 @@ class Settings:
         or "DoujinshiUniverse-ScraperBot/1.0 (+https://github.com/vairegi/mtproto-userbot)"
     )
 
-    # List sweep
+    # List sweep — v1.6 pacing matches BOT 0's prefetch_cron exactly:
+    #   PREFETCH_DELAY_SEC=1s, PREFETCH_INTERVAL_SEC=6h, PREFETCH_MAX_PAGES=30
+    # The real anti-ban mechanism is the shared token bucket (10/min for
+    # /search) + the 6-hour inter-phase gap, NOT the per-fetch delay.
     list_sorts: List[str] = field(default_factory=lambda: _env_csv(
         "LIST_SORTS", ["popular", "date", "popular-today", "popular-week"]))
-    list_max_pages: int = _env_int("LIST_MAX_PAGES", 20)
-    list_tick_sec: int = _env_int("LIST_TICK_SEC", 300)
-    list_delay_sec: float = _env_float("LIST_DELAY_SEC", 1.5)
+    list_max_pages: int = _env_int("LIST_MAX_PAGES", 30)
+    list_tick_sec: int = _env_int("LIST_TICK_SEC", 21600)   # 6 hours
+    list_delay_sec: float = _env_float("LIST_DELAY_SEC", 1.0)
+    # Sleep after a bucket-skip. Short (1s) matches BOT 0 — the bucket is
+    # the throttle, not this sleep.
+    list_skip_sleep_sec: float = _env_float("LIST_SKIP_SLEEP_SEC", 1.0)
 
     # Detail sweep
     details_tick_sec: int = _env_int("DETAILS_TICK_SEC", 60)
@@ -109,15 +115,23 @@ class Settings:
     # Logging
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper().strip() or "INFO"
 
-    # Extra per-tag sweeps (e.g. incest, vanilla, big-breasts). Each tag
-    # becomes its own sort key: search?query=tag:<name>&sort=popular.
-    # Auto-expanded via env var so you can add tags without a redeploy.
+    # Manual per-tag sweeps (always included on top of trending tags).
     extra_tag_sorts: List[str] = field(default_factory=lambda: _env_csv(
         "EXTRA_TAG_SORTS", ["incest"]))
+
+    # Trending-tag auto-discovery — scrapes nhentai.net/tags/popular HTML
+    # once every trending_tags_refresh_sec to pick up the current top N.
+    trending_tags_enabled: bool = _env_bool("TRENDING_TAGS_ENABLED", True)
+    trending_tags_top_n: int   = _env_int("TRENDING_TAGS_TOP_N", 10)
+    trending_tags_refresh_sec: int = _env_int("TRENDING_TAGS_REFRESH_SEC", 24 * 3600)
 
     # Live channel dashboard
     log_channel_id: str = os.getenv("BOT1_LOG_CHANNEL_ID", "-1003796521529").strip()
     channel_refresh_sec: int = _env_int("BOT1_CHANNEL_REFRESH_SEC", 5)
+
+    # Timezone display for dashboard timestamps (IST = UTC+05:30).
+    display_tz_offset_min: int = _env_int("BOT1_DISPLAY_TZ_OFFSET_MIN", 330)
+    display_tz_label: str = os.getenv("BOT1_DISPLAY_TZ_LABEL", "IST").strip() or "IST"
 
     def validate(self) -> list[str]:
         """Return list of human-readable errors (empty = OK)."""
