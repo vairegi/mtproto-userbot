@@ -72,6 +72,8 @@ _K_REFRESH    = "dash_refresh_sec"    # int: /time <n> override
 # API calls that would return 400 "message is not modified".
 _last_a: str = ""
 _last_b: str = ""
+_last_edit_at: float = 0.0
+_EDIT_MIN_INTERVAL = 2.0  # s — stay under Telegram editMessageText rate limit
 
 
 # ---------------------------------------------------------------------------
@@ -174,13 +176,26 @@ def record_bucket_skip() -> None:
 def record_activity(*, sweeping: str = "", last_gid: str = "",
                     last_tag: str = "") -> None:
     """Update the 'current activity' message (Message B) fields.
-    Empty strings are ignored so a caller can update just one field."""
+    Empty strings are ignored so a caller can update just one field.
+
+    v1.7: also fire an immediate edit (throttled to one per
+    _EDIT_MIN_INTERVAL seconds) so the message walks live through the
+    grid instead of only updating on the refresh loop's 5s tick."""
     a = _activity()
     if sweeping:  a["sweeping"]  = sweeping
     if last_gid:  a["last_gid"]  = str(last_gid)
     if last_tag:  a["last_tag"]  = last_tag
     a["updated_at"] = time.time()
     _save_activity(a)
+
+    global _last_edit_at
+    now = time.time()
+    if now - _last_edit_at >= _EDIT_MIN_INTERVAL:
+        _last_edit_at = now
+        try:
+            asyncio.create_task(_refresh_now(_phase_num(), final=False))
+        except RuntimeError:
+            pass  # no running loop — refresh_loop will pick it up
 
 
 # ---------------------------------------------------------------------------
@@ -290,9 +305,9 @@ def _html_escape(s: str) -> str:
 
 
 def _blockquote(body: str) -> str:
-    """Wrap body in an expandable Telegram blockquote (vertical accent
-    line + native Collapse/Expand). Requires parse_mode=HTML."""
-    return f"<blockquote expandable>{_html_escape(body)}</blockquote>"
+    """Wrap body in a SIMPLE Telegram blockquote (vertical accent line,
+    no Collapse/Expand button). Requires parse_mode=HTML."""
+    return f"<blockquote>{_html_escape(body)}</blockquote>"
 
 
 def _render_summary(phase: int) -> str:

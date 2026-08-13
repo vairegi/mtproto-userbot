@@ -21,11 +21,11 @@ from app.config import settings
 from app.logging_setup import setup_logging
 from app.routes import mount_all
 from app import mongo_client, turso_client
-from app.services import list_sweeper, details_sweeper
+from app.services import list_sweeper, details_sweeper, channel_dashboard
 
 log = setup_logging("scraperbot")
 
-app = FastAPI(title="ScraperBot (BOT 1)", version="1.0.0")
+app = FastAPI(title="ScraperBot (BOT 1)", version="1.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,7 +76,12 @@ async def _startup() -> None:
             list_sweeper.run_forever(_stop_event), name="list_sweeper"))
         _tasks.append(asyncio.create_task(
             details_sweeper.run_forever(_stop_event), name="details_sweeper"))
-        log.info("sweepers spawned: %s", [t.get_name() for t in _tasks])
+        # v1.5: live channel dashboard — edits the pinned pair of messages
+        # every channel_refresh_sec (default 5s, overridable with /time <n>).
+        _tasks.append(asyncio.create_task(
+            channel_dashboard.refresh_loop(_stop_event), name="dashboard"))
+        log.info("sweepers + dashboard spawned: %s",
+                 [t.get_name() for t in _tasks])
     else:
         log.error("Sweepers NOT started — missing MONGO_URI or TURSO_DATABASE_URL")
 
