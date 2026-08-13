@@ -118,15 +118,19 @@ async def _fetch_and_cache(
     is_tag = sort.startswith("tag:")
     if is_tag:
         tag_name = sort[4:].strip()
+        # Upstream: search API with tag query (same as v1.7+)
         query = f"tag:{tag_name}"
-        cache_sort = f"tag-{tag_name}"      # store as its own cache namespace
         real_sort = "popular"
+        # Cache key: BOT 0's user-search format so a user typing the tag
+        # name in the mini-app hits this pre-warmed row.
+        key = cache.bot0_search_key(tag_name, "popular", page)
     else:
+        # Upstream: /galleries with empty query (chip pages).
         query = ""
-        cache_sort = sort
         real_sort = sort
-
-    key = cache.search_key(query, cache_sort, page)
+        # Cache key: BOT 0's chip format — drop-in replacement for
+        # prefetch_cron, read by scraper_bridge's home-row path.
+        key = cache.bot0_chip_key(sort, page)
 
     # Dashboard: reflect what we're doing on the activity line.
     from . import channel_dashboard

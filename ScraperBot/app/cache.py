@@ -27,6 +27,7 @@ def gallery_key(gid: str | int) -> str:
 
 
 def search_key(query: str, sort: str, page: int) -> str:
+    """Legacy BOT 1 format — kept for backward compat, DO NOT use for new writes."""
     q = (query or "").strip().lower()
     s = (sort or "popular").strip().lower()
     p = int(page or 1)
@@ -34,6 +35,34 @@ def search_key(query: str, sort: str, page: int) -> str:
         return f"search:{q}|{s}|{p}"
     h = hashlib.sha1(q.encode("utf-8")).hexdigest()[:16]
     return f"search:{h}|{s}|{p}"
+
+
+def bot0_chip_key(sort: str, page: int) -> str:
+    """BOT 0's empty-query chip format — what prefetch_cron writes and
+    scraper_bridge reads for home-page rows.
+    Matches: search:popular-today:page1
+    """
+    return f"search:{(sort or 'popular').strip().lower()}:page{int(page or 1)}"
+
+
+def bot0_search_key(query: str, sort: str, page: int) -> str:
+    """BOT 0's user-typed query format — what scraper_bridge reads when a
+    user types into the search box.
+    Matches: search:q=sole female|sort=popular|page=1
+    """
+    q = (query or "").strip().lower()
+    s = (sort or "popular").strip().lower()
+    return f"search:q={q}|sort={s}|page={int(page or 1)}"
+
+
+def bucket_for_key(key: str) -> str:
+    # Route new key formats to the right nhentai bucket. Chip + q= keys
+    # both hit /api/v2/search — same bucket.
+    if key.startswith("gallery:"):    return "galleries"
+    if key.startswith("search:"):     return "search"
+    if key.startswith("suggest:"):    return "suggestions"
+    if key.startswith("trending:"):   return "popular"
+    return "galleries_list"
 
 
 def trending_key(kind: str = "popular") -> str:

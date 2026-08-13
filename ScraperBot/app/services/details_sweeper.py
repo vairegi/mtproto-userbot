@@ -79,14 +79,23 @@ def _cursor_advance() -> Tuple[str, int]:
 
 
 async def _read_search_cache(sort: str, page: int) -> Optional[Dict[str, Any]]:
-    """Read a search-page blob straight from the shared cache. Never fetches."""
-    key = cache.search_key("", sort, page)
-    hit = await turso_client.get(key)
-    if hit and hit.get("payload"):
-        return hit["payload"]
-    m = mongo_client.cache_get_mongo(key)
-    if m and m.get("payload"):
-        return m["payload"]
+    """Read a search-page blob straight from the shared cache. Never fetches.
+
+    v1.10: try BOTH key formats — the BOT 0 chip format (new canonical)
+    and the legacy BOT 1 format (what old rows were written with)."""
+    keys = [cache.bot0_chip_key(sort, page)]
+    if sort.startswith("tag:"):
+        tag = sort[4:].strip()
+        keys.append(cache.bot0_search_key(tag, "popular", page))
+    keys.append(cache.search_key("", sort, page))  # legacy fallback
+
+    for key in keys:
+        hit = await turso_client.get(key)
+        if hit and hit.get("payload"):
+            return hit["payload"]
+        m = mongo_client.cache_get_mongo(key)
+        if m and m.get("payload"):
+            return m["payload"]
     return None
 
 
