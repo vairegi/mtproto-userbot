@@ -206,7 +206,6 @@ async def get(key: str) -> Optional[dict]:
         return None
     # We only care about payload + expires_at for reads; select them if
     # they exist, else fall back to just payload.
-    global _SCHEMA_READY
     if not _SCHEMA_READY:
         await _discover_columns()
     # Build SELECT list from discovered columns so a missing expires_at
@@ -257,7 +256,6 @@ async def put(key: str, payload: Any, ttl_sec: int) -> bool:
     """
     if not turso_available():
         return False
-    global _SCHEMA_READY
     if not _SCHEMA_READY:
         await _discover_columns()
     if not _COLS:
