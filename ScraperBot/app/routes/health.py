@@ -12,8 +12,10 @@ router = APIRouter()
 _STARTED = time.time()
 
 
-@router.get("/", include_in_schema=False)
+@router.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 def root() -> dict:
+    # HEAD is included so UptimeRobot's default HEAD probe stops logging
+    # 405 Method Not Allowed on every ping.
     from ..services import list_sweeper, details_sweeper
     return {
         "service": "ScraperBot (BOT 1)",
@@ -25,6 +27,6 @@ def root() -> dict:
     }
 
 
-@router.get("/healthz", include_in_schema=False)
+@router.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
 def healthz() -> dict:
     return {"ok": True, "uptime_sec": int(time.time() - _STARTED)}

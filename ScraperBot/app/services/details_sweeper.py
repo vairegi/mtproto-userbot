@@ -90,15 +90,38 @@ async def _read_search_cache(sort: str, page: int) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _coerce_epoch(v: Any) -> float:
+    """BOT 0's older cache writes stored `expires_at` as a BSON datetime;
+    newer writes use epoch floats. Accept either — plus int strings — and
+    always return a float epoch. Never raises."""
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    # datetime.datetime — pymongo returns naive UTC by default.
+    try:
+        import datetime as _dt
+        if isinstance(v, _dt.datetime):
+            if v.tzinfo is None:
+                v = v.replace(tzinfo=_dt.timezone.utc)
+            return v.timestamp()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
 async def _gallery_is_fresh(gid: str) -> bool:
     """True if gallery:<id> is present AND not expired in either backend."""
     key = cache.gallery_key(gid)
     now = time.time()
     hit = await turso_client.get(key)
-    if hit and int(hit.get("expires_at", 0)) > now:
+    if hit and _coerce_epoch(hit.get("expires_at")) > now:
         return True
     m = mongo_client.cache_get_mongo(key)
-    if m and float(m.get("expires_at", 0)) > now:
+    if m and _coerce_epoch(m.get("expires_at")) > now:
         return True
     return False
 
