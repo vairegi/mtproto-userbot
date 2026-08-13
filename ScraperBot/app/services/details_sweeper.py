@@ -138,6 +138,7 @@ async def _fetch_one_gallery(
 
     if await _gallery_is_fresh(gid):
         _stats_bump(hits=1)
+        channel_dashboard.record_cached_gallery(source_sort or "popular")
         return "hit"   # already in cache — NOT counted as new
 
     if not cache.try_consume(key):

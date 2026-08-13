@@ -141,6 +141,14 @@ def record_new_gallery(sort_or_tag: str) -> None:
     _save_totals(t)
 
 
+def record_cached_gallery(sort_or_tag: str) -> None:
+    c = _counters()
+    pc = c.get("per_cached") or {}
+    pc[sort_or_tag] = int(pc.get(sort_or_tag, 0)) + 1
+    c["per_cached"] = pc
+    _save_counters(c)
+
+
 def record_search_page_written() -> None:
     c = _counters()
     c["search_pages"] = int(c.get("search_pages", 0)) + 1
@@ -197,7 +205,7 @@ async def start_phase() -> None:
     phase = _phase_num() + 1
     mongo_client.state_set(_K_PHASE, phase)
     _save_counters({
-        "new_galleries": 0, "per_sort": {},
+        "new_galleries": 0, "per_sort": {}, "per_cached": {},
         "search_pages": 0, "errors": 0, "skips": 0,
         "started_at": time.time(),
     })
@@ -273,11 +281,15 @@ def _render() -> str:
     trending_keys = [f"tag:{t}" for t in trending if isinstance(t, str) and t]
     tag_order = list(dict.fromkeys(configured + trending_keys + tags_seen))
 
+    per_cached = c.get("per_cached") or {}
     for s in core + tag_order:
         n = int(per_sort.get(s, 0))
+        m = int(per_cached.get(s, 0))
         label = _label_for(s)
-        # Pad label to a fixed column so the right side aligns.
-        lines.append(f"➥ {label:<20} ▸ {n}")
+        if m:
+            lines.append(f"➥ {label:<20} ▸ {n} new · {m} cached")
+        else:
+            lines.append(f"➥ {label:<20} ▸ {n}")
 
     lines.append(f"➥ Pages written: {int(c.get('search_pages', 0))}")
     lines.append(f"➥ Errors: {int(c.get('errors', 0))} · Skips: {int(c.get('skips', 0))}")
@@ -285,10 +297,8 @@ def _render() -> str:
     # ---- activity (merged) ------------------------------------------------
     lines.append("")
     lines.append("———")
-    cur = cursor_get()
-    cur_sort = cur.get("sort_label") or cur.get("sort") or "—"
-    cur_page = cur.get("page", "—")
-    lines.append(f"➥ Now: {cur_sort} · page {cur_page}")
+    sweeping = str(a.get("sweeping") or "—")
+    lines.append(f"➥ Now: {sweeping}")
     lines.append(f"➥ Last gallery: {a.get('last_gid', '—')}")
     lines.append(f"➥ Last tag: {a.get('last_tag', '—')}")
 

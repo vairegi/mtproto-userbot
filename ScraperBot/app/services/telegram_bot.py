@@ -91,10 +91,35 @@ def _status_text() -> str:
     )
 
 
+def _health_text() -> str:
+    from .. import mongo_client, turso_client
+    from . import channel_dashboard as cd
+    import time as _t
+    t = cd._totals()
+    now = _t.time()
+    ring = t.get("ring_24h") or []
+    new_24h = sum(1 for ts in ring if isinstance(ts,(int,float)) and now-ts<86400)
+    hring = t.get("ring_hb") or []
+    new_2h = sum(1 for ts in hring if isinstance(ts,(int,float)) and now-ts<7200)
+    mongo_ok = mongo_client.db() is not None
+    turso_ok = turso_client.turso_available()
+    paused = mongo_client.is_paused()
+    banner = "🟢 running" if not paused else "⏸️ paused"
+    return (
+        f"<b>ScraperBot health</b> — {banner}\n"
+        f"• Mongo: {'✅' if mongo_ok else '❌'}   Turso: {'✅' if turso_ok else '❌'}\n"
+        f"• Total galleries: {int(t.get('total_galleries',0))}\n"
+        f"• New last 2h: {new_2h}\n"
+        f"• New last 24h: {new_24h}\n"
+        f"• Phase: #{cd._phase_num()}"
+    )
+
+
 def _help_text() -> str:
     return (
         "<b>ScraperBot commands</b>\n"
         "/status    — sweep counters + last run\n"
+        "/health    — live health snapshot (Mongo/Turso, totals, new items)\n"
         "/pause     — pause both sweepers (admin)\n"
         "/resume    — resume both sweepers (admin)\n"
         "/trigger   — kick a list sweep now (admin)\n"
@@ -123,6 +148,10 @@ async def handle_update(update: Dict[str, Any]) -> None:
 
     if cmd == "/status":
         await send_message(chat_id, _status_text())
+        return
+
+    if cmd == "/health":
+        await send_message(chat_id, _health_text())
         return
 
     if cmd in ("/pause", "/resume", "/trigger", "/time"):
