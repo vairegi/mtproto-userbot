@@ -1,32 +1,30 @@
 """
 turso_client.py — Turso client using the raw HTTP API (v2/pipeline).
 
-v1.2 rewrite: drops libsql-client entirely. libsql-client 0.3.x returns
-different result shapes depending on whether the URL is libsql:// (WS) or
-https:// (HTTP), and yielded `'result'` KeyErrors against your https
-Turso endpoint on every read/write.
+v1.5 rewrite: schema-proof INSERT.
 
-The HTTP API is stable, documented, and identical to what BOT 0's
-turso_client uses at deploy time:
+BOT 0's real Turso schema (confirmed via `SELECT sql FROM sqlite_schema`):
 
-    POST <TURSO_DATABASE_URL>/v2/pipeline
-    Authorization: Bearer <TURSO_AUTH_TOKEN>
-    { "requests": [
-        {"type":"execute","stmt":{"sql":"…","args":[…]}},
-        {"type":"close"}
-    ]}
+    CREATE TABLE nhentai_cache (
+        "key"       TEXT PRIMARY KEY,
+        payload     TEXT NOT NULL,
+        cached_at   INTEGER NOT NULL,
+        expires_at  INTEGER NOT NULL,
+        ttl_sec     INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL DEFAULT 0
+    )
 
-Response shape:
-    { "results": [
-        {"type":"ok","response":{"type":"execute","result":{
-            "cols":[{"name":"payload"},{"name":"updated_at"},…],
-            "rows":[[{"type":"text","value":"…"}, …]]
-        }}},
-        {"type":"ok","response":{"type":"close"}}
-    ]}
+Earlier ScraperBot versions guessed the columns and hit NOT NULL / no-such-
+column errors as each new field revealed itself. v1.5 stops guessing:
 
-We normalise `libsql://` to `https://` for backward compat and use httpx
-so there is exactly one dependency shape across the whole file.
+  1. On bootstrap: read `PRAGMA table_info(nhentai_cache)` and cache the
+     real column set + which are NOT NULL.
+  2. On INSERT: build the column list from the discovered schema. Every
+     column present in the table is written; missing-in-code columns get
+     a safe default (current epoch for *_at, TTL for ttl_sec).
+  3. If the table doesn't exist yet, CREATE it with BOT 0's exact schema.
+
+Result: future schema drift no longer breaks writes.
 """
 from __future__ import annotations
 
@@ -34,7 +32,7 @@ import json
 import logging
 import threading
 import time
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -44,7 +42,6 @@ log = logging.getLogger("scraperbot.turso")
 
 
 def _http_base_url() -> str:
-    """Normalise the configured URL to the HTTP form the pipeline API needs."""
     url = (settings.turso_url or "").strip().rstrip("/")
     if not url:
         return ""
@@ -55,6 +52,13 @@ def _http_base_url() -> str:
 
 _client_lock = threading.Lock()
 _client: Optional[httpx.AsyncClient] = None
+
+# Discovered schema — populated by bootstrap_schema().
+#   _COLS = {"key", "payload", "cached_at", ...}
+#   _NOT_NULL = {"key", "payload", "cached_at", ...}
+_COLS: set[str] = set()
+_NOT_NULL: set[str] = set()
+_SCHEMA_READY = False
 
 
 def _get_client() -> Optional[httpx.AsyncClient]:
@@ -85,9 +89,6 @@ def turso_available() -> bool:
 
 
 async def _pipeline(stmts: List[dict]) -> Optional[List[dict]]:
-    """Run one or more statements through /v2/pipeline. Returns the list of
-    per-statement `result` dicts (only for successful `execute` responses),
-    or None on transport / auth failure."""
     c = _get_client()
     if c is None:
         return None
@@ -111,8 +112,7 @@ async def _pipeline(stmts: List[dict]) -> Optional[List[dict]]:
 
     out: List[dict] = []
     for entry in (data.get("results") or []):
-        etype = entry.get("type")
-        if etype == "error":
+        if entry.get("type") == "error":
             log.warning("Turso pipeline stmt error: %s",
                         (entry.get("error") or {}).get("message"))
             out.append({})
@@ -123,81 +123,99 @@ async def _pipeline(stmts: List[dict]) -> Optional[List[dict]]:
     return out
 
 
-def _row_value(cell: Any) -> Any:
-    """The HTTP API wraps every cell as {'type': 'text'|'integer'|'null',
-    'value': '…'}. Extract the raw value; also tolerates plain values from
-    older API responses."""
+def _cell_value(cell: Any) -> Any:
     if isinstance(cell, dict):
         t = cell.get("type")
         v = cell.get("value")
         if t == "null" or v is None:
             return None
         if t == "integer":
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return v
+            try: return int(v)
+            except (TypeError, ValueError): return v
         if t == "float":
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return v
+            try: return float(v)
+            except (TypeError, ValueError): return v
         return v
     return cell
 
 
 def _row_named(cols: list, row: list) -> dict:
-    """Build a {col_name: value} dict from a pipeline row."""
     out: dict = {}
     for i, c in enumerate(cols or []):
         name = c.get("name") if isinstance(c, dict) else str(c)
         if not name:
             name = f"col_{i}"
         val = row[i] if i < len(row) else None
-        out[name] = _row_value(val)
+        out[name] = _cell_value(val)
     return out
 
 
+async def _discover_columns() -> None:
+    """PRAGMA table_info(nhentai_cache) → populate _COLS / _NOT_NULL."""
+    global _COLS, _NOT_NULL, _SCHEMA_READY
+    res = await _pipeline([{"sql": "PRAGMA table_info(nhentai_cache)"}])
+    if not res:
+        return
+    result = res[0] or {}
+    cols_meta = result.get("cols") or []
+    rows = result.get("rows") or []
+    _COLS = set()
+    _NOT_NULL = set()
+    for row in rows:
+        named = _row_named(cols_meta, row)
+        name = str(named.get("name") or "").strip()
+        if not name:
+            continue
+        _COLS.add(name)
+        # SQLite PRAGMA returns notnull=1 for NOT NULL columns
+        if int(named.get("notnull") or 0) == 1:
+            _NOT_NULL.add(name)
+    _SCHEMA_READY = True
+    log.info("Turso schema discovered: cols=%s not_null=%s",
+             sorted(_COLS), sorted(_NOT_NULL))
+
+
 async def bootstrap_schema() -> None:
-    """CREATE TABLE IF NOT EXISTS. Idempotent; safe every boot."""
+    """CREATE TABLE IF NOT EXISTS (using BOT 0's exact shape), then
+    read PRAGMA table_info to lock in the real column set."""
     if not turso_available():
         log.info("Turso not configured — skipping schema bootstrap")
         return
-    sql = ("CREATE TABLE IF NOT EXISTS nhentai_cache ("
-           "key TEXT PRIMARY KEY, "
-           "payload TEXT NOT NULL, "
-           "updated_at INTEGER NOT NULL, "
-           "expires_at INTEGER NOT NULL)")
-    res = await _pipeline([{"sql": sql}])
+    # BOT 0's exact schema — CREATE IF NOT EXISTS is a no-op if BOT 0 got
+    # here first, and correctly bootstraps a fresh DB if BOT 1 is first.
+    create_sql = (
+        'CREATE TABLE IF NOT EXISTS nhentai_cache ('
+        '"key" TEXT PRIMARY KEY, '
+        'payload TEXT NOT NULL, '
+        'cached_at INTEGER NOT NULL, '
+        'expires_at INTEGER NOT NULL, '
+        'ttl_sec INTEGER NOT NULL, '
+        'updated_at INTEGER NOT NULL DEFAULT 0'
+        ')'
+    )
+    res = await _pipeline([{"sql": create_sql}])
     if res is None:
         log.warning("Turso: schema create failed (transport)")
         return
     log.info("Turso: schema OK")
-
-    # v1.3: migrate pre-existing tables that lack our columns. BOT 0
-    # created nhentai_cache with a different schema (no updated_at /
-    # expires_at), so every INSERT/SELECT that referenced those columns
-    # was logging `Parse error: no such column: updated_at`. ALTER TABLE
-    # is idempotent-enough for us: we swallow the 'duplicate column name'
-    # error and move on.
-    for col in ("updated_at", "expires_at"):
-        try:
-            mig = await _pipeline([{
-                "sql": f"ALTER TABLE nhentai_cache ADD COLUMN "
-                       f"{col} INTEGER NOT NULL DEFAULT 0",
-            }])
-            if mig is not None:
-                log.info("Turso: migrated column %s (or already present)", col)
-        except Exception as e:  # noqa: BLE001
-            log.debug("Turso: column %s probably exists (%s)", col, e)
+    await _discover_columns()
 
 
 async def get(key: str) -> Optional[dict]:
     if not turso_available():
         return None
+    # We only care about payload + expires_at for reads; select them if
+    # they exist, else fall back to just payload.
+    global _SCHEMA_READY
+    if not _SCHEMA_READY:
+        await _discover_columns()
+    # Build SELECT list from discovered columns so a missing expires_at
+    # column doesn't blow up the query.
+    wanted = [c for c in ("payload", "expires_at", "updated_at", "cached_at")
+              if c in _COLS] or ["payload"]
+    sel = ", ".join(wanted)
     res = await _pipeline([{
-        "sql": "SELECT payload, updated_at, expires_at "
-               "FROM nhentai_cache WHERE key = ?",
+        "sql": f'SELECT {sel} FROM nhentai_cache WHERE "key" = ?',
         "args": [{"type": "text", "value": str(key)}],
     }])
     if not res:
@@ -219,30 +237,87 @@ async def get(key: str) -> Optional[dict]:
         "payload": payload,
         "updated_at": int(named.get("updated_at") or 0),
         "expires_at": int(named.get("expires_at") or 0),
+        "cached_at":  int(named.get("cached_at") or 0),
     }
 
 
 async def put(key: str, payload: Any, ttl_sec: int) -> bool:
+    """Schema-proof INSERT.
+
+    Writes every column that exists in the table:
+      * key         — the cache key
+      * payload     — JSON blob
+      * cached_at   — first-write epoch (== now for new rows, unchanged on update)
+      * expires_at  — now + ttl_sec
+      * ttl_sec     — the TTL used
+      * updated_at  — now (always refreshed)
+
+    If BOT 0 later adds another NOT NULL column, we log which one and stop
+    silently succeeding a broken write.
+    """
     if not turso_available():
         return False
+    global _SCHEMA_READY
+    if not _SCHEMA_READY:
+        await _discover_columns()
+    if not _COLS:
+        # PRAGMA came back empty — table probably doesn't exist; fall back
+        # to the CREATE path and retry once.
+        await bootstrap_schema()
+        if not _COLS:
+            log.warning("Turso: schema still unknown, refusing write for %s", key)
+            return False
+
     now = int(time.time())
+    ttl = int(ttl_sec)
     body = json.dumps(payload, ensure_ascii=False)
-    sql = ("INSERT INTO nhentai_cache (key, payload, updated_at, expires_at) "
-           "VALUES (?, ?, ?, ?) "
-           "ON CONFLICT(key) DO UPDATE SET "
-           "  payload    = excluded.payload, "
-           "  updated_at = excluded.updated_at, "
-           "  expires_at = excluded.expires_at")
-    res = await _pipeline([{
-        "sql": sql,
-        "args": [
-            {"type": "text",    "value": str(key)},
-            {"type": "text",    "value": body},
-            {"type": "integer", "value": str(now)},
-            {"type": "integer", "value": str(now + int(ttl_sec))},
-        ],
-    }])
-    return res is not None
+
+    # Full value table — every column BOT 0's schema has ever used.
+    values: Dict[str, Any] = {
+        "key":        {"type": "text",    "value": str(key)},
+        "payload":    {"type": "text",    "value": body},
+        "cached_at":  {"type": "integer", "value": str(now)},
+        "expires_at": {"type": "integer", "value": str(now + ttl)},
+        "ttl_sec":    {"type": "integer", "value": str(ttl)},
+        "updated_at": {"type": "integer", "value": str(now)},
+    }
+
+    # Filter to columns that actually exist.
+    active_cols = [c for c in ("key", "payload", "cached_at", "expires_at",
+                               "ttl_sec", "updated_at") if c in _COLS]
+    if "key" not in active_cols or "payload" not in active_cols:
+        log.warning("Turso: table missing required columns key/payload")
+        return False
+
+    # Alert loudly if the table has a NOT NULL column we don't know how to
+    # fill — future-proofing against BOT 0 adding another mandatory column.
+    unknown_not_null = _NOT_NULL - set(values.keys())
+    if unknown_not_null:
+        log.warning(
+            "Turso: table has NOT NULL columns we can't fill: %s — "
+            "add them to turso_client._DEFAULTS_ or the write will fail.",
+            sorted(unknown_not_null),
+        )
+
+    col_list = ", ".join(f'"{c}"' for c in active_cols)
+    placeholders = ", ".join("?" for _ in active_cols)
+
+    # ON CONFLICT: update everything except cached_at (that's when the row
+    # was first cached — preserve the original value).
+    update_cols = [c for c in active_cols
+                   if c not in ("key", "cached_at")]
+    update_set = ", ".join(f'"{c}" = excluded."{c}"' for c in update_cols)
+
+    sql = (
+        f'INSERT INTO nhentai_cache ({col_list}) VALUES ({placeholders}) '
+        f'ON CONFLICT("key") DO UPDATE SET {update_set}'
+    )
+    args = [values[c] for c in active_cols]
+    res = await _pipeline([{"sql": sql, "args": args}])
+    if not res:
+        return False
+    # Empty dict in position 0 means the stmt errored (see _pipeline).
+    return bool(res[0])
 
 
 async def close() -> None:

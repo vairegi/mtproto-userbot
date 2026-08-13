@@ -127,18 +127,23 @@ async def _gallery_is_fresh(gid: str) -> bool:
 
 
 async def _fetch_one_gallery(
-    client: httpx.AsyncClient, gid: str
+    client: httpx.AsyncClient, gid: str, *, source_sort: str = "",
 ) -> str:
-    """One /galleries/<id> call → cache. Returns ok / hit / skip / rate / error."""
+    """One /galleries/<id> call → cache. Returns ok / hit / skip / rate / error.
+    `source_sort` is the list-sort or tag pseudo-sort the gid came from
+    (e.g. 'popular-today' or 'tag:incest') so the dashboard can attribute
+    the new gallery to the right counter line."""
+    from . import channel_dashboard
     key = cache.gallery_key(gid)
 
     if await _gallery_is_fresh(gid):
         _stats_bump(hits=1)
-        return "hit"
+        return "hit"   # already in cache — NOT counted as new
 
     if not cache.try_consume(key):
         log.info("⏭  galleries bucket exhausted gid=%s", gid)
         _stats_bump(skips=1)
+        channel_dashboard.record_bucket_skip()
         return "skip"
 
     try:
@@ -150,16 +155,22 @@ async def _fetch_one_gallery(
     except hf_scraper_lite.UpstreamError as e:
         log.warning("upstream error gid=%s status=%s", gid, e.status)
         _stats_bump(errors=1)
+        channel_dashboard.record_error()
         return "error"
 
     write_res = await cache.put(key, payload)
     if not (write_res.get("turso") or write_res.get("mongo")):
         _stats_bump(errors=1)
+        channel_dashboard.record_error()
         return "error"
 
     log.info("📝 detail WRITE gid=%s turso=%s mongo=%s", gid,
              write_res.get("turso"), write_res.get("mongo"))
     _stats_bump(writes=1)
+    # Attribute NEW gallery to its source sort/tag so the summary line
+    # "New in <label>: N" ticks up on the right row.
+    channel_dashboard.record_new_gallery(source_sort or "popular")
+    channel_dashboard.record_activity(last_gid=str(gid))
     return "ok"
 
 
@@ -186,7 +197,7 @@ async def _work_page(
             break
         if mongo_client.is_paused():
             break
-        res = await _fetch_one_gallery(client, gid)
+        res = await _fetch_one_gallery(client, gid, source_sort=sort)
         tally[res if res in tally else "error"] += 1
         # Only sleep if we actually made an upstream call.
         if res in ("ok", "rate", "error"):

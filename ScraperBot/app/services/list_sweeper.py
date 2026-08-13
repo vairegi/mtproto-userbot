@@ -112,17 +112,39 @@ async def _fetch_and_cache(
         "rate"      — upstream 429 (priority-pushed)
         "error"     — upstream / write error
     """
-    key = cache.search_key("", sort, page)
+    # `sort` may be a raw sort id ('popular') OR a tag pseudo-sort ('tag:incest').
+    # Both hit the same cache-key namespace so BOT 0's mini-app reads them via
+    # its normal search cache.
+    is_tag = sort.startswith("tag:")
+    if is_tag:
+        tag_name = sort[4:].strip()
+        query = f"tag:{tag_name}"
+        cache_sort = f"tag-{tag_name}"      # store as its own cache namespace
+        real_sort = "popular"
+    else:
+        query = ""
+        cache_sort = sort
+        real_sort = sort
+
+    key = cache.search_key(query, cache_sort, page)
+
+    # Dashboard: reflect what we're doing on the activity line.
+    from . import channel_dashboard
+    channel_dashboard.record_activity(
+        sweeping=f"{sort} · page {page}",
+        last_tag=(sort[4:].strip() if is_tag else ""),
+    )
 
     if not cache.try_consume(key):
         log.info("⏭  bucket exhausted key=%s", key)
         _priority_push(sort, page)
         _stats_bump(skips=1)
+        channel_dashboard.record_bucket_skip()
         return "skip"
 
     try:
         payload = await hf_scraper_lite.fetch_search_page(
-            client, query="", sort=sort, page=page,
+            client, query=query, sort=real_sort, page=page,
         )
     except hf_scraper_lite.RateLimited as e:
         log.warning("🚫 429 key=%s retry_after=%s", key, e.retry_after)
@@ -132,18 +154,22 @@ async def _fetch_and_cache(
     except hf_scraper_lite.UpstreamError as e:
         log.warning("upstream error key=%s status=%s", key, e.status)
         _stats_bump(errors=1)
+        channel_dashboard.record_error()
         return "error"
 
     write_res = await cache.put(key, payload)
     if not (write_res.get("turso") or write_res.get("mongo")):
         _stats_bump(errors=1)
+        channel_dashboard.record_error()
         return "error"
 
     log.info("📝 WRITE key=%s turso=%s mongo=%s", key,
              write_res.get("turso"), write_res.get("mongo"))
     _stats_bump(writes=1)
+    channel_dashboard.record_search_page_written()
 
-    # Hint details_sweeper: freshly-written page's IDs deserve hydration.
+    # Hint details_sweeper: freshly-written page's IDs deserve hydration,
+    # and pass the sort/tag along so 'new' galleries can be attributed.
     await _register_details_hint(sort, page)
     return "ok"
 
@@ -153,9 +179,21 @@ async def sweep_once() -> Dict[str, Any]:
     if mongo_client.is_paused():
         return {"skipped": "paused"}
 
+    from . import channel_dashboard
+    await channel_dashboard.start_phase()
+
     _stats_reset_current()
     started = time.time()
     ok = skip = rate = err = 0
+
+    # Build the full sort list = configured sorts + one 'tag:<name>' pseudo
+    # sort per extra tag. This is what makes tags auto-appear in the
+    # dashboard: every tag becomes a first-class sort key.
+    sorts_this_phase = list(settings.list_sorts)
+    for t in settings.extra_tag_sorts:
+        t = (t or "").strip()
+        if t and f"tag:{t}" not in sorts_this_phase:
+            sorts_this_phase.append(f"tag:{t}")
 
     client = await hf_scraper_lite.make_client()
     try:
@@ -173,7 +211,7 @@ async def sweep_once() -> Dict[str, Any]:
         # Regular sweep — column-major so no sort starves.
         max_pages = max(1, int(settings.list_max_pages))
         for page in range(1, max_pages + 1):
-            for sort in settings.list_sorts:
+            for sort in sorts_this_phase:
                 if mongo_client.is_paused():
                     break
                 res = await _fetch_and_cache(client, sort, page)
@@ -193,6 +231,13 @@ async def sweep_once() -> Dict[str, Any]:
     _stats_bump(sweeps=1)
     log.info("list sweep done ok=%d skip=%d rate=%d err=%d dur=%.1fs",
              ok, skip, rate, err, duration)
+
+    # Freeze the dashboard pair with the phase's final numbers.
+    try:
+        await channel_dashboard.end_phase()
+    except Exception as e:  # noqa: BLE001
+        log.warning("dashboard end_phase failed: %s", e)
+
     return {
         "ok": ok, "skip": skip, "rate_limited": rate, "errors": err,
         "duration_sec": round(duration, 2),

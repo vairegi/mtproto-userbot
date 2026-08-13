@@ -109,6 +109,16 @@ class Settings:
     # Logging
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper().strip() or "INFO"
 
+    # Extra per-tag sweeps (e.g. incest, vanilla, big-breasts). Each tag
+    # becomes its own sort key: search?query=tag:<name>&sort=popular.
+    # Auto-expanded via env var so you can add tags without a redeploy.
+    extra_tag_sorts: List[str] = field(default_factory=lambda: _env_csv(
+        "EXTRA_TAG_SORTS", ["incest"]))
+
+    # Live channel dashboard
+    log_channel_id: str = os.getenv("BOT1_LOG_CHANNEL_ID", "-1003796521529").strip()
+    channel_refresh_sec: int = _env_int("BOT1_CHANNEL_REFRESH_SEC", 5)
+
     def validate(self) -> list[str]:
         """Return list of human-readable errors (empty = OK)."""
         errs: list[str] = []

@@ -94,11 +94,12 @@ def _status_text() -> str:
 def _help_text() -> str:
     return (
         "<b>ScraperBot commands</b>\n"
-        "/status  — sweep counters + last run\n"
-        "/pause   — pause both sweepers (admin)\n"
-        "/resume  — resume both sweepers (admin)\n"
-        "/trigger — kick a list sweep now (admin)\n"
-        "/help    — this message"
+        "/status    — sweep counters + last run\n"
+        "/pause     — pause both sweepers (admin)\n"
+        "/resume    — resume both sweepers (admin)\n"
+        "/trigger   — kick a list sweep now (admin)\n"
+        "/time &lt;n&gt; — set channel dashboard refresh (2–300 s, admin)\n"
+        "/help      — this message"
     )
 
 
@@ -124,7 +125,7 @@ async def handle_update(update: Dict[str, Any]) -> None:
         await send_message(chat_id, _status_text())
         return
 
-    if cmd in ("/pause", "/resume", "/trigger"):
+    if cmd in ("/pause", "/resume", "/trigger", "/time"):
         if not is_tg_admin(from_user):
             await send_message(chat_id, "❌ admin only")
             return
@@ -142,6 +143,24 @@ async def handle_update(update: Dict[str, Any]) -> None:
             import asyncio
             asyncio.create_task(list_sweeper.sweep_once())
             await send_message(chat_id, "🚀 list sweep kicked. /status for progress.")
+            return
+        if cmd == "/time":
+            from . import channel_dashboard
+            parts = text.split()
+            if len(parts) < 2:
+                cur = channel_dashboard.get_refresh_sec()
+                await send_message(chat_id,
+                    f"⏱ current channel refresh: <b>{cur}s</b>. "
+                    f"Usage: <code>/time 10</code> (allowed 2–300).")
+                return
+            try:
+                new_n = int(parts[1])
+            except ValueError:
+                await send_message(chat_id, "❌ usage: /time &lt;seconds&gt;")
+                return
+            applied = channel_dashboard.set_refresh_sec(new_n)
+            await send_message(chat_id,
+                f"⏱ channel refresh set to <b>{applied}s</b>.")
             return
 
 
