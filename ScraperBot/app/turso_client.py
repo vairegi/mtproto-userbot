@@ -169,8 +169,27 @@ async def bootstrap_schema() -> None:
            "updated_at INTEGER NOT NULL, "
            "expires_at INTEGER NOT NULL)")
     res = await _pipeline([{"sql": sql}])
-    if res is not None:
-        log.info("Turso: schema OK")
+    if res is None:
+        log.warning("Turso: schema create failed (transport)")
+        return
+    log.info("Turso: schema OK")
+
+    # v1.3: migrate pre-existing tables that lack our columns. BOT 0
+    # created nhentai_cache with a different schema (no updated_at /
+    # expires_at), so every INSERT/SELECT that referenced those columns
+    # was logging `Parse error: no such column: updated_at`. ALTER TABLE
+    # is idempotent-enough for us: we swallow the 'duplicate column name'
+    # error and move on.
+    for col in ("updated_at", "expires_at"):
+        try:
+            mig = await _pipeline([{
+                "sql": f"ALTER TABLE nhentai_cache ADD COLUMN "
+                       f"{col} INTEGER NOT NULL DEFAULT 0",
+            }])
+            if mig is not None:
+                log.info("Turso: migrated column %s (or already present)", col)
+        except Exception as e:  # noqa: BLE001
+            log.debug("Turso: column %s probably exists (%s)", col, e)
 
 
 async def get(key: str) -> Optional[dict]:
