@@ -91,6 +91,13 @@ class Settings:
     list_sorts: List[str] = field(default_factory=lambda: _env_csv(
         "LIST_SORTS", ["popular", "date", "popular-today", "popular-week"]))
     list_max_pages: int = _env_int("LIST_MAX_PAGES", 30)
+    # v1.13: tag sorts sweep fewer pages than chip sorts. Chip sorts (the
+    # four in `list_sorts`) are what users see on the Discover screen so
+    # they get the full LIST_MAX_PAGES depth. Tag sorts (trending +
+    # EXTRA_TAG_SORTS) are typed-search fodder — users almost never scroll
+    # past page 7, and going deeper burns the shared /search bucket for no
+    # visible win. Env-overridable via LIST_TAG_MAX_PAGES.
+    list_tag_max_pages: int = _env_int("LIST_TAG_MAX_PAGES", 7)
     list_tick_sec: int = _env_int("LIST_TICK_SEC", 21600)   # 6 hours
     list_delay_sec: float = _env_float("LIST_DELAY_SEC", 1.0)
     # Sleep after a bucket-skip. Short (1s) matches BOT 0 — the bucket is

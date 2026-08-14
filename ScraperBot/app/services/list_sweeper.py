@@ -241,9 +241,22 @@ async def sweep_once() -> Dict[str, Any]:
             await asyncio.sleep(settings.list_delay_sec)
 
         # Regular sweep — column-major so no sort starves.
-        max_pages = max(1, int(settings.list_max_pages))
-        for page in range(1, max_pages + 1):
+        # v1.13: chip sorts sweep list_max_pages (default 30); tag sorts
+        # sweep only list_tag_max_pages (default 7). We iterate up to the
+        # wider of the two depths and skip a (sort, page) pair when the
+        # page exceeds the per-sort cap.
+        chip_max_pages = max(1, int(settings.list_max_pages))
+        tag_max_pages  = max(1, int(settings.list_tag_max_pages))
+        overall_max    = max(chip_max_pages, tag_max_pages)
+        for page in range(1, overall_max + 1):
             for sidx, sort in enumerate(sorts_this_phase):
+                # v1.13: enforce per-sort page cap. Tag sorts are prefixed
+                # `tag:` in sorts_this_phase; chip sorts are bare
+                # ("popular", "date", ...). Skip a tag combo once page > 7.
+                is_tag = isinstance(sort, str) and sort.startswith("tag:")
+                per_sort_cap = tag_max_pages if is_tag else chip_max_pages
+                if page > per_sort_cap:
+                    continue
                 # Resume: skip combos strictly before the saved cursor.
                 if page < resume_page:
                     continue
@@ -289,8 +302,9 @@ async def sweep_once() -> Dict[str, Any]:
 
 async def run_forever(stop_event: asyncio.Event) -> None:
     """Boot task: sweep, then sleep list_tick_sec, forever."""
-    log.info("list_sweeper: starting (tick=%ds sorts=%s max_pages=%d)",
-             settings.list_tick_sec, settings.list_sorts, settings.list_max_pages)
+    log.info("list_sweeper: starting (tick=%ds sorts=%s chip_max_pages=%d tag_max_pages=%d)",
+             settings.list_tick_sec, settings.list_sorts,
+             settings.list_max_pages, settings.list_tag_max_pages)
     while not stop_event.is_set():
         if not settings.scraper_enabled:
             log.info("scraper disabled via SCRAPER_ENABLED=0 — idling")
@@ -316,5 +330,6 @@ def status() -> Dict[str, Any]:
         "enabled":   settings.scraper_enabled,
         "sorts":     settings.list_sorts,
         "max_pages": settings.list_max_pages,
+        "tag_max_pages": settings.list_tag_max_pages,
         "tick_sec":  settings.list_tick_sec,
     }
