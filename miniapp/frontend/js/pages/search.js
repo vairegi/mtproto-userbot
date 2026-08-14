@@ -592,9 +592,27 @@ function buildSearchBar(state, refetch, toggleHomeRows) {
     }
   }
 
+  // v12.20: SEARCH-ON-ENTER ONLY. Previously the "input" listener fired
+  // commit(false) on every keystroke with a 350 ms debounce, so typing
+  // "in" for "incest" would auto-search after a short pause and burn a
+  // full upstream call for a 2-letter query. Removing that listener means
+  // typed characters only update the visible clear-button state — no
+  // network call, no cache write — until the user actually presses Enter,
+  // submits the form, or the input fires `change` on blur.
+  //
+  // compositionstart/end are still tracked so composing IMEs don't get
+  // half-committed if the user hits Enter mid-composition, but the
+  // auto-commit on compositionend has been removed for the same reason
+  // (a Chinese/Japanese user finishing a composition should not trigger
+  // a search either — only Enter should).
   input.addEventListener("compositionstart", () => { composing = true; });
-  input.addEventListener("compositionend",   () => { composing = false; commit(false); });
-  input.addEventListener("input", () => { if (!composing) commit(false); });
+  input.addEventListener("compositionend",   () => { composing = false; });
+  // Keep the clear-button visibility in sync with the input WITHOUT
+  // committing / firing a search.
+  input.addEventListener("input", () => {
+    state.query = input.value;
+    clear.classList.toggle("u-hide", !state.query);
+  });
   const enterHit = (e) => {
     e.preventDefault();
     commit(true);            // fire NOW — no 350ms debounce on Enter
@@ -609,7 +627,8 @@ function buildSearchBar(state, refetch, toggleHomeRows) {
     if (e.key === "Enter" || e.key === "Go" || e.keyCode === 13) enterHit(e);
   });
   // v12: last-ditch fallback — some IMEs only fire `change` when the
-  // search key commits/blurs the field.
+  // search key commits/blurs the field. Still gated on `composing` so a
+  // stray blur during IME composition does not fire a partial search.
   input.addEventListener("change", () => { if (!composing) commit(true); });
   form.addEventListener("submit", (e) => {
     e.preventDefault();

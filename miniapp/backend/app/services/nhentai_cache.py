@@ -60,6 +60,37 @@ TTL_SUGGEST_SEC    = _env_int("NHCACHE_TTL_SUGGEST_SEC",     3 * 24 * 3600)   # 
 TTL_TRENDING_SEC   = _env_int("NHCACHE_TTL_TRENDING_SEC",              1800)   # 30 min
 TTL_STALE_GRACE_SEC = _env_int("NHCACHE_TTL_STALE_GRACE_SEC", 7 * 24 * 3600)   # keep stale docs around this long for "serve-stale-if-error"
 
+# v12.20: NEVER-EXPIRE sentinel. Chip-sort and tag-sort search pages are
+# fully owned by BOT 1's continuous sweep — every phase INSERT-OR-REPLACEs
+# the whole page payload, so new items appear and removed items disappear
+# automatically. TTL freshness makes no sense for a row a background worker
+# is authoritatively rewriting; instead we stamp expires_at=0 and treat
+# that as "always fresh, never call nhentai". Non-chip/tag keys still use
+# TTL. Toggle via NHCACHE_CHIP_TAG_NEVER_EXPIRE=0 to revert without a code
+# change.
+NHCACHE_CHIP_TAG_NEVER_EXPIRE = os.environ.get(
+    "NHCACHE_CHIP_TAG_NEVER_EXPIRE", "1").strip() not in ("0", "false", "False", "")
+
+
+def _is_chip_or_tag_key(key: str) -> bool:
+    """True for keys whose payload is owned by BOT 1's sweep and therefore
+    should never expire. Two formats qualify:
+        search:<sort>:page<N>              chip sorts
+        search:q=<q>|sort=<s>|page=<N>     tag / typed-search sorts
+    Legacy `search:<hash>|<sort>|<page>` (Mongo-only, from earlier BOT 1
+    versions) is NOT included — those rows are read-only fallbacks.
+    """
+    if not isinstance(key, str) or not key.startswith("search:"):
+        return False
+    tail = key[len("search:"):]
+    # Chip: <sort>:pageN, no pipe, one colon separating sort from pageN.
+    if "|" not in tail and tail.count(":") == 1 and ":page" in tail:
+        return True
+    # Tag / typed: q=...|sort=...|page=N (all three parts required).
+    if tail.startswith("q=") and "|sort=" in tail and "|page=" in tail:
+        return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Token-bucket capacities (per minute) — sourced from openapi.json ANON tier.
@@ -177,7 +208,11 @@ def _turso_get(key: str, allow_stale: bool) -> Optional[dict]:
     except (TypeError, ValueError):
         return None
     now = _now_epoch()
-    if expires_at > now:
+    # v12.20: expires_at == 0 is the never-expire sentinel for chip/tag rows
+    # that BOT 1 authoritatively rewrites every sweep. Always fresh.
+    if expires_at == 0:
+        pass  # never expires
+    elif expires_at > now:
         pass  # fresh
     elif allow_stale and (now - expires_at) < TTL_STALE_GRACE_SEC:
         pass  # stale-but-servable
@@ -201,6 +236,18 @@ def _mongo_get(key: str, allow_stale: bool) -> Optional[dict]:
         return None
     now = _now_dt()
     exp = doc.get("expires_at")
+    # v12.20: BOT 1 writes epoch seconds; BOT 0 historically wrote datetimes.
+    # Both are handled. The never-expire sentinel is exp==0 OR exp is a
+    # tz-aware datetime at epoch 0 — either way, treat as always fresh.
+    if isinstance(exp, (int, float)):
+        if exp == 0:
+            return doc.get("payload")
+        # Compare epoch-seconds to now (as epoch).
+        if exp > _now_epoch():
+            return doc.get("payload")
+        if allow_stale and (_now_epoch() - exp) < TTL_STALE_GRACE_SEC:
+            return doc.get("payload")
+        return None
     if exp and exp > now:
         return doc.get("payload")
     if allow_stale and exp:
@@ -227,6 +274,15 @@ def _turso_put(key: str, payload_json: str, ttl: int) -> bool:
     if _turso is None or not _turso.turso_available():
         return False
     now = _now_epoch()
+    # v12.20: chip/tag rows get expires_at=0 sentinel so they never expire.
+    # ttl_sec is still stored (as 0) so anyone querying the row sees the
+    # intent clearly.
+    if NHCACHE_CHIP_TAG_NEVER_EXPIRE and _is_chip_or_tag_key(key):
+        expires_at = 0
+        stored_ttl = 0
+    else:
+        expires_at = now + ttl
+        stored_ttl = ttl
     try:
         rs = _turso.execute(
             "INSERT INTO nhentai_cache (key, payload, cached_at, expires_at, ttl_sec) "
@@ -234,7 +290,7 @@ def _turso_put(key: str, payload_json: str, ttl: int) -> bool:
             "ON CONFLICT(key) DO UPDATE SET "
             "payload=excluded.payload, cached_at=excluded.cached_at, "
             "expires_at=excluded.expires_at, ttl_sec=excluded.ttl_sec",
-            [key, payload_json, now, now + ttl, ttl],
+            [key, payload_json, now, expires_at, stored_ttl],
         )
         return rs is not None
     except Exception as e:  # noqa: BLE001
@@ -246,12 +302,23 @@ def _mongo_put(key: str, payload: Any, ttl: int) -> bool:
     conn = _handle()
     if conn is None:
         return False
+    # v12.20: same never-expire treatment as _turso_put. Note that BOT 1
+    # writes expires_at as an epoch NUMBER; BOT 0 historically writes a
+    # datetime. _mongo_get handles both shapes, so either sentinel form
+    # (0 as int/float) works; we pick the numeric form for consistency
+    # with BOT 1.
+    if NHCACHE_CHIP_TAG_NEVER_EXPIRE and _is_chip_or_tag_key(key):
+        exp_val: Any = 0
+        stored_ttl = 0
+    else:
+        exp_val = _now_dt() + timedelta(seconds=ttl)
+        stored_ttl = ttl
     doc = {
         "_id":        key,
         "payload":    payload,
-        "expires_at": _now_dt() + timedelta(seconds=ttl),
+        "expires_at": exp_val,
         "cached_at":  _now_dt(),
-        "ttl_sec":    ttl,
+        "ttl_sec":    stored_ttl,
     }
     try:
         conn.nhentai_cache.replace_one({"_id": key}, doc, upsert=True)
@@ -287,6 +354,9 @@ def put(key: str, payload: Any, ttl_sec: Optional[int] = None):
         return False
 
     # v12.9 dedup: compare against the existing fresh Turso row (if any).
+    # v12.20: expires_at == 0 is the never-expire sentinel — treat it as
+    # "always fresh" here too, otherwise every chip/tag rewrite would bypass
+    # dedup and flood Turso with identical writes.
     if _turso is not None and _turso.turso_available():
         try:
             rs = _turso.execute(
@@ -295,8 +365,12 @@ def put(key: str, payload: Any, ttl_sec: Optional[int] = None):
             )
             if rs is not None and getattr(rs, "rows", None):
                 existing_json, existing_exp = rs.rows[0]
-                if (existing_json == payload_json
-                        and int(existing_exp or 0) > _now_epoch()):
+                try:
+                    _exp = int(existing_exp or 0)
+                except (TypeError, ValueError):
+                    _exp = 0
+                _is_fresh = (_exp == 0) or (_exp > _now_epoch())
+                if existing_json == payload_json and _is_fresh:
                     return "unchanged"
         except Exception:  # noqa: BLE001
             pass  # dedup is best-effort; never block the write path
