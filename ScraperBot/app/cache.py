@@ -83,6 +83,33 @@ def ttl_for_key(key: str) -> int:
     return settings.ttl_search_sec
 
 
+# v1.12: never-expire predicate. Chip-sort and tag-sort search pages are
+# fully owned by this bot's continuous sweep — every phase INSERT-OR-REPLACEs
+# the whole page, so new items appear and removed items disappear
+# automatically. TTL freshness makes no sense for a row we authoritatively
+# rewrite; instead we stamp expires_at=0 on write and BOT 0's read path
+# (nhentai_cache.py v12.20) treats that as "always fresh, never call
+# nhentai".
+import os as _os_ne
+NEVER_EXPIRE_CHIP_TAG = _os_ne.environ.get(
+    "NHCACHE_CHIP_TAG_NEVER_EXPIRE", "1").strip() not in ("0", "false", "False", "")
+
+
+def is_chip_or_tag_key(key: str) -> bool:
+    """Byte-identical predicate to BOT 0's _is_chip_or_tag_key. Two formats:
+        search:<sort>:page<N>              chip sorts (bot0_chip_key)
+        search:q=<q>|sort=<s>|page=<N>     tag / typed-search sorts (bot0_search_key)
+    """
+    if not isinstance(key, str) or not key.startswith("search:"):
+        return False
+    tail = key[len("search:"):]
+    if "|" not in tail and tail.count(":") == 1 and ":page" in tail:
+        return True
+    if tail.startswith("q=") and "|sort=" in tail and "|page=" in tail:
+        return True
+    return False
+
+
 def bucket_for_key(key: str) -> str:
     if key.startswith("gallery:"):
         return "galleries"
@@ -105,8 +132,17 @@ def bucket_capacity(bucket: str) -> int:
 
 # ---- write path ----------------------------------------------------------
 async def put(key: str, payload: Any) -> dict:
-    """Write to Turso first, mirror to Mongo. Both are best-effort."""
-    ttl = ttl_for_key(key)
+    """Write to Turso first, mirror to Mongo. Both are best-effort.
+
+    v1.12: chip and tag keys pass ttl_sec=0 to signal never-expire. Both
+    writers (turso_client.put, mongo_client.cache_put_mongo) treat ttl==0
+    as "stamp expires_at=0 sentinel" — BOT 0's read path recognises the
+    sentinel and always serves the row without falling back to nhentai.
+    """
+    if NEVER_EXPIRE_CHIP_TAG and is_chip_or_tag_key(key):
+        ttl = 0
+    else:
+        ttl = ttl_for_key(key)
     turso_ok = await turso_client.put(key, payload, ttl)
     mongo_ok = mongo_client.cache_put_mongo(key, payload, ttl)
     return {"turso": bool(turso_ok), "mongo": bool(mongo_ok), "ttl": ttl}

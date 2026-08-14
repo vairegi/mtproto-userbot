@@ -135,13 +135,18 @@ def cache_put_mongo(key: str, payload: Any, ttl_sec: int) -> bool:
     if d is None:
         return False
     now = time.time()
+    # v1.12: ttl_sec == 0 is the never-expire sentinel. Store expires_at=0
+    # verbatim; BOT 0's nhentai_cache._mongo_get (v12.20) recognises the
+    # numeric zero as always-fresh. Non-zero ttl behaves as before.
+    ttl_i = int(ttl_sec)
+    expires_at_val = 0 if ttl_i == 0 else (now + ttl_i)
     try:
         d[CACHE_COLL].update_one(
             {"_id": key},
             {"$set": {
                 "payload": payload,
                 "updated_at": now,
-                "expires_at": now + int(ttl_sec),
+                "expires_at": expires_at_val,
                 "writer": "scraperbot",
             }},
             upsert=True,

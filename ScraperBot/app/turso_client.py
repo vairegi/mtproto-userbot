@@ -270,12 +270,17 @@ async def put(key: str, payload: Any, ttl_sec: int) -> bool:
     ttl = int(ttl_sec)
     body = json.dumps(payload, ensure_ascii=False)
 
+    # v1.12: ttl_sec == 0 is the never-expire sentinel. Store expires_at=0
+    # verbatim so BOT 0's nhentai_cache.py (v12.20) recognises the row as
+    # always-fresh. Non-zero ttl behaves as before: expires_at = now + ttl.
+    expires_at_val = 0 if ttl == 0 else (now + ttl)
+
     # Full value table — every column BOT 0's schema has ever used.
     values: Dict[str, Any] = {
         "key":        {"type": "text",    "value": str(key)},
         "payload":    {"type": "text",    "value": body},
         "cached_at":  {"type": "integer", "value": str(now)},
-        "expires_at": {"type": "integer", "value": str(now + ttl)},
+        "expires_at": {"type": "integer", "value": str(expires_at_val)},
         "ttl_sec":    {"type": "integer", "value": str(ttl)},
         "updated_at": {"type": "integer", "value": str(now)},
     }
