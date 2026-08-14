@@ -49,8 +49,14 @@ def bot0_search_key(query: str, sort: str, page: int) -> str:
     """BOT 0's user-typed query format — what scraper_bridge reads when a
     user types into the search box.
     Matches: search:q=sole female|sort=popular|page=1
+
+    v1.11: query normalization made byte-identical to BOT 0's
+    hf_scraper.search() (v12.19): lowercase + internal whitespace
+    collapse ("  Sole   Female " -> "sole female"). Without the collapse,
+    a multi-space query produced different keys on the two bots and the
+    warm row was never hit.
     """
-    q = (query or "").strip().lower()
+    q = " ".join((query or "").lower().split())
     s = (sort or "popular").strip().lower()
     return f"search:q={q}|sort={s}|page={int(page or 1)}"
 
