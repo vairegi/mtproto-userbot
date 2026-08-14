@@ -741,7 +741,47 @@ async def search(query: str, page: int = 1) -> Optional[SearchPage]:
     params: Dict[str, Any] = {"query": q, "sort": "date", "page": int(page or 1)}
     cache_key = f"search:{q}:p{page}"
 
-    data = await _fetch_json_cached(cache_key, "/search", params, _SEARCH_CACHE_TTL_SEC)
+    # v12.19 (cache-key alignment): BOT 1 (ScraperBot) warms the SHARED
+    # Turso/Mongo cache under BOT 0's canonical user-search key format
+    #     search:q=<lower>|sort=<s>|page=<N>
+    # which this function's legacy `search:<q>:p<N>` ( -> Turso
+    # `search:search:<q>:p<N>`) NEVER matches — so every typed search was
+    # a permanent L3 upstream call. Read BOT 1's warm row FIRST (query
+    # lowercased on BOTH sides); on miss fall through to the legacy
+    # cached fetch, then dual-write the result under the canonical key
+    # so the NEXT read of this query is a Turso HIT. Both "date" and
+    # "popular" orderings of the same query are served from the same
+    # underlying upstream page, so we read both warm variants.
+    _qn = " ".join(q.lower().split())
+    _nhc0 = _turso_cache_module()
+    if _nhc0 is not None:
+        for _srt in ("date", "popular"):
+            _warm_key = f"search:q={_qn}|sort={_srt}|page={int(page or 1)}"
+            try:
+                _warm = _nhc0.get(_warm_key, allow_stale=False)
+            except Exception:  # noqa: BLE001
+                _warm = None
+            if isinstance(_warm, dict):
+                _ttl_r = getattr(_nhc0, "ttl_for_key", lambda _k: 0)(_warm_key)
+                log.info(_LOG_HIT, _warm_key, _ttl_r)
+                _cache_put(cache_key, _warm, _SEARCH_CACHE_TTL_SEC)  # re-warm L1
+                data = _warm
+                break
+        else:
+            data = None
+    else:
+        data = None
+
+    if data is None:
+        data = await _fetch_json_cached(cache_key, "/search", params, _SEARCH_CACHE_TTL_SEC)
+        if data is not None and _nhc0 is not None:
+            # Dual-write the freshly-fetched payload under the canonical
+            # key so subsequent typed searches (either bot) hit L2.
+            _canon = f"search:q={_qn}|sort=date|page={int(page or 1)}"
+            try:
+                _nhc0.put(_canon, data)
+            except Exception as e:  # noqa: BLE001
+                log.debug("canonical turso write failed for %s: %s", _canon, e)
     if data is None:
         return None
 
