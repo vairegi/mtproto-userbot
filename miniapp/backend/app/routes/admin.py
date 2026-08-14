@@ -27,6 +27,7 @@ from ..services import (
     broadcast, deletion_scheduler, force_join, queue_bridge, rescrape,
     scraper_bridge, share_guard,
 )
+from ..services import nhentai_cache as _nhc_admin
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -314,6 +315,26 @@ def broadcast_status(run_id: str, _a: dict = Depends(require_admin)) -> dict:
 def broadcast_recent(limit: int = 10,
                      _a: dict = Depends(require_admin)) -> dict:
     return {"items": broadcast.list_recent(limit=int(max(1, min(50, limit))))}
+
+
+# v12.21: /admin/cache/promote-sentinel
+#   One-shot admin endpoint that flips every existing chip-sort + tag-sort
+#   row in Turso + Mongo to the never-expire sentinel (expires_at=0,
+#   ttl_sec=0). Use this once after deploying v12.20 so users don't have to
+#   wait a full BOT 1 phase for legacy rows to get overwritten under the
+#   sentinel by BOT 1 v1.12. Idempotent — rows already at 0 are skipped.
+@router.post("/cache/promote-sentinel")
+def cache_promote_sentinel(_a: dict = Depends(require_admin)) -> dict:
+    """Promote every chip-sort + tag-sort cache row to never-expire.
+
+    Returns per-store affected-row counts:
+        {"ok": True,
+         "turso": <rows>, "turso_ok": bool,
+         "mongo": <rows>, "mongo_ok": bool}
+    """
+    res = _nhc_admin.promote_chip_tag_sentinel()
+    res["ok"] = bool(res.get("turso_ok") or res.get("mongo_ok"))
+    return res
 
 
 @router.get("/broadcast/preview")

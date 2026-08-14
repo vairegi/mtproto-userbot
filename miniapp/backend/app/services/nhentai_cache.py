@@ -397,6 +397,94 @@ def invalidate(key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# v12.21: promote existing chip/tag rows to the never-expire sentinel.
+#
+# Rows written before v12.20 / v1.12 still carry a real expires_at timestamp.
+# This helper flips every chip/tag row to expires_at=0 / ttl_sec=0 so it
+# becomes permanently fresh under v12.20's read path. Idempotent — rows
+# already at the sentinel are left alone.
+#
+# Two SQL/Mongo statements, each with `WHERE expires_at != 0` so re-running
+# is cheap. Returns per-store counts + a total.
+# ---------------------------------------------------------------------------
+def promote_chip_tag_sentinel() -> dict:
+    """Convert every chip-sort + tag-sort row to the never-expire sentinel.
+
+    Matches the two key formats defined in `_is_chip_or_tag_key`:
+        search:<sort>:page<N>              (chip sorts)
+        search:q=<q>|sort=<s>|page=<N>     (tag / typed sorts)
+
+    Returns:
+        {"turso": <rows_updated>, "mongo": <rows_updated>,
+         "turso_ok": bool, "mongo_ok": bool}
+    """
+    result: dict = {"turso": 0, "mongo": 0, "turso_ok": False, "mongo_ok": False}
+
+    # ---- Turso: two UPDATEs, one per key format ----
+    if _turso is not None and _turso.turso_available():
+        try:
+            # Chip format: search:<sort>:page<N>. GLOB is SQLite-native and
+            # cheaper than LIKE; the `NOT LIKE '%|%'` guard excludes the tag
+            # format that also starts with `search:`.
+            rs1 = _turso.execute(
+                "UPDATE nhentai_cache "
+                "   SET expires_at = 0, ttl_sec = 0 "
+                " WHERE key GLOB 'search:*:page*' "
+                "   AND key NOT LIKE '%|%' "
+                "   AND expires_at != 0",
+                [],
+            )
+            # Tag format: search:q=<q>|sort=<s>|page=<N>
+            rs2 = _turso.execute(
+                "UPDATE nhentai_cache "
+                "   SET expires_at = 0, ttl_sec = 0 "
+                " WHERE key LIKE 'search:q=%|sort=%|page=%' "
+                "   AND expires_at != 0",
+                [],
+            )
+            # libsql returns affected-row count in rows_affected; guard both.
+            def _rows(rs):
+                if rs is None:
+                    return 0
+                for attr in ("rows_affected", "affected_row_count", "rowcount"):
+                    v = getattr(rs, attr, None)
+                    if isinstance(v, int):
+                        return v
+                return 0
+            result["turso"] = _rows(rs1) + _rows(rs2)
+            result["turso_ok"] = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("promote_chip_tag_sentinel: turso failed: %s", e)
+
+    # ---- Mongo: same two predicates, updateMany ----
+    conn = _handle()
+    if conn is not None:
+        try:
+            import re as _re
+            # Chip: search:<sort>:page<N>, no pipes, exactly one colon in the tail.
+            chip_re = _re.compile(r"^search:[^|:]+:page\d+$")
+            # Tag/typed: search:q=...|sort=...|page=N
+            tag_re = _re.compile(r"^search:q=.*\|sort=.*\|page=\d+$")
+            r1 = conn.nhentai_cache.update_many(
+                {"_id": chip_re, "expires_at": {"$ne": 0}},
+                {"$set": {"expires_at": 0, "ttl_sec": 0}},
+            )
+            r2 = conn.nhentai_cache.update_many(
+                {"_id": tag_re, "expires_at": {"$ne": 0}},
+                {"$set": {"expires_at": 0, "ttl_sec": 0}},
+            )
+            result["mongo"] = int(getattr(r1, "modified_count", 0)) + \
+                              int(getattr(r2, "modified_count", 0))
+            result["mongo_ok"] = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("promote_chip_tag_sentinel: mongo failed: %s", e)
+
+    log.info("promote_chip_tag_sentinel: turso=%d mongo=%d",
+             result["turso"], result["mongo"])
+    return result
+
+
+# ---------------------------------------------------------------------------
 # v12.13 (#C): Turso dedup helpers.
 #
 # The nhentai_cache table declares `key TEXT PRIMARY KEY`, so by construction
