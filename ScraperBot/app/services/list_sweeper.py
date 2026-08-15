@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Tuple
 
 import httpx
 
-from .. import cache, mongo_client, hf_scraper_lite
+from .. import cache, mongo_client, hf_scraper_lite, normalize
 from ..config import settings
 
 log = logging.getLogger("scraperbot.list_sweeper")
@@ -170,9 +170,17 @@ async def _fetch_and_cache(
         return "skip"
 
     try:
-        payload = await hf_scraper_lite.fetch_search_page(
+        raw = await hf_scraper_lite.fetch_search_page(
             client, query=query, sort=real_sort, page=page,
         )
+        # v1.16: BOT 0 reads `search:*` as a LIST of card dicts
+        # (`if isinstance(_hit, list)`). Store the normalized list, not the
+        # raw {"result": [...]} dict — otherwise every read is a MISS.
+        payload = normalize.normalize_search_page(raw)
+        if not payload:
+            _stats_bump(errors=1)
+            channel_dashboard.record_error()
+            return "error"
     except hf_scraper_lite.RateLimited as e:
         log.warning("🚫 429 key=%s retry_after=%s", key, e.retry_after)
         _priority_push(sort, page)

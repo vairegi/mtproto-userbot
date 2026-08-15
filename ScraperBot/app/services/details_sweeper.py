@@ -157,7 +157,15 @@ async def _fetch_one_gallery(
         return "skip"
 
     try:
-        payload = await hf_scraper_lite.fetch_gallery(client, gid)
+        raw = await hf_scraper_lite.fetch_gallery(client, gid)
+        # v1.16: store the NORMALIZED detail dict (title=string, tag_groups,
+        # page1_url, ...) — the raw v2 JSON makes the frontend render
+        # `[object Object]`.
+        payload = normalize.normalize_gallery(raw)
+        if payload is None:
+            _stats_bump(errors=1)
+            channel_dashboard.record_error()
+            return "error"
     except hf_scraper_lite.RateLimited as e:
         log.warning("🚫 429 gid=%s retry_after=%s", gid, e.retry_after)
         _stats_bump(rate_limited=1)
