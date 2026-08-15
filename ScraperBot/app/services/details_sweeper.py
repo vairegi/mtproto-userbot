@@ -26,7 +26,7 @@ import httpx
 
 from .. import cache, mongo_client, turso_client, hf_scraper_lite
 from ..config import settings
-from . import list_sweeper
+from . import list_sweeper, normalize
 
 log = logging.getLogger("scraperbot.details_sweeper")
 
