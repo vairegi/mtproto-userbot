@@ -868,63 +868,188 @@ def _rn_gallery(payload):
     return None
 
 
-def renormalize_existing_rows(dry_run: bool = False) -> dict:
+# ---------------------------------------------------------------------------
+# v12.26: memory-safe paginated Turso iterator.
+#
+# Why: v12.24's diagnostic endpoints (shape-audit, renormalize) loaded the
+# ENTIRE nhentai_cache table into a Python list via `SELECT key, payload
+# FROM nhentai_cache WHERE key LIKE ?`. On a 512 MB Render instance that
+# OOM-crashed the mini-app backend (Render event: "exceeded its memory
+# limit"). The libSQL HTTP driver in this codebase returns the whole result
+# set as an in-memory list, so the fix is at the SQL layer: paginate with
+# LIMIT/OFFSET, yield one row at a time, never hold more than `batch` rows.
+# ---------------------------------------------------------------------------
+def _iter_turso_rows(prefix: str, batch: int = 200,
+                     start_offset: int = 0, hard_limit=None):
+    """Generator: yield (key, payload_str) one row at a time.
+
+    Uses LIMIT/OFFSET paging so total in-flight bytes are bounded by
+    `batch` rows regardless of table size. `hard_limit` caps the total
+    yielded rows across the whole walk (used to implement ?limit= slicing
+    on the admin endpoints).
+    """
+    if _turso is None or not _turso.turso_available():
+        return
+    off = int(start_offset or 0)
+    yielded = 0
+    while True:
+        remaining = None if hard_limit is None else max(0, int(hard_limit) - yielded)
+        if remaining == 0:
+            return
+        this_batch = batch if remaining is None else min(batch, remaining)
+        rs = _turso.execute(
+            "SELECT key, payload FROM nhentai_cache WHERE key LIKE ? "
+            "ORDER BY key LIMIT ? OFFSET ?",
+            [prefix, this_batch, off],
+        )
+        rows = getattr(rs, "rows", None)
+        if rows is None and isinstance(rs, dict):
+            rows = rs.get("rows")
+        rows = rows or []
+        if not rows:
+            return
+        for row in rows:
+            yield row[0], row[1]
+            yielded += 1
+        off += len(rows)
+        # Give the event loop / GC a breath between batches.
+        try:
+            import gc as _gc
+            _gc.collect(0)
+        except Exception:  # noqa: BLE001
+            pass
+        if len(rows) < this_batch:
+            return
+
+
+# In-process guard — at most one concurrent heavy diagnostic. A second
+# concurrent caller gets a clean signal instead of racing into a coincident
+# double allocation.
+try:
+    import threading as _threading
+    _RENORM_LOCK = _threading.BoundedSemaphore(1)
+except Exception:  # noqa: BLE001
+    _RENORM_LOCK = None
+
+
+class RenormalizeBusy(RuntimeError):
+    """Raised when another renormalize/shape-audit is already running."""
+
+
+def renormalize_existing_rows(dry_run: bool = False,
+                              limit=None, offset: int = 0,
+                              batch: int = 200) -> dict:
     """Rewrite legacy wrong-shape rows in-place to BOT 0's canonical shapes.
 
     v12.24: `dry_run=True` walks the same rows and counts what WOULD be
     rewritten without calling put() — used by /cache/renormalize/dry-run so
     the operator can see the blast radius before committing.
+
+    v12.26 (memory-safe):
+      * Turso is walked with LIMIT/OFFSET pagination (`batch` rows at a time).
+      * Mongo cursor uses .batch_size() + a payload+_id projection.
+      * Each row is `del`'d after processing so per-batch peak RSS is
+        bounded.
+      * `limit`/`offset` support slice-mode so a full renormalize can be run
+        in chunks (e.g. limit=200, offset=0 -> 200 -> 400 -> ...) on a
+        512 MB instance.
+      * In-process semaphore prevents two concurrent runs from doubling the
+        working set.
     """
-    out = {"turso_search": 0, "turso_gallery": 0,
-           "mongo_search": 0, "mongo_gallery": 0, "skipped": 0,
-           "dry_run": dry_run}
-    def _rows_turso(prefix):
-        rs = _turso.execute("SELECT key, payload FROM nhentai_cache WHERE key LIKE ?", [prefix])
-        rows = getattr(rs, "rows", None)
-        if rows is None and isinstance(rs, dict):
-            rows = rs.get("rows")
-        return rows or []
-    if _turso is not None and _turso.turso_available():
-        try:
+    if _RENORM_LOCK is not None and not _RENORM_LOCK.acquire(blocking=False):
+        raise RenormalizeBusy(
+            "another renormalize/shape-audit is already running")
+    try:
+        out = {"turso_search": 0, "turso_gallery": 0,
+               "mongo_search": 0, "mongo_gallery": 0, "skipped": 0,
+               "dry_run": dry_run, "batch": int(batch),
+               "offset": int(offset or 0),
+               "limit": None if limit is None else int(limit)}
+        # v12.26 slice-mode: `limit` is a TOTAL budget across both families
+        # AND both stores (Turso + Mongo), not per-family. This matches the
+        # /cache/renormalize?limit= endpoint's docstring ("max rows to
+        # process this call") — the caller expects one page = one call.
+        remaining = None if limit is None else int(limit)
+        def _take():
+            """Return current budget; None = unlimited."""
+            return None if remaining is None else max(0, remaining)
+        if _turso is not None and _turso.turso_available():
             for prefix, fn, ctr in (("search:%", _rn_search, "turso_search"),
                                     ("gallery:%", _rn_gallery, "turso_gallery")):
-                for row in _rows_turso(prefix):
-                    key = row[0]
-                    try:
-                        payload = json.loads(row[1])
-                    except Exception:
-                        continue
-                    new = fn(payload)
-                    if new is None:
-                        out["skipped"] += 1
-                        continue
-                    if not dry_run:
-                        put(key, new)
-                    out[ctr] += 1
-        except Exception as e:
-            log.warning("renormalize turso failed: %s", e)
-    conn = _handle()
-    if conn is not None:
-        try:
+                if _take() == 0:
+                    break
+                try:
+                    for key, payload_raw in _iter_turso_rows(
+                            prefix, batch=batch, start_offset=offset,
+                            hard_limit=_take()):
+                        try:
+                            payload = json.loads(payload_raw)
+                        except Exception:
+                            del payload_raw
+                            if remaining is not None: remaining -= 1
+                            continue
+                        del payload_raw
+                        new = fn(payload)
+                        del payload
+                        if new is None:
+                            out["skipped"] += 1
+                            if remaining is not None: remaining -= 1
+                            continue
+                        if not dry_run:
+                            put(key, new)
+                        del new
+                        out[ctr] += 1
+                        if remaining is not None: remaining -= 1
+                except Exception as e:  # noqa: BLE001
+                    log.warning("renormalize turso (%s) failed: %s", prefix, e)
+        conn = _handle()
+        if conn is not None:
             for prefix, fn, ctr in (("search:", _rn_search, "mongo_search"),
                                     ("gallery:", _rn_gallery, "mongo_gallery")):
-                for doc in conn.nhentai_cache.find({"_id": {"$regex": "^" + prefix}}):
-                    new = fn(doc.get("payload"))
-                    if new is None:
-                        out["skipped"] += 1
-                        continue
-                    if not dry_run:
-                        put(doc["_id"], new)
-                    out[ctr] += 1
-        except Exception as e:
-            log.warning("renormalize mongo failed: %s", e)
-    log.info("renormalize done (dry_run=%s): %s", dry_run, out)
-    return out
+                if _take() == 0:
+                    break
+                try:
+                    cur = conn.nhentai_cache.find(
+                        {"_id": {"$regex": "^" + prefix}},
+                        {"_id": 1, "payload": 1},
+                    ).batch_size(int(batch))
+                    if offset:
+                        cur = cur.skip(int(offset))
+                    if remaining is not None:
+                        cur = cur.limit(int(remaining))
+                    for doc in cur:
+                        payload = doc.get("payload")
+                        new = fn(payload)
+                        del payload
+                        if new is None:
+                            out["skipped"] += 1
+                            continue
+                        if not dry_run:
+                            put(doc["_id"], new)
+                        del new
+                        out[ctr] += 1
+                        if remaining is not None:
+                            remaining -= 1
+                            if remaining <= 0:
+                                break
+                except Exception as e:  # noqa: BLE001
+                    log.warning("renormalize mongo (%s) failed: %s", prefix, e)
+        log.info("renormalize done (dry_run=%s, batch=%d, offset=%s, "
+                 "limit=%s): %s", dry_run, batch, offset, limit, out)
+        return out
+    finally:
+        if _RENORM_LOCK is not None:
+            try:
+                _RENORM_LOCK.release()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # v12.24: shape-audit — read-only diagnostic that proves whether renormalize
 # is needed (rows the current read path REJECTS) and whether it worked.
-def shape_audit() -> dict:
+# v12.26: streamed + batched so a full-table audit on a 512 MB instance no
+# longer OOMs the process.
+def shape_audit(batch: int = 200) -> dict:
     """Count rows whose payload shape the strict read path accepts vs rejects.
 
     Read contract (scraper_bridge):
@@ -933,47 +1058,73 @@ def shape_audit() -> dict:
 
     Anything else currently reads as a MISS even though it's stored — exactly
     the "mini-app still loads from nhentai" symptom.
+
+    v12.26 memory-safety: uses _iter_turso_rows (LIMIT/OFFSET pagination) and
+    a Mongo cursor with batch_size + projection, so peak RSS is bounded by
+    ~`batch` rows regardless of table size. Guarded by the same in-process
+    semaphore as renormalize to prevent concurrent full-table walks.
     """
-    def _classify(key: str, payload) -> str:
-        if key.startswith("search:"):
-            return "ok" if isinstance(payload, list) else "wrong"
-        if key.startswith("gallery:"):
-            ok = isinstance(payload, dict) and bool(payload.get("id")) \
-                and isinstance(payload.get("title"), str) \
-                and "tag_groups" in payload
-            return "ok" if ok else "wrong"
-        return "ok"
-    res = {"turso": {"search_ok": 0, "search_wrong": 0,
-                     "gallery_ok": 0, "gallery_wrong": 0, "errors": 0},
-           "mongo": {"search_ok": 0, "search_wrong": 0,
-                     "gallery_ok": 0, "gallery_wrong": 0, "errors": 0}}
-    if _turso is not None and _turso.turso_available():
-        try:
+    if _RENORM_LOCK is not None and not _RENORM_LOCK.acquire(blocking=False):
+        raise RenormalizeBusy(
+            "another renormalize/shape-audit is already running")
+    try:
+        import gc as _gc
+        def _classify(key: str, payload) -> str:
+            if key.startswith("search:"):
+                return "ok" if isinstance(payload, list) else "wrong"
+            if key.startswith("gallery:"):
+                ok = isinstance(payload, dict) and bool(payload.get("id")) \
+                    and isinstance(payload.get("title"), str) \
+                    and "tag_groups" in payload
+                return "ok" if ok else "wrong"
+            return "ok"
+        res = {"turso": {"search_ok": 0, "search_wrong": 0,
+                         "gallery_ok": 0, "gallery_wrong": 0, "errors": 0},
+               "mongo": {"search_ok": 0, "search_wrong": 0,
+                         "gallery_ok": 0, "gallery_wrong": 0, "errors": 0},
+               "batch": int(batch)}
+        if _turso is not None and _turso.turso_available():
             for prefix in ("search:%", "gallery:%"):
-                rs = _turso.execute(
-                    "SELECT key, payload FROM nhentai_cache WHERE key LIKE ?",
-                    [prefix])
-                rows = getattr(rs, "rows", None)
-                if rows is None and isinstance(rs, dict):
-                    rows = rs.get("rows")
-                for row in (rows or []):
-                    try:
-                        payload = json.loads(row[1])
-                    except Exception:
-                        res["turso"]["errors"] += 1
-                        continue
-                    fam = "search" if row[0].startswith("search:") else "gallery"
-                    res["turso"][f"{fam}_{_classify(row[0], payload)}"] += 1
-        except Exception as e:
-            log.warning("shape_audit turso failed: %s", e)
-    conn = _handle()
-    if conn is not None:
-        try:
+                try:
+                    for key, payload_raw in _iter_turso_rows(prefix, batch=batch):
+                        try:
+                            payload = json.loads(payload_raw)
+                        except Exception:
+                            res["turso"]["errors"] += 1
+                            del payload_raw
+                            continue
+                        del payload_raw
+                        fam = "search" if key.startswith("search:") else "gallery"
+                        res["turso"][f"{fam}_{_classify(key, payload)}"] += 1
+                        del payload
+                except Exception as e:  # noqa: BLE001
+                    log.warning("shape_audit turso (%s) failed: %s", prefix, e)
+                _gc.collect(0)
+        conn = _handle()
+        if conn is not None:
             for prefix in ("search:", "gallery:"):
-                for doc in conn.nhentai_cache.find(
-                        {"_id": {"$regex": "^" + prefix}}, {"payload": 1}):
-                    fam = "search" if doc["_id"].startswith("search:") else "gallery"
-                    res["mongo"][f"{fam}_{_classify(doc['_id'], doc.get('payload'))}"] += 1
-        except Exception as e:
-            log.warning("shape_audit mongo failed: %s", e)
-    return res
+                try:
+                    cur = conn.nhentai_cache.find(
+                        {"_id": {"$regex": "^" + prefix}},
+                        {"_id": 1, "payload": 1},
+                    ).batch_size(int(batch))
+                    for doc in cur:
+                        _id = doc.get("_id", "")
+                        payload = doc.get("payload")
+                        fam = "search" if _id.startswith("search:") else "gallery"
+                        res["mongo"][f"{fam}_{_classify(_id, payload)}"] += 1
+                        del payload
+                except Exception as e:  # noqa: BLE001
+                    log.warning("shape_audit mongo (%s) failed: %s", prefix, e)
+                _gc.collect(0)
+        return res
+    finally:
+        if _RENORM_LOCK is not None:
+            try:
+                _RENORM_LOCK.release()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+# (v12.24's shape_audit tail block removed in v12.26 — the streamed version
+# above replaces it in place.)

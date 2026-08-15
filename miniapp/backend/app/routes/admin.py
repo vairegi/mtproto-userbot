@@ -18,7 +18,9 @@ Endpoints:
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from .. import db
@@ -462,33 +464,80 @@ def cache_hitmiss_reset(_a: dict = Depends(require_admin_or_key)) -> dict:
     return {"ok": True}
 
 
+def _bounded(v, lo, hi, default):
+    """Clamp query-param integers to a safe range so a stray ?batch=100000
+    can't reintroduce the OOM this endpoint was rebuilt to avoid."""
+    try:
+        n = int(v) if v is not None else default
+    except (TypeError, ValueError):
+        n = default
+    return max(lo, min(hi, n))
+
+
 @router.post("/cache/renormalize")
-def cache_renormalize(_a: dict = Depends(require_admin_or_key)) -> dict:
+def cache_renormalize(
+    limit: Optional[int] = Query(None, description="max rows to process this call"),
+    offset: int = Query(0, ge=0, description="starting row offset"),
+    batch: int = Query(200, description="rows per Turso page / Mongo cursor batch"),
+    _a: dict = Depends(require_admin_or_key),
+) -> dict:
     """v12.23: one-time fix for BOT 1's pre-v1.16 raw-shape rows. Walks
-    every search:* + gallery:* row in Turso + Mongo and rewrites it in the
-    normalized shape BOT 0 reads. Idempotent. Returns per-store counts."""
-    res = _nhc_admin.renormalize_existing_rows()
+    search:* + gallery:* rows in Turso + Mongo and rewrites them in the
+    normalized shape BOT 0 reads. Idempotent.
+
+    v12.26: memory-safe — streamed with LIMIT/OFFSET pagination so a full
+    table walk no longer OOMs the 512 MB Render instance. Optional
+    ?limit=&offset=&batch= for slice-mode; call in chunks if the full run
+    still spikes memory.
+    """
+    b = _bounded(batch, 20, 500, 200)
+    lim = None if limit is None else _bounded(limit, 1, 5000, 200)
+    try:
+        res = _nhc_admin.renormalize_existing_rows(
+            dry_run=False, limit=lim, offset=int(offset or 0), batch=b)
+    except getattr(_nhc_admin, "RenormalizeBusy", RuntimeError) as e:
+        raise HTTPException(429, f"renormalize busy: {e}")
     res["ok"] = True
     return res
 
 
 @router.post("/cache/renormalize/dry-run")
-def cache_renormalize_dry_run(_a: dict = Depends(require_admin_or_key)) -> dict:
+def cache_renormalize_dry_run(
+    limit: Optional[int] = Query(None),
+    offset: int = Query(0, ge=0),
+    batch: int = Query(200),
+    _a: dict = Depends(require_admin_or_key),
+) -> dict:
     """v12.24: count how many rows WOULD be rewritten, without writing.
-    Run this BEFORE /cache/renormalize to see the blast radius. The counts
-    include rows already in the correct shape (renormalize is idempotent),
-    so pair it with GET /cache/shape-audit to see how many are actually
-    wrong vs merely re-checkable."""
-    res = _nhc_admin.renormalize_existing_rows(dry_run=True)
+    v12.26: same memory-safe streaming + ?limit=&offset=&batch= as the real
+    endpoint. Safe to run at any batch size; nothing is written.
+    """
+    b = _bounded(batch, 20, 500, 200)
+    lim = None if limit is None else _bounded(limit, 1, 5000, 200)
+    try:
+        res = _nhc_admin.renormalize_existing_rows(
+            dry_run=True, limit=lim, offset=int(offset or 0), batch=b)
+    except getattr(_nhc_admin, "RenormalizeBusy", RuntimeError) as e:
+        raise HTTPException(429, f"renormalize busy: {e}")
     res["ok"] = True
     return res
 
 
 @router.get("/cache/shape-audit")
-def cache_shape_audit(_a: dict = Depends(require_admin_or_key)) -> dict:
+def cache_shape_audit(
+    batch: int = Query(200, description="rows per Turso page / Mongo cursor batch"),
+    _a: dict = Depends(require_admin_or_key),
+) -> dict:
     """v12.24: read-only shape diagnostic. For each key family
     (search:*, gallery:*) count rows whose payload the strict read path
     ACCEPTS (…_ok) vs REJECTS as a MISS (…_wrong). A nonzero *_wrong count
     is the precise reason the mini-app falls through to nhentai despite
-    the row being stored (and despite any never-expire sentinel)."""
-    return {"ok": True, "shape_audit": _nhc_admin.shape_audit()}
+    the row being stored (and despite any never-expire sentinel).
+
+    v12.26: streamed with LIMIT/OFFSET; peak RSS bounded by ~batch rows.
+    """
+    b = _bounded(batch, 20, 500, 200)
+    try:
+        return {"ok": True, "shape_audit": _nhc_admin.shape_audit(batch=b)}
+    except getattr(_nhc_admin, "RenormalizeBusy", RuntimeError) as e:
+        raise HTTPException(429, f"shape-audit busy: {e}")
