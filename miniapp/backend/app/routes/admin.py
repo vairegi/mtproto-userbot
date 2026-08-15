@@ -460,3 +460,13 @@ def cache_hitmiss_reset(_a: dict = Depends(require_admin)) -> dict:
     """Zero the histogram (e.g. after a deploy, to measure the new build)."""
     _nhc_admin.hitmiss_reset()
     return {"ok": True}
+
+
+@router.post("/cache/renormalize")
+def cache_renormalize(_a: dict = Depends(require_admin)) -> dict:
+    """v12.23: one-time fix for BOT 1's pre-v1.16 raw-shape rows. Walks
+    every search:* + gallery:* row in Turso + Mongo and rewrites it in the
+    normalized shape BOT 0 reads. Idempotent. Returns per-store counts."""
+    res = _nhc_admin.renormalize_existing_rows()
+    res["ok"] = True
+    return res

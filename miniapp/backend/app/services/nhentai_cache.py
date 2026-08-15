@@ -806,3 +806,108 @@ def all_buckets_state() -> list[dict]:
 def _now_dt() -> datetime:
     # UTC datetime because Mongo TTL indexes require a BSON Date, not epoch.
     return datetime.now(tz=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# v12.23: re-normalize legacy wrong-shape rows (one-time admin pass).
+# BOT 1 (pre-v1.16) wrote RAW nhentai JSON; BOT 0 only reads normalized
+# shapes. Walk every search:* + gallery:* row and rewrite in correct shape.
+# Idempotent: already-correct rows are skipped.
+# ---------------------------------------------------------------------------
+def _rn_search(payload):
+    """list -> already good (skip); dict with 'result' -> normalize."""
+    if isinstance(payload, list):
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("result"), list):
+        from . import scraper_bridge as _sb
+        out = []
+        for item in payload["result"]:
+            if not isinstance(item, dict) or item.get("id") is None:
+                continue
+            if 12227 not in (item.get("tag_ids") or []):
+                continue
+            out.append({
+                "id": str(item.get("id")),
+                "title": _sb._title_from_item(item),
+                "title_en_clean": _sb._title_en_clean_from_item(item),
+                "cover": _sb._thumb_url_from_item(item),
+                "pages": item.get("num_pages"),
+                "tags": [],
+            })
+        return out or None
+    return None
+
+
+def _rn_gallery(payload):
+    """dict with tag_groups -> already good (skip); raw v2 -> normalize."""
+    if isinstance(payload, dict) and isinstance(payload.get("tag_groups"), dict):
+        return None
+    if isinstance(payload, dict) and payload.get("id") is not None and isinstance(payload.get("title"), dict):
+        from . import scraper_bridge as _sb
+        item = payload
+        t = item.get("title") or {}
+        groups = _sb._group_tags(item)
+        flat = [{"name": n, "type": ty} for ty, names in groups.items() for n in names]
+        page1 = _sb._direct_nhentai_page1(item)
+        cover_path = (item.get("cover") or {}).get("path") or ""
+        cover = page1 or (_sb._T_CDN + "/" + cover_path.lstrip("/") if cover_path else _sb._thumb_url_from_item(item))
+        return {
+            "id": item.get("id"),
+            "title": _sb.clean_title(t.get("pretty") or "") if t.get("pretty") else _sb._title_from_item(item),
+            "title_english": t.get("english") or "",
+            "title_japanese": t.get("japanese") or "",
+            "cover": cover,
+            "page1_url": page1,
+            "pages": item.get("num_pages"),
+            "favorites": item.get("num_favorites"),
+            "upload_date": _sb._iso_date(item.get("upload_date")),
+            "scanlator": item.get("scanlator") or "",
+            "tags": flat,
+            "tag_groups": groups,
+        }
+    return None
+
+
+def renormalize_existing_rows() -> dict:
+    out = {"turso_search": 0, "turso_gallery": 0,
+           "mongo_search": 0, "mongo_gallery": 0, "skipped": 0}
+    def _rows_turso(prefix):
+        rs = _turso.execute("SELECT key, payload FROM nhentai_cache WHERE key LIKE ?", [prefix])
+        rows = getattr(rs, "rows", None)
+        if rows is None and isinstance(rs, dict):
+            rows = rs.get("rows")
+        return rows or []
+    if _turso is not None and _turso.turso_available():
+        try:
+            for prefix, fn, ctr in (("search:%", _rn_search, "turso_search"),
+                                    ("gallery:%", _rn_gallery, "turso_gallery")):
+                for row in _rows_turso(prefix):
+                    key = row[0]
+                    try:
+                        payload = json.loads(row[1])
+                    except Exception:
+                        continue
+                    new = fn(payload)
+                    if new is None:
+                        out["skipped"] += 1
+                        continue
+                    put(key, new)
+                    out[ctr] += 1
+        except Exception as e:
+            log.warning("renormalize turso failed: %s", e)
+    conn = _handle()
+    if conn is not None:
+        try:
+            for prefix, fn, ctr in (("search:", _rn_search, "mongo_search"),
+                                    ("gallery:", _rn_gallery, "mongo_gallery")):
+                for doc in conn.nhentai_cache.find({"_id": {"$regex": "^" + prefix}}):
+                    new = fn(doc.get("payload"))
+                    if new is None:
+                        out["skipped"] += 1
+                        continue
+                    put(doc["_id"], new)
+                    out[ctr] += 1
+        except Exception as e:
+            log.warning("renormalize mongo failed: %s", e)
+    log.info("renormalize done: %s", out)
+    return out
