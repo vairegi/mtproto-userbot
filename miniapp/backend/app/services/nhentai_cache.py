@@ -257,17 +257,84 @@ def _mongo_get(key: str, allow_stale: bool) -> Optional[dict]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# v12.22 (#3): per-bucket HIT/MISS histogram.
+#
+# In-process counters only (per Render service restart) — deliberately NOT
+# written to Mongo/Turso so the read hot path pays zero extra I/O. Surfaces
+# via GET /api/admin/cache/hitmiss so the admin can verify the cache works
+# without reading raw logs. Thread-safe via a module-level Lock; bounded
+# by the fixed bucket set below so it can never grow unbounded.
+# ---------------------------------------------------------------------------
+import threading as _hm_threading
+
+_HM_LOCK = _hm_threading.Lock()
+# bucket -> {"hit": n, "miss": n}. Buckets mirror bucket_for_key()'s ids.
+_HITMISS: dict = {}
+
+
+def _hm_bucket_of(key: str) -> str:
+    """Coarse bucket for the histogram. Chip/tag search pages are split out
+    from detail/gallery reads because that's the axis the admin cares about
+    ('are my Discover chips warm?')."""
+    if not isinstance(key, str):
+        return "other"
+    if key.startswith("search:"):
+        return "search"
+    if key.startswith("gallery:"):
+        return "gallery"
+    if key.startswith("suggest:"):
+        return "suggest"
+    if key.startswith("trending:"):
+        return "trending"
+    return "other"
+
+
+def _hm_record(key: str, hit: bool) -> None:
+    b = _hm_bucket_of(key)
+    with _HM_LOCK:
+        slot = _HITMISS.setdefault(b, {"hit": 0, "miss": 0})
+        slot["hit" if hit else "miss"] += 1
+
+
+def hitmiss_snapshot() -> dict:
+    """Return a copy of the counters + derived hit-rate per bucket."""
+    with _HM_LOCK:
+        snap = {b: dict(v) for b, v in _HITMISS.items()}
+    out = {}
+    for b, v in snap.items():
+        h = int(v.get("hit", 0))
+        m = int(v.get("miss", 0))
+        total = h + m
+        out[b] = {
+            "hit": h,
+            "miss": m,
+            "total": total,
+            "hit_rate": round(h / total, 4) if total else None,
+        }
+    return out
+
+
+def hitmiss_reset() -> None:
+    with _HM_LOCK:
+        _HITMISS.clear()
+
+
 def get(key: str, allow_stale: bool = False) -> Optional[dict]:
     """Return the cached payload for `key`, or None.
 
     `allow_stale=True` lets the caller pull a doc that's past its expires_at
     but still within TTL_STALE_GRACE_SEC — powers 'upstream 429 → serve
     stale-if-error'. v12.4: reads Turso first, Mongo as fallback.
+    v12.22: records a hit/miss into the in-process histogram (item #3).
     """
     payload = _turso_get(key, allow_stale)
     if payload is not None:
+        _hm_record(key, True)
         return payload
-    return _mongo_get(key, allow_stale)
+    payload = _mongo_get(key, allow_stale)
+    _hm_record(key, payload is not None)
+    return payload
 
 
 def _turso_put(key: str, payload_json: str, ttl: int) -> bool:

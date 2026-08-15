@@ -437,3 +437,26 @@ def set_details_scraper(body: DetailsScraperBody, _a: dict = Depends(require_adm
     # needed (and none would work anyway: separate Render services).
     db.set_setting(_DPC_FLAG_KEY, bool(body.enabled))
     return {"ok": True, "enabled": bool(body.enabled)}
+
+
+# v12.22 (#3): /admin/cache/hitmiss
+#   In-process per-bucket HIT/MISS histogram. Lets the admin confirm the
+#   cache is actually being served (search/gallery/suggest/trending) without
+#   reading raw Render logs. Counters reset on service restart.
+@router.get("/cache/hitmiss")
+def cache_hitmiss(_a: dict = Depends(require_admin)) -> dict:
+    """Return the in-process HIT/MISS histogram from nhentai_cache.
+
+    Example:
+        {"ok": true,
+         "buckets": {"search": {"hit": 140, "miss": 3, "total": 143,
+                                "hit_rate": 0.979}}}
+    """
+    return {"ok": True, "buckets": _nhc_admin.hitmiss_snapshot()}
+
+
+@router.post("/cache/hitmiss/reset")
+def cache_hitmiss_reset(_a: dict = Depends(require_admin)) -> dict:
+    """Zero the histogram (e.g. after a deploy, to measure the new build)."""
+    _nhc_admin.hitmiss_reset()
+    return {"ok": True}
