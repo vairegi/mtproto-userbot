@@ -283,6 +283,15 @@ async def sweep_once() -> Dict[str, Any]:
     mongo_client.state_set(_LAST_KEY, time.time())
     _stats_bump(sweeps=1)
     log.info("details sweep done %s dur=%.1fs", combined, duration)
+    # v1.18: explain the commonest "did nothing" pattern so the Render log
+    # (and the person reading it) isn't misled into thinking the sweeper is
+    # broken. ok=0 + hit>0 + no_ids=0 means every gallery ID on the page was
+    # already cached — i.e. the details cache is WARM, not failing.
+    if combined.get("ok", 0) == 0 and combined.get("hit", 0) > 0 \
+            and combined.get("error", 0) == 0:
+        log.info("details sweep: all %d galleries already warm (cache hit, "
+                 "nothing to fetch) — this is the healthy steady state",
+                 combined.get("hit", 0))
     combined["duration_sec"] = round(duration, 2)
     return combined
 

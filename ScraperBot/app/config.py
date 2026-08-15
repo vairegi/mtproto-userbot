@@ -112,6 +112,20 @@ class Settings:
     # the throttle, not this sleep.
     list_skip_sleep_sec: float = _env_float("LIST_SKIP_SLEEP_SEC", 1.0)
 
+    # v1.18: jittered inter-attempt pacing for the list sweep. Previously a
+    # deterministic ~2s cadence (list_delay_sec + fetch time) produced a
+    # metronome pattern that nhentai rate-limits easily, and on
+    # bucket-exhausted we immediately moved to the next key with only a 1s
+    # pause — burning attempts while the shared bucket was still dry.
+    # Now: a random sleep in [LIST_INTER_ATTEMPT_MIN_SEC, MAX] between
+    # scrape attempts, a longer pause on bucket exhaustion so the shared
+    # token bucket actually gets to refill, and honoring nhentai's
+    # Retry-After on 429s (capped at LIST_429_SLEEP_CAP_SEC).
+    list_inter_attempt_min_sec: float = _env_float("LIST_INTER_ATTEMPT_MIN_SEC", 3.0)
+    list_inter_attempt_max_sec: float = _env_float("LIST_INTER_ATTEMPT_MAX_SEC", 6.0)
+    list_bucket_skip_wait_sec: float = _env_float("LIST_BUCKET_SKIP_WAIT_SEC", 8.0)
+    list_429_sleep_cap_sec: float = _env_float("LIST_429_SLEEP_CAP_SEC", 300.0)
+
     # Detail sweep
     details_tick_sec: int = _env_int("DETAILS_TICK_SEC", 60)
     details_rest_sec: float = _env_float("DETAILS_REST_SEC", 3.0)

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -37,6 +38,23 @@ _PRIO_KEY = "list_priority"
 _STATS_KEY = "list_stats"
 _LAST_KEY = "list_last_run"
 _PRIO_CAP = 40
+
+
+async def _inter_attempt_sleep() -> None:
+    """v1.18: jittered pacing between scrape attempts.
+
+    The old cadence was a near-constant ~2s (fetch + 1s LIST_DELAY_SEC),
+    a metronome pattern trivial for nhentai's rate limiter to fingerprint,
+    and it kept bursting right up against the shared token bucket. A uniform
+    random gap in [LIST_INTER_ATTEMPT_MIN_SEC, LIST_INTER_ATTEMPT_MAX_SEC]
+    (default 3-6s) both de-correlates the request stream and keeps average
+    throughput comfortably under the anon limit.
+    """
+    lo = float(settings.list_inter_attempt_min_sec)
+    hi = float(settings.list_inter_attempt_max_sec)
+    if hi < lo:
+        hi = lo
+    await asyncio.sleep(random.uniform(lo, hi))
 
 _pending_pages_for_details: List[Tuple[str, int]] = []
 _pending_lock = asyncio.Lock()
@@ -163,10 +181,15 @@ async def _fetch_and_cache(
         channel_dashboard.record_activity(
             sweeping=f"{sort} · page {page} (skipped, retry later)",
         )
-        # Longer sleep on skip — keeps us from burning the loop when
-        # the bucket is dry (the phase pacing is what protects us, not
-        # this sleep, but slowing the skip loop makes Message B readable).
-        await asyncio.sleep(settings.list_skip_sleep_sec)
+        # v1.18: actually WAIT for the shared token bucket to refill instead
+        # of skipping on to the next key after ~1s. Previously each dry
+        # bucket cost one priority-queue slot and one loop iteration; on a
+        # burst (like the 11:05 UTC phase in the Render log) we burned 6
+        # consecutive attempts while the bucket was still empty. Now we
+        # back off for LIST_BUCKET_SKIP_WAIT_SEC (default 8s — roughly the
+        # time to refill ~1 token at 10/min) before moving on. The page is
+        # still priority-pushed so it WILL be retried mid-phase / next tick.
+        await asyncio.sleep(float(settings.list_bucket_skip_wait_sec))
         return "skip"
 
     try:
@@ -185,6 +208,18 @@ async def _fetch_and_cache(
         log.warning("🚫 429 key=%s retry_after=%s", key, e.retry_after)
         _priority_push(sort, page)
         _stats_bump(rate_limited=1)
+        # v1.18: honor nhentai's Retry-After. Previously we logged the 429
+        # and immediately swept to the next key — which then ALSO 429'd
+        # (see the three consecutive 429s 11:05:48→11:06:01 in the Render
+        # log). Sleep out the server-mandated cooldown (capped at
+        # LIST_429_SLEEP_CAP_SEC so a pathological retry_after can't stall
+        # the phase forever). The page stays on the priority queue.
+        try:
+            wait = float(e.retry_after or 0)
+        except (TypeError, ValueError):
+            wait = 0.0
+        if wait > 0:
+            await asyncio.sleep(min(wait, float(settings.list_429_sleep_cap_sec)))
         return "rate"
     except hf_scraper_lite.UpstreamError as e:
         log.warning("upstream error key=%s status=%s", key, e.status)
@@ -261,7 +296,7 @@ async def sweep_once() -> Dict[str, Any]:
             elif res == "skip": skip += 1
             elif res == "rate": rate += 1
             else:               err += 1
-            await asyncio.sleep(settings.list_delay_sec)
+            await _inter_attempt_sleep()
 
         # Regular sweep — column-major so no sort starves.
         # v1.13: chip sorts sweep list_max_pages (default 30); tag sorts
@@ -306,7 +341,7 @@ async def sweep_once() -> Dict[str, Any]:
                 elif res == "skip": skip += 1
                 elif res == "rate": rate += 1
                 else:               err += 1
-                await asyncio.sleep(settings.list_delay_sec)
+                await _inter_attempt_sleep()
 
                 # v1.14: mid-phase priority drain. Every _DRAIN_EVERY
                 # combos, pull up to _DRAIN_BATCH entries from the
@@ -327,7 +362,7 @@ async def sweep_once() -> Dict[str, Any]:
                         elif pres == "skip": skip += 1
                         elif pres == "rate": rate += 1
                         else:                err += 1
-                        await asyncio.sleep(settings.list_delay_sec)
+                        await _inter_attempt_sleep()
     finally:
         try:
             await client.aclose()
