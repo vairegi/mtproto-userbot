@@ -344,22 +344,55 @@ async def sweep_once() -> Dict[str, Any]:
     }
 
 
+def _next_tick_sec(last: Dict[str, Any]) -> int:
+    """v1.15 (#4): adaptive phase gap.
+
+    Clean phase (0 skips AND 0 errors) → shorten the next gap by 25%,
+    floored at list_tick_min_sec. Any skip or error → lengthen by 25%,
+    capped at list_tick_max_sec. When ADAPTIVE_TICK_ENABLED=0 the fixed
+    list_tick_sec is returned unchanged.
+    """
+    base = int(settings.list_tick_sec)
+    if not getattr(settings, "adaptive_tick_enabled", False):
+        return base
+    lo = max(60, int(getattr(settings, "list_tick_min_sec", 10800)))
+    hi = max(lo, int(getattr(settings, "list_tick_max_sec", 43200)))
+    skips = int(last.get("skip", 0)) + int(last.get("rate_limited", 0))
+    errs = int(last.get("errors", 0))
+    prev = int(mongo_client.state_get("list_adaptive_tick", base) or base)
+    if skips == 0 and errs == 0:
+        nxt = int(prev * 0.75)
+    else:
+        nxt = int(prev * 1.25)
+    nxt = max(lo, min(hi, nxt))
+    mongo_client.state_set("list_adaptive_tick", nxt)
+    log.info("adaptive tick: prev=%ds skips=%d errors=%d -> next=%ds",
+             prev, skips, errs, nxt)
+    return nxt
+
+
 async def run_forever(stop_event: asyncio.Event) -> None:
-    """Boot task: sweep, then sleep list_tick_sec, forever."""
-    log.info("list_sweeper: starting (tick=%ds sorts=%s chip_max_pages=%d tag_max_pages=%d)",
+    """Boot task: sweep, then sleep (fixed or adaptive), forever."""
+    log.info("list_sweeper: starting (tick=%ds sorts=%s chip_max_pages=%d tag_max_pages=%d adaptive=%s)",
              settings.list_tick_sec, settings.list_sorts,
-             settings.list_max_pages, settings.list_tag_max_pages)
+             settings.list_max_pages, settings.list_tag_max_pages,
+             getattr(settings, "adaptive_tick_enabled", False))
+    last_result: Dict[str, Any] = {"skip": 0, "rate_limited": 0, "errors": 0}
     while not stop_event.is_set():
         if not settings.scraper_enabled:
             log.info("scraper disabled via SCRAPER_ENABLED=0 — idling")
         else:
             try:
-                await sweep_once()
+                res = await sweep_once()
+                if isinstance(res, dict):
+                    last_result = res
             except Exception as e:  # noqa: BLE001
                 log.exception("list_sweeper: unhandled exception: %s", e)
                 _stats_bump(errors=1)
+                last_result = {"skip": 0, "rate_limited": 0, "errors": 1}
+        gap = _next_tick_sec(last_result)
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=settings.list_tick_sec)
+            await asyncio.wait_for(stop_event.wait(), timeout=gap)
         except asyncio.TimeoutError:
             pass
     log.info("list_sweeper: stopped")
@@ -376,4 +409,11 @@ def status() -> Dict[str, Any]:
         "max_pages": settings.list_max_pages,
         "tag_max_pages": settings.list_tag_max_pages,
         "tick_sec":  settings.list_tick_sec,
+        # v1.15 (#4) adaptive tick state
+        "adaptive_tick_enabled": getattr(settings, "adaptive_tick_enabled", False),
+        "adaptive_tick_next_sec": mongo_client.state_get("list_adaptive_tick",
+                                                          settings.list_tick_sec),
+        # v1.15 (#2) retry backlog depth — growing phase-over-phase means
+        # the bucket is undersized before users hit cache misses.
+        "retry_backlog": len(mongo_client.state_get(_PRIO_KEY, []) or []),
     }

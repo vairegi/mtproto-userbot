@@ -123,6 +123,7 @@ def record_new_gallery(sort_or_tag: str) -> None:
     per_sort[sort_or_tag] = int(per_sort.get(sort_or_tag, 0)) + 1
     c["per_sort"] = per_sort
     c["new_galleries"] = int(c.get("new_galleries", 0)) + 1
+    c["last_write_at"] = time.time()  # v1.15 (#1) freshness heartbeat
     _save_counters(c)
 
     t = _totals()
@@ -146,12 +147,18 @@ def record_cached_gallery(sort_or_tag: str) -> None:
     pc = c.get("per_cached") or {}
     pc[sort_or_tag] = int(pc.get(sort_or_tag, 0)) + 1
     c["per_cached"] = pc
+    c["last_write_at"] = time.time()  # v1.15 (#1) freshness heartbeat
     _save_counters(c)
 
 
 def record_search_page_written() -> None:
     c = _counters()
     c["search_pages"] = int(c.get("search_pages", 0)) + 1
+    # v1.15 (#1): freshness heartbeat — stamp every successful write so the
+    # dashboard can show "Last write: Ns ago". A dead-but-looping sweeper
+    # stops updating this, which is the fastest visual tell that writes
+    # have stalled even while the phase counter keeps ticking.
+    c["last_write_at"] = time.time()
     _save_counters(c)
 
 
@@ -293,6 +300,27 @@ def _render() -> str:
 
     lines.append(f"➥ Pages written: {int(c.get('search_pages', 0))}")
     lines.append(f"➥ Errors: {int(c.get('errors', 0))} · Skips: {int(c.get('skips', 0))}")
+
+    # v1.15 (#1): freshness heartbeat — seconds since the last successful
+    # write. If the sweeper is looping but writes have stalled, this number
+    # climbs and you can see it immediately instead of reading raw logs.
+    last_write = c.get("last_write_at")
+    if isinstance(last_write, (int, float)) and last_write > 0:
+        ago = max(0, int(now - last_write))
+        lines.append(f"➥ Last write: {ago}s ago")
+    else:
+        lines.append("➥ Last write: —")
+
+    # v1.15 (#2): retry backlog — how many (sort, page) pairs are sitting
+    # in the priority queue waiting for the bucket to refill. Growing
+    # phase-over-phase means the bucket is undersized BEFORE users hit
+    # cache misses.
+    try:
+        _prio = mongo_client.state_get("list_priority", []) or []
+        backlog = len(_prio) if isinstance(_prio, list) else 0
+    except Exception:  # noqa: BLE001
+        backlog = 0
+    lines.append(f"➥ Retry backlog: {backlog}")
 
     # ---- activity (merged) ------------------------------------------------
     lines.append("")

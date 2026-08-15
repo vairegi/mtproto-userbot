@@ -91,6 +91,14 @@ class Settings:
     list_sorts: List[str] = field(default_factory=lambda: _env_csv(
         "LIST_SORTS", ["popular", "date", "popular-today", "popular-week"]))
     list_max_pages: int = _env_int("LIST_MAX_PAGES", 30)
+    # v1.15 (#4): adaptive tick. Instead of a fixed 6 h phase gap, the
+    # sweeper self-tunes: a clean phase (0 skips, 0 errors) shortens the
+    # next gap toward list_tick_min_sec (fresher cache); a phase with any
+    # skips or errors lengthens it toward list_tick_max_sec (eases off the
+    # bucket). Off by default — set ADAPTIVE_TICK_ENABLED=1 to enable.
+    adaptive_tick_enabled: bool = _env_bool("ADAPTIVE_TICK_ENABLED", False)
+    list_tick_min_sec: int = _env_int("LIST_TICK_MIN_SEC", 10800)   # 3 h
+    list_tick_max_sec: int = _env_int("LIST_TICK_MAX_SEC", 43200)   # 12 h
     # v1.13: tag sorts sweep fewer pages than chip sorts. Chip sorts (the
     # four in `list_sorts`) are what users see on the Discover screen so
     # they get the full LIST_MAX_PAGES depth. Tag sorts (trending +
