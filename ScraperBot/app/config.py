@@ -118,6 +118,12 @@ class Settings:
     # Buckets
     bucket_search: int = _env_int("BUCKET_SEARCH", 10)
     bucket_galleries: int = _env_int("BUCKET_GALLERIES", 20)
+    # v1.14: BOT 1 self-caps the /search bucket to leave headroom for BOT 0.
+    # Both bots now share the same Turso `nhentai_ratelimit` row; BOT 0
+    # (user-facing) uses the full 10/min anon limit, so BOT 1 (background
+    # scraper) deliberately under-consumes so user requests always win.
+    # Default 8/min = 10/min limit minus a 2-token reserve for BOT 0.
+    bucket_search_scraper: int = _env_int("BUCKET_SEARCH_SCRAPER", 8)
 
     # Logging
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper().strip() or "INFO"

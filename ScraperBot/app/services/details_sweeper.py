@@ -150,7 +150,7 @@ async def _fetch_one_gallery(
         channel_dashboard.record_cached_gallery(source_sort or "popular")
         return "hit"   # already in cache — NOT counted as new
 
-    if not cache.try_consume(key):
+    if not await cache.try_consume(key):
         log.info("⏭  galleries bucket exhausted gid=%s", gid)
         _stats_bump(skips=1)
         channel_dashboard.record_bucket_skip()

@@ -103,6 +103,21 @@ async def drain_details_hints() -> List[Tuple[str, int]]:
     return out
 
 
+async def _priority_pop_n(n: int) -> List[Tuple[str, int]]:
+    """Pop up to N entries from the priority queue (used for mid-phase drain)."""
+    async with _pending_lock:
+        out = list(_pending_pages_for_details[:n])
+        del _pending_pages_for_details[:n]
+    return out
+
+
+async def _priority_pop_all_list() -> List[Tuple[str, int]]:
+    """Alias for drain_details_hints kept for backward compatibility with
+    existing callers in this file that drain the whole queue at phase
+    start."""
+    return await drain_details_hints()
+
+
 async def _fetch_and_cache(
     client: httpx.AsyncClient, sort: str, page: int
 ) -> str:
@@ -139,7 +154,7 @@ async def _fetch_and_cache(
         last_tag=(sort[4:].strip() if is_tag else ""),
     )
 
-    if not cache.try_consume(key):
+    if not await cache.try_consume(key):
         log.info("⏭  bucket exhausted key=%s", key)
         _priority_push(sort, page)
         _stats_bump(skips=1)
@@ -245,9 +260,17 @@ async def sweep_once() -> Dict[str, Any]:
         # sweep only list_tag_max_pages (default 7). We iterate up to the
         # wider of the two depths and skip a (sort, page) pair when the
         # page exceeds the per-sort cap.
+        #
+        # v1.14: interleave priority-queue drains every 10 (sort, page)
+        # combinations so bucket-skipped pages don't sit waiting for the
+        # NEXT phase (up to 6 h away) — they're retried mid-phase once
+        # the token bucket has had time to refill.
         chip_max_pages = max(1, int(settings.list_max_pages))
         tag_max_pages  = max(1, int(settings.list_tag_max_pages))
         overall_max    = max(chip_max_pages, tag_max_pages)
+        _combos_since_drain = 0
+        _DRAIN_EVERY = 10
+        _DRAIN_BATCH = 5
         for page in range(1, overall_max + 1):
             for sidx, sort in enumerate(sorts_this_phase):
                 # v1.13: enforce per-sort page cap. Tag sorts are prefixed
@@ -276,6 +299,27 @@ async def sweep_once() -> Dict[str, Any]:
                 elif res == "rate": rate += 1
                 else:               err += 1
                 await asyncio.sleep(settings.list_delay_sec)
+
+                # v1.14: mid-phase priority drain. Every _DRAIN_EVERY
+                # combos, pull up to _DRAIN_BATCH entries from the
+                # priority queue and retry them now (bucket has had time
+                # to refill since they were skipped). Newly-skipped pages
+                # are pushed back to the queue by _fetch_and_cache itself,
+                # so we never lose them.
+                _combos_since_drain += 1
+                if _combos_since_drain >= _DRAIN_EVERY:
+                    _combos_since_drain = 0
+                    drained = await _priority_pop_n(_DRAIN_BATCH)
+                    for (psort, ppage) in drained:
+                        if mongo_client.is_paused():
+                            _priority_push(psort, ppage)  # put it back
+                            continue
+                        pres = await _fetch_and_cache(client, psort, ppage)
+                        if pres == "ok":     ok += 1
+                        elif pres == "skip": skip += 1
+                        elif pres == "rate": rate += 1
+                        else:                err += 1
+                        await asyncio.sleep(settings.list_delay_sec)
     finally:
         try:
             await client.aclose()

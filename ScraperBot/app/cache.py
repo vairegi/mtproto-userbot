@@ -122,7 +122,13 @@ def bucket_for_key(key: str) -> str:
 
 def bucket_capacity(bucket: str) -> int:
     if bucket == "search":
-        return settings.bucket_search
+        # v1.14: BOT 1 deliberately uses a LOWER effective capacity for the
+        # /search bucket than BOT 0's documented 10/min. Both bots now share
+        # the same Turso nhentai_ratelimit row, so the TOTAL across both bots
+        # must stay under nhentai's anon limit. BOT 0 (user-facing) gets the
+        # full 10/min; BOT 1 (background) caps itself at bucket_search_scraper
+        # (default 8) so user requests always have headroom.
+        return settings.bucket_search_scraper
     if bucket == "galleries":
         return settings.bucket_galleries
     if bucket == "popular":
@@ -148,8 +154,15 @@ async def put(key: str, payload: Any) -> dict:
     return {"turso": bool(turso_ok), "mongo": bool(mongo_ok), "ttl": ttl}
 
 
-def try_consume(key: str) -> bool:
-    """Consume one token for the bucket this key belongs to."""
+async def try_consume(key: str) -> bool:
+    """Consume one token for the bucket this key belongs to.
+
+    v1.14: now async because the Turso-backed bucket path is async. Both
+    call sites (list_sweeper._fetch_and_cache, details_sweeper) are async
+    and await this. Also honours the v1.14 per-bot search cap: BOT 1's
+    /search consumption is clamped to settings.bucket_search_scraper
+    (default 8/min) so BOT 0's user-facing requests always win the last
+    2 tokens of the shared 10/min /search bucket."""
     b = bucket_for_key(key)
     cap = bucket_capacity(b)
-    return mongo_client.bucket_try_consume(b, cap)
+    return await mongo_client.bucket_try_consume(b, cap)

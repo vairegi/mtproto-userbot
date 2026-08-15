@@ -158,18 +158,105 @@ def cache_put_mongo(key: str, payload: Any, ttl_sec: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Shared token bucket — same collection name BOT 0 uses so BOT 0 + BOT 1
-# consume ONE quota per bucket.
+# Shared token bucket — v1.14: Turso-first, Mongo fallback.
+#
+# Historically BOT 1 wrote to Mongo collection `nhentai_bucket` while BOT 0
+# wrote to Turso table `nhentai_ratelimit`. They never saw each other's
+# consumption, so the "shared" quota was a lie — this is why the BOT 1
+# dashboard showed 141+ bucket skips while BOT 0 was still fetching pages.
+#
+# After v1.14, BOTH bots use Turso `nhentai_ratelimit` (token-bucket schema:
+# {bucket_id, tokens, capacity, rate_per_sec, updated_at}) with identical
+# refill math. Mongo `nhentai_bucket` is kept ONLY as a fail-open fallback
+# when Turso is unreachable, so a Turso outage doesn't stall the sweep.
 # ---------------------------------------------------------------------------
-BUCKET_COLL = "nhentai_bucket"
+BUCKET_COLL = "nhentai_bucket"   # kept for the Mongo fallback only
 
 
-def bucket_try_consume(bucket: str, capacity_per_min: int) -> bool:
-    """Sliding-window bucket. Returns True if a token was consumed.
+async def _turso_bucket_try_consume(bucket: str, capacity_per_min: int) -> Optional[bool]:
+    """Turso-backed atomic consume — byte-identical algorithm to BOT 0's
+    `_turso_try_consume` so both bots share one bucket.
 
-    Same shape BOT 0's nhentai_cache.try_consume uses (list of timestamps
-    per bucket), so the two processes coordinate through Mongo alone.
-    """
+    Returns True on success, False when the bucket is exhausted, None when
+    Turso is unreachable (caller falls back to Mongo)."""
+    try:
+        from . import turso_client
+    except Exception:  # noqa: BLE001
+        return None
+    if not turso_client.turso_available():
+        return None
+
+    now = time.time()
+    rate_per_sec = float(capacity_per_min) / 60.0
+
+    # INSERT OR IGNORE — no-op if the row exists.
+    try:
+        res = await turso_client.execute(
+            "INSERT OR IGNORE INTO nhentai_ratelimit "
+            "(bucket_id, tokens, capacity, rate_per_sec, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [bucket, float(capacity_per_min), float(capacity_per_min),
+             rate_per_sec, now],
+        )
+        if res is None:
+            return None
+    except Exception as e:  # noqa: BLE001
+        log.debug("bucket_try_consume turso insert failed: %s", e)
+        return None
+
+    # Atomic refill-and-spend — same SQL BOT 0 uses. The WHERE clause
+    # prevents over-spend; if it fails, zero rows are affected and we
+    # return False without touching updated_at (so the next caller still
+    # gets the full refill they earned).
+    try:
+        res = await turso_client.execute(
+            "UPDATE nhentai_ratelimit SET "
+            "  tokens = MIN(CAST(capacity AS REAL), tokens + MAX(0, ? - updated_at) * rate_per_sec) - ?, "
+            "  updated_at = ? "
+            "WHERE bucket_id = ? "
+            "  AND MIN(CAST(capacity AS REAL), tokens + MAX(0, ? - updated_at) * rate_per_sec) >= ?",
+            [now, 1.0, now, bucket, now, 1.0],
+        )
+        if res is None:
+            return None
+    except Exception as e:  # noqa: BLE001
+        log.debug("bucket_try_consume turso update failed: %s", e)
+        return None
+
+    # libsql returns affected-row count in rows_affected; guard both.
+    affected = res.get("affected_row_count")
+    if affected is None:
+        affected = res.get("rows_affected")
+    if affected is None:
+        # Older response shape — probe the row to see if tokens went negative.
+        try:
+            probe = await turso_client.execute(
+                "SELECT tokens FROM nhentai_ratelimit WHERE bucket_id = ?",
+                [bucket],
+            )
+            if probe and probe.get("rows"):
+                row = probe["rows"][0]
+                # libsql cells are {type, value} dicts
+                cell = row[0] if isinstance(row, list) and row else None
+                tok = None
+                if isinstance(cell, dict):
+                    v = cell.get("value")
+                    try:
+                        tok = float(v)
+                    except (TypeError, ValueError):
+                        tok = None
+                if tok is not None:
+                    return tok >= 0
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    return bool(int(affected) > 0)
+
+
+def _mongo_bucket_try_consume(bucket: str, capacity_per_min: int) -> bool:
+    """Mongo fallback — original sliding-window logic from pre-v1.14.
+    Used ONLY when Turso is unreachable so a Turso outage doesn't stall
+    the sweep entirely."""
     d = db()
     if d is None:
         # Fail-open: no Mongo → let the call through (we still respect
@@ -207,3 +294,15 @@ def bucket_try_consume(bucket: str, capacity_per_min: int) -> bool:
     except PyMongoError as e:
         log.warning("bucket_try_consume(%s) failed (fail-open): %s", bucket, e)
         return True
+
+
+async def bucket_try_consume(bucket: str, capacity_per_min: int) -> bool:
+    """Turso-first, Mongo-fallback token bucket.
+
+    v1.14: Turso is the primary store so BOT 0 + BOT 1 share one quota.
+    Mongo `nhentai_bucket` is kept only as a fail-open fallback for when
+    Turso is unreachable (network blip, Turso maintenance, etc.)."""
+    turso_result = await _turso_bucket_try_consume(bucket, capacity_per_min)
+    if turso_result is not None:
+        return turso_result
+    return _mongo_bucket_try_consume(bucket, capacity_per_min)

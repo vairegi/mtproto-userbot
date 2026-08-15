@@ -197,8 +197,55 @@ async def bootstrap_schema() -> None:
     if res is None:
         log.warning("Turso: schema create failed (transport)")
         return
+
+    # v1.14: ALSO bootstrap the shared token-bucket table so both bots
+    # write to the SAME Turso collection. BOT 0 uses this as the primary
+    # store (with Mongo as fallback); BOT 1 historically used a separate
+    # Mongo collection `nhentai_bucket` and the two processes never saw
+    # each other's consumption. After this bootstrap, both bots consume
+    # from `nhentai_ratelimit` on Turso and the shared quota is enforced
+    # consistently.
+    create_rl_sql = (
+        'CREATE TABLE IF NOT EXISTS nhentai_ratelimit ('
+        '"bucket_id" TEXT PRIMARY KEY, '
+        'tokens REAL NOT NULL, '
+        'capacity REAL NOT NULL, '
+        'rate_per_sec REAL NOT NULL, '
+        'updated_at REAL NOT NULL'
+        ')'
+    )
+    res_rl = await _pipeline([{"sql": create_rl_sql}])
+    if res_rl is None:
+        log.warning("Turso: ratelimit schema create failed (transport)")
+        return
     log.info("Turso: schema OK")
     await _discover_columns()
+
+
+async def execute(sql: str, args: Optional[List[Any]] = None) -> Optional[dict]:
+    """Generic one-shot statement execution (used by the shared token bucket).
+
+    Returns the raw libsql result dict for the first statement. Args are
+    converted into libsql's {type, value} shape — primitives only.
+    """
+    if not turso_available():
+        return None
+    stmt_args = []
+    for a in (args or []):
+        if a is None:
+            stmt_args.append({"type": "null"})
+        elif isinstance(a, bool):
+            stmt_args.append({"type": "integer", "value": "1" if a else "0"})
+        elif isinstance(a, int):
+            stmt_args.append({"type": "integer", "value": str(a)})
+        elif isinstance(a, float):
+            stmt_args.append({"type": "float",   "value": str(a)})
+        else:
+            stmt_args.append({"type": "text",    "value": str(a)})
+    res = await _pipeline([{"sql": sql, "args": stmt_args}])
+    if not res:
+        return None
+    return res[0]
 
 
 async def get(key: str) -> Optional[dict]:
