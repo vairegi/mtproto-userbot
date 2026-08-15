@@ -239,7 +239,8 @@ async def execute(sql: str, args: Optional[List[Any]] = None) -> Optional[dict]:
         elif isinstance(a, int):
             stmt_args.append({"type": "integer", "value": str(a)})
         elif isinstance(a, float):
-            stmt_args.append({"type": "float",   "value": str(a)})
+            # v1.17: libsql rejects stringified floats ("expected f64").
+            stmt_args.append({"type": "float",   "value": float(a)})
         else:
             stmt_args.append({"type": "text",    "value": str(a)})
     res = await _pipeline([{"sql": sql, "args": stmt_args}])

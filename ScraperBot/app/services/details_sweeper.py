@@ -78,7 +78,7 @@ def _cursor_advance() -> Tuple[str, int]:
     return current_sort, current_page
 
 
-async def _read_search_cache(sort: str, page: int) -> Optional[Dict[str, Any]]:
+async def _read_search_cache(sort: str, page: int) -> Optional[Any]:
     """Read a search-page blob straight from the shared cache. Never fetches.
 
     v1.10: try BOTH key formats — the BOT 0 chip format (new canonical)
@@ -97,6 +97,29 @@ async def _read_search_cache(sort: str, page: int) -> Optional[Dict[str, Any]]:
         if m and m.get("payload"):
             return m["payload"]
     return None
+
+
+def _extract_ids_any(payload: Any) -> List[str]:
+    """v1.17: extract IDs from EITHER shape — v1.16 normalized list of
+    card dicts, or legacy raw nhentai dict. Fixes the crash
+    'list' object has no attribute 'get'."""
+    if isinstance(payload, list):
+        ids: List[str] = []
+        seen: set = set()
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            gid = item.get("id") or item.get("gallery_id") or item.get("media_id")
+            if gid is None:
+                continue
+            sv = str(gid).strip()
+            if sv and sv not in seen:
+                seen.add(sv)
+                ids.append(sv)
+        return ids
+    if isinstance(payload, dict):
+        return hf_scraper_lite.extract_ids_from_search(payload)
+    return []
 
 
 def _coerce_epoch(v: Any) -> float:
@@ -203,7 +226,7 @@ async def _work_page(
         # list_sweeper hasn't written this page yet — skip cheaply.
         tally["no_ids"] = 1
         return tally
-    ids = hf_scraper_lite.extract_ids_from_search(payload)
+    ids = _extract_ids_any(payload)
     if not ids:
         tally["no_ids"] = 1
         return tally
