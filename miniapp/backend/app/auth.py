@@ -85,3 +85,61 @@ async def require_admin(user: dict = Depends(get_current_user)) -> dict:
     if int(user.get("id", 0)) != int(settings.admin_user_id):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin only")
     return user
+
+
+async def require_admin_key(x_admin_key: str = Header(default="")) -> dict:
+    """v12.25: static-key-only auth for maintenance endpoints.
+
+    Accepts the ADMIN_STATIC_KEY env value via the `X-Admin-Key` header
+    (or the `admin_key` query param). Uses a constant-time compare so the
+    key can't be recovered via timing. Returns a synthetic admin dict so
+    callers can use it wherever require_admin is expected — but NOTE: it
+    does NOT do Telegram initData verification, so it must only gate
+    read-only / cache-rewrite routes, never user-data or state-mutating
+    routes.
+
+    Disabled when ADMIN_STATIC_KEY is unset (empty) — always 401 then.
+    """
+    key = settings.admin_static_key or ""
+    if not key:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Static admin key is not configured",
+        )
+    incoming = (x_admin_key or "").strip()
+    if not incoming:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing X-Admin-Key")
+    if not hmac.compare_digest(incoming, key):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Bad X-Admin-Key")
+    return {
+        "id": int(settings.admin_user_id),
+        "first_name": "StaticKeyAdmin",
+        "username": "static_key",
+        "is_static_key": True,
+    }
+
+
+async def require_admin_or_key(
+    x_admin_key: str = Header(default=""),
+    x_telegram_init_data: str = Header(default=""),
+) -> dict:
+    """v12.25: accept EITHER a valid static key OR the normal Telegram
+    initData admin session. Used by the cache maintenance endpoints so they
+    work both from inside the Mini App (initData) and from curl/scripts
+    (X-Admin-Key), whichever is configured.
+
+    Decision order:
+      1. If a static key was supplied, validate it; if bad -> 401.
+      2. Otherwise verify Telegram initData directly and check the admin
+         user id (must NOT go through get_current_user, which would raise
+         401 for a curl request that has no initData header yet).
+    """
+    incoming = (x_admin_key or "").strip()
+    if incoming:
+        return await require_admin_key(x_admin_key=incoming)
+    user = verify_init_data(x_telegram_init_data)
+    if not user:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Bad initData")
+    if int(user.get("id", 0)) != int(settings.admin_user_id):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin only")
+    return user

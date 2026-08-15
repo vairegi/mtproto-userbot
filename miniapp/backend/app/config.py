@@ -23,6 +23,11 @@ class Settings:
     # Auth / Telegram
     bot_token: str = os.environ.get("BOT_TOKEN", "") or os.environ.get("ADMIN_BOT_TOKEN", "")
     admin_user_id: int = _int("ADMIN_USER_ID", 0)
+    # v12.25: optional static key for the read-only / cache-rewrite
+    # maintenance endpoints (shape-audit, renormalize, dry-run, hitmiss).
+    # Lets curl / scripts / scheduled jobs drive them without a Telegram
+    # initData session. EMPTY = disabled (those routes still accept initData).
+    admin_static_key: str = os.environ.get("ADMIN_STATIC_KEY", "")
 
     # V2 DM-delivery on dedup (BUG 1) — the database channel the admin bot
     # copyMessages from when a user taps Queue on an already-completed

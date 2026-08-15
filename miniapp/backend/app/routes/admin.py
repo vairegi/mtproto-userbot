@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from .. import db
-from ..auth import require_admin
+from ..auth import require_admin, require_admin_or_key
 from ..services import (
     broadcast, deletion_scheduler, force_join, queue_bridge, rescrape,
     scraper_bridge, share_guard,
@@ -444,7 +444,7 @@ def set_details_scraper(body: DetailsScraperBody, _a: dict = Depends(require_adm
 #   cache is actually being served (search/gallery/suggest/trending) without
 #   reading raw Render logs. Counters reset on service restart.
 @router.get("/cache/hitmiss")
-def cache_hitmiss(_a: dict = Depends(require_admin)) -> dict:
+def cache_hitmiss(_a: dict = Depends(require_admin_or_key)) -> dict:
     """Return the in-process HIT/MISS histogram from nhentai_cache.
 
     Example:
@@ -456,14 +456,14 @@ def cache_hitmiss(_a: dict = Depends(require_admin)) -> dict:
 
 
 @router.post("/cache/hitmiss/reset")
-def cache_hitmiss_reset(_a: dict = Depends(require_admin)) -> dict:
+def cache_hitmiss_reset(_a: dict = Depends(require_admin_or_key)) -> dict:
     """Zero the histogram (e.g. after a deploy, to measure the new build)."""
     _nhc_admin.hitmiss_reset()
     return {"ok": True}
 
 
 @router.post("/cache/renormalize")
-def cache_renormalize(_a: dict = Depends(require_admin)) -> dict:
+def cache_renormalize(_a: dict = Depends(require_admin_or_key)) -> dict:
     """v12.23: one-time fix for BOT 1's pre-v1.16 raw-shape rows. Walks
     every search:* + gallery:* row in Turso + Mongo and rewrites it in the
     normalized shape BOT 0 reads. Idempotent. Returns per-store counts."""
@@ -473,7 +473,7 @@ def cache_renormalize(_a: dict = Depends(require_admin)) -> dict:
 
 
 @router.post("/cache/renormalize/dry-run")
-def cache_renormalize_dry_run(_a: dict = Depends(require_admin)) -> dict:
+def cache_renormalize_dry_run(_a: dict = Depends(require_admin_or_key)) -> dict:
     """v12.24: count how many rows WOULD be rewritten, without writing.
     Run this BEFORE /cache/renormalize to see the blast radius. The counts
     include rows already in the correct shape (renormalize is idempotent),
@@ -485,7 +485,7 @@ def cache_renormalize_dry_run(_a: dict = Depends(require_admin)) -> dict:
 
 
 @router.get("/cache/shape-audit")
-def cache_shape_audit(_a: dict = Depends(require_admin)) -> dict:
+def cache_shape_audit(_a: dict = Depends(require_admin_or_key)) -> dict:
     """v12.24: read-only shape diagnostic. For each key family
     (search:*, gallery:*) count rows whose payload the strict read path
     ACCEPTS (…_ok) vs REJECTS as a MISS (…_wrong). A nonzero *_wrong count
