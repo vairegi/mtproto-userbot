@@ -868,9 +868,16 @@ def _rn_gallery(payload):
     return None
 
 
-def renormalize_existing_rows() -> dict:
+def renormalize_existing_rows(dry_run: bool = False) -> dict:
+    """Rewrite legacy wrong-shape rows in-place to BOT 0's canonical shapes.
+
+    v12.24: `dry_run=True` walks the same rows and counts what WOULD be
+    rewritten without calling put() — used by /cache/renormalize/dry-run so
+    the operator can see the blast radius before committing.
+    """
     out = {"turso_search": 0, "turso_gallery": 0,
-           "mongo_search": 0, "mongo_gallery": 0, "skipped": 0}
+           "mongo_search": 0, "mongo_gallery": 0, "skipped": 0,
+           "dry_run": dry_run}
     def _rows_turso(prefix):
         rs = _turso.execute("SELECT key, payload FROM nhentai_cache WHERE key LIKE ?", [prefix])
         rows = getattr(rs, "rows", None)
@@ -891,7 +898,8 @@ def renormalize_existing_rows() -> dict:
                     if new is None:
                         out["skipped"] += 1
                         continue
-                    put(key, new)
+                    if not dry_run:
+                        put(key, new)
                     out[ctr] += 1
         except Exception as e:
             log.warning("renormalize turso failed: %s", e)
@@ -905,9 +913,67 @@ def renormalize_existing_rows() -> dict:
                     if new is None:
                         out["skipped"] += 1
                         continue
-                    put(doc["_id"], new)
+                    if not dry_run:
+                        put(doc["_id"], new)
                     out[ctr] += 1
         except Exception as e:
             log.warning("renormalize mongo failed: %s", e)
-    log.info("renormalize done: %s", out)
+    log.info("renormalize done (dry_run=%s): %s", dry_run, out)
     return out
+
+
+# v12.24: shape-audit — read-only diagnostic that proves whether renormalize
+# is needed (rows the current read path REJECTS) and whether it worked.
+def shape_audit() -> dict:
+    """Count rows whose payload shape the strict read path accepts vs rejects.
+
+    Read contract (scraper_bridge):
+      search:*  rows must be a LIST of card dicts (isinstance(_hit, list))
+      gallery:* rows must be a normalized DICT with an 'id' key
+
+    Anything else currently reads as a MISS even though it's stored — exactly
+    the "mini-app still loads from nhentai" symptom.
+    """
+    def _classify(key: str, payload) -> str:
+        if key.startswith("search:"):
+            return "ok" if isinstance(payload, list) else "wrong"
+        if key.startswith("gallery:"):
+            ok = isinstance(payload, dict) and bool(payload.get("id")) \
+                and isinstance(payload.get("title"), str) \
+                and "tag_groups" in payload
+            return "ok" if ok else "wrong"
+        return "ok"
+    res = {"turso": {"search_ok": 0, "search_wrong": 0,
+                     "gallery_ok": 0, "gallery_wrong": 0, "errors": 0},
+           "mongo": {"search_ok": 0, "search_wrong": 0,
+                     "gallery_ok": 0, "gallery_wrong": 0, "errors": 0}}
+    if _turso is not None and _turso.turso_available():
+        try:
+            for prefix in ("search:%", "gallery:%"):
+                rs = _turso.execute(
+                    "SELECT key, payload FROM nhentai_cache WHERE key LIKE ?",
+                    [prefix])
+                rows = getattr(rs, "rows", None)
+                if rows is None and isinstance(rs, dict):
+                    rows = rs.get("rows")
+                for row in (rows or []):
+                    try:
+                        payload = json.loads(row[1])
+                    except Exception:
+                        res["turso"]["errors"] += 1
+                        continue
+                    fam = "search" if row[0].startswith("search:") else "gallery"
+                    res["turso"][f"{fam}_{_classify(row[0], payload)}"] += 1
+        except Exception as e:
+            log.warning("shape_audit turso failed: %s", e)
+    conn = _handle()
+    if conn is not None:
+        try:
+            for prefix in ("search:", "gallery:"):
+                for doc in conn.nhentai_cache.find(
+                        {"_id": {"$regex": "^" + prefix}}, {"payload": 1}):
+                    fam = "search" if doc["_id"].startswith("search:") else "gallery"
+                    res["mongo"][f"{fam}_{_classify(doc['_id'], doc.get('payload'))}"] += 1
+        except Exception as e:
+            log.warning("shape_audit mongo failed: %s", e)
+    return res

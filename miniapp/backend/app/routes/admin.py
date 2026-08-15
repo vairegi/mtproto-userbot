@@ -470,3 +470,25 @@ def cache_renormalize(_a: dict = Depends(require_admin)) -> dict:
     res = _nhc_admin.renormalize_existing_rows()
     res["ok"] = True
     return res
+
+
+@router.post("/cache/renormalize/dry-run")
+def cache_renormalize_dry_run(_a: dict = Depends(require_admin)) -> dict:
+    """v12.24: count how many rows WOULD be rewritten, without writing.
+    Run this BEFORE /cache/renormalize to see the blast radius. The counts
+    include rows already in the correct shape (renormalize is idempotent),
+    so pair it with GET /cache/shape-audit to see how many are actually
+    wrong vs merely re-checkable."""
+    res = _nhc_admin.renormalize_existing_rows(dry_run=True)
+    res["ok"] = True
+    return res
+
+
+@router.get("/cache/shape-audit")
+def cache_shape_audit(_a: dict = Depends(require_admin)) -> dict:
+    """v12.24: read-only shape diagnostic. For each key family
+    (search:*, gallery:*) count rows whose payload the strict read path
+    ACCEPTS (…_ok) vs REJECTS as a MISS (…_wrong). A nonzero *_wrong count
+    is the precise reason the mini-app falls through to nhentai despite
+    the row being stored (and despite any never-expire sentinel)."""
+    return {"ok": True, "shape_audit": _nhc_admin.shape_audit()}
