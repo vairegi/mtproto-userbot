@@ -879,26 +879,38 @@ def _rn_gallery(payload):
 # set as an in-memory list, so the fix is at the SQL layer: paginate with
 # LIMIT/OFFSET, yield one row at a time, never hold more than `batch` rows.
 # ---------------------------------------------------------------------------
-def _iter_turso_rows(prefix: str, batch: int = 200,
+def _iter_turso_rows(prefix: str, batch: int = 25,
                      start_offset: int = 0, hard_limit=None):
     """Generator: yield (key, payload_str) one row at a time.
 
-    Uses LIMIT/OFFSET paging so total in-flight bytes are bounded by
-    `batch` rows regardless of table size. `hard_limit` caps the total
-    yielded rows across the whole walk (used to implement ?limit= slicing
-    on the admin endpoints).
+    v12.27 TWO-PHASE FETCH — the memory-safety upgrade over v12.26:
+      Phase 1: SELECT only the `key` column for the current batch (tiny
+               — ~40 bytes per row, so 25 rows = ~1 KB in flight).
+      Phase 2: for each key, SELECT the payload for THAT one key alone,
+               yield (key, payload), then drop the payload before moving
+               on to the next key.
+
+    Why: v12.26 fetched `key, payload` together in `batch` chunks. On a
+    real nhentai_cache row a payload is 5–15 KB, so batch=200 kept 1–3 MB
+    resident. That was fine in isolation on a laptop, but stacked on top
+    of BOT 0's already-loaded worker + Telethon + Mongo pool it tipped the
+    512 MB Render instance and produced 502s. Two-phase fetch trades more
+    round-trips (twice as many) for a hard cap of "one payload resident
+    at a time", which is what actually matters on a 512 MB box.
     """
     if _turso is None or not _turso.turso_available():
         return
     off = int(start_offset or 0)
     yielded = 0
+    import gc as _gc
     while True:
         remaining = None if hard_limit is None else max(0, int(hard_limit) - yielded)
         if remaining == 0:
             return
         this_batch = batch if remaining is None else min(batch, remaining)
+        # PHASE 1: keys only — tiny result set even on huge tables.
         rs = _turso.execute(
-            "SELECT key, payload FROM nhentai_cache WHERE key LIKE ? "
+            "SELECT key FROM nhentai_cache WHERE key LIKE ? "
             "ORDER BY key LIMIT ? OFFSET ?",
             [prefix, this_batch, off],
         )
@@ -908,17 +920,33 @@ def _iter_turso_rows(prefix: str, batch: int = 200,
         rows = rows or []
         if not rows:
             return
-        for row in rows:
-            yield row[0], row[1]
+        keys_this_page = [r[0] for r in rows]
+        page_size = len(rows)
+        del rows, rs  # release the phase-1 result immediately
+        _gc.collect(0)
+        # PHASE 2: one payload at a time — hard cap on resident bytes.
+        for k in keys_this_page:
+            rs2 = _turso.execute(
+                "SELECT payload FROM nhentai_cache WHERE key = ? LIMIT 1",
+                [k],
+            )
+            r2 = getattr(rs2, "rows", None)
+            if r2 is None and isinstance(rs2, dict):
+                r2 = rs2.get("rows")
+            r2 = r2 or []
+            payload_raw = r2[0][0] if r2 else None
+            del rs2, r2
+            if payload_raw is None:
+                # Row was deleted between phase 1 and phase 2 — skip.
+                yielded += 1
+                continue
+            yield k, payload_raw
+            del payload_raw
             yielded += 1
-        off += len(rows)
-        # Give the event loop / GC a breath between batches.
-        try:
-            import gc as _gc
-            _gc.collect(0)
-        except Exception:  # noqa: BLE001
-            pass
-        if len(rows) < this_batch:
+        off += page_size
+        del keys_this_page
+        _gc.collect(0)
+        if page_size < this_batch:
             return
 
 
@@ -938,7 +966,8 @@ class RenormalizeBusy(RuntimeError):
 
 def renormalize_existing_rows(dry_run: bool = False,
                               limit=None, offset: int = 0,
-                              batch: int = 200) -> dict:
+                              batch: int = 25,
+                              prefix: Optional[str] = None) -> dict:
     """Rewrite legacy wrong-shape rows in-place to BOT 0's canonical shapes.
 
     v12.24: `dry_run=True` walks the same rows and counts what WOULD be
@@ -973,9 +1002,22 @@ def renormalize_existing_rows(dry_run: bool = False,
         def _take():
             """Return current budget; None = unlimited."""
             return None if remaining is None else max(0, remaining)
+        # v12.27: optional family filter so a targeted run can touch ONLY
+        # the family that actually has shape drift (e.g. after a hitmiss
+        # snapshot proves gallery cache is 100% healthy but search is not).
+        _families_turso = (("search:%", _rn_search, "turso_search"),
+                           ("gallery:%", _rn_gallery, "turso_gallery"))
+        _families_mongo = (("search:", _rn_search, "mongo_search"),
+                           ("gallery:", _rn_gallery, "mongo_gallery"))
+        if prefix:
+            pf = prefix.strip().lower().rstrip(":%")
+            if pf not in ("search", "gallery"):
+                raise ValueError("prefix must be 'search' or 'gallery'")
+            _families_turso = tuple(f for f in _families_turso if f[0].startswith(pf))
+            _families_mongo = tuple(f for f in _families_mongo if f[0].startswith(pf))
+            out["prefix"] = pf
         if _turso is not None and _turso.turso_available():
-            for prefix, fn, ctr in (("search:%", _rn_search, "turso_search"),
-                                    ("gallery:%", _rn_gallery, "turso_gallery")):
+            for prefix, fn, ctr in _families_turso:
                 if _take() == 0:
                     break
                 try:
@@ -1004,8 +1046,7 @@ def renormalize_existing_rows(dry_run: bool = False,
                     log.warning("renormalize turso (%s) failed: %s", prefix, e)
         conn = _handle()
         if conn is not None:
-            for prefix, fn, ctr in (("search:", _rn_search, "mongo_search"),
-                                    ("gallery:", _rn_gallery, "mongo_gallery")):
+            for prefix, fn, ctr in _families_mongo:
                 if _take() == 0:
                     break
                 try:
@@ -1049,7 +1090,7 @@ def renormalize_existing_rows(dry_run: bool = False,
 # is needed (rows the current read path REJECTS) and whether it worked.
 # v12.26: streamed + batched so a full-table audit on a 512 MB instance no
 # longer OOMs the process.
-def shape_audit(batch: int = 200) -> dict:
+def shape_audit(batch: int = 25, prefix: Optional[str] = None) -> dict:
     """Count rows whose payload shape the strict read path accepts vs rejects.
 
     Read contract (scraper_bridge):
@@ -1083,8 +1124,19 @@ def shape_audit(batch: int = 200) -> dict:
                "mongo": {"search_ok": 0, "search_wrong": 0,
                          "gallery_ok": 0, "gallery_wrong": 0, "errors": 0},
                "batch": int(batch)}
+        # v12.27: family filter — same story as renormalize. `prefix="search"`
+        # walks only search:* rows; "gallery" only gallery:*; None = both.
+        _turso_prefixes = ("search:%", "gallery:%")
+        _mongo_prefixes = ("search:", "gallery:")
+        if prefix:
+            pf = prefix.strip().lower().rstrip(":%")
+            if pf not in ("search", "gallery"):
+                raise ValueError("prefix must be 'search' or 'gallery'")
+            _turso_prefixes = tuple(p for p in _turso_prefixes if p.startswith(pf))
+            _mongo_prefixes = tuple(p for p in _mongo_prefixes if p.startswith(pf))
+            res["prefix"] = pf
         if _turso is not None and _turso.turso_available():
-            for prefix in ("search:%", "gallery:%"):
+            for prefix in _turso_prefixes:
                 try:
                     for key, payload_raw in _iter_turso_rows(prefix, batch=batch):
                         try:
@@ -1102,7 +1154,7 @@ def shape_audit(batch: int = 200) -> dict:
                 _gc.collect(0)
         conn = _handle()
         if conn is not None:
-            for prefix in ("search:", "gallery:"):
+            for prefix in _mongo_prefixes:
                 try:
                     cur = conn.nhentai_cache.find(
                         {"_id": {"$regex": "^" + prefix}},

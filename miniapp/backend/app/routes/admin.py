@@ -474,27 +474,45 @@ def _bounded(v, lo, hi, default):
     return max(lo, min(hi, n))
 
 
+def _bounded_prefix(v):
+    """v12.27: validate the optional family filter. `search`/`gallery`
+    accepted; anything else -> 400."""
+    if v is None or v == "":
+        return None
+    s = str(v).strip().lower().rstrip(":%")
+    if s not in ("search", "gallery"):
+        raise HTTPException(400, "prefix must be 'search' or 'gallery'")
+    return s
+
+
 @router.post("/cache/renormalize")
 def cache_renormalize(
     limit: Optional[int] = Query(None, description="max rows to process this call"),
     offset: int = Query(0, ge=0, description="starting row offset"),
-    batch: int = Query(200, description="rows per Turso page / Mongo cursor batch"),
+    batch: int = Query(25, description="rows per Turso page / Mongo cursor batch (v12.27 default: 25)"),
+    prefix: Optional[str] = Query(None, description="'search' or 'gallery' — skip the other family entirely"),
     _a: dict = Depends(require_admin_or_key),
 ) -> dict:
     """v12.23: one-time fix for BOT 1's pre-v1.16 raw-shape rows. Walks
     search:* + gallery:* rows in Turso + Mongo and rewrites them in the
     normalized shape BOT 0 reads. Idempotent.
 
-    v12.26: memory-safe — streamed with LIMIT/OFFSET pagination so a full
-    table walk no longer OOMs the 512 MB Render instance. Optional
-    ?limit=&offset=&batch= for slice-mode; call in chunks if the full run
-    still spikes memory.
+    v12.26 streaming, v12.27 memory-safety upgrades:
+      * batch default LOWERED from 200 → 25 (v12.26's default still crashed
+        the 512 MB Render backend at ~4s, before it even finished phase 1).
+      * `_iter_turso_rows` now fetches keys first, then ONE payload at a
+        time — hard cap on resident payload bytes regardless of batch.
+      * new `?prefix=search|gallery` filter to touch just one family (e.g.
+        skip gallery rows entirely once hitmiss proves gallery cache is
+        healthy).
     """
-    b = _bounded(batch, 20, 500, 200)
+    b = _bounded(batch, 5, 200, 25)
     lim = None if limit is None else _bounded(limit, 1, 5000, 200)
+    pf = _bounded_prefix(prefix)
     try:
         res = _nhc_admin.renormalize_existing_rows(
-            dry_run=False, limit=lim, offset=int(offset or 0), batch=b)
+            dry_run=False, limit=lim, offset=int(offset or 0),
+            batch=b, prefix=pf)
     except getattr(_nhc_admin, "RenormalizeBusy", RuntimeError) as e:
         raise HTTPException(429, f"renormalize busy: {e}")
     res["ok"] = True
@@ -505,18 +523,21 @@ def cache_renormalize(
 def cache_renormalize_dry_run(
     limit: Optional[int] = Query(None),
     offset: int = Query(0, ge=0),
-    batch: int = Query(200),
+    batch: int = Query(25),
+    prefix: Optional[str] = Query(None),
     _a: dict = Depends(require_admin_or_key),
 ) -> dict:
     """v12.24: count how many rows WOULD be rewritten, without writing.
-    v12.26: same memory-safe streaming + ?limit=&offset=&batch= as the real
-    endpoint. Safe to run at any batch size; nothing is written.
+    v12.26/v12.27: same memory-safe streaming + ?limit=&offset=&batch=&prefix=
+    as the real endpoint. Nothing is written.
     """
-    b = _bounded(batch, 20, 500, 200)
+    b = _bounded(batch, 5, 200, 25)
     lim = None if limit is None else _bounded(limit, 1, 5000, 200)
+    pf = _bounded_prefix(prefix)
     try:
         res = _nhc_admin.renormalize_existing_rows(
-            dry_run=True, limit=lim, offset=int(offset or 0), batch=b)
+            dry_run=True, limit=lim, offset=int(offset or 0),
+            batch=b, prefix=pf)
     except getattr(_nhc_admin, "RenormalizeBusy", RuntimeError) as e:
         raise HTTPException(429, f"renormalize busy: {e}")
     res["ok"] = True
@@ -525,7 +546,8 @@ def cache_renormalize_dry_run(
 
 @router.get("/cache/shape-audit")
 def cache_shape_audit(
-    batch: int = Query(200, description="rows per Turso page / Mongo cursor batch"),
+    batch: int = Query(25, description="rows per Turso page / Mongo cursor batch (v12.27 default: 25)"),
+    prefix: Optional[str] = Query(None, description="'search' or 'gallery' to audit only one family"),
     _a: dict = Depends(require_admin_or_key),
 ) -> dict:
     """v12.24: read-only shape diagnostic. For each key family
@@ -534,10 +556,13 @@ def cache_shape_audit(
     is the precise reason the mini-app falls through to nhentai despite
     the row being stored (and despite any never-expire sentinel).
 
-    v12.26: streamed with LIMIT/OFFSET; peak RSS bounded by ~batch rows.
+    v12.26/v12.27: two-phase streaming (keys first, one payload at a time),
+    optional ?prefix= filter, batch default 25.
     """
-    b = _bounded(batch, 20, 500, 200)
+    b = _bounded(batch, 5, 200, 25)
+    pf = _bounded_prefix(prefix)
     try:
-        return {"ok": True, "shape_audit": _nhc_admin.shape_audit(batch=b)}
+        return {"ok": True,
+                "shape_audit": _nhc_admin.shape_audit(batch=b, prefix=pf)}
     except getattr(_nhc_admin, "RenormalizeBusy", RuntimeError) as e:
         raise HTTPException(429, f"shape-audit busy: {e}")
