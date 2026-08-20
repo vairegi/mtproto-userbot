@@ -7,7 +7,7 @@
 #   1) Every V2 file that must exist is present and non-empty.
 #   2) Every root-level Python file passes `python3 -m py_compile`.
 #   3) The mini-app's own verify.sh passes (delegates to miniapp/verify.sh).
-#   4) tests_v2_smoke.py runs and reports 0 failures.
+#   4) (v12.32: tests_v2_smoke.py removed from repo)
 #
 # Exit code 0 iff every step passes.
 # ============================================================================
@@ -34,7 +34,6 @@ V2_REQUIRED=(
   relay_v2.py
   # Migration + tests
   scripts/migrate_v2_recover_stuck.py
-  tests_v2_smoke.py
   # Untouched files that V2 depends on
   admin_bot.py config.py db.py worker.py hf_scraper.py
   queue_service.py start.sh
@@ -96,18 +95,6 @@ else
   bad "miniapp/verify.sh not found"
 fi
 
-hr "==> 5. tests_v2_smoke.py"
-if command -v python3 >/dev/null; then
-  if python3 tests_v2_smoke.py > /tmp/tests_v2_smoke.log 2>&1; then
-    n=$(grep -c 'PASS ' /tmp/tests_v2_smoke.log || true)
-    ok "tests_v2_smoke.py: $n assertions passed"
-  else
-    bad "tests_v2_smoke.py FAILED"
-    tail -25 /tmp/tests_v2_smoke.log | sed 's/^/    /'
-  fi
-else
-  say "(python3 not available — skipping)"
-fi
 
 echo
 if [ "$fail" -eq 0 ]; then
