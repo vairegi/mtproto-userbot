@@ -140,6 +140,16 @@ def _extract_filename(msg: Message) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
+# v12.33: message-ID floor is now PER-CLIENT, not a module global.
+# With 2+ userbots in one process (see userbot_pool.py), each client has
+# its own DM history with Bot 2 and its own outbound message-id sequence,
+# so a single global would let userbot A's `send_link` clobber userbot B's
+# floor mid-flight. Key = id(client); value = last outbound msg id in
+# THAT client's DM with Bot 2. Old v11.3 semantics preserved for a single
+# client (the map just has one entry).
+_last_sent_msg_id_by_client: dict[int, int] = {}
+
+
 async def send_link(
     client: TelegramClient,
     bot2_entity,
@@ -151,30 +161,33 @@ async def send_link(
     it gives us a small safety margin (~1s) so we never miss the reply due
     to clock skew between our host and Telegram's servers.
 
-    v11.3: also records the SENT message's id into module-level state
-    (``_last_sent_msg_id``) so ``wait_for_pdf`` can anchor on a hard
-    message-ID floor in addition to the timestamp. This kills the
-    cover-pairing race where a late PDF from a previous (timed-out) job
-    was claimed by the NEXT job's wait — the exact "coverpost +
-    coverpost back-to-back" symptom in the DB channel.
+    v11.3 / v12.33: also records the SENT message's id into a PER-CLIENT
+    map so ``wait_for_pdf`` can anchor on a hard message-ID floor. This
+    kills the cover-pairing race where a late PDF from a previous
+    (timed-out) job was claimed by the NEXT job's wait — the exact
+    "coverpost + coverpost back-to-back" symptom in the DB channel — and
+    the v12.33 variant of the same race across two userbot slots.
     """
-    global _last_sent_msg_id
     since = time.time()
     sent = await client.send_message(bot2_entity, url)
-    _last_sent_msg_id = int(getattr(sent, "id", 0) or 0)
+    _last_sent_msg_id_by_client[id(client)] = int(getattr(sent, "id", 0) or 0)
     return since
 
 
-# v11.3: message-ID of the most recent outbound link we DM'd to Bot 2.
-# Read by wait_for_pdf() as a strict floor; anything at or below this id
-# is either our own message or a reply to an EARLIER job.
-_last_sent_msg_id: int = 0
+def last_sent_msg_id(client: Optional[TelegramClient] = None) -> int:
+    """Return the id of the most recent link message sent to Bot 2 by
+    `client`. 0 means unknown — callers should fall back to timestamp-only
+    filtering.
 
-
-def last_sent_msg_id() -> int:
-    """Return the id of the most recent link message we sent to Bot 2.
-    0 means unknown — callers should fall back to timestamp-only filtering."""
-    return _last_sent_msg_id
+    Back-compat: called with no arg, returns the id from the FIRST client
+    that has ever sent — preserves v11.3 call sites that didn't know
+    about the pool. New v12.33 call sites must pass their client.
+    """
+    if client is not None:
+        return int(_last_sent_msg_id_by_client.get(id(client), 0))
+    if not _last_sent_msg_id_by_client:
+        return 0
+    return int(_last_sent_msg_id_by_client[min(_last_sent_msg_id_by_client)])
 
 
 async def wait_for_pdf(
@@ -203,9 +216,11 @@ async def wait_for_pdf(
     """
     deadline = time.monotonic() + max(1, int(timeout_sec))
     seen_ids: set = set()
-    # v11.3: hard message-ID floor — replies to earlier jobs (which may
-    # be late by minutes if Bot 2 was slow) must never satisfy this wait.
-    floor_id = _last_sent_msg_id
+    # v11.3 / v12.33: hard message-ID floor — replies to earlier jobs (which
+    # may be late by minutes if Bot 2 was slow) must never satisfy this wait.
+    # PER-CLIENT: with 2+ userbots each has its own DM & id sequence with
+    # Bot 2, so reading a global would corrupt the floor across slots.
+    floor_id = int(_last_sent_msg_id_by_client.get(id(client), 0))
 
     while time.monotonic() < deadline:
         try:

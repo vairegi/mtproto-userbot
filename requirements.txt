@@ -1,7 +1,9 @@
-# v12.32: pinned to the 2026-08-20 successful build for reproducibility,
+# v12.33: pinned to the 2026-08-20 successful build for reproducibility,
 # PLUS pillow (the small-cover bug: cover_image_normalise needs Pillow to
 # re-encode .webp/.png covers to JPEG; without it Telegram rejects the
-# photo upload and falls back to a tiny document-style preview).
+# photo upload and falls back to a tiny document-style preview),
+# PLUS psutil (v12.33 /checkram admin command: reads RSS for the 3-process
+# BOT 0 topology so an admin can spot RAM drift toward the 512 MB ceiling).
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 httpx==0.27.0
@@ -11,3 +13,4 @@ telethon==1.44.0
 python-telegram-bot==22.8
 pydantic==2.13.4
 pillow==11.3.0
+psutil>=5.9,<6.0

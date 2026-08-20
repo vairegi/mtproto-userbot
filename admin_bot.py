@@ -2031,6 +2031,114 @@ async def _on_startup(app: Application) -> None:
     # Resume tracking any progress batches left over from before a restart.
     progress_tracker.ensure_tracker_running(app)
 
+
+# ---------------------------------------------------------------------------
+# /checkram — admin-only RAM monitor (v12.33)
+#
+# Reports RSS for all THREE BOT 0 processes (uvicorn, admin_bot, worker) plus
+# the combined total against the Render 512 MB ceiling. Uses psutil.process_iter
+# filtered by cmdline so no PID files or IPC are needed — works even after a
+# supervisor restart of one of the siblings.
+# ---------------------------------------------------------------------------
+_RAM_CEILING_MB = 512.0
+_PROC_MATCHERS = (
+    # (display label, list of substrings that must ALL be in cmdline)
+    ("uvicorn",    ("uvicorn",)),
+    ("worker",     ("worker.py",)),
+    ("admin_bot",  ("admin_bot.py",)),
+)
+
+
+def _match_proc(cmdline: list, needles: tuple) -> bool:
+    joined = " ".join(cmdline or [])
+    return all(n in joined for n in needles)
+
+
+@only_admin
+async def cmd_checkram(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report per-process RSS + total for the 3-process BOT 0 topology."""
+    msg = update.effective_message
+    if not msg:
+        return
+    try:
+        import psutil  # lazy import: psutil failure never blocks boot
+    except Exception as e:  # noqa: BLE001
+        await msg.reply_text(
+            f"⚠️ /checkram unavailable: psutil import failed: {e!s}"
+        )
+        return
+
+    # Walk process table once, collect RSS by label. If a sibling process
+    # forked children (uvicorn workers do), sum them under the same label.
+    totals: dict = {label: 0.0 for label, _ in _PROC_MATCHERS}
+    for p in psutil.process_iter(attrs=["cmdline", "memory_info"]):
+        try:
+            info = p.info or {}
+            cmdline = info.get("cmdline") or []
+            mem = info.get("memory_info")
+            if not cmdline or not mem:
+                continue
+            for label, needles in _PROC_MATCHERS:
+                if _match_proc(cmdline, needles):
+                    totals[label] += float(mem.rss) / (1024.0 * 1024.0)
+                    break
+        except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+            continue
+
+    total_used = sum(totals.values())
+    pct = (total_used / _RAM_CEILING_MB) * 100.0 if _RAM_CEILING_MB > 0 else 0.0
+
+    # If we couldn't find ANY siblings (e.g. non-standard cmdline), fall
+    # back to reporting THIS process's RSS so the command isn't silent.
+    if total_used <= 0.0:
+        try:
+            me_rss = psutil.Process().memory_info().rss / (1024.0 * 1024.0)
+        except Exception:  # noqa: BLE001
+            me_rss = 0.0
+        total_used = me_rss
+        pct = (total_used / _RAM_CEILING_MB) * 100.0
+        await msg.reply_text(
+            f"📊 RAM Usage: {total_used:.1f} MB / "
+            f"{_RAM_CEILING_MB:.1f} MB [{pct:.1f}%]\n"
+            "(process_iter did not find sibling processes; reported this "
+            "process only)"
+        )
+        return
+
+    # Pretty per-process breakdown + total. Non-zero labels first, in the
+    # same order as _PROC_MATCHERS for stable output.
+    lines = ["📊 RAM Usage"]
+    for label, _ in _PROC_MATCHERS:
+        rss = totals.get(label, 0.0)
+        if rss > 0.0:
+            lines.append(f"• {label:<10s} {rss:7.1f} MB")
+    # v12.33: also show pool slot diagnostics if available. No secrets.
+    try:
+        from userbot_pool import get_global as _get_pool
+        _pool = _get_pool()
+        if _pool is not None:
+            snap = _pool.snapshot()
+            if snap:
+                lines.append("")
+                lines.append("🤖 Userbot pool")
+                for s in snap:
+                    cool = (f" cooling {s['cooling_for']:.0f}s"
+                            if s["cooling_for"] > 0 else "")
+                    lines.append(
+                        f"• slot {s['index']}  in_flight={s['in_flight']}  "
+                        f"fetches={s['total_fetches']}  "
+                        f"floods={s['total_floods']}{cool}"
+                    )
+    except Exception:  # noqa: BLE001
+        pass
+    lines.append("─" * 22)
+    lines.append(
+        f"• TOTAL      {total_used:7.1f} MB / "
+        f"{_RAM_CEILING_MB:.1f} MB [{pct:.1f}%]"
+    )
+    await msg.reply_text("```\n" + "\n".join(lines) + "\n```",
+                         parse_mode=ParseMode.MARKDOWN)
+
 # ---------------------------------------------------------------------------
 # /diag — admin-only diagnostic probe (added 2026-08-01)
 #
@@ -3051,6 +3159,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("popupoff", cmd_popupoff))
     app.add_handler(CommandHandler("popupstatus", cmd_popupstatus))
     app.add_handler(CommandHandler("prefetch", cmd_prefetch))   # v12.4
+    app.add_handler(CommandHandler("checkram", cmd_checkram))   # v12.33
 
     # Absorb everything else silently (Yeh ALWAYS bilkul LAST mein hona chahiye)
     app.add_handler(MessageHandler(filters.ALL, swallow))

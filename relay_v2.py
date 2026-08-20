@@ -475,39 +475,32 @@ def _self_cover_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# v11.3 — cover-post <-> PDF pairing serialisation
+# v11.3 / v12.33 — cover-post <-> PDF pairing serialisation
 # ---------------------------------------------------------------------------
 #
-# Root cause of the pairing bug (user report): worker.py runs jobs
-# sequentially, but bot2_client.wait_for_pdf pairs covers to PDFs by
+# v11.3 root cause: bot2_client.wait_for_pdf pairs covers to PDFs by
 # timestamp only (since_ts), not by a per-cover anchor. When Bot 2 is
-# slow (large galleries) the next cover post can be sent while the
-# previous PDF is still being generated — and the FIRST PDF to arrive
-# gets paired with whichever gallery is currently waiting. Covers pile
-# up in the DB channel without their matching PDFs.
+# slow (large galleries) the next cover post could be sent while the
+# previous PDF was still being generated — and the first PDF to arrive
+# would be claimed by the wrong job. v11.3 fixed this by putting the
+# ENTIRE post_cover → Bot2 send → wait-for-PDF chain under one
+# process-local asyncio.Lock. Correct but serial: with 1 userbot the
+# queue drained at Bot 2's speed.
 #
-# Fix: serialise the cover-post -> Bot2-send -> wait-for-PDF section
-# with a process-local asyncio.Lock. The next cover is not posted until
-# the previous gallery's PDF has landed (or timed out). Zero extra
-# latency when uncontended; worker.py's loop is sequential anyway.
+# v12.33 refactor (multi-userbot pool): the wait_for_pdf race is now
+# closed by bot2_client's PER-CLIENT `_last_sent_msg_id_by_client` floor
+# (each userbot has its own DM history with Bot 2, so the message-id
+# floor is naturally isolated). The lock's job shrinks to: keep the two
+# DB-channel writes (post cover, forward PDF) atomic so the channel
+# always reads cover_A, pdf_A, cover_B, pdf_B — never interleaved.
 #
-# Locks are lazily created per event loop (avoids the v11.2 "bound to a
-# different event loop" class of bug) and closed-loop entries are
-# evicted lazily to keep the dict bounded.
-_cover_pair_locks: dict = {}
-
-
-def _cover_pair_lock() -> asyncio.Lock:
-    """Return the cover-pairing lock bound to the CURRENT event loop."""
-    loop = asyncio.get_running_loop()
-    lock = _cover_pair_locks.get(loop)
-    if lock is None:
-        stale = [lp for lp in _cover_pair_locks if lp.is_closed()]
-        for lp in stale:
-            _cover_pair_locks.pop(lp, None)
-        lock = asyncio.Lock()
-        _cover_pair_locks[loop] = lock
-    return lock
+# Concretely: post_cover and forward_messages are held under the pool's
+# `channel_write()` lock; the send-URL-to-Bot2 + wait-for-PDF section
+# runs OUTSIDE the lock so 2+ userbots wait on Bot 2 in parallel. That
+# is where the throughput comes from.
+#
+# The pool's channel lock lives on the UserbotPool singleton
+# (userbot_pool.get_global().channel_write()). See userbot_pool.py.
 
 
 # ---------------------------------------------------------------------------
@@ -625,12 +618,92 @@ async def process_job(
                            reason="V2 disabled at runtime", purge=True)
             return JobOutcome(FAILED_OTHER, "V2 disabled via SELF_COVER_POST_ENABLED=0")
 
-        # ---- v11.3 critical section: cover-post -> Bot2-send -> wait-for-PDF ----
-        # Serialised via _cover_pair_lock so the DB channel never shows a new
-        # cover while the previous gallery's PDF is still being generated.
-        async with _cover_pair_lock():
-            _emit_progress(conn, gid, "scrape", "Scraping gallery metadata + cover")
+        # ---- v12.33: fetch (unlocked) + channel writes (locked) ----------
+        # v11.3 used to hold ONE lock across the entire cover → send → wait
+        # chain. That fixed the pairing race but forced the queue to drain
+        # at Bot 2's speed — a single stuck 200-page fetch stalled every
+        # other job for ~7 min. v12.33 splits the lock's boundary:
+        #
+        #   1. Send URL to Bot 2 and wait for the PDF UNLOCKED. Different
+        #      userbot slots have independent DMs with Bot 2, so N slots
+        #      wait in parallel. The wait_for_pdf pairing race is closed by
+        #      bot2_client's PER-CLIENT _last_sent_msg_id_by_client floor.
+        #
+        #   2. Post cover + forward the PDF into the DB channel LOCKED
+        #      behind userbot_pool.channel_write(). This keeps the channel
+        #      ordering guarantee (cover_A, pdf_A, cover_B, pdf_B).
+        #
+        # The pool's channel-write lock is the ONE process-global lock;
+        # imported lazily to avoid a hard dep for legacy call sites.
+        from userbot_pool import get_global as _get_pool
+        _pool = _get_pool()
 
+        _emit_progress(conn, gid, "scrape", "Scraping gallery metadata + cover")
+
+        # ---- 3a) Kick Bot 2 FIRST (unlocked) --------------------------
+        # Fire the URL to @Gallery_DLBot immediately so its PDF render
+        # runs in parallel with our metadata scrape. This is the whole
+        # point of the pool: different slots' Bot 2 waits overlap.
+        try:
+            since_ts = await _with_flood(
+                lambda: bot2_client.send_link(client, bot2, url),
+                context="dm_bot2", conn=conn,
+            )
+            db.touch_bot_ping(conn, "bot2")
+        except Exception as e:  # noqa: BLE001
+            gs.mark_failed(conn, gid, status=gs.STATUS_FAILED_OTHER,
+                           reason=f"bot2 send failed: {e!s}"[:400])
+            if job_id is not None:
+                db.upsert_job_progress(conn, job_id, db.PHASE_FAILED,
+                                       detail=f"bot2 send failed: {e!s}"[:180])
+            return JobOutcome(FAILED_OTHER, f"bot2 send failed: {e!s}")
+
+        _emit_progress(conn, gid, "bot2_send",
+                       "URL sent to PDF generator bot")
+
+        # ---- 3c) Wait for PDF from Bot 2 (UNLOCKED — parallelism!) ---
+        if job_id is not None:
+            db.upsert_job_progress(
+                conn, job_id, db.PHASE_WAIT_PDF,
+                title=url[:80],
+                detail="waiting for PDF from Bot 2",
+            )
+        _emit_progress(conn, gid, "bot2_wait",
+                       "Your PDF is being generated…")
+
+        # v11.3: adaptive timeout — we don't yet know page count at this
+        # point (cover hasn't been posted). Use base timeout; if the
+        # cover post below completes fast we'll still hit the same wait
+        # loop with the right upper bound because compute_pdf_timeout is
+        # a floor when pages is None.
+        _pdf_wait = _bot2_timeout_sec(None)
+
+        # Start the Bot 2 wait as a task so we can post the cover in
+        # parallel with it — the two operations don't share resources.
+        wait_task = asyncio.create_task(
+            bot2_client.wait_for_pdf(client, bot2, since_ts, _pdf_wait)
+        )
+
+        # ---- 3d) Post cover into DB channel (LOCKED) -----------------
+        # Held under the pool's channel lock so cover_A and cover_B
+        # can't interleave with each other's PDFs. Fast (≤ few hundred
+        # ms) so it doesn't meaningfully block the other slot.
+        cover = None
+        cover_exc: Optional[Exception] = None
+        if _pool is not None:
+            _channel_write = _pool.channel_write()
+        else:
+            # Fallback for tests / legacy callers where the pool hasn't
+            # been wired: a no-op contextmanager. Correctness in prod
+            # requires the pool; this path exists only so unit tests can
+            # run process_job without booting the pool.
+            from contextlib import asynccontextmanager as _acm
+            @_acm
+            async def _noop_cw():
+                yield
+            _channel_write = _noop_cw()
+
+        async with _channel_write:
             try:
                 cover = await _with_flood(
                     lambda: cover_poster.post_cover(
@@ -642,100 +715,88 @@ async def process_job(
                 )
             except Exception as e:  # noqa: BLE001
                 log.exception("relay_v2: cover_poster raised: %s", e)
-                cover = None
+                cover_exc = e
 
-            if cover is None:
-                reason = "cover scrape/post returned nothing"
-                gs.mark_failed(conn, gid, status=gs.STATUS_FAILED_SCRAPE,
-                               reason=reason)
-                await _notify_admin_failure(
-                    client, url, gid,
-                    "SCRAPE FAILED — hf_scraper returned no metadata (gallery "
-                    "deleted, private, or the v2 API changed shape). No cover "
-                    "posted, Bot 2 not contacted.",
-                    conn,
-                )
-                if job_id is not None:
-                    # Friendly text for the requester; technical reason stays in
-                    # the queue row + admin DM only.
-                    db.upsert_job_progress(
-                        conn, job_id, db.PHASE_FAILED,
-                        detail=USER_MSG_SCRAPE_FAIL,
-                    )
-                    try:
-                        db.mark_status(conn, job_id, "failed", reason)
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("mark_status(failed) on scrape fail failed: %s", e)
-                return JobOutcome(FAILED_SCRAPE, reason)
-
-            if job_id is not None:
-                db.upsert_job_progress(
-                    conn, job_id, db.PHASE_SENT_BOTS,
-                    title=(cover.title or url)[:80],
-                    detail="cover posted, contacting Bot 2",
-                )
-
-            _emit_progress(conn, gid, "cover",
-                           "Cover posted to DB channel")
-            _emit_progress(conn, gid, "bot2_send",
-                           "Contacting PDF generator bot")
-
-            # ---- 4) DM Bot 2 + wait for PDF --------------------------------
+        if cover is None:
+            # Scrape/cover post failed — cancel the pending Bot 2 wait to
+            # free the task, then tombstone. The URL already went to Bot
+            # 2; its late reply is ignored by the per-client id floor.
+            wait_task.cancel()
             try:
-                since_ts = await _with_flood(
-                    lambda: bot2_client.send_link(client, bot2, url),
-                    context="dm_bot2", conn=conn,
-                )
-                db.touch_bot_ping(conn, "bot2")
-            except Exception as e:  # noqa: BLE001
-                # Send failure → roll back the cover post, tombstone as OTHER.
-                await cover_poster.delete_cover(
-                    client, channel_id=cover.channel_id, msg_id=cover.msg_id,
-                )
-                gs.mark_failed(conn, gid, status=gs.STATUS_FAILED_OTHER,
-                               reason=f"bot2 send failed: {e!s}"[:400])
-                if job_id is not None:
-                    db.upsert_job_progress(conn, job_id, db.PHASE_FAILED,
-                                           detail=f"bot2 send failed: {e!s}"[:180])
-                return JobOutcome(FAILED_OTHER, f"bot2 send failed: {e!s}")
-
+                await wait_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            reason = (f"cover scrape/post raised: {cover_exc!s}"
+                      if cover_exc else "cover scrape/post returned nothing")
+            gs.mark_failed(conn, gid, status=gs.STATUS_FAILED_SCRAPE,
+                           reason=reason[:400])
+            await _notify_admin_failure(
+                client, url, gid,
+                "SCRAPE FAILED — hf_scraper returned no metadata (gallery "
+                "deleted, private, or the v2 API changed shape). No cover "
+                "posted; a URL was already sent to Bot 2 (its reply will "
+                "be ignored by the per-client message-id floor).",
+                conn,
+            )
             if job_id is not None:
                 db.upsert_job_progress(
-                    conn, job_id, db.PHASE_WAIT_PDF,
-                    title=(cover.title or url)[:80],
-                    detail="waiting for PDF from Bot 2",
+                    conn, job_id, db.PHASE_FAILED,
+                    detail=USER_MSG_SCRAPE_FAIL,
                 )
-            _emit_progress(conn, gid, "bot2_wait",
-                           "Your PDF is being generated…")
+                try:
+                    db.mark_status(conn, job_id, "failed", reason[:400])
+                except Exception as e:  # noqa: BLE001
+                    log.warning("mark_status(failed) on scrape fail failed: %s", e)
+            return JobOutcome(FAILED_SCRAPE, reason[:200])
 
-            # v11.3: scale the wait timeout by the gallery's page count so a
-            # 200-page (~150 MB) doujinshi gets enough time for Bot 2 to
-            # render the PDF. cover.pages is populated by hf_scraper; when
-            # unknown the helper falls back to the pre-v11.3 default.
-            _pdf_wait = _bot2_timeout_sec(getattr(cover, "pages", None))
+        if job_id is not None:
+            db.upsert_job_progress(
+                conn, job_id, db.PHASE_SENT_BOTS,
+                title=(cover.title or url)[:80],
+                detail="cover posted, waiting for PDF",
+            )
+        _emit_progress(conn, gid, "cover",
+                       "Cover posted to DB channel")
+
+        # v11.3: now that we know the page count, upgrade the Bot 2
+        # deadline. If compute_pdf_timeout wants MORE time for a large
+        # gallery, restart the wait task with the wider window.
+        _pdf_wait_upgraded = _bot2_timeout_sec(getattr(cover, "pages", None))
+        if _pdf_wait_upgraded > _pdf_wait and not wait_task.done():
+            wait_task.cancel()
+            try:
+                await wait_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            _pdf_wait = _pdf_wait_upgraded
             _emit_progress(
                 conn, gid, "bot2_wait",
                 f"Waiting up to {describe_timeout(getattr(cover, 'pages', None), _pdf_wait)}",
             )
-            try:
-                outcome = await bot2_client.wait_for_pdf(
-                    client, bot2, since_ts, _pdf_wait,
-                )
-            except FloodWaitError as e:
-                secs = int(getattr(e, "seconds", 0)) + 5
-                log.warning("FloodWait during Bot 2 wait: sleeping %ss", secs)
-                db.log_flood(conn, secs, "wait_bot2")
-                await asyncio.sleep(secs)
-                # Simplest safe recovery: mark PARTIAL if we still have a cover,
-                # else FAILED_TIMEOUT. A retry from the user is cheap now that
-                # the dedup gate would just return "already_completed" or
-                # allow a fresh attempt after tombstone reset.
-                gs.mark_failed(conn, gid, status=gs.STATUS_FAILED_TIMEOUT,
-                               reason="flood-wait during Bot 2 wait")
-                if job_id is not None:
-                    db.upsert_job_progress(conn, job_id, db.PHASE_FAILED,
-                                           detail="flood-wait during Bot 2 wait")
-                return JobOutcome(FAILED_NO_PDF, "flood-wait during Bot 2 wait")
+            wait_task = asyncio.create_task(
+                bot2_client.wait_for_pdf(client, bot2, since_ts, _pdf_wait)
+            )
+
+        # Now block on the (possibly-parallel-running) Bot 2 wait.
+        try:
+            outcome = await wait_task
+        except FloodWaitError as e:
+            secs = int(getattr(e, "seconds", 0)) + 5
+            log.warning("FloodWait during Bot 2 wait: sleeping %ss", secs)
+            db.log_flood(conn, secs, "wait_bot2")
+            # v12.33: cool THIS userbot slot in the pool (admin alert fires).
+            if _pool is not None:
+                for _s in _pool.slots:
+                    if _s.client is client:
+                        await _pool.mark_flood(_s, secs, context="wait_bot2")
+                        break
+            await asyncio.sleep(secs)
+            gs.mark_failed(conn, gid, status=gs.STATUS_FAILED_TIMEOUT,
+                           reason="flood-wait during Bot 2 wait")
+            if job_id is not None:
+                db.upsert_job_progress(conn, job_id, db.PHASE_FAILED,
+                                       detail="flood-wait during Bot 2 wait")
+            return JobOutcome(FAILED_NO_PDF, "flood-wait during Bot 2 wait")
 
         # ---- 5) Branch on Bot 2 outcome --------------------------------
 
@@ -822,27 +883,47 @@ async def process_job(
         _emit_progress(conn, gid, "pdf_received",
                        "PDF received — posting to channel")
 
-        # ---- 6) Forward PDF as reply to our cover ----------------------
+        # ---- 6) Forward PDF as reply to our cover (LOCKED) -------------
+        # v12.33: this MUST run under the pool's channel_write() lock so
+        # the DB channel reads cover_A, pdf_A, cover_B, pdf_B. Without
+        # the lock, a fast slot could forward its PDF between the other
+        # slot's cover and PDF.
         if job_id is not None:
             db.upsert_job_progress(
                 conn, job_id, db.PHASE_FORWARDING,
                 title=(cover.title or url)[:80],
                 detail="forwarding PDF to channel",
             )
-        try:
-            forwarded = await _with_flood(
-                lambda: client.forward_messages(
-                    channel, bot2_msg, drop_author=True,
-                ),
-                context="forward_pdf", conn=conn,
-            )
-        except Exception as e:  # noqa: BLE001
+
+        if _pool is not None:
+            _fwd_cw = _pool.channel_write()
+        else:
+            from contextlib import asynccontextmanager as _acm2
+            @_acm2
+            async def _noop_fwd():
+                yield
+            _fwd_cw = _noop_fwd()
+
+        forwarded = None
+        forward_exc: Optional[Exception] = None
+        async with _fwd_cw:
+            try:
+                forwarded = await _with_flood(
+                    lambda: client.forward_messages(
+                        channel, bot2_msg, drop_author=True,
+                    ),
+                    context="forward_pdf", conn=conn,
+                )
+            except Exception as e:  # noqa: BLE001
+                forward_exc = e
+
+        if forward_exc is not None:
             gs.mark_failed(conn, gid, status=gs.STATUS_FAILED_OTHER,
-                           reason=f"forward failed: {e!s}"[:400])
+                           reason=f"forward failed: {forward_exc!s}"[:400])
             if job_id is not None:
                 db.upsert_job_progress(conn, job_id, db.PHASE_FAILED,
-                                       detail=f"forward failed: {e!s}"[:180])
-            return JobOutcome(FAILED_OTHER, f"forward failed: {e!s}")
+                                       detail=f"forward failed: {forward_exc!s}"[:180])
+            return JobOutcome(FAILED_OTHER, f"forward failed: {forward_exc!s}")
 
         # Extract the PDF's new message ID inside the DB channel.
         pdf_msg_id = 0

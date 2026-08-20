@@ -8,6 +8,8 @@
 #   2) Every root-level Python file passes `python3 -m py_compile`.
 #   3) The mini-app's own verify.sh passes (delegates to miniapp/verify.sh).
 #   4) (v12.32: tests_v2_smoke.py removed from repo)
+#   5) (v12.33: multi-userbot pool — userbot_pool.py added, worker.py &
+#      relay_v2.py refactored, /checkram in admin_bot.py; see GUIDE.md.)
 #
 # Exit code 0 iff every step passes.
 # ============================================================================

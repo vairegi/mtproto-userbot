@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-# start.sh — single entrypoint (v12.31/32 3-process topology, 512MB-safe).
+# start.sh — single entrypoint (v12.33 3-process topology, 512MB-safe).
 #   1) Pre-flight: env + MongoDB + ONE-SHOT Telethon session check
 #      (userbot.py runs blocking here, then exits — not resident).
+#      v12.33: only STRING_SESSION (slot 1) is checked here. Slot 2's
+#      STRING_SESSION_2 is validated later by UserbotPool.start() inside
+#      worker.py; a missing/blank STRING_SESSION_2 silently falls back
+#      to a 1-slot pool (byte-equivalent to v12.32 for ordering).
 #   2) Background supervised: admin_bot.py + worker.py.
-#      relay.py (legacy V1) removed in v12.31.
+#      relay.py (legacy V1) removed in v12.31; worker.py owns the
+#      v12.33 multi-userbot pool.
 #   3) Foreground: uvicorn (Mini App backend) — the port Render scans.
 # =============================================================================
 
@@ -31,7 +36,7 @@ export LOG_DIR
 log() { echo "[start.sh $(date -u '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 log "============================================================"
-log "MTProto relay bot starting (v12.31/32 3-process topology)"
+log "MTProto relay bot starting (v12.33 3-process topology + userbot pool)"
 log "  app dir : ${APP_DIR}"
 log "  python  : ${PY} ($(${PY} --version 2>&1))"
 log "  logs    : ${LOG_DIR}"

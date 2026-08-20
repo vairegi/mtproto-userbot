@@ -106,6 +106,12 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+# v12.33: single source of truth for the running version. Read by /health,
+# /checkram, structured logs. Bump this on every ship; no other v12.xx
+# reference should be treated as authoritative.
+VERSION: str = "v12.33"
+
+
 @dataclass(frozen=True)
 class Settings:
     # Userbot
@@ -145,6 +151,11 @@ class Settings:
 
     # Paths
     base_dir: Path = field(default=BASE_DIR)
+
+    # v12.33: bot version, mirrored from the module-level VERSION constant so
+    # /health & /checkram can print it without importing the constant
+    # directly.
+    version: str = VERSION
 
     # ---- Secret handling ----
     _SECRET_FIELDS = (

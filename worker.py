@@ -32,7 +32,10 @@ from logging_setup import setup_logging
 # relay_v2.
 import relay_v2 as _relay_v2
 from startup_check import run_checks
-from userbot import build_client
+# v12.33: single-userbot bootstrap replaced by UserbotPool. build_client is
+# still used by userbot.py's one-shot session self-check (start.sh step 1b);
+# the resident worker process now owns N Telethon clients via the pool.
+from userbot_pool import UserbotPool, set_global as _set_pool_global
 
 # v12.4: background prefetch cron. Import is guarded so a broken
 # mini-app tree (e.g. missing libsql-client in a stripped test env)
@@ -122,13 +125,41 @@ async def _is_paused() -> bool:
 
 
 async def _run_loop() -> int:
-    client = build_client()
-    await client.connect()
-
-    if not await client.is_user_authorized():
-        await _notify_admin("❌ Userbot session invalid at startup. Regenerate with scripts/gen_session.py.")
-        log.error("userbot session not authorised — exiting")
+    # v12.33: build the N-userbot pool from env. Slot 1 uses the legacy
+    # STRING_SESSION (unchanged env), slot 2 uses STRING_SESSION_2 (same
+    # API_ID / API_HASH — both userbots belong to the same Telegram dev
+    # app per the v12.33 briefing). Any slot with a missing session is
+    # silently skipped so a solo-userbot deploy still works.
+    try:
+        pool = UserbotPool.from_env()
+    except Exception as e:  # noqa: BLE001
+        await _notify_admin(
+            f"❌ UserbotPool build failed: {e!s}\n"
+            "Check STRING_SESSION (slot 1) and STRING_SESSION_2 (slot 2) in Render env."
+        )
+        log.error("UserbotPool.from_env failed: %s", e)
         return 3
+
+    try:
+        await pool.start()
+    except (AuthKeyError, UnauthorizedError) as e:
+        await _notify_admin(
+            f"❌ Userbot session invalid at startup: {e!s}\n"
+            "Regenerate with scripts/gen_session.py."
+        )
+        log.error("userbot session not authorised — exiting: %s", e)
+        return 3
+    except Exception as e:  # noqa: BLE001
+        await _notify_admin(f"❌ UserbotPool start failed: {e!s}")
+        log.error("pool.start failed: %s", e)
+        return 3
+
+    _set_pool_global(pool)
+    log.info("v12.33: userbot pool ready with %d slot(s)", len(pool.slots))
+
+    # Legacy alias so the rest of _run_loop's code keeps working. The
+    # inner dispatch below uses `pool.acquire()` to pick per-job.
+    client = pool.slots[0].client
 
     # Reset stuck jobs (§8)
     conn = db.connect()
@@ -294,13 +325,34 @@ async def _run_loop() -> int:
             job_id, url, via_search, submitted_by, submitter_is_admin, mpost_enabled,
         )
 
+        # v12.33: dispatch to a healthy pool slot instead of the single
+        # legacy client. `async with pool.acquire()` picks the least-in-flight
+        # non-cooling slot and bumps its counter; the counter drops even if
+        # process_job raises. FloodWaits inside process_job call
+        # pool.mark_flood() which fires the admin alert.
         try:
-            outcome = await process_job(
-                client, url, url_hash, job_id=job_id,
-                via_search=via_search, username=username,
-                mpost_enabled=mpost_enabled,
-                submitted_by=submitted_by,
-            )
+            from userbot_pool import NoUserbotAvailable
+            try:
+                async with pool.acquire() as slot:
+                    log.info("job %s dispatched to userbot slot %d",
+                             job_id, slot.index)
+                    outcome = await process_job(
+                        slot.client, url, url_hash, job_id=job_id,
+                        via_search=via_search, username=username,
+                        mpost_enabled=mpost_enabled,
+                        submitted_by=submitted_by,
+                    )
+            except NoUserbotAvailable as e:
+                # Every slot is cooling. Re-queue and sleep a bit.
+                log.warning("job %s: %s — requeue", job_id, e)
+                conn = db.connect()
+                try:
+                    db.mark_status(conn, job_id, "pending",
+                                   "all userbots cooling; retrying")
+                finally:
+                    conn.close()
+                await asyncio.sleep(5)
+                continue
         except (AuthKeyError, UnauthorizedError) as e:
             await _notify_admin(
                 f"❌ Userbot session became invalid mid-run: {e!s}\n"
@@ -358,7 +410,8 @@ async def _run_loop() -> int:
         await _random_delay()
 
     log.info("worker stopping")
-    await client.disconnect()
+    # v12.33: stop the whole pool, not just slot 1's client.
+    await pool.stop()
     return 0
 
 
