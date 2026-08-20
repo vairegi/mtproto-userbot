@@ -338,7 +338,13 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
     # nhentai requires SOME query; when the user typed nothing we ask for
     # "english" which returns huge trending list. That matches the
     # English-only spirit of the Mini App exactly.
-    query = q.strip() if q else "english"
+    # v12.29: normalize the typed query (lowercase + whitespace-collapse)
+    # BEFORE building the Turso key — byte-identical to hf_scraper.search()
+    # v12.19 and BOT 1's cache.bot0_search_key. Without this, a typed
+    # query like "Sole  Female" produced a different key than BOT 1's warm
+    # row and ALWAYS missed the cache (and the 429 back-off cache, which
+    # is keyed by the same tuple).
+    query = " ".join(q.lower().split()) if q else "english"
 
     params = {"query": query, "sort": real_sort, "page": int(page or 1)}
 
@@ -730,7 +736,9 @@ def _direct_nhentai_soft_empty(q_clean: str, upstream_page: int, sort: str) -> b
                 "popular-today": "popular-today", "date": "date",
                 "recent": "date", "": "popular", None: "popular"}
     real_sort = sort_map.get((sort or "").lower(), "popular")
-    query = q_clean.strip() if q_clean else "english"
+    # v12.29: same lowercase+collapse normalization as _direct_nhentai_search
+    # so the soft-empty probe checks the SAME back-off key the fetch uses.
+    query = " ".join(q_clean.lower().split()) if q_clean else "english"
     cache_key = ("search", query, real_sort, int(upstream_page or 1))
     ban = _RATE_LIMIT_CACHE.get(cache_key)
     return bool(ban and ban > _time.time())
@@ -779,7 +787,21 @@ def search(q: str, page: int, sort: str, lang: str,
 
     while len(collected) < want_total and upstream_page <= max_upstream:
         rows: list[dict] = []
-        if q_clean and HAVE_HF and hasattr(_hf, "search"):
+        # v12.29 (SORT BUG FIX): hf_scraper.search() takes NO sort argument
+        # and internally hardcodes params["sort"]="date", then serves/writes
+        # the SAME warm rows for both "date" and "popular" of a query.
+        # Routing every chip's typed query through it collapsed ALL sort
+        # tabs (Popular Now / New Uploads / Popular Week / Popular) into
+        # the identical date-ordered page. hf is therefore only legitimate
+        # when the REQUESTED sort actually maps to "date" — every other
+        # sort goes straight to _direct_nhentai_search, which honours the
+        # sort and reads/writes the per-sort Turso key
+        # (search:q=<q>|sort=<s>|page=<N>) that BOT 1 warms.
+        _sort_map_top = {"popular": "popular", "popular-week": "popular-week",
+                         "popular-today": "popular-today", "date": "date",
+                         "recent": "date"}
+        _requested_sort = _sort_map_top.get((sort or "").lower(), "popular")
+        if q_clean and HAVE_HF and hasattr(_hf, "search") and _requested_sort == "date":
             try:
                 page_obj = _run_async(_hf.search(query=q_clean, page=upstream_page))
                 if page_obj is not None:
@@ -805,7 +827,8 @@ def search(q: str, page: int, sort: str, lang: str,
                              "popular-today": "popular-today", "date": "date",
                              "recent": "date"}
                 _rs = _sort_map.get((sort or "").lower(), "popular")
-                _ck = ("search", (q_clean or "english"), _rs, int(upstream_page))
+                _ck = ("search", (" ".join(q_clean.lower().split()) if q_clean else "english"),
+                       _rs, int(upstream_page))
                 if _RATE_LIMIT_CACHE.get(_ck, 0) > _time.time():
                     rate_limited_pages.append(upstream_page)
             except Exception:  # noqa: BLE001

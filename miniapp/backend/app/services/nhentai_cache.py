@@ -741,8 +741,30 @@ def try_consume(bucket_id: str, cost: float = 1.0) -> bool:
 
     v12.4: Turso first (atomic), Mongo fallback (per-process), fail-open
     when neither is available.
+
+    v12.28: region-aware bucket split. When settings.bot0_region is set
+    (BOT0_REGION env, e.g. "ap-singapore"), the bucket_id is suffixed
+    "_<region>" BEFORE the BUCKETS lookup and before both backends, so
+    this process spends from its own nhentai_ratelimit row and never
+    contends with the other-region bot on the legacy shared row. Empty
+    region (the default, current Oregon backend) -> byte-identical legacy
+    bucket_id, zero behavior change, no schema migration (the Turso
+    INSERT OR IGNORE bootstrap auto-creates the suffixed row on first
+    use; Mongo upserts it likewise). Capacity falls back to the base
+    bucket's configured capacity via the unsuffixed lookup.
     """
-    cap, _label = BUCKETS.get(bucket_id, (10, bucket_id))
+    region = ""
+    try:
+        from ..config import settings as _cfg  # local import: avoid cycle
+        region = (getattr(_cfg, "bot0_region", "") or "").strip()
+    except Exception:  # noqa: BLE001  -- never let config lookup break the hot path
+        region = ""
+    base_id = bucket_id
+    if region:
+        bucket_id = f"{bucket_id}_{region}"
+    # Capacity: look up the SUFFIXED id first (in case it is ever added to
+    # BUCKETS), else fall back to the base bucket's configured capacity.
+    cap, _label = BUCKETS.get(bucket_id, BUCKETS.get(base_id, (10, base_id)))
     turso_result = _turso_try_consume(bucket_id, cap, cost)
     if turso_result is not None:
         return turso_result

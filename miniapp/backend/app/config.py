@@ -29,6 +29,16 @@ class Settings:
     # initData session. EMPTY = disabled (those routes still accept initData).
     admin_static_key: str = os.environ.get("ADMIN_STATIC_KEY", "")
 
+    # v12.28: region-aware Turso token-bucket split (paired with BOT 1
+    # v1.19). When BOT 0 is deployed to a region OTHER than the one BOT 1
+    # occupies, set BOT0_REGION (e.g. "ap-singapore") so its
+    # nhentai_ratelimit bucket_ids are suffixed "_<region>" and it spends
+    # from its own row instead of contending with the other-region bot.
+    # EMPTY (default) = legacy bucket ids, byte-identical behavior — the
+    # current Oregon backend runs with this unset, so v12.28 is a pure
+    # no-op until BOT0_REGION is explicitly set.
+    bot0_region: str = os.environ.get("BOT0_REGION", "").strip()
+
     # V2 DM-delivery on dedup (BUG 1) — the database channel the admin bot
     # copyMessages from when a user taps Queue on an already-completed
     # gallery. Same env var as the parent bot uses.
