@@ -157,10 +157,6 @@ async def _run_loop() -> int:
     _set_pool_global(pool)
     log.info("v12.33: userbot pool ready with %d slot(s)", len(pool.slots))
 
-    # Legacy alias so the rest of _run_loop's code keeps working. The
-    # inner dispatch below uses `pool.acquire()` to pick per-job.
-    client = pool.slots[0].client
-
     # Reset stuck jobs (§8)
     conn = db.connect()
     try:

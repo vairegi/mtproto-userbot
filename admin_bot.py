@@ -28,7 +28,9 @@ import sys
 from typing import Awaitable, Callable, Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.constants import ChatAction
+# v12.33 fix: ParseMode promoted to top-level import. Previously it was a
+# function-local import inside one handler (F821 in CI lint for /checkram).
+from telegram.constants import ChatAction, ParseMode
 from pymongo import MongoClient
 from telegram.ext import (
     Application,
