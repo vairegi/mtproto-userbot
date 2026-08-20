@@ -165,4 +165,11 @@ async def try_consume(key: str) -> bool:
     2 tokens of the shared 10/min /search bucket."""
     b = bucket_for_key(key)
     cap = bucket_capacity(b)
+    # v1.19: region-aware bucket split. When BOT1_REGION is set (e.g.
+    # "ap-singapore" on the Singapore service), spend from a region-
+    # suffixed bucket row so this side never throttles / is throttled by
+    # the other-region bot sharing the legacy row. Empty suffix -> legacy
+    # bucket id, byte-identical to pre-v1.19 behavior.
+    if settings.region_suffix:
+        b = f"{b}_{settings.region_suffix}"
     return await mongo_client.bucket_try_consume(b, cap)

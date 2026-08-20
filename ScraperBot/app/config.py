@@ -147,6 +147,21 @@ class Settings:
     # Default 8/min = 10/min limit minus a 2-token reserve for BOT 0.
     bucket_search_scraper: int = _env_int("BUCKET_SEARCH_SCRAPER", 8)
 
+    # v1.19: region-aware Turso token-bucket split.
+    # BOT 0 (Oregon) and BOT 1 (now also deployable to Singapore) both
+    # consume the SHARED Turso `nhentai_ratelimit` row keyed by bucket_id.
+    # When BOT 1 runs on a DIFFERENT Render region (different egress IP),
+    # sharing the same bucket row lets one side throttle the other from a
+    # different IP — which defeats the point of the region move. Setting
+    # BOT1_REGION (e.g. "ap-singapore") suffixes every bucket_id with
+    # "_<region>" so BOT 1 spends from its OWN row
+    # (e.g. bucket "search_ap-singapore") instead of the legacy "search".
+    # EMPTY (default) = legacy behavior, byte-identical bucket ids, safe
+    # to deploy to the existing Oregon service with no behavior change.
+    # The INSERT OR IGNORE bootstrap auto-creates the new row on first use;
+    # NO Turso schema migration is needed.
+    region_suffix: str = os.getenv("BOT1_REGION", "").strip()
+
     # Logging
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper().strip() or "INFO"
 

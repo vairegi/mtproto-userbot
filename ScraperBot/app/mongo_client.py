@@ -301,7 +301,15 @@ async def bucket_try_consume(bucket: str, capacity_per_min: int) -> bool:
 
     v1.14: Turso is the primary store so BOT 0 + BOT 1 share one quota.
     Mongo `nhentai_bucket` is kept only as a fail-open fallback for when
-    Turso is unreachable (network blip, Turso maintenance, etc.)."""
+    Turso is unreachable (network blip, Turso maintenance, etc.).
+
+    v1.19: the `bucket` id passed in may ALREADY carry a region suffix
+    (applied in cache.try_consume from settings.region_suffix). This
+    function is region-agnostic — it passes whatever id it receives
+    straight through to both the Turso and Mongo paths unchanged, so a
+    region-suffixed id (e.g. "search_ap-singapore") transparently uses
+    its own row via the existing INSERT OR IGNORE bootstrap (no schema
+    migration)."""
     turso_result = await _turso_bucket_try_consume(bucket, capacity_per_min)
     if turso_result is not None:
         return turso_result

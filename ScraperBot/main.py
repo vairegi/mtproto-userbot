@@ -25,7 +25,7 @@ from app.services import list_sweeper, details_sweeper, channel_dashboard
 
 log = setup_logging("scraperbot")
 
-app = FastAPI(title="ScraperBot (BOT 1)", version="1.18.0")
+app = FastAPI(title="ScraperBot (BOT 1)", version="1.19.0")
 
 app.add_middleware(
     CORSMiddleware,
