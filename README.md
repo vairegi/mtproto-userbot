@@ -1,43 +1,58 @@
-# Telegram Gallery-Fetch Relay Pipeline
+# ScraperBot (BOT 1)
 
-Implementation of Build Brief v2 for Ryan.
+Isolated background scraper that hydrates the SAME MongoDB + Turso cache
+BOT 0 reads from, so the mini-app serves details instantly without BOT 0
+ever having to scrape.
 
-**What this does:** Ryan sends `/fetch <url>` (one URL per line) to an Admin Bot.
-For each URL the userbot DMs `@hentaifoxbot` (Bot 1) and `@Gallery_DLBot` (Bot 2),
-waits for Bot 1's cover post to appear in the Database Channel, then natively
-forwards Bot 2's PDF right underneath it — one link at a time, no downloads,
-no re-uploads.
+- Runs as a **FastAPI web service** (Render Free) with UptimeRobot keeping it warm.
+- **Reads/writes only cache keys**: `search:<sort>:page<N>` and `gallery:<id>`.
+- **Never touches** BOT 0's queue, users, admins, or `galleries` state-machine docs.
+- Zero shared code with BOT 0 — same folder, own dependencies, own process.
 
-**Runtime target:** Ubuntu 24.04, Python 3.11/3.12, no headless browsers, pm2.
+## Endpoints
 
-**Layout on the server:**
+| Path              | Purpose                                       |
+| ----------------- | --------------------------------------------- |
+| `GET  /`          | Bot info + live status (UptimeRobot pings here) |
+| `GET  /healthz`   | Health probe                                  |
+| `GET  /status`    | Sweep counters, last-run timestamps           |
+| `POST /trigger`   | Force one sweep now (admin key)               |
+| `POST /pause`     | Pause both sweepers (admin key)               |
+| `POST /resume`    | Resume both sweepers (admin key)              |
+| `POST /telegram`  | Telegram webhook — `/status`, `/pause`, `/resume`, `/trigger` in chat |
+
+## Files
 
 ```
-/home/ryan/relay/
-├── .env                    # secrets (chmod 600) — Ryan creates from .env.example
+ScraperBot/
+├── app/
+│   ├── __init__.py
+│   ├── config.py               # env parsing
+│   ├── logging_setup.py
+│   ├── mongo_client.py         # Mongo handle (shared cluster)
+│   ├── turso_client.py         # libsql client (shared DB)
+│   ├── cache.py                # cache-key helpers + token bucket (matches BOT 0)
+│   ├── hf_scraper_lite.py      # nhentai API client (list + detail)
+│   ├── auth.py                 # admin key + Telegram user-id gate
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── list_sweeper.py     # search:<sort>:page<N> warmer
+│   │   ├── details_sweeper.py  # gallery:<id> warmer
+│   │   └── telegram_bot.py     # thin bot API wrapper (webhook)
+│   └── routes/
+│       ├── __init__.py
+│       ├── health.py
+│       ├── status.py
+│       ├── admin.py
+│       └── telegram.py
+├── scripts/
+│   └── set_webhook.py          # one-shot webhook registration helper
+├── main.py                     # FastAPI entrypoint + startup tasks
+├── requirements.txt
+├── Procfile
+├── runtime.txt
 ├── .env.example
-├── requirements.txt        # pinned
-├── config.py
-├── logging_setup.py
-├── db.py
-├── url_utils.py
-├── queue_service.py
-├── startup_check.py
-├── userbot.py              # Telethon client (long-running worker)
-├── relay.py                # per-job flow: DM → wait → match → forward
-├── worker.py               # main loop entry point
-├── admin_bot.py            # separate process, python-telegram-bot
-├── queue.db                # created on first run
-├── logs/                   # created on first run
-├── backups/
-│   └── backup.sh
-├── pm2/
-│   └── ecosystem.config.js
-└── INSTALL.md              # Ryan's step-by-step guide
+└── README.md
 ```
 
-Two pm2 processes: `relay-worker` (userbot) and `relay-admin` (admin bot).
-They share the same SQLite file but never write in parallel — the admin bot
-only inserts into `queue`; the worker owns everything else.
-
-See `INSTALL.md` for the full walkthrough written for Termius/nano.
+See `DEPLOY.md` in the parent chat for the step-by-step Render deploy guide.
