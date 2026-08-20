@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 # =============================================================================
 # start.sh — single entrypoint that replaces PM2.
+#
+# v12.31 topology (Render 512 MB free tier) — 3 resident processes:
+#   1) Pre-flight: env + MongoDB + ONE-SHOT Telethon session check
+#      (userbot.py runs BLOCKING here, then exits — no longer resident).
+#   2) Background supervised: admin_bot.py + worker.py.
+#      relay.py (legacy V1) was REMOVED in v12.31; worker.py routes every
+#      job directly to relay_v2.
+#   3) Foreground: uvicorn (Mini App backend). It is the process Render's
+#      port scanner needs open, so it gets the foreground slot (was held
+#      by userbot.py before, which added ~60-80 MB resident for no reason
+#      — worker.py owns the real Telethon client via userbot.build_client).
 # =============================================================================
 
 set -uo pipefail
@@ -33,7 +44,7 @@ export LOG_DIR
 log() { echo "[start.sh $(date -u '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 log "============================================================"
-log "MTProto relay bot starting"
+log "MTProto relay bot starting (v12.31 3-process topology)"
 log "  app dir : ${APP_DIR}"
 log "  python  : ${PY} ($(${PY} --version 2>&1))"
 log "  logs    : ${LOG_DIR}"
@@ -61,7 +72,7 @@ if [ -n "${MISSING}" ]; then
   log "  Hugging Face Spaces -> Settings -> Variables and secrets"
   log ""
   log "Required: API_ID, API_HASH, BOT_TOKEN, MONGO_URI, STRING_SESSION,"
-  log "          ADMIN_USER_ID, BOT1_USERNAME, BOT2_USERNAME, DATABASE_CHANNEL_ID"
+  log "          ADMIN_USER_ID, BOT2_USERNAME, DATABASE_CHANNEL_ID"
   exit 1
 fi
 log "env check: all required variables are present"
@@ -88,6 +99,24 @@ else
   log "  4. Atlas -> Network Access allows 0.0.0.0/0"
   exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# 1b. One-shot Telethon session check — userbot.py connects, verifies the
+#     STRING_SESSION is still authorized, prints who we logged in as, then
+#     EXITS. v12.31: this used to be the resident foreground process,
+#     keeping a Telethon client alive for the whole container lifetime for
+#     no reason (worker.py owns the real client via userbot.build_client).
+#     Now it's a boot-time validator only — same failure signal, no RSS.
+# ---------------------------------------------------------------------------
+log "validating Telethon STRING_SESSION..."
+${PY} -u userbot.py
+USERBOT_CODE=$?
+if [ ${USERBOT_CODE} -ne 0 ]; then
+  log "FATAL: userbot.py session check failed (code=${USERBOT_CODE})"
+  log "  check API_ID / API_HASH / STRING_SESSION"
+  exit ${USERBOT_CODE}
+fi
+log "Telethon session verified"
 
 # ---------------------------------------------------------------------------
 # 2. Process supervision helpers
@@ -207,67 +236,40 @@ log "------------------------------------------------------------"
 log "launching background processes"
 log "------------------------------------------------------------"
 
-# --- Mini App: serves the frontend AND passes Render's port scan ---
-MINIAPP_ROOT="$(cd "$(dirname "$0")" && pwd)/miniapp"
-
-if [ -d "$MINIAPP_ROOT" ]; then
-    log "[start.sh] Booting Mini App backend on port ${PORT:-8000}"
-    (
-        cd "$MINIAPP_ROOT"
-        export PYTHONPATH="$(dirname "$MINIAPP_ROOT"):$MINIAPP_ROOT/backend:${PYTHONPATH:-}"
-        exec uvicorn backend.main:app \
-            --host 0.0.0.0 \
-            --port "${PORT:-8000}" \
-            --log-level "${MINIAPP_LOG_LEVEL:-info}"
-    ) &
-    MINIAPP_PID=$!
-    PIDS="${PIDS} ${MINIAPP_PID}"
-    log "[start.sh] Mini App PID=${MINIAPP_PID} on port ${PORT:-8000}"
-else
-    log "[start.sh] WARN: $MINIAPP_ROOT missing, skipping Mini App startup"
-fi
-# --- End of Mini App block ---
-
 supervise "admin_bot.py" "admin_bot"
 sleep 3                      # let the Admin Bot claim the Telegram polling slot
 
 supervise "worker.py" "worker"
 sleep 2
 
-supervise "relay.py" "relay"
-sleep 1
-
 # ---------------------------------------------------------------------------
-# 4. Run userbot.py in the FOREGROUND
+# 4. Foreground: Mini App backend (uvicorn) on ${PORT:-8000}
+#    Must be FOREGROUND so Render's port scanner sees an open port and the
+#    container has a PID 1 to hold it alive. v12.31: uvicorn moved here
+#    from a supervised background slot — pre-v12.31 it was OOM-killed
+#    before it could bind ("No open ports detected" in the Render log),
+#    and the foreground slot was wasted on a userbot.py process that had
+#    already finished its session check and was just parked.
 # ---------------------------------------------------------------------------
-log "------------------------------------------------------------"
-log "starting userbot.py in the foreground"
-log "------------------------------------------------------------"
+MINIAPP_ROOT="${APP_DIR}/miniapp"
 
-${PY} -u userbot.py
-USERBOT_CODE=$?
-log "userbot.py returned code=${USERBOT_CODE}"
-
-if [ ${USERBOT_CODE} -ne 0 ]; then
-  log "userbot.py failed — check API_ID / API_HASH / STRING_SESSION"
+if [ ! -d "${MINIAPP_ROOT}" ]; then
+  log "FATAL: ${MINIAPP_ROOT} missing — cannot start Mini App backend"
   shutdown
-  exit ${USERBOT_CODE}
+  exit 1
 fi
 
-log "userbot.py validated OK; entering foreground watchdog loop"
-log "the bot is now running — background processes are supervised"
+log "------------------------------------------------------------"
+log "starting Mini App backend (uvicorn) on port ${PORT:-8000} in the foreground"
+log "------------------------------------------------------------"
 
-while :; do
-  sleep 60
-  alive=0
-  for pid in ${PIDS}; do
-    if kill -0 "${pid}" 2>/dev/null; then
-      alive=$(( alive + 1 ))
-    fi
-  done
-  if [ ${alive} -eq 0 ]; then
-    log "FATAL: every background supervisor has exited — exiting so the"
-    log "platform restarts the container"
-    exit 1
-  fi
-done
+cd "${MINIAPP_ROOT}"
+export PYTHONPATH="$(dirname "${MINIAPP_ROOT}"):${MINIAPP_ROOT}/backend:${PYTHONPATH:-}"
+
+# exec replaces this shell so signals go straight to uvicorn; the trap on
+# SIGTERM/SIGINT installed above still fires for the supervised children
+# before uvicorn exits the container.
+exec uvicorn backend.main:app \
+  --host 0.0.0.0 \
+  --port "${PORT:-8000}" \
+  --log-level "${MINIAPP_LOG_LEVEL:-info}"

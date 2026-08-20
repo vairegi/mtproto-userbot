@@ -31,5 +31,5 @@ Add these under **Settings → Variables and secrets** as **Secrets** (not varia
 
 Optional: `DOUJINSHIBOT_USERNAME`, `SOURCE_API_BASE`, `SOURCE_API_KEY`, `LOG_LEVEL`, `TIMEZONE`.
 
-The container starts `start.sh`, which brings up `admin_bot.py`, `worker.py`, `relay.py`
-in the background and `userbot.py` in the foreground.
+The container starts `start.sh`, which brings up `admin_bot.py` and `worker.py`
+in the background and the Mini App (uvicorn) in the foreground.

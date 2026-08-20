@@ -25,7 +25,11 @@ from telethon.errors import AuthKeyError, UnauthorizedError
 import db
 from config import settings
 from logging_setup import setup_logging
-import relay as _relay_v1
+# v12.31: relay.py (V1) removed — the legacy Bot 1 (@postedstuffbot) flow
+# has been off in production (SELF_COVER_POST_ENABLED defaults to 1) and the
+# extra supervised process contributed ~90-130 MB of resident RSS that pushed
+# the 512 MB Render free tier into OOM. process_job now always routes to
+# relay_v2.
 import relay_v2 as _relay_v2
 from startup_check import run_checks
 from userbot import build_client
@@ -64,23 +68,15 @@ else:
     _details_cron_import_err = None
 
 
-def _v2_enabled() -> bool:
-    """V2 relay is the default. Set SELF_COVER_POST_ENABLED=0 to fall back
-    to the legacy V1 (Bot 1) path — see docs/MIGRATION_V2.md §5."""
-    raw = (os.getenv("SELF_COVER_POST_ENABLED", "1") or "1").strip().lower()
-    return raw not in ("0", "false", "no", "off")
-
-
 async def process_job(*args, **kwargs):
-    """Thin router: pick V1 or V2 orchestrator based on env flag.
+    """Thin passthrough to relay_v2.process_job.
 
-    Keeping the name `process_job` here means the rest of worker.py (log
-    lines, tests, imports) is unchanged and the routing decision lives in
-    one place.
+    v12.31: the V1/V2 router was removed together with relay.py. Keeping
+    the wrapper name `process_job` means the rest of worker.py (log lines,
+    tests, call sites) is unchanged. SELF_COVER_POST_ENABLED is now
+    advisory only — the code always uses V2.
     """
-    if _v2_enabled():
-        return await _relay_v2.process_job(*args, **kwargs)
-    return await _relay_v1.process_job(*args, **kwargs)
+    return await _relay_v2.process_job(*args, **kwargs)
 
 log = setup_logging("worker")
 

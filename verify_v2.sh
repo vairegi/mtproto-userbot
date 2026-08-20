@@ -36,7 +36,7 @@ V2_REQUIRED=(
   scripts/migrate_v2_recover_stuck.py
   tests_v2_smoke.py
   # Untouched files that V2 depends on
-  admin_bot.py config.py db.py worker.py relay.py hf_scraper.py
+  admin_bot.py config.py db.py worker.py hf_scraper.py
   queue_service.py start.sh
   # Miniapp V2 edits (must not be blank)
   miniapp/backend/app/routes/queue.py

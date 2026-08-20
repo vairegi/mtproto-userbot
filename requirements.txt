@@ -1,7 +1,12 @@
+# v12.31: pinned to what the 2026-08-20 successful Render build installed,
+# so a future deploy can't be tipped over the 512 MB memory ceiling by a
+# transitive dep silently jumping a major version. When bumping any of
+# these, redeploy and watch the Render Metrics tab for baseline-RSS drift.
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 httpx==0.27.0
 pymongo==4.7.2
 python-dotenv==1.0.1
-telethon
-python-telegram-bot
+telethon==1.44.0
+python-telegram-bot==22.8
+pydantic==2.13.4

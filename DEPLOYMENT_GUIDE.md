@@ -201,7 +201,7 @@ There are two ways. Pick whichever feels easier.
    Dockerfile            .env.example        .gitignore
    hf_scraper.py         INSTALL.md          logging_setup.py
    progress_tracker.py   queue_service.py    README.md
-   README_HF.md          relay.py            requirements.txt
+   README_HF.md          requirements.txt
    scripts/              search_picker.py    source_api.py
    start.sh              startup_check.py    tests_db_mongo.py
    url_utils.py          userbot.py          worker.py

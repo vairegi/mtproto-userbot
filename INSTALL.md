@@ -56,7 +56,6 @@ File list you should end up with:
 ├── startup_check.py
 ├── userbot.py
 ├── source_api.py
-├── relay.py
 ├── worker.py
 ├── admin_bot.py
 ├── scripts/gen_session.py
