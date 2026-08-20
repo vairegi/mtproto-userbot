@@ -768,7 +768,15 @@ def search(q: str, page: int, sort: str, lang: str,
     """
     include_tags = include_tags or []
     exclude_tags = exclude_tags or []
-    q_clean = (q or "").strip()
+    # v12.30: lowercase + whitespace-collapse at the TOP so every downstream
+    # read (hf branch, direct branch, 429 soft-empty probe, and the Turso
+    # key formation inside _direct_nhentai_search) sees the same canonical
+    # form BOT 1's cache.bot0_search_key writes. Previously a typed 'Incest'
+    # from the UI landed in Turso as ...q=incest|... but any probe /
+    # rate-limit key computed against the raw q would look at 'Incest' and
+    # miss. Also fixes 'Sole  Female' (double space) diverging from BOT 1's
+    # 'sole female' warm row.
+    q_clean = " ".join((q or "").lower().split())
     per_page = int(per_page) if per_page and per_page > 0 else 25
 
     try:
@@ -857,6 +865,29 @@ def search(q: str, page: int, sort: str, lang: str,
         consecutive_empty = 0
         collected.extend(rows)
         upstream_page += 1
+
+    # v12.30 (DUP FIX): dedup by gallery id BEFORE slicing the window.
+    # nhentai reorders popular lists constantly, so upstream pages 1 and 2
+    # of the same sort routinely share several galleries. Left in place,
+    # those duplicates show up as the SAME card twice on one user-facing
+    # page (visible in the mini-app screenshots: identical covers repeated
+    # on Discover). Preserves the original order the aggregator produced,
+    # skips only exact-id repeats.
+    _seen_ids: set[str] = set()
+    _deduped: list[dict] = []
+    for _row in collected:
+        try:
+            _rid = str(_row.get("id") or "").strip()
+        except AttributeError:
+            _rid = ""
+        if not _rid:
+            _deduped.append(_row)   # no id -> can't dedup, keep it
+            continue
+        if _rid in _seen_ids:
+            continue
+        _seen_ids.add(_rid)
+        _deduped.append(_row)
+    collected = _deduped
 
     window = collected[start_offset:start_offset + per_page]
     items = [_normalize(r) for r in window]
