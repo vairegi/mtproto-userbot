@@ -336,7 +336,7 @@ export async function render(root, { me }) {
     return make("card", {
       id: g.id, title: g.title, cover: g.cover, pages: g.pages,
       badge: null,  // v11.9 (#5): removed "Np" badge — covers stay clean
-      is_cached: typeof g.is_cached === "boolean" ? g.is_cached : false,
+      is_cached: typeof g.is_cached === "boolean" ? g.is_cached : undefined,
       onOpen: () => openDetail(g),
     });
   }
