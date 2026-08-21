@@ -131,7 +131,7 @@ export function renderRecommendations(me) {
       const card = make("card", {
         id: g.id, title: g.title, cover: g.cover, pages: g.pages,
         badge: null,  // v11.9 (#5): removed "Np" badge
-        is_cached: typeof g.is_cached === "boolean" ? g.is_cached : false,
+        is_cached: typeof g.is_cached === "boolean" ? g.is_cached : undefined,
         onOpen: () => openGalleryDetail(g, me),
       });
       grid.appendChild(card);
