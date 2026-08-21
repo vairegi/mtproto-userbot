@@ -360,7 +360,10 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
     # `search:<sort>:pageN` form that prefetch_cron already writes, so a
     # user hit lands DIRECTLY on the row the prefetch warmed. User-typed
     # queries use a distinct but still-deterministic tail.
-    if query == "english":
+    # v12.33c: chip reads use query=english; BOT 1 now warms with
+    # language:english. Treat BOTH as the chip namespace so reads hit the
+    # warmed `search:<sort>:pageN` rows either way.
+    if query in ("english", "language:english"):
         _turso_key = f"search:{real_sort}:page{int(page or 1)}"
     else:
         _turso_key = f"search:q={query}|sort={real_sort}|page={int(page or 1)}"
@@ -375,7 +378,7 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
             # v12.11 (#1b): user is looking at this page NOW — hydrate its
             # card details on the next scraper tick (empty-query chip pages
             # only; those map 1:1 to the cron's sort/page walk).
-            if query == "english":
+            if query in ("english", "language:english"):
                 _notify_details_scraper(real_sort, int(page or 1))
             return _hit
 
@@ -470,7 +473,7 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
             _stale = None
         if isinstance(_stale, list) and _stale:
             log.info(_LOG_STALE, _turso_key)
-            if query == "english":
+            if query in ("english", "language:english"):
                 _notify_details_scraper(real_sort, int(page or 1))
             return _stale
     # v12.11 (#1b): fresh fetch path — notify on a non-empty result too.
