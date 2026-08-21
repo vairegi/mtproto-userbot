@@ -1,10 +1,14 @@
 /*
-  pages/profile.js — User profile page   (v11.7)
+  pages/profile.js — User profile page   (v12.36)
 
-  v11.7 additions:
-    * User Stats panel — saves, ratings-given, shares, day-streak
-    * Badges grid — unlocked + locked (greyed) with tooltip on hover
-    Both come from /api/stats/me. The old "Saved Files" grid stays put.
+  v12.36 — task brief: the visible Saved Files grid AND the Badges (x/y)
+  block are removed from the Profile tab. Saved-files browsing already
+  lives in the Saved tab via /api/bookmarks; Activity + Leaderboard are
+  the only Profile surfaces now.
+
+  Top Queuers Today (top 11) was promoted here from the Admin tab; it
+  reads from /api/stats/leaderboard which is a public per-user endpoint.
+  Badge logic is gone from the file entirely.
 */
 
 import { api } from "core/api.js";
@@ -14,33 +18,31 @@ import { openGalleryDetail } from "plugins/detail-sheet.js";  // v11.9
 // v12.3: prefetchGallery import removed — no more background warming storm.
 
 export async function render(root, { me }) {
-  const $hero   = h("div", { class: "profile-hero" });
-  const $stats  = h("div", { style: { marginTop: "16px" } });   // v11.7
-  const $badges = h("div", { style: { marginTop: "16px" } });   // v11.7
-  const $saved  = h("div", { style: { marginTop: "20px" } });
-  root.append($hero, $stats, $badges, $saved);
+  const $hero = h("div", { class: "profile-hero" });
+  const $stats = h("div", { style: { marginTop: "16px" } });     // v11.7 (kept)
+  const $leader = h("div", { style: { marginTop: "16px" } }); // v12.36
+  root.append($hero, $stats, $leader);
 
   paintHero(me);
-  paintStats(null);      // skeleton first
-  paintBadges(null);
+  paintStats(null);       // skeleton first
+  paintLeaderboard(null); // v12.36: skeleton first
 
   try {
-    const [fresh, bookmarks, stats] = await Promise.all([
+    const [fresh, stats, leaderboard] = await Promise.all([
       api.get("/api/profile/me"),
-      api.get("/api/bookmarks"),
+      // /api/stats/me still serves saves/ratings/shares/streak — we still
+      // need it for the Your Activity tiles (v11.7 contract preserved).
       api.get("/api/stats/me").catch(() => null),
+      // v12.36: new endpoint; the previous Top-Queuers widget on the Admin
+      // tab was promoted here and the cap raised to 11 users (was 5).
+      api.get("/api/stats/leaderboard?limit=11").catch(() => null),
     ]);
     paintHero(fresh);
     store.set("me", fresh);
-    store.set("bookmarks", bookmarks.items || []);
-    paintSaved(bookmarks.items || []);
-    if (stats) {
-      paintStats(stats);
-      paintBadges(stats.badges || []);
-    }
+    if (stats) paintStats(stats);
+    if (leaderboard) paintLeaderboard(leaderboard.items || []);
   } catch (e) {
     console.warn("profile refresh failed:", e);
-    paintSaved(store.get("bookmarks", []));
   }
 
   function paintHero(u) {
@@ -129,74 +131,71 @@ export async function render(root, { me }) {
     );
   }
 
-  function paintBadges(badges) {
-    $badges.innerHTML = "";
-    if (badges == null) return; // waiting for load
-    const unlocked = badges.filter(b => b.unlocked).length;
-    $badges.appendChild(h("h3", {
+  /* v12.36 ---------------------------------------------------------------
+     Leaderboard ("Top Queuers Today") promoted here from admin.js.
+     Limit raised 5 → 11 to match the operator's brief. Renders the top
+     11 users ranked by today's queue count.
+     ----------------------------------------------------------------------- */
+  function paintLeaderboard(rows) {
+    $leader.innerHTML = "";
+    $leader.appendChild(h("h3", {
       style: { margin: "0 0 10px", fontSize: "15px",
                color: "var(--du-ink-mid)", fontWeight: "600" }
-    }, `🏅 Badges (${unlocked}/${badges.length})`));
-    const grid = h("div", {
-      style: {
-        display: "grid",
-        gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
-        gap: "8px",
-      },
-    });
-    for (const b of badges) {
-      grid.appendChild(h("div", {
-        title: `${b.name} — ${b.desc}${b.unlocked ? "" : " (locked)"}`,
-        style: {
-          background: b.unlocked ? "var(--du-bg-2)" : "var(--du-bg-1)",
-          border: "1px solid " + (b.unlocked ? "var(--du-border-strong)" : "var(--du-border)"),
-          borderRadius: "10px",
-          padding: "10px 4px",
-          textAlign: "center",
-          opacity: b.unlocked ? "1" : "0.42",
-          filter: b.unlocked ? "none" : "grayscale(0.7)",
-          transition: "transform 140ms ease, opacity 140ms ease",
-        },
-      },
-        h("div", { style: { fontSize: "22px", lineHeight: "1" } }, b.icon || "🏅"),
-        h("div", { style: { fontSize: "10px", color: "var(--du-ink-mid)",
-                            marginTop: "3px", fontWeight: "600" } },
-          b.name),
-      ));
-    }
-    $badges.appendChild(grid);
-  }
-
-  function paintSaved(items) {
-    $saved.innerHTML = "";
-    $saved.appendChild(h("h3", {
-      style: { margin: "0 0 12px", fontSize: "15px",
-               color: "var(--du-ink-mid)", fontWeight: "600" }
-    }, `⭐ Saved Files (${items.length})`));
-    if (!items.length) {
-      $saved.appendChild(h("div", { class: "empty" },
-        h("div", { class: "icon" }, "📁"),
-        h("div", { class: "title" }, "Nothing saved yet"),
-        h("div", {}, "Bookmarked galleries appear here."),
+    }, "🏆 Top Queuers Today"));
+    if (!rows || !rows.length) {
+      $leader.appendChild(h("div", { class: "empty" },
+        h("div", { class: "icon" }, "🪶"),
+        h("div", { class: "title" }, "No queues today yet"),
+        h("div", {}, "Be the first to break the silence."),
       ));
       return;
     }
-    const grid = h("div", { class: "card-grid" });
-    for (const g of items.slice(0, 12)) {
-      // v12.3: prefetch removed — sheet fetches detail on tap.
-      grid.appendChild(make("card", {
-        id: g.id, title: g.title, cover: g.cover, pages: g.pages,
-        badge: null,  // v11.9 (#5): removed "Np" badge
-        onOpen: () => openGalleryDetail(g, store.get("me")),
-      }));
-    }
-    $saved.appendChild(grid);
-    if (items.length > 12) {
-      $saved.appendChild(h("button", {
-        class: "btn secondary btn-lift block",
-        style: { marginTop: "12px" },
-        onclick: () => { location.hash = "#bookmarks"; },
-      }, `See all ${items.length} bookmarks →`));
-    }
+    const wrap = h("div", {
+      style: {
+        background: "var(--du-bg-2)",
+        border: "1px solid var(--du-border)",
+        borderRadius: "12px",
+        padding: "12px",
+      },
+    });
+    rows.forEach(function (r, idx) {
+      const who = r.username
+        ? ("@" + r.username)
+        : (r.first_name || ("#" + r.user_id));
+      const rank = String(idx + 1).padStart(2, "0");
+      const row = h("div", {
+        class: "kv-row",
+        style: {
+          padding: "6px 0",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          borderBottom: idx === rows.length - 1
+            ? "none"
+            : "1px solid var(--du-border)",
+        },
+      },
+        h("span", {
+          class: "k",
+          style: { color: "var(--du-ink-mid)",
+                   fontVariantNumeric: "tabular-nums",
+                   width: "28px",
+                   textAlign: "right",
+                   marginRight: "10px" },
+        }, rank + "."),
+        h("span", {
+          class: "k",
+          style: { color: "var(--du-ink-hi)", flex: "1" },
+          title: "User ID: " + r.user_id,
+        }, who + " · " + r.user_id),
+        h("span", {
+          class: "v",
+          style: { color: "var(--du-ink-hi)",
+                   fontVariantNumeric: "tabular-nums" },
+        }, r.count + " queues"),
+      );
+      wrap.appendChild(row);
+    });
+    $leader.appendChild(wrap);
   }
 }
