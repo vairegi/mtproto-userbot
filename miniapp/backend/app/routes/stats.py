@@ -44,7 +44,7 @@ def stats(_a: dict = Depends(require_admin)) -> dict:
     top_today = list(usage_coll.aggregate([
         {"$match": {"date": _today_str()}},
         {"$sort": {"count": -1}},
-        {"$limit": 5},
+        {"$limit": 11},
         {"$lookup": {
             "from": "miniapp_users",
             "localField": "user_id",
