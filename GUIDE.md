@@ -76,3 +76,19 @@ Admin-only. Silent for non-admins (`@only_admin` gate). If `psutil.process_iter`
 
 ### Locked next task from HANDOVER §13
 - **DONE.** Multi-userbot pool shipped in v12.33. Next task is unlocked; ask Ryan for the next brief.
+
+## v12.33b — concurrent dispatch fix (2026-08-21)
+
+### Symptom
+Prod logs showed `v12.33: userbot pool ready with 2 slot(s)` but every job (2836–2845) logged `dispatched to userbot slot 1`. Slot 2 never received work.
+
+### Root cause
+The first v12.33 `worker.py` main loop still ran jobs **serially**: `await process_job(...)` blocked the loop for the whole job lifetime, so at each dispatch `pool.acquire()` saw every slot with `in_flight=0` and the tie-break always picked slot 1. The pool existed but could never parallelise.
+
+### Fix
+- `worker.py` `_run_loop` is now a **dispatcher**: it spawns one `asyncio.Task` per job (`_run_one_job`), bounded by `max_concurrent = len(pool.slots)`, and keeps pulling while there is capacity.
+- Gates, in order: reap finished tasks → pause flag → capacity → `pool.has_healthy_slot()` → `db.next_pending` → `mark_processing` (synchronous, so the next loop can't double-pull the row) → `create_task`.
+- `_run_one_job` holds the slot for the whole job (`async with pool.acquire()`), then applies the outcome (status, token refund, terminal progress phase, batch counters) exactly as the serial loop did. Auth/session failures set a `fatal` event; the dispatcher drains in-flight tasks and exits 4.
+- Batch summary fires only when the queue is drained AND `in_flight` is empty. On SIGTERM, in-flight jobs are drained via `asyncio.gather` before `pool.stop()`.
+- **Inter-job delay removed when pooled** (user decision 2026-08-21): `if max_concurrent == 1: await _random_delay()` keeps the v12.32 pacing only in 1-slot rollback mode.
+- `userbot_pool.py`: added `has_healthy_slot()` so the dispatcher doesn't pull a job it can't dispatch while all slots cool.

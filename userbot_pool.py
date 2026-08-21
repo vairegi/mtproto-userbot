@@ -217,6 +217,16 @@ class UserbotPool:
         finally:
             slot.in_flight = max(0, slot.in_flight - 1)
 
+    def has_healthy_slot(self) -> bool:
+        """True if at least one slot is not currently cooling.
+
+        Used by worker.py's dispatcher as a cheap pre-pull gate so we
+        don't mark a job 'processing' and then immediately have to
+        re-queue it because every slot is cooling.
+        """
+        now = time.monotonic()
+        return any(not s.is_cooling(now) for s in self.slots)
+
     # ---------------------- Serialised DB-channel writes ---------------------
 
     @asynccontextmanager

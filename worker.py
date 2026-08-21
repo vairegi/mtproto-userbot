@@ -124,6 +124,112 @@ async def _is_paused() -> bool:
         conn.close()
 
 
+async def _run_one_job(
+    pool: UserbotPool,
+    job_id: int,
+    url: str,
+    url_hash: str,
+    *,
+    via_search: bool,
+    username,
+    mpost_enabled: bool,
+    submitted_by,
+    submitter_is_admin: bool,
+    batch: dict,
+    fatal: asyncio.Event,
+    fatal_reason: list,
+) -> None:
+    """v12.33b: one queued download, executed as its own asyncio.Task.
+
+    Holds a pool slot for the whole job; applies the outcome (status,
+    refund, progress terminal phase, batch counters) exactly as the
+    v12.32 serial loop did. Auth/session failures set `fatal` so the
+    dispatcher exits with code 4 after draining in-flight tasks.
+    Never raises outward — the dispatcher reaps tasks with t.result().
+    """
+    from userbot_pool import NoUserbotAvailable
+    try:
+        async with pool.acquire() as slot:
+            log.info("job %s dispatched to userbot slot %d", job_id, slot.index)
+            outcome = await process_job(
+                slot.client, url, url_hash, job_id=job_id,
+                via_search=via_search, username=username,
+                mpost_enabled=mpost_enabled,
+                submitted_by=submitted_by,
+            )
+    except NoUserbotAvailable as e:
+        # Every slot started cooling between the dispatcher's health gate
+        # and our acquire. Re-queue; the health gate will hold the
+        # dispatcher until a slot recovers.
+        log.warning("job %s: %s — requeue", job_id, e)
+        conn = db.connect()
+        try:
+            db.mark_status(conn, job_id, "pending",
+                           "all userbots cooling; retrying")
+        finally:
+            conn.close()
+        return
+    except (AuthKeyError, UnauthorizedError) as e:
+        await _notify_admin(
+            f"❌ Userbot session became invalid mid-run: {e!s}\n"
+            "Regenerate with scripts/gen_session.py and restart the worker."
+        )
+        log.error("session invalid mid-run: %s", e)
+        fatal_reason.append(str(e))
+        fatal.set()
+        return
+    except Exception as e:  # noqa: BLE001
+        log.exception("job %s crashed", job_id)
+        conn = db.connect()
+        try:
+            db.mark_status(conn, job_id, "failed", f"crash: {e!s}"[:500])
+            db.upsert_job_progress(conn, job_id, db.PHASE_FAILED,
+                                   detail=f"crash: {e!s}"[:200])
+            # v11 (Q2b): refund token if this /search job crashed outright.
+            if via_search and submitted_by and not submitter_is_admin:
+                db.refund_token(conn, int(submitted_by), 1)
+                log.info("job %s refunded 1 token to user_id=%s (crash)",
+                         job_id, submitted_by)
+        finally:
+            conn.close()
+        batch["failed"].append((url, f"crash: {e!s}"[:200]))
+        return
+
+    # Apply outcome
+    conn = db.connect()
+    try:
+        if outcome.status == "done":
+            db.mark_status(conn, job_id, "done", None)
+            batch["done"] += 1
+        elif outcome.status == "partial":
+            db.mark_status(conn, job_id, "partial", outcome.detail[:500])
+            batch["partial"] += 1
+        else:
+            db.mark_status(conn, job_id, "failed", outcome.detail[:500])
+            batch["failed"].append((url, outcome.detail[:200]))
+            # v11 (Q2b): refund on failed (but NOT partial — partial still
+            # delivered a PDF so the user got value).
+            if via_search and submitted_by and not submitter_is_admin:
+                db.refund_token(conn, int(submitted_by), 1)
+                log.info("job %s refunded 1 token to user_id=%s (failed)",
+                         job_id, submitted_by)
+        # Safety net: force job_progress to a terminal phase.
+        current = db.get_progress_for_jobs(conn, [job_id])
+        phase_now = (current[0]["phase"] if current else None)
+        if phase_now not in (db.PHASE_DONE, db.PHASE_FAILED, db.PHASE_PARTIAL):
+            terminal_phase = {
+                "done": db.PHASE_DONE,
+                "partial": db.PHASE_PARTIAL,
+            }.get(outcome.status, db.PHASE_FAILED)
+            db.upsert_job_progress(conn, job_id, terminal_phase,
+                                   detail=outcome.detail[:200])
+    finally:
+        conn.close()
+
+    log.info("job %s END status=%s detail=%s",
+             job_id, outcome.status, outcome.detail)
+
+
 async def _run_loop() -> int:
     # v12.33: build the N-userbot pool from env. Slot 1 uses the legacy
     # STRING_SESSION (unchanged env), slot 2 uses STRING_SESSION_2 (same
@@ -166,13 +272,20 @@ async def _run_loop() -> int:
     finally:
         conn.close()
 
-    # Batch-summary bookkeeping: we consider a "batch" the stretch of consecutive
-    # non-empty polls. When the queue drains, we send a summary of the counts
-    # accumulated since the batch started.
-    batch_done = 0
-    batch_partial = 0
-    batch_failed: list = []       # list[(url, reason)]
-    batch_active = False
+    # v12.33b batch bookkeeping: shared dict mutated by in-flight job
+    # tasks. Single event loop ⇒ plain dict is safe (no locks needed).
+    batch: dict = {"done": 0, "partial": 0, "failed": []}
+
+    # v12.33b: concurrent dispatch state. The first v12.33 loop awaited
+    # each process_job in-line, so only ONE job was ever in flight and
+    # pool.acquire() always tied at in_flight=0 — every job landed on
+    # slot 1 (confirmed in prod logs: jobs 2836-2845 all slot 1). Now
+    # the dispatcher spawns one asyncio.Task per job (bounded by pool
+    # size) and keeps pulling while there's capacity.
+    max_concurrent = max(1, len(pool.slots))
+    in_flight: set = set()          # set[asyncio.Task]
+    fatal = asyncio.Event()         # set by a task on AuthKey/Unauthorized
+    fatal_reason: list = []
 
     # v12.4: spawn the Turso cache warmer as a background task. It runs
     # in the same event loop as the worker so a bucket-exhaustion event
@@ -251,13 +364,35 @@ async def _run_loop() -> int:
             _details_cron_import_err,
         )
 
-    log.info("worker started, entering main loop")
-    while not _stop.is_set():
-        # Paused? sleep and re-check
+    log.info("worker started, entering main loop (concurrent dispatch, max=%d)",
+             max_concurrent)
+    while not _stop.is_set() and not fatal.is_set():
+        # ---- 1) Reap finished job tasks --------------------------------
+        for t in [t for t in in_flight if t.done()]:
+            in_flight.discard(t)
+            try:
+                t.result()
+            except Exception as e:  # noqa: BLE001
+                # Should not happen — _run_one_job catches everything —
+                # but never let a reaped task kill the dispatcher.
+                log.error("job task raised unexpectedly: %s", e)
+
+        # ---- 2) Pause gate ---------------------------------------------
         if await _is_paused():
             await asyncio.sleep(5)
             continue
 
+        # ---- 3) Capacity gate ------------------------------------------
+        if len(in_flight) >= max_concurrent:
+            await asyncio.sleep(0.5)
+            continue
+
+        # ---- 4) Health gate: don't pull a job we can't dispatch --------
+        if not pool.has_healthy_slot():
+            await asyncio.sleep(5)
+            continue
+
+        # ---- 5) Pull next pending job ----------------------------------
         conn = db.connect()
         try:
             row = db.next_pending(conn)
@@ -265,22 +400,22 @@ async def _run_loop() -> int:
             conn.close()
 
         if row is None:
-            # Queue drained — if we were in a batch, emit summary.
-            if batch_active:
+            # Queue drained AND nothing in flight → emit batch summary.
+            if not in_flight and (batch["done"] or batch["partial"]
+                                  or batch["failed"]):
                 lines = [
                     "Batch summary:",
-                    f"  ✅ done: {batch_done}",
-                    f"  ⚠️  partial: {batch_partial}",
-                    f"  ❌ failed: {len(batch_failed)}",
+                    f"  ✅ done: {batch['done']}",
+                    f"  ⚠️  partial: {batch['partial']}",
+                    f"  ❌ failed: {len(batch['failed'])}",
                 ]
-                if batch_failed:
+                if batch["failed"]:
                     lines.append("  failed reasons:")
-                    for u, r in batch_failed[:25]:
+                    for u, r in batch["failed"][:25]:
                         lines.append(f"   • {u}  —  {r}")
                 await _notify_admin("\n".join(lines))
-                batch_done = batch_partial = 0
-                batch_failed = []
-                batch_active = False
+                batch["done"] = batch["partial"] = 0
+                batch["failed"] = []
             await asyncio.sleep(3)
             continue
 
@@ -308,102 +443,50 @@ async def _run_loop() -> int:
                 conn.close()
         mpost_enabled = bool(via_search and submitted_by and not submitter_is_admin)
 
-        # Mark processing
+        # Mark processing SYNCHRONOUSLY so next_pending can't hand the
+        # same row to the next loop iteration.
         conn = db.connect()
         try:
             db.mark_processing(conn, job_id)
         finally:
             conn.close()
 
-        batch_active = True
         log.info(
             "job %s START %s (via_search=%s user=%s admin=%s mpost=%s)",
             job_id, url, via_search, submitted_by, submitter_is_admin, mpost_enabled,
         )
 
-        # v12.33: dispatch to a healthy pool slot instead of the single
-        # legacy client. `async with pool.acquire()` picks the least-in-flight
-        # non-cooling slot and bumps its counter; the counter drops even if
-        # process_job raises. FloodWaits inside process_job call
-        # pool.mark_flood() which fires the admin alert.
-        try:
-            from userbot_pool import NoUserbotAvailable
-            try:
-                async with pool.acquire() as slot:
-                    log.info("job %s dispatched to userbot slot %d",
-                             job_id, slot.index)
-                    outcome = await process_job(
-                        slot.client, url, url_hash, job_id=job_id,
-                        via_search=via_search, username=username,
-                        mpost_enabled=mpost_enabled,
-                        submitted_by=submitted_by,
-                    )
-            except NoUserbotAvailable as e:
-                # Every slot is cooling. Re-queue and sleep a bit.
-                log.warning("job %s: %s — requeue", job_id, e)
-                conn = db.connect()
-                try:
-                    db.mark_status(conn, job_id, "pending",
-                                   "all userbots cooling; retrying")
-                finally:
-                    conn.close()
-                await asyncio.sleep(5)
-                continue
-        except (AuthKeyError, UnauthorizedError) as e:
-            await _notify_admin(
-                f"❌ Userbot session became invalid mid-run: {e!s}\n"
-                "Regenerate with scripts/gen_session.py and restart the worker."
-            )
-            log.error("session invalid mid-run: %s", e)
-            return 4
-        except Exception as e:  # noqa: BLE001
-            log.exception("job %s crashed", job_id)
-            conn = db.connect()
-            try:
-                db.mark_status(conn, job_id, "failed", f"crash: {e!s}"[:500])
-                db.upsert_job_progress(conn, job_id, db.PHASE_FAILED, detail=f"crash: {e!s}"[:200])
-                # v11 (Q2b): refund token if this /search job crashed outright.
-                # Only regular users spend tokens, so this is a no-op for admins.
-                if via_search and submitted_by and not submitter_is_admin:
-                    db.refund_token(conn, int(submitted_by), 1)
-                    log.info("job %s refunded 1 token to user_id=%s (crash)", job_id, submitted_by)
-            finally:
-                conn.close()
-            batch_failed.append((url, f"crash: {e!s}"[:200]))
+        # ---- 6) Spawn the job as its own task; loop keeps pulling ------
+        task = asyncio.create_task(
+            _run_one_job(
+                pool, job_id, url, url_hash,
+                via_search=via_search, username=username,
+                mpost_enabled=mpost_enabled, submitted_by=submitted_by,
+                submitter_is_admin=submitter_is_admin,
+                batch=batch, fatal=fatal, fatal_reason=fatal_reason,
+            ),
+            name=f"job-{job_id}",
+        )
+        in_flight.add(task)
+
+        # v12.33b: inter-job delay REMOVED when the pool has >1 slot
+        # (user decision 2026-08-21 — throughput is the point of the
+        # pool). In 1-slot rollback mode the delay still paces the queue
+        # exactly like v12.32.
+        if max_concurrent == 1:
             await _random_delay()
-            continue
 
-        # Apply outcome
-        conn = db.connect()
-        try:
-            if outcome.status == "done":
-                db.mark_status(conn, job_id, "done", None)
-                batch_done += 1
-            elif outcome.status == "partial":
-                db.mark_status(conn, job_id, "partial", outcome.detail[:500])
-                batch_partial += 1
-            else:
-                db.mark_status(conn, job_id, "failed", outcome.detail[:500])
-                batch_failed.append((url, outcome.detail[:200]))
-                # v11 (Q2b): refund on failed (but NOT partial — partial still
-                # delivered a PDF so the user got value).
-                if via_search and submitted_by and not submitter_is_admin:
-                    db.refund_token(conn, int(submitted_by), 1)
-                    log.info("job %s refunded 1 token to user_id=%s (failed)", job_id, submitted_by)
-            # Safety net: force job_progress to a terminal phase.
-            current = db.get_progress_for_jobs(conn, [job_id])
-            phase_now = (current[0]["phase"] if current else None)
-            if phase_now not in (db.PHASE_DONE, db.PHASE_FAILED, db.PHASE_PARTIAL):
-                terminal_phase = {
-                    "done": db.PHASE_DONE,
-                    "partial": db.PHASE_PARTIAL,
-                }.get(outcome.status, db.PHASE_FAILED)
-                db.upsert_job_progress(conn, job_id, terminal_phase, detail=outcome.detail[:200])
-        finally:
-            conn.close()
+    # ---- Shutdown: drain in-flight jobs before disconnecting -----------
+    if in_flight:
+        log.info("waiting for %d in-flight job(s) to finish before exit",
+                 len(in_flight))
+        await asyncio.gather(*in_flight, return_exceptions=True)
 
-        log.info("job %s END status=%s detail=%s", job_id, outcome.status, outcome.detail)
-        await _random_delay()
+    if fatal.is_set():
+        log.error("fatal session error (%s) — exiting 4",
+                  fatal_reason[0] if fatal_reason else "?")
+        await pool.stop()
+        return 4
 
     log.info("worker stopping")
     # v12.33: stop the whole pool, not just slot 1's client.
