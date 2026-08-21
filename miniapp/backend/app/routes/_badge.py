@@ -15,9 +15,31 @@ Design notes
 """
 from __future__ import annotations
 
+import sys
 from typing import Any, List
 
-from .. import db as _midb
+# v12.35 (Task 2): the previous `from .. import db` bound _midb to
+# miniapp/backend/app/db.py — a Local stub scoped to miniapp_* collections
+# only, with NO `connect()`, NO `galleries` collection, NO
+# `get_cached_gallery_ids()`. Every call into attach_is_cached() then
+# silently raised AttributeError inside the broad `except Exception`, so
+# NO card on ANY list page ever received an `is_cached` field — that's
+# why the badges never showed up in the mini-app even though the frontend
+# fallback was already `undefined`.
+#
+# The repo-root db.py (APP_DIR/db.py) IS on PYTHONPATH via start.sh line
+# 22 + 170 and OWNS `connect()` / `get_cached_gallery_ids()` / the
+# `galleries` collection that relay_v2 writes to. Use the top-level
+# import and prepend the repo root first so we always pick that one,
+# regardless of where the request happens to be mounted.
+_HERE = __file__
+# __file__ = .../miniapp/backend/app/routes/_badge.py  →  repo root is 4 levels up
+_REPO_ROOT = __import__("os").path.abspath(
+    __import__("os").path.join(_HERE, "..", "..", "..", "..", "..")
+)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+import db as _midb  # noqa: E402,F401
 
 
 def attach_is_cached(items: List[Any]) -> None:
