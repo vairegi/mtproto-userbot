@@ -42,6 +42,9 @@ def random_gallery(
             if items:
                 pick = random.choice(items)
                 pick["_reason"] = f"you liked {tag}"
+                # v12.34 (Task 1): ⚡⚡ / 📥 badge flag for this single card.
+                from ._badge import attach_is_cached
+                attach_is_cached([pick])
                 return pick
             # Fall through to default if the tag returned nothing.
 
@@ -55,4 +58,8 @@ def random_gallery(
         raise HTTPException(502, f"Upstream failed: {e}")
     if not items:
         raise HTTPException(404, "No galleries available")
-    return random.choice(items)
+    pick = random.choice(items)
+    # v12.34 (Task 1): ⚡⚡ / 📥 badge flag for this single card.
+    from ._badge import attach_is_cached
+    attach_is_cached([pick])
+    return pick

@@ -42,4 +42,7 @@ def trending_galleries_endpoint(
         )
     except Exception:
         items = []
+    # v12.34 (Task 1): ⚡⚡ / 📥 badge flag on each card.
+    from ._badge import attach_is_cached
+    attach_is_cached(items)
     return {"items": items or []}

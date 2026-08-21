@@ -13,6 +13,8 @@ from fastapi import APIRouter, Depends, Query
 
 from ..auth import get_current_user
 from ..services import scraper_bridge
+# v12.34 (Task 1): shared badge helper (used by every list route).
+from ._badge import attach_is_cached
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
@@ -58,6 +60,10 @@ def search(
         items = result
         has_more = len(items) >= per_page
         rate_limited_pages = []
+    # v12.34 (Task 1): attach is_cached flag per card. One Mongo query for
+    # the whole page (covered by _id index) — no N+1. Failure is silent:
+    # badges are cosmetic and must never break a search.
+    attach_is_cached(items)
     return {
         "items": items,
         "page": page,

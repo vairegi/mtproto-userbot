@@ -109,7 +109,7 @@ def _int(name: str, default: int) -> int:
 # v12.33: single source of truth for the running version. Read by /health,
 # /checkram, structured logs. Bump this on every ship; no other v12.xx
 # reference should be treated as authoritative.
-VERSION: str = "v12.33"
+VERSION: str = "v12.34"
 
 
 @dataclass(frozen=True)

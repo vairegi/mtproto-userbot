@@ -429,6 +429,32 @@ def has_completed(conn: MongoHandle, url_hash: str) -> bool:
     return doc is not None
 
 
+def get_cached_gallery_ids(conn: MongoHandle, gallery_ids) -> set:
+    """v12.34 (Task 1): batch "is this gallery already in the DB channel?" check.
+
+    Given up to ~50 gallery ids (whatever a list route just fetched), return
+    the SUBSET whose Mongo `galleries` doc is in status COMPLETED. Used by
+    every list endpoint to attach an `is_cached` flag per card so the Mini
+    App can render the ⚡⚡ / 📥 badge without an extra roundtrip per item.
+
+    Costs ONE Mongo query per list request (find + covered index on _id).
+    Returns an empty set on any error — badges are cosmetic, never fail the
+    request. Ids are coerced to str because `galleries._id` is the string
+    gallery id (see gallery_state.STATUS_COMPLETED writes).
+    """
+    try:
+        ids = [str(g) for g in (gallery_ids or []) if g is not None]
+        if not ids:
+            return set()
+        cursor = conn.galleries.find(
+            {"_id": {"$in": ids}, "status": "COMPLETED"},
+            {"_id": 1},
+        )
+        return {str(d["_id"]) for d in cursor}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def has_pending_or_processing(conn: MongoHandle, url_hash: str) -> bool:
     doc = conn.queue.find_one(
         {"url_hash": url_hash, "status": {"$in": ["pending", "processing"]}}, {"_id": 1}

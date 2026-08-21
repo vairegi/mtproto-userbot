@@ -89,6 +89,30 @@ class CoverPost:
     used_fallback_text_only: bool = False   # True if cover download failed
 
 
+@dataclass
+class PreparedCover:
+    """v12.34 (Task 2): everything needed to post a cover, WITHOUT having
+    posted it yet.
+
+    Built by `prepare_cover()` (scrape + caption + cover bytes), consumed
+    by `post_prepared_cover()` inside the pool's channel_write() lock so
+    the cover post + PDF forward land back-to-back with no other job's
+    writes in between.
+
+    `cover_bytes` is held in memory for the lifetime of the Bot 2 wait
+    (~10-600s per job). Worst case is pool_size × ~1 MB ≈ 2 MB —
+    negligible against the 512 MB ceiling.
+    """
+    caption: str
+    cover_bytes: Optional[bytes]
+    cover_ext: str                    # ".jpg" / ".png" / "" — post hint
+    title: str
+    pages: Optional[int]
+    tags: List                        # typed [{'name','type'}] — same as CoverPost
+    cover_url: Optional[str]
+    gallery_id: Optional[str]
+
+
 # ---------------------------------------------------------------------------
 # Deep-link builder
 # ---------------------------------------------------------------------------
@@ -317,28 +341,30 @@ def _guess_extension(cover_url: str) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def post_cover(
-    client: TelegramClient,
+# ---------------------------------------------------------------------------
+# v12.34 (Task 2): split the old post_cover into prepare + post.
+# ---------------------------------------------------------------------------
+# `prepare_cover` does scrape + caption + cover download WITHOUT touching
+# the channel. `post_prepared_cover` does ONLY the channel send. The pair
+# exists so relay_v2 can hold the channel lock around
+#   post_prepared_cover(...)  +  forward_messages(pdf)
+# back-to-back, guaranteeing the DB channel always reads
+# cover_A, pdf_A, cover_B, pdf_B — never cover_A, cover_B, pdf_A, pdf_B.
+#
+# `post_cover` (legacy single-call) is kept as a thin wrapper so any old
+# call site continues to work byte-identically to v12.33.
+# ---------------------------------------------------------------------------
+
+async def prepare_cover(
     url: str,
     *,
-    channel_id: Optional[int] = None,
     requester_handle: Optional[str] = None,
-) -> Optional[CoverPost]:
-    """Scrape the gallery + post its cover to the database channel.
+) -> Optional[PreparedCover]:
+    """Scrape the gallery + build the caption + download the cover bytes.
 
-    Returns a `CoverPost` on success (or on cover-download failure — in which
-    case the text-only fallback message is posted and marked via
-    `used_fallback_text_only=True`).
-
-    Returns None if:
-      - hf_scraper couldn't return metadata (invalid URL / gallery deleted),
-      - the channel_id resolution failed,
-      - Telegram refused the send for a non-flood reason.
+    NO channel write. Returns a PreparedCover on success, None if the
+    scrape returned nothing usable (invalid URL / gallery deleted).
     """
-    if channel_id is None:
-        channel_id = int(settings.database_channel_id)
-
-    # 1) scrape ------------------------------------------------------------
     try:
         meta = await hf_scraper.fetch_gallery_meta(url)
     except Exception as e:  # noqa: BLE001
@@ -350,11 +376,6 @@ async def post_cover(
         return None
 
     title  = str(getattr(meta, "title", "") or "")
-    # BUG FIX: hf_scraper now returns TYPED tags ({'name','type'} dicts).
-    # Preserve that shape end-to-end so:
-    #   - _format_caption can build grouped rows (Groups/Parodies/Artists/…)
-    #   - relay_v2 can persist typed tags on `galleries[gid].tags` so the
-    #     mini-app can rebuild the same caption for the DM forward.
     tags_v = getattr(meta, "tags", []) or []
     tags_typed: List = []
     for t in tags_v:
@@ -374,51 +395,62 @@ async def post_cover(
     caption = _format_caption(
         title, tags_typed, pages, url, requester_handle, gallery_id=gid,
     )
-    # Return the tags on CoverPost in the SAME typed dict shape
-    # (relay_v2 now persists them as-is to Mongo).
-    tags = tags_typed
 
-    # 2) download cover ---------------------------------------------------
     cover_bytes = await _download_cover(cover_url) if cover_url else None
+    cover_ext = ""
+    if cover_bytes:
+        # v11.2 normalise step moved into prepare so the in-memory bytes
+        # are already JPEG-clean by the time the channel lock is held.
+        norm_bytes, norm_ext = normalise_cover_bytes(
+            cover_bytes, source_url=cover_url or "",
+        )
+        cover_bytes = norm_bytes if norm_bytes else cover_bytes
+        cover_ext = norm_ext or _guess_extension(cover_url or "")
 
-    # 3) post to the DB channel -------------------------------------------
-    # Improvement #7: post the cover as a SPOILER-blurred photo. Telethon
-    # exposes `spoiler` on InputMediaUploadedPhoto only (not on the
-    # high-level send_file kwargs), so we upload the bytes first and then
-    # build the InputMedia manually with spoiler=True. Since Bot API's
-    # copyMessage preserves the media's original spoiler flag, every
-    # downstream DM copy — dm_delivery.py, relay_v2.py auto-DM, and
-    # admin_bot.py's fj:check re-delivery — automatically inherits the
-    # spoiler without any change on the copy side.
+    return PreparedCover(
+        caption=caption,
+        cover_bytes=cover_bytes,
+        cover_ext=cover_ext,
+        title=title,
+        pages=int(pages) if pages else None,
+        tags=tags_typed,
+        cover_url=cover_url,
+        gallery_id=str(gid) if gid is not None else None,
+    )
+
+
+async def post_prepared_cover(
+    client: TelegramClient,
+    prepared: PreparedCover,
+    *,
+    channel_id: Optional[int] = None,
+) -> Optional[CoverPost]:
+    """Post a PreparedCover into the DB channel. MUST be called under the
+    pool's channel_write() lock by v12.34 callers.
+
+    Returns a CoverPost on success, None on a non-flood send failure.
+    FloodWaitError bubbles up unchanged (caller's _with_flood handles it).
+    """
+    if channel_id is None:
+        channel_id = int(settings.database_channel_id)
+
+    gid_slug = prepared.gallery_id or "x"
     try:
-        if cover_bytes:
-            # v11.2: re-encode to JPEG so Telegram never rejects the photo.
-            # `normalise_cover_bytes` returns (bytes, ext); on failure it
-            # returns the original bytes with a best-guess extension so
-            # the pre-v11.2 behaviour is preserved.
-            norm_bytes, norm_ext = normalise_cover_bytes(
-                cover_bytes, source_url=cover_url or "",
-            )
-            buf = io.BytesIO(norm_bytes if norm_bytes else cover_bytes)
-            buf.name = f"cover_{getattr(meta, 'gallery_id', 'x')}{norm_ext or _guess_extension(cover_url or '')}"
+        if prepared.cover_bytes:
+            buf = io.BytesIO(prepared.cover_bytes)
+            buf.name = f"cover_{gid_slug}{prepared.cover_ext or '.jpg'}"
             try:
-                uploaded = await client.upload_file(
-                    buf, file_name=buf.name,
-                )
+                uploaded = await client.upload_file(buf, file_name=buf.name)
                 spoiler_media = InputMediaUploadedPhoto(
                     file=uploaded, spoiler=True,
                 )
                 sent = await client.send_file(
                     channel_id,
                     file=spoiler_media,
-                    caption=caption,
-                    force_document=False,   # send as photo, not doc
+                    caption=prepared.caption,
+                    force_document=False,
                 )
             except Exception as _spoiler_err:  # noqa: BLE001
-                # If the spoiler-media path fails for any reason (older
-                # Telegram DC edge case, upload_file quirk, etc.), fall
-                # back to the plain non-spoiler send so a cover still
-                # lands — the PDF-reply chain must not break.
                 log.warning(
                     "cover_poster: spoiler upload failed, falling back to "
                     "non-spoiler send: %s", _spoiler_err,
@@ -427,16 +459,14 @@ async def post_cover(
                 sent = await client.send_file(
                     channel_id,
                     file=buf,
-                    caption=caption,
+                    caption=prepared.caption,
                     force_document=False,
                 )
             used_fallback = False
         else:
-            # Text-only fallback: the PDF still needs something to reply to.
-            sent = await client.send_message(channel_id, caption)
+            sent = await client.send_message(channel_id, prepared.caption)
             used_fallback = True
     except FloodWaitError:
-        # Bubble up so the caller's flood-wait wrapper can decide.
         raise
     except Exception as e:  # noqa: BLE001
         log.exception("cover_poster: send_file/send_message failed: %s", e)
@@ -449,12 +479,31 @@ async def post_cover(
         msg_id=msg_id,
         channel_id=int(channel_id),
         open_link=open_link,
-        title=title,
-        pages=int(pages) if pages else None,
-        tags=tags,
-        cover_url=cover_url,
+        title=prepared.title,
+        pages=prepared.pages,
+        tags=prepared.tags,
+        cover_url=prepared.cover_url,
         used_fallback_text_only=used_fallback,
     )
+
+
+async def post_cover(
+    client: TelegramClient,
+    url: str,
+    *,
+    channel_id: Optional[int] = None,
+    requester_handle: Optional[str] = None,
+) -> Optional[CoverPost]:
+    """v12.34 legacy wrapper: prepare + post in one call.
+
+    Kept so any old call site keeps working byte-identically to v12.33.
+    New code in relay_v2.py uses prepare_cover + post_prepared_cover
+    directly so the channel write can sit inside the pool's lock.
+    """
+    prepared = await prepare_cover(url, requester_handle=requester_handle)
+    if prepared is None:
+        return None
+    return await post_prepared_cover(client, prepared, channel_id=channel_id)
 
 
 async def delete_cover(

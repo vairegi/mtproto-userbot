@@ -92,3 +92,24 @@ The first v12.33 `worker.py` main loop still ran jobs **serially**: `await proce
 - Batch summary fires only when the queue is drained AND `in_flight` is empty. On SIGTERM, in-flight jobs are drained via `asyncio.gather` before `pool.stop()`.
 - **Inter-job delay removed when pooled** (user decision 2026-08-21): `if max_concurrent == 1: await _random_delay()` keeps the v12.32 pacing only in 1-slot rollback mode.
 - `userbot_pool.py`: added `has_healthy_slot()` so the dispatcher doesn't pull a job it can't dispatch while all slots cool.
+
+## v12.34 — status badges + atomic channel pairing (2026-08-21)
+
+### Task 1 — ⚡⚡ / 📥 card badges (backend + frontend)
+- **`db.py`** — new `get_cached_gallery_ids(conn, ids) -> set`: ONE Mongo `find` against `galleries.{_id, status}` (covered by the `_id` index) returning the subset of ids in status `COMPLETED`. Silent-fail (returns empty set on any error).
+- **`miniapp/backend/app/routes/_badge.py`** (NEW) — shared `attach_is_cached(items)` helper. Mutates each dict item in place to add `is_cached: bool`. Never raises; badges are cosmetic and must never 500 a list route.
+- **Wired into every card-list route**: `search.py`, `bookmarks.py`, `recommendations.py`, `random.py` (single-item path via `attach_is_cached([pick])`), `trending.py`.
+- **`miniapp/frontend/js/components/card.js`** — renders a `<span class="status-pill cached|uncached">` top-right of the cover when `props.is_cached` is a boolean: `⚡⚡` when true, `📥` when false. No pill when the field is absent (legacy endpoints).
+- **`miniapp/frontend/css/components.css`** — `.status-pill` rule: `rgba(0,0,0,0.6)` background, 10px radius, `pointer-events:none` so taps pass through to the card. If a legacy `.badge` and the new pill coexist, the pill drops 22px to avoid overlap.
+- **Badge semantics**: `COMPLETED` only counts as cached (per user decision 2026-08-21). PROCESSING / PARTIAL / FAILED do NOT show ⚡⚡.
+
+### Task 2 — atomic cover+PDF channel pairing (the "jumbled channel" fix)
+- **Symptom** (prod screenshot 2026-08-21): DB channel showed `cover_A, cover_B` back-to-back, then `pdf_A, pdf_B` back-to-back. Root cause: v12.33 held the pool's `channel_write()` lock TWICE per job — once for the cover post (step 3d), once for the PDF forward (step 6). Two slots could interleave their writes across those windows.
+- **`cover_poster.py` split** into `prepare_cover(url, requester_handle)` (scrape + caption + cover download, NO channel write; returns `PreparedCover` holding caption + bytes + meta) and `post_prepared_cover(client, prepared, channel_id)` (the channel send only). Legacy `post_cover(client, url, ...)` kept as a thin wrapper so old call sites are byte-identical to v12.33.
+- **`relay_v2.py` reordered** to: dedup → resolve entities → `prepare_cover` (unlocked) → `send_link` to Bot 2 (unlocked) → `wait_for_pdf` (unlocked — parallelism lives here) → on OK, **ONE** `async with pool.channel_write():` window containing `post_prepared_cover` immediately followed by `forward_messages(pdf)`. The channel therefore always reads `cover_A, pdf_A, cover_B, pdf_B`.
+- **Side effects (user-approved)**: on Bot 2 timeout / error / scrape failure, NOTHING is posted to the channel — no orphan covers, nothing to roll back. If the cover post succeeds but the PDF forward fails inside the lock, the cover is deleted before releasing the lock (channel stays clean).
+- v12.33's cancel-and-restart `wait_task` hack is gone: `prepare_cover` knows the page count BEFORE Bot 2 is contacted, so the adaptive `_bot2_timeout_sec(pages)` is correct on the first call.
+- RAM: at most `pool_size × ~1 MB` of cover bytes held during the Bot 2 wait (~2 MB worst case at pool_size=2) — negligible against the 512 MB ceiling.
+
+### Rollout
+- Ships as **v12.34** (`config.VERSION = "v12.34"`). No new env vars. No new processes. Deploy = push to `main`, both Render services redeploy from the same commit.

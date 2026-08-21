@@ -23,6 +23,9 @@ def recommend(
     uid = int(_user["id"])
     items = db.recommend_from_bookmarks(uid, limit=limit)
     top_tags = db.top_user_tags(uid, limit=3)
+    # v12.34 (Task 1): ⚡⚡ / 📥 badge flag on each card.
+    from ._badge import attach_is_cached
+    attach_is_cached(items)
     return {
         "items":       items,
         "seed_tags":   top_tags,     # explains "Because you like: X, Y, Z"

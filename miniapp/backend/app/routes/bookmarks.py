@@ -36,6 +36,9 @@ def list_bm(user: dict = Depends(get_current_user)) -> dict:
         "pages": r.get("pages"),
         "tags":  r.get("tags") or [],
     } for r in rows]
+    # v12.34 (Task 1): ⚡⚡ / 📥 badge flag on each card.
+    from ._badge import attach_is_cached
+    attach_is_cached(items)
     return {"items": items}
 
 

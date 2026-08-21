@@ -25,6 +25,19 @@ register("card", (props) => {
   // v12.10 (#8): grid shows the cleaned English title when present.
   const gridTitle = (props.title_en_clean || "").trim() || title || "";
 
+  // v12.34 (Task 1): status pill on the top-right of the cover.
+  //   is_cached=true  → ⚡⚡  (PDF already in the DB channel; instant DM)
+  //   is_cached=false → 📥  (must queue; user tap will enqueue a fetch)
+  //   is_cached=undefined → no pill (e.g. legacy endpoints that don't set it)
+  let statusPill = null;
+  if (typeof props.is_cached === "boolean") {
+    statusPill = h(
+      "span",
+      { class: props.is_cached ? "status-pill cached" : "status-pill uncached" },
+      props.is_cached ? "⚡⚡" : "📥",
+    );
+  }
+
   // v12.12 (#3): TDZ fix. v12.10's wide-card IIFE ran INSIDE the h(...)
   // children arguments, and its closure captured `card` — a const whose
   // initialization only completes AFTER h() returns. If the cover probe
@@ -44,6 +57,7 @@ register("card", (props) => {
   },
     imgEl,
     badge ? h("span", { class: "badge" }, badge) : null,
+    statusPill,
     h("div", { class: "meta" },
       h("div", { class: "title", title: title || gridTitle }, gridTitle || `#${id}`),
       h("div", { class: "sub" }, pageCount ? `${pageCount} pages` : "—"),
