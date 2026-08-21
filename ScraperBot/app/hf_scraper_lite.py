@@ -105,8 +105,16 @@ async def fetch_search_page(
     if q:
         params["query"] = q
         return await _get_json(client, "/search", params)
-    # Empty query — /galleries, no `query` param at all.
-    return await _get_json(client, "/galleries", params)
+    # v12.33c (pagination bug fix): the empty-query path previously used
+    # GET /api/v2/galleries?sort=..&page=N. That endpoint IGNORES both
+    # `sort` and `page` — proven live: page=1 and page=6 return the same
+    # latest-uploads feed, so every Discover page rendered identical cards.
+    # /api/v2/search requires a non-empty query, so for chip pages we send
+    # query=language:english (the app's English-only spirit; mirrors BOT 0's
+    # scraper_bridge empty-query fallback which uses query=english) and the
+    # /search endpoint which DOES honor sort + page.
+    params["query"] = "language:english"
+    return await _get_json(client, "/search", params)
 
 
 async def fetch_gallery(
