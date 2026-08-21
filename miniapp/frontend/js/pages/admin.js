@@ -497,20 +497,8 @@ function sectionStats() {
                               color: "var(--du-ink-hi)" } }, String(v ?? 0)),
         ));
       }
-      if (s.top_queuers_today && s.top_queuers_today.length) {
-        top.appendChild(h("div", { style: { color: "var(--du-ink-mid)",
-            fontSize: "12px", fontWeight: "600", margin: "8px 0 4px" } },
-          "🔥 Top queuers today"));
-        for (const r of s.top_queuers_today) {
-          // v11.4: show @username (or first name) alongside the numeric id
-          const who = r.username ? ("@" + r.username)
-                    : (r.first_name || "#" + r.user_id);
-          top.appendChild(h("div", { class: "kv-row" },
-            h("span", { class: "k" }, who + " · " + r.user_id),
-            h("span", { class: "v" }, `${r.count} queues`),
-          ));
-        }
-      }
+      // v12.36: Top Queuers Today now lives on the Profile tab (limit
+      // bumped 5 -> 11). It is intentionally absent from this view.
     } catch (e) {
       grid.innerHTML = "";
       grid.appendChild(h("div", {}, "Failed: " + e.message));
