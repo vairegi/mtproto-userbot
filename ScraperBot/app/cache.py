@@ -20,6 +20,9 @@ from .config import settings
 
 log = logging.getLogger("scraperbot.cache")
 
+# v1.20: Mongo cache mirror is rollback-only, OFF by default.
+_TURSO_ONLY = os.environ.get("BOT1_CACHE_MONGO_MIRROR", "0").strip() not in ("0", "", "false", "no")
+
 
 # ---- key builders (byte-for-byte match with BOT 0) -----------------------
 def gallery_key(gid: str | int) -> str:
@@ -150,7 +153,7 @@ async def put(key: str, payload: Any) -> dict:
     else:
         ttl = ttl_for_key(key)
     turso_ok = await turso_client.put(key, payload, ttl)
-    mongo_ok = mongo_client.cache_put_mongo(key, payload, ttl)
+    mongo_ok = False if _TURSO_ONLY else mongo_client.cache_put_mongo(key, payload, ttl)
     return {"turso": bool(turso_ok), "mongo": bool(mongo_ok), "ttl": ttl}
 
 

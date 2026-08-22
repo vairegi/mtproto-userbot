@@ -21,6 +21,7 @@ from app.config import settings
 from app.logging_setup import setup_logging
 from app.routes import mount_all
 from app import mongo_client, turso_client
+from app.services import turso_schema
 from app.services import list_sweeper, details_sweeper, channel_dashboard
 
 log = setup_logging("scraperbot")
@@ -62,6 +63,10 @@ async def _startup() -> None:
     # Bootstrap Turso schema if reachable.
     try:
         await turso_client.bootstrap_schema()
+        try:
+            await turso_schema.ensure_schema()
+        except Exception as e:
+            log.warning("turso schema migration failed (non-fatal): %s", e)
     except Exception as e:  # noqa: BLE001
         log.warning("turso bootstrap failed: %s", e)
 
