@@ -311,7 +311,7 @@ async def cmd_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(text)
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     conn = db.connect()
     try:
@@ -321,7 +321,7 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("⏸ Paused. Worker will finish the current job then wait.")
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     conn = db.connect()
     try:
@@ -331,7 +331,7 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("▶️ Resumed.")
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """v11.4 — /broadcast. Reply to ANY message (text, photo, video, document,
     styled caption with spoilers, etc.) with /broadcast and that exact message
@@ -408,7 +408,7 @@ def _glink(gid) -> str:
     return f"https://nhentai.net/g/{gid}/"
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_topsave(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """v11.4 — /topsave. Lists the most-saved doujinshi across ALL users,
     ranked by how many distinct users bookmarked each gallery."""
@@ -523,7 +523,7 @@ async def _broadcast_weekly_digest(app, body: str) -> tuple[int, int]:
 # Records an admin-authored improvement note that surfaces in the mini-app
 # Settings tab ("What's new" panel). Backed by `miniapp_improvements`.
 # ---------------------------------------------------------------------------
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_addimp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     import uuid as _uuid
     text = " ".join(ctx.args or []).strip()
@@ -552,7 +552,7 @@ async def cmd_addimp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "✅ Improvement posted — users will see it in Settings → What's new.")
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually broadcast this week's top-5 saves right now."""
     conn = db.connect()
@@ -630,7 +630,7 @@ def _ensure_weekly_digest_running(app) -> None:
     log.info("weekly-digest background task spawned")
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_allsaved(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """v11.4 — /allsaved. Per-user save summary: username, total saves, and
     that user's 5 most recent saved doujinshi (title + link). Shows the top
@@ -719,7 +719,7 @@ def _build_open_link(channel_id: int, msg_id: int) -> str:
     return f"https://t.me/c/{cid}/{int(msg_id)}"
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_coverpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually post a cover for a nhentai gallery to the DB channel.
 
@@ -822,7 +822,7 @@ async def cmd_coverpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 def _resolve_msg_id(raw: str) -> Optional[int]:
     """v12.38: parse either a bare int message id OR a Telegram post link
     (`https://t.me/c/<channel>/<msg>[?single]`) into an int message id.
@@ -1013,7 +1013,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("\n".join(lines)[:4000])
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_last(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     conn = db.connect()
     try:
@@ -1033,7 +1033,7 @@ async def cmd_last(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(text[:4000])
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     conn = db.connect()
     try:
@@ -1629,7 +1629,7 @@ async def cmd_freepost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("freepost set to %d by user_id=%s", n, update.effective_user.id)
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_alltoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin view of every user's token consumption today, sorted by usage desc."""
     conn = db.connect()
@@ -1660,7 +1660,7 @@ async def cmd_alltoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ban state, and last-seen timestamp. Sorted by used_today DESC so the
 # heaviest users float to the top (same as mini-app default).
 # ---------------------------------------------------------------------------
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """List users with today's usage, cap, ban state, last-seen.
 
@@ -2114,7 +2114,7 @@ def _match_proc(cmdline: list, needles: tuple) -> bool:
     return all(n in joined for n in needles)
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_checkram(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Report per-process RSS + total for the 3-process BOT 0 topology."""
     msg = update.effective_message
@@ -2211,7 +2211,7 @@ async def cmd_checkram(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 # /diag — admin-only diagnostic probe (updated 2026-08-01 — nhentai edition)
 # ---------------------------------------------------------------------------
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Probe the current scraper source and report results back to the admin."""
     msg = update.effective_message
@@ -2624,7 +2624,7 @@ def _ensure_auto_queue_running(app) -> None:
 
 # --------------------------- /autoon /autooff /autotime ---------------------------
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_autoon(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Enable daily auto-queue."""
     conn = db.connect()
@@ -2640,7 +2640,7 @@ async def cmd_autoon(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_autooff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Disable daily auto-queue."""
     conn = db.connect()
@@ -2654,7 +2654,7 @@ async def cmd_autooff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_autocooldown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Set the cooldown (in minutes) between consecutive auto-posts.
     Usage: /autocooldown N   (N >= 1, default 30)
@@ -2691,7 +2691,7 @@ async def cmd_autocooldown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     await msg.reply_text(f"✅ Auto-queue cooldown set to {minutes} min.")
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_autotime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Set the daily auto-queue time. Usage: /autotime HH:MM (24-hour, IST)."""
     msg = update.effective_message
@@ -2728,7 +2728,7 @@ async def cmd_autotime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_autostatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the current auto-queue configuration."""
     conn = db.connect()
@@ -2790,7 +2790,7 @@ async def cmd_autostatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 # All state lives in control_flags; the mini-app polls GET /api/popup on open.
 # ---------------------------------------------------------------------------
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_popupmsg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Set the popup message (and optional image when a photo is attached)."""
     msg = update.effective_message
@@ -2844,7 +2844,7 @@ async def cmd_popupmsg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_popuptime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Set the per-user cooldown between popup shows, in hours."""
     msg = update.effective_message
@@ -2877,7 +2877,7 @@ async def cmd_popuptime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_text(f"⏱ Popup frequency: {label}.")
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_popupon(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     conn = db.connect()
     try:
@@ -2892,7 +2892,7 @@ async def cmd_popupon(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("🔔 Popup ON." + note)
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_popupoff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     conn = db.connect()
     try:
@@ -2902,7 +2902,7 @@ async def cmd_popupoff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("🔕 Popup OFF.")
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_popupstatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Quick sanity-check of the current popup config."""
     conn = db.connect()
@@ -3049,7 +3049,7 @@ def _render_prefetch_status() -> str:
     return "\n".join(lines)
 
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_prefetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/prefetch [status|now]  — v12.4 cache-warmer inspector."""
     args = (ctx.args or [])
@@ -3116,14 +3116,14 @@ async def cmd_app(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=kb,
     )
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_appon(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Flip Mini App to PUBLIC mode."""
     _set_miniapp_visibility(True)
     await update.effective_message.reply_text(
         "✅ Mini App is now PUBLIC (all users can browse & queue).")
 
-@only_admin
+# v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 async def cmd_appoff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Flip Mini App to PRIVATE (admin-only) mode."""
     _set_miniapp_visibility(False)
