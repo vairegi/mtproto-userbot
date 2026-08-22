@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os  # v12.39: hoisted to top so the BOT1_CACHE_MONGO_MIRROR env-gate works
 from typing import Any, Optional
 
 from . import mongo_client, turso_client
@@ -93,7 +94,6 @@ def ttl_for_key(key: str) -> int:
 # rewrite; instead we stamp expires_at=0 on write and BOT 0's read path
 # (nhentai_cache.py v12.20) treats that as "always fresh, never call
 # nhentai".
-import os as _os_ne
 NEVER_EXPIRE_CHIP_TAG = _os_ne.environ.get(
     "NHCACHE_CHIP_TAG_NEVER_EXPIRE", "1").strip() not in ("0", "false", "False", "")
 

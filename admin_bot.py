@@ -3100,6 +3100,8 @@ async def cmd_app(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(
             "⚠️ MINIAPP_URL is not configured on the server.")
         return
+    # v12.39: function signature is (update, ctx); derive msg locally.
+    msg = update.effective_message
     _chat_type = getattr(getattr(msg, "chat", None), "type", "") or ""
     if _chat_type == "private":
         kb = InlineKeyboardMarkup([[
