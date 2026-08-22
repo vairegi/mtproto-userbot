@@ -35,7 +35,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 # v12.39: late-binding for bm_cover_get / bm_cover_put Mongo fallback.
-from . import db as _midb
+from .. import db as _midb
 
 log = logging.getLogger("miniapp.nhentai_cache")
 
