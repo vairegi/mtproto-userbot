@@ -2,7 +2,7 @@
 from __future__ import annotations
 import asyncio, logging
 from typing import Iterable
-from . import turso_client
+from app import turso_client
 log = logging.getLogger("scraperbot.turso_schema")
 
 _SCHEMA: tuple[str, ...] = (
