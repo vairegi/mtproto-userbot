@@ -261,30 +261,56 @@ def _mongo_get(key: str, allow_stale: bool) -> Optional[dict]:
         if _TURSO_ONLY:
             return None
         doc = conn.nhentai_cache.find_one({"_id": key})
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log.warning("mongo_get(%s): find_one raised: %s", key, e)
         return None
     if not doc:
         return None
-    now = _now_dt()
     exp = doc.get("expires_at")
-    # v12.20: BOT 1 writes epoch seconds; BOT 0 historically wrote datetimes.
-    # Both are handled. The never-expire sentinel is exp==0 OR exp is a
-    # tz-aware datetime at epoch 0 — either way, treat as always fresh.
+    # v12.34d: coerce EVERY stored shape to epoch seconds BEFORE any
+    # comparison. Historical BOT 0 rows stored `expires_at` as a naive
+    # datetime (no tzinfo); the previous code compared that against an
+    # aware `_now_dt()`, raising `TypeError: can't compare offset-naive
+    # and offset-aware datetimes` for every gallery row still in the
+    # legacy Mongo cache. That exception propagated through _turso_get's
+    # caller and made the Mini App fall through to a nhentai upstream
+    # refetch even when Turso had the fresh row — the exact bug in the
+    # 2026-08-22 13:18:06 log line for gallery:427795.
+    now_ep = _now_epoch()
+    exp_ep: Optional[float] = None
     if isinstance(exp, (int, float)):
-        if exp == 0:
-            return doc.get("payload")
-        # Compare epoch-seconds to now (as epoch).
-        if exp > _now_epoch():
-            return doc.get("payload")
-        if allow_stale and (_now_epoch() - exp) < TTL_STALE_GRACE_SEC:
-            return doc.get("payload")
+        exp_ep = float(exp)
+    elif isinstance(exp, datetime):
+        try:
+            if exp.tzinfo is None:
+                # Legacy naive datetime — assume UTC (that's what BOT 0
+                # historically wrote via datetime.utcnow()).
+                exp = exp.replace(tzinfo=timezone.utc)
+            exp_ep = exp.timestamp()
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "mongo_get(%s): expires_at datetime coerce failed (%r): %s",
+                key, exp, e,
+            )
+            return None
+    else:
+        # Unknown shape (None, str, dict, …). Log once and treat as expired
+        # so we fall through to a cold refetch instead of raising.
+        log.warning(
+            "mongo_get(%s): expires_at has unexpected type %s (%r) — "
+            "treating as expired",
+            key, type(exp).__name__, exp,
+        )
         return None
-    if exp and exp > now:
+
+    if exp_ep == 0:
+        # v12.20 never-expire sentinel — chip/tag rows BOT 1 rewrites
+        # every sweep. Always fresh.
         return doc.get("payload")
-    if allow_stale and exp:
-        stale_cutoff = now - timedelta(seconds=TTL_STALE_GRACE_SEC)
-        if exp > stale_cutoff:
-            return doc.get("payload")
+    if exp_ep > now_ep:
+        return doc.get("payload")
+    if allow_stale and (now_ep - exp_ep) < TTL_STALE_GRACE_SEC:
+        return doc.get("payload")
     return None
 
 

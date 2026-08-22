@@ -195,3 +195,58 @@ hitting fine.
 - Ships as **v12.34c**. No new env vars. No new deps. Deploy = copy 3
   files over `miniapp/backend/app/services/`, commit, push. Only BOT 0
   redeploys (nothing in `ScraperBot/` changed).
+
+## v12.34d — Mongo `expires_at` datetime coercion + stale-row purge (2026-08-22)
+
+### Symptom (v12.34c log surfaced it)
+Immediately after v12.34c deploy, opening `gallery:427795` twice logged:
+```
+🌐 [CACHE MISS] key=gallery:427795         (open 1 — legitimate cold)
+📝 [TURSO WRITE] key=gallery:427795 bytes=…
+🌐 [CACHE MISS] key=gallery:427795         (open 2 — should have been HIT)
+WARNING miniapp.scraper nhc.get(gallery:427795) raised:
+    can't compare offset-naive and offset-aware datetimes
+```
+
+### Root cause
+`nhentai_cache._mongo_get()` line 259 previously did `exp > now` where
+`now = _now_dt()` is timezone-aware but `exp` from a pre-v12.4 Mongo
+row was a **naive** `datetime.utcnow()` value. Python raises
+`TypeError` on that comparison. The exception propagated through
+`nhentai_cache.get()` → the v12.34c wrapper in `scraper_bridge` caught
+it → returned None → fell through to nhentai upstream → refetch.
+
+Turso reads worked fine (row was present, fresh, v12.34c
+`read_your_writes=True` in effect). The bug was in the **Mongo
+fallback** path: for every gallery ID that still had a stale row in
+the legacy `nhentai_cache` collection, the read path crashed with a
+type error and re-fetched upstream — even though Turso had it.
+
+### Fix
+- **`miniapp/backend/app/services/nhentai_cache.py::_mongo_get`.**
+  Coerce every stored `expires_at` shape to epoch float BEFORE any
+  comparison: `int|float` → passthrough; `datetime` with `tzinfo` →
+  `.timestamp()`; naive datetime → assume UTC and coerce; anything
+  else → log-warn and treat as expired. Never raises.
+- **`scripts/purge_mongo_nhentai_cache.py` (NEW).** One-shot
+  maintenance script that deletes every row from the Mongo
+  `nhentai_cache` collection. Rationale: since v12.4 both bots have
+  Mongo writes gated OFF; the remaining rows are pre-v12.4 leftovers
+  serving no purpose. Ships with `DRY_RUN=1` mode and prints
+  before/after row counts.
+
+### Verification signature after deploy + purge
+- Second open of the same gallery id → `⚡ [TURSO CACHE HIT]` (no
+  followup MISS/WRITE).
+- If a poisoned row somehow re-appears, the log now says
+  `WARNING mongo_get(<key>): expires_at has unexpected type <T> …` or
+  `WARNING mongo_get(<key>): expires_at datetime coerce failed …`
+  instead of raising.
+- Purge script: `MONGO_URI=... python scripts/purge_mongo_nhentai_cache.py`
+  prints `deleted: N` and `rows after: 0`. Run once; idempotent.
+
+### Rollout
+- Ships as **v12.34d**. No new env vars. No new deps. Only BOT 0
+  redeploys (nothing in `ScraperBot/` changed). After the redeploy,
+  run the purge script ONCE with `MONGO_URI` in your Render shell (or
+  locally) to clear the stale collection.
