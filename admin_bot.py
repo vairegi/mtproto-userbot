@@ -786,36 +786,66 @@ async def cmd_coverpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    channel_id = int(settings.database_channel_id)
+    # v12.38: send the cover into the *admin's own chat*, NOT the DB channel.
+    # v12.34 was hard-coded to chat_id=channel_id, which meant the cover
+    # landed in a private channel the admin could not see. New workflow:
+    #   1) /coverpost <url>            -> cover + caption land here
+    #   2) admin forwards/copies it into DB channel manually
+    #   3) admin replies with /verify <gid> <cover_link> [pdf_link]
+    # (cover_link / pdf_link now accept full t.me/c/.../nnn post links.)
+    admin_chat_id = int(msg.chat_id)
     try:
         sent = await ctx.bot.send_photo(
-            chat_id=channel_id,
+            chat_id=admin_chat_id,
             photo=cover_url,
             caption=caption,
             parse_mode="Markdown",
         )
     except Exception as e:  # noqa: BLE001
         await msg.reply_text(
-            f"❌ Failed to send_photo to DB channel: {e!s}\n"
-            "You can post the cover manually and then use /verify."
+            f"❌ Failed to send_photo to your chat: {e!s}\n"
+            "Post the cover manually and then use /verify."
         )
         return
 
-    open_link = _build_open_link(channel_id, sent.message_id)
+    db_channel_id = int(settings.database_channel_id)
     await msg.reply_text(
-        "✅ Cover posted to DB channel.\n\n"
-        f"📑 Message id: `{sent.message_id}`\n"
-        f"🔗 Open link: {open_link}\n\n"
-        f"Now post the PDF in the DB channel, then run:\n"
-        f"`/verify {url} {sent.message_id}`\n\n"
-        "That binds this cover to the gallery so the mini-app forwards "
-        "from here next time anyone taps this post.",
+        "✅ Cover sent to your chat (above).\n\n"
+        f"📑 Message id here: `{sent.message_id}`\n"
+        "Now copy/forward this cover → DB channel, post the PDF right "
+        "under it, then run:\n"
+        f"`/verify {url} <cover_link> [pdf_link]`\n\n"
+        "Each link accepts either a bare int message id OR a full "
+        "`https://t.me/c/<channel>/<msg_id>` post link.",
         parse_mode="Markdown",
         disable_web_page_preview=True,
     )
 
 
 @only_admin
+def _resolve_msg_id(raw: str) -> Optional[int]:
+    """v12.38: parse either a bare int message id OR a Telegram post link
+    (`https://t.me/c/<channel>/<msg>[?single]`) into an int message id.
+    Returns None on garbage so /verify can reply with a usage hint."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    s = s.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    for prefix in ("https://t.me/c/", "http://t.me/c/", "t.me/c/"):
+        if s.startswith(prefix):
+            tail = s[len(prefix):]
+            parts = [p for p in tail.split("/") if p]
+            if len(parts) >= 2:
+                try:
+                    return int(parts[1])
+                except ValueError:
+                    return None
+    return None
+
 async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Bind an already-posted cover (posted manually or via /coverpost) to a
     gallery's MongoDB doc, marking it COMPLETED so the mini-app forwards
@@ -836,17 +866,29 @@ async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     raw = args[0].strip()
-    try:
-        cover_msg_id = int(args[1])
-    except (TypeError, ValueError):
-        await msg.reply_text("cover_msg_id must be an integer.")
+    if len(args) < 2:
+        await msg.reply_text(
+            "Usage: /verify <url_or_gallery_id> <cover_link> [pdf_link]\n"
+            "Each link may be an integer message id OR a\n"
+            "`https://t.me/c/<channel>/<msg_id>` post link.\n"
+            "Example: /verify 393878 https://t.me/c/2298797194/123 124"
+        )
+        return
+    cover_msg_id = _resolve_msg_id(args[1])
+    if cover_msg_id is None:
+        await msg.reply_text(
+            "cover_link must be an integer message id OR a full\n"
+            "`https://t.me/c/<channel>/<msg_id>` link."
+        )
         return
     pdf_msg_id: Optional[int] = None
     if len(args) >= 3:
-        try:
-            pdf_msg_id = int(args[2])
-        except (TypeError, ValueError):
-            await msg.reply_text("pdf_msg_id (optional) must be an integer.")
+        pdf_msg_id = _resolve_msg_id(args[2])
+        if pdf_msg_id is None:
+            await msg.reply_text(
+                "pdf_link must be an integer message id OR a full\n"
+                "`https://t.me/c/<channel>/<msg_id>` link."
+            )
             return
 
     url = f"https://nhentai.net/g/{raw}/" if raw.isdigit() else raw
@@ -1798,11 +1840,15 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await search_picker.start_search(update, ctx, query)
         return
 
-    # Build the Mini App URL, deep-linking to the query when the user gave one.
+    # v12.38: posted link is the bot deep-link, matching the card already
+    # shown in #Doujinshi (http://t.me/<bot>/spritual). Stops leaking the
+    # onrender / https://telegram-relay-bot-eaxu.onrender.com host into the
+    # public group chat.
     from urllib.parse import quote
-    target_url = MINIAPP_URL
+    _bot_user = (settings.doujinshibot_username or "doujinshidownloadbot").lstrip("@")
+    target_url = f"http://t.me/{_bot_user}/spritual"
     if query:
-        target_url = f"{MINIAPP_URL}#/search?q={quote(query)}"
+        target_url = f"{target_url}?q={quote(query)}"
 
     # Telegram rejects web_app inline buttons outside private chats
     # (BadRequest: Button_type_invalid). Fall back to a normal URL button
