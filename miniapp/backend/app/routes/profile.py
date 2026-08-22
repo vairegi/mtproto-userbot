@@ -21,7 +21,10 @@ def me(user: dict = Depends(get_current_user)) -> dict:
     uid = int(user["id"])
     stored = db.upsert_user(user)
     public_mode = db.get_public_mode()
-    is_admin = uid == int(settings.admin_user_id)
+    # v12.38: widen Admin-tab visibility to every admin row, not just
+    # the root super-admin. /listadmins shown in the bot now matches
+    # the Admin tab in the Mini App.
+    is_admin = (uid == int(settings.admin_user_id)) or db.is_admin_user(uid)
     rl = ratelimit.usage_summary(uid)
 
     # Non-admin + private mode = restricted view.
