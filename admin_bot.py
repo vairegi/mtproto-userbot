@@ -1804,12 +1804,24 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if query:
         target_url = f"{MINIAPP_URL}#/search?q={quote(query)}"
 
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "🔎 Open in Mini App",
-            web_app=WebAppInfo(url=target_url),
-        )
-    ]])
+    # Telegram rejects web_app inline buttons outside private chats
+    # (BadRequest: Button_type_invalid). Fall back to a normal URL button
+    # in groups/channels so /search never crashes in admin/log chats.
+    _chat_type = getattr(getattr(msg, "chat", None), "type", "") or ""
+    if _chat_type == "private":
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔎 Open in Mini App",
+                web_app=WebAppInfo(url=target_url),
+            )
+        ]])
+    else:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔎 Open in Mini App",
+                url=target_url,
+            )
+        ]])
 
     body = (
         "Search has moved to the Mini App ✨\n\n"
@@ -3042,9 +3054,15 @@ async def cmd_app(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(
             "⚠️ MINIAPP_URL is not configured on the server.")
         return
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🌌 Open Universe", web_app=WebAppInfo(url=MINIAPP_URL))
-    ]])
+    _chat_type = getattr(getattr(msg, "chat", None), "type", "") or ""
+    if _chat_type == "private":
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌌 Open Universe", web_app=WebAppInfo(url=MINIAPP_URL))
+        ]])
+    else:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌌 Open Universe", url=MINIAPP_URL)
+        ]])
     await update.effective_message.reply_text(
         "Tap to open the Doujinshi Universe browser:",
         reply_markup=kb,
