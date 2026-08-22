@@ -210,6 +210,12 @@ def cursor_clear() -> None:
 
 async def start_phase() -> None:
     phase = _phase_num() + 1
+    # v1.20: each phase gets its OWN Telegram message. Previously the
+    # stored message id survived across phases, so the writer kept editing
+    # the old phase message forever. Clearing it here makes the next writer
+    # tick send a fresh message for the new phase while leaving the last
+    # phase frozen in history.
+    mongo_client.state_set(_K_MSG_ID, 0)
     mongo_client.state_set(_K_PHASE, phase)
     _save_counters({
         "new_galleries": 0, "per_sort": {}, "per_cached": {},

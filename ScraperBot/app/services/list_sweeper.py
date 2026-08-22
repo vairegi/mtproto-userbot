@@ -151,12 +151,16 @@ async def _fetch_and_cache(
     is_tag = sort.startswith("tag:")
     if is_tag:
         tag_name = sort[4:].strip()
-        # Upstream: search API with tag query (same as v1.7+)
+        # Upstream: search API with tag query (same as v1.7+).
+        # v1.20: align tag warms with BOT 0's default typed-search sort.
+        # The Mini App sends non-empty queries as sort=popular-today unless
+        # the user explicitly switches tabs, so warming tag rows under
+        # sort=popular caused guaranteed Turso misses for default searches
+        # like q=nakadashi. Warm the popular-today namespace instead.
         query = f"tag:{tag_name}"
-        real_sort = "popular"
-        # Cache key: BOT 0's user-search format so a user typing the tag
-        # name in the mini-app hits this pre-warmed row.
-        key = cache.bot0_search_key(tag_name, "popular", page)
+        real_sort = "popular-today"
+        # Cache key must byte-match BOT 0's typed-query lookup key.
+        key = cache.bot0_search_key(tag_name, "popular-today", page)
     else:
         # Upstream: /galleries with empty query (chip pages).
         query = ""
