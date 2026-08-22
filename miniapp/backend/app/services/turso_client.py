@@ -293,8 +293,32 @@ def _make_client():
             _TURSO_URL,
         )
         return None
+    # v12.34c: libsql_client added `read_your_writes=True` in newer
+    # releases — with it set, a POST that just wrote a row is guaranteed
+    # to see that row on its very next GET, even when the endpoint is
+    # routed to a read-replica that hasn't yet replicated. This was the
+    # exact BOT 0 pattern of "write ok / next read misses": three fresh
+    # clients in ~2 minutes all failed to see `gallery:<id>` immediately
+    # after their own successful PUT.
+    #
+    # We pass the kwarg defensively: if the installed libsql_client is old
+    # enough to reject the kwarg we fall back to the pre-v12.34c call so a
+    # dependency drift can never take the cache offline.
     try:
-        return libsql_client.create_client(url=_TURSO_URL, auth_token=_TURSO_TOKEN)
+        try:
+            return libsql_client.create_client(
+                url=_TURSO_URL,
+                auth_token=_TURSO_TOKEN,
+                read_your_writes=True,
+            )
+        except TypeError:
+            # old libsql_client: kwarg unsupported — legacy call.
+            log.info(
+                "turso: libsql_client without read_your_writes kwarg; "
+                "falling back to legacy create_client() (upgrade libsql "
+                "to fix intermittent write-then-read misses on replicas)"
+            )
+            return libsql_client.create_client(url=_TURSO_URL, auth_token=_TURSO_TOKEN)
     except Exception as e:  # noqa: BLE001
         log.warning("turso: create_client failed: %s", e)
         return None
@@ -471,6 +495,8 @@ def execute(sql: str, args: Optional[list] = None):
     """Run one SQL statement synchronously. Returns the libsql ResultSet
     (has .rows attribute) or None on any error.
     Caller MUST tolerate None and fall back to the Mongo path.
+    v12.34c: log at WARNING (not silent) when the coroutine returns None so
+    the callers of `nhentai_cache.get()` can be diagnosed from the log.
     """
     if not turso_available():
         return None
@@ -482,7 +508,17 @@ def execute(sql: str, args: Optional[list] = None):
     def _factory():
         return _execute_async(sql, args)
     try:
-        return _run(_factory)
+        rs = _run(_factory)
     except Exception as e:  # noqa: BLE001
         log.warning("turso: execute failed (%s): %s", sql.split(None, 1)[0], e)
         return None
+    if rs is None:
+        # v12.34c: _run returned None (client build/close race, transport
+        # error, or turso_available() flipped). Surface it so the log tells
+        # us WHICH mode failed.
+        log.warning(
+            "turso: execute returned None for %s (rs=None; check libsql "
+            "client build / transport)",
+            sql.split(None, 1)[0],
+        )
+    return rs

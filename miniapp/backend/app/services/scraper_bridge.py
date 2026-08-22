@@ -574,11 +574,20 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
     if _nhc is not None:
         try:
             _hit = _nhc.get(_detail_turso_key, allow_stale=False)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            log.warning("nhc.get(%s) raised: %s", _detail_turso_key, e)
             _hit = None
         if isinstance(_hit, dict) and _hit.get("id"):
             log.info(_LOG_HIT, _detail_turso_key)
             return _hit
+        # v12.34c: log when the read returned but the gate at line 579
+        # rejected it — disambiguates cold-miss from bad-payload.
+        if _hit is not None:
+            log.warning(
+                "nhc.get(%s) returned type=%s (truthy=%s) but failed "
+                "'isinstance dict + has id' gate — refetching from nhentai",
+                _detail_turso_key, type(_hit).__name__, bool(_hit),
+            )
 
     try:
         # v2 endpoint for a single gallery: /api/v2/galleries/<id>

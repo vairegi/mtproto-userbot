@@ -143,3 +143,55 @@ The first v12.33 `worker.py` main loop still ran jobs **serially**: `await proce
 
 ### Locked next task
 - Patch shipped + verified compile. Awaiting operator's next brief.
+
+## v12.34c — silent cache-miss fix (2026-08-22)
+
+### Symptom
+Same gallery ID clicked 3+ times in 2 minutes; every open logged
+`🌐 [CACHE MISS] Fetched from upstream nhentai and cached to Turso  key=gallery:674790`
+followed by `📝 [TURSO WRITE] … bytes=2069`. Never `⚡ [TURSO CACHE HIT]`
+for any `gallery:<id>` in the window. Chip/tag `search:*` rows kept
+hitting fine.
+
+### Root cause (verified with a direct Turso probe against the live DB)
+- Row `gallery:674790` **was** physically present in `nhentai_cache` after
+  the first write (2069-byte JSON payload, `expires_at` 29.5 days in the
+  future, `ttl_sec=2592000`, payload deserialises to a dict with `.id`).
+- 6 419 total fresh `gallery:*` rows in the same table, 0 expired.
+- BOT 0's `_turso_get()` path returned `None` on the immediate re-read
+  anyway, and every failure mode was silently swallowed (no
+  log line to disambiguate). The two known write-then-read failure
+  surfaces in libsql-client 0.3.x are (a) `read_your_writes` default OFF
+  meaning a fresh client GET can hit a replica that hasn't replicated,
+  and (b) the per-call `create_client → execute → close` race can return
+  a ResultSet without `.rows` before the response has fully drained.
+
+### Fix
+- **`miniapp/backend/app/services/turso_client.py`.** `_make_client()`
+  now passes `read_your_writes=True` to `libsql_client.create_client(…)`
+  with a graceful `TypeError` fallback if the installed libsql_client is
+  too old to accept the kwarg (logs one INFO line prompting an upgrade).
+  Also: `execute()` now logs `WARNING` when the coroutine returns None
+  instead of silently returning None — the log will tell you WHICH mode
+  failed on the next miss.
+- **`miniapp/backend/app/services/nhentai_cache.py`.** `_turso_get()`
+  gains 5 named diagnostic branches: turso unavailable, execute raised,
+  `rs is None`, `rs.rows` empty (legit cold miss), `expires_at` unparseable,
+  row expired, payload not JSON. Each returns None but logs `key` +
+  reason first so a `grep 'turso_get(gallery:'` on Render tells the
+  operator exactly why a MISS fired.
+- **`miniapp/backend/app/services/scraper_bridge.py`.** `_direct_nhentai_detail`
+  now logs a WARNING when `_nhc.get()` returned something non-None but
+  the `isinstance(dict) and has_id` gate rejected it — disambiguates
+  bad-payload from cold-miss.
+
+### Verification signature after deploy
+- BOT 0 Render on a warm gallery: single `⚡ [TURSO CACHE HIT] key=gallery:<N>`, NO followup MISS/WRITE for the same id.
+- On a genuine cold miss: `turso_get(gallery:<N>): rs.rows empty (row not in table)` (DEBUG) → MISS → WRITE.
+- On a libsql transport error: `turso_get(gallery:<N>): rs is None` (WARNING) → tells us to upgrade the client.
+- On a bad payload: `turso_get(gallery:<N>): payload not JSON-parseable` (WARNING) with a 120-char head so we can inspect.
+
+### Rollout
+- Ships as **v12.34c**. No new env vars. No new deps. Deploy = copy 3
+  files over `miniapp/backend/app/services/`, commit, push. Only BOT 0
+  redeploys (nothing in `ScraperBot/` changed).

@@ -196,22 +196,37 @@ def _now_epoch() -> int:
 
 
 def _turso_get(key: str, allow_stale: bool) -> Optional[dict]:
+    # v12.34c: every branch that returns None here USED to be silent, so a
+    # BOT-0 detail request whose Turso row was PHYSICALLY present would
+    # still fall through to nhentai and re-write. Every silent-None path
+    # now emits a debug (or warning) with the failure mode so a Render
+    # log tail tells you WHY the cache missed.
     if _turso is None or not _turso.turso_available():
+        log.debug("turso_get(%s): turso unavailable", key)
         return None
     try:
         rs = _turso.execute(
             "SELECT payload, expires_at FROM nhentai_cache WHERE key = ?",
             [key],
         )
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log.warning("turso_get(%s): execute raised: %s", key, e)
         return None
-    if not rs or not getattr(rs, "rows", None):
+    if rs is None:
+        log.warning("turso_get(%s): rs is None", key)
+        return None
+    if not getattr(rs, "rows", None):
+        # Row physically absent — legitimate cold miss; keep at DEBUG so we
+        # don't drown the log during a first-time sweep, but the log tail
+        # can flip to DEBUG when investigating.
+        log.debug("turso_get(%s): rs.rows empty (row not in table)", key)
         return None
     row = rs.rows[0]
     payload_json = row[0]
     try:
         expires_at = int(row[1])
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as e:
+        log.warning("turso_get(%s): expires_at not int (%r): %s", key, row[1], e)
         return None
     now = _now_epoch()
     # v12.20: expires_at == 0 is the never-expire sentinel for chip/tag rows
@@ -223,10 +238,18 @@ def _turso_get(key: str, allow_stale: bool) -> Optional[dict]:
     elif allow_stale and (now - expires_at) < TTL_STALE_GRACE_SEC:
         pass  # stale-but-servable
     else:
+        log.debug(
+            "turso_get(%s): row expired (expires_at=%d, now=%d, delta=%d)",
+            key, expires_at, now, expires_at - now,
+        )
         return None
     try:
         return json.loads(payload_json)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as e:
+        log.warning(
+            "turso_get(%s): payload not JSON-parseable (%s); payload_head=%r",
+            key, e, (payload_json or "")[:120],
+        )
         return None
 
 
