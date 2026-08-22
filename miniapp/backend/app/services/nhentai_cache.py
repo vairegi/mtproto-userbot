@@ -401,7 +401,11 @@ def _turso_put(key: str, payload_json: str, ttl: int) -> bool:
     # v12.20: chip/tag rows get expires_at=0 sentinel so they never expire.
     # ttl_sec is still stored (as 0) so anyone querying the row sees the
     # intent clearly.
-    if NHCACHE_CHIP_TAG_NEVER_EXPIRE and _is_chip_or_tag_key(key):
+   # v12.34e: global never-expire kill-switch. When set, EVERY row —
+    # chip, tag, gallery, typed search — is written with the expires_at=0
+    # sentinel. Both readers already treat 0 as always-fresh.
+    NEVER_EXPIRE_ALL = os.environ.get("NHCACHE_NEVER_EXPIRE_ALL", "0").strip() in ("1", "true", "yes")
+    if NEVER_EXPIRE_ALL or (NHCACHE_CHIP_TAG_NEVER_EXPIRE and _is_chip_or_tag_key(key)):
         expires_at = 0
         stored_ttl = 0
     else:
