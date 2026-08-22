@@ -36,7 +36,28 @@ from typing import Any, Optional
 
 log = logging.getLogger("miniapp.scraper")
 
-# v12.9: emoji-tagged cache telemetry, mirrors hf_scraper's lines so a
+# v12.34b: cross-bot user-hint hook. Imported lazily via the
+# `_bot0_hints()` accessor below so an import failure (e.g. deployment
+# without bot0_hints.py) can never break a Mini App request — the worst
+# case is the hint never gets pushed and BOT 1 stays on its regular
+# round-robin schedule, identical to v12.34.
+def _bot0_hints():
+    try:
+        import bot0_hints as _bh  # noqa: WPS433
+        return _bh
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _hint_push(gid) -> None:
+    bh = _bot0_hints()
+    if bh is None:
+        return
+    try:
+        bh.hint_push_gid(gid)
+    except Exception:  # noqa: BLE001
+        # Never raise into the request hot path.
+        pass
 # `grep '[TURSO CACHE HIT]'` catches BOTH the sync (scraper_bridge) and
 # async (hf_scraper) paths in the same Render log window.
 _LOG_HIT    = "⚡ [TURSO CACHE HIT] Served data from Turso  key=%s"
@@ -459,6 +480,14 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
                 log.info(_LOG_DEDUP, _turso_key)
             elif _ok:
                 log.info(_LOG_WRITE, _turso_key, _bytes)
+                # v12.34b: tell BOT 1 the user actually wants each row in
+                # this page so its next details tick warms the gallery.<id>
+                # rows. Fire-and-forget; capped queue, gravity-trimmed.
+                try:
+                    for _item in out:
+                        _hint_push(_item.get("id"))
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as e:  # noqa: BLE001
             log.debug("turso write failed for %s: %s", _turso_key, e)
 
@@ -635,6 +664,11 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
                 log.info(_LOG_DEDUP, _detail_turso_key)
             elif _ok:
                 log.info(_LOG_WRITE, _detail_turso_key, _bytes)
+                # v12.34b: hint the cross-bot user-hint queue so the NEXT
+                # user (and the same user on a refresh) finds this row
+                # already in cache. Fire-and-forget — never affects the
+                # current request's return value.
+                _hint_push(_detail_out.get("id"))
         except Exception as e:  # noqa: BLE001
             log.debug("turso write failed for %s: %s", _detail_turso_key, e)
 

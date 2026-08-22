@@ -121,3 +121,25 @@ The first v12.33 `worker.py` main loop still ran jobs **serially**: `await proce
 - Fix: one line, `miniapp/backend/app/services/nhentai_cache.py:38` → `from .. import db as _midb`.
 - Verification: `py_compile` OK; `from miniapp.backend.app.services.nhentai_cache import bm_cover_get, bm_cover_put` OK.
 - Commit: `19e2546` (local; push to main pending operator GitHub auth — sandbox has no credentials).
+
+## v12.34b — cross-bot user-hint hook (2026-08-22)
+
+### What changed
+- **`bot0_hints.py` (NEW, repo root).** BOT 0-side hint publisher. `_get_client()` lazily creates a `MongoClient` against the existing `MONGO_URI` / `MONGO_DB_NAME` env; `hint_push_gid(gid)` does an atomic `$push` followed by a `$slice`-with-negative-cap trim to 200 entries on the `scraper1_state` doc `_id="user_gallery_hints"`. Silent on any Mongo failure — never affects the request hot path.
+- **`ScraperBot/app/mongo_client.py`.** New functions `hint_pop_gids(n=4)` (one atomic `find_one_and_update` with `$slice` positive-start) and `hint_queue_size()`. Both never raise; both return empty / 0 on Mongo outage.
+- **`ScraperBot/app/services/details_sweeper.py`.** `sweep_once()` gets a new step **0** that runs BEFORE the existing priority-hints drain: `mongo_client.hint_pop_gids(min(details_per_tick, 4))` → `_work_external_hints(client, gids)` → each gid runs through the existing `_fetch_one_gallery(client, gid, source_sort="user-hint")` path. The "user-hint" label rolls up under a dedicated row in the channel dashboard so you can see it (and only it) trend up after a deploy.
+- **`miniapp/backend/app/services/scraper_bridge.py`.** `_hint_push(gid)` helper, lazily imports `bot0_hints` so a missing module never breaks the request. Called at **both** cache-write points: list-page Turso write (one hint per item, capped by the existing queue size) and gallery-detail Turso write (one hint for the opened gallery).
+
+### Storage shape
+- Bot 0 writes: `db["relaybot"]["scraper1_state"].update_one({"_id":"user_gallery_hints"}, {"$push":{"value":<gid>},…}, upsert=True)`, then a gravity `$slice: [<arr>, -200]`.
+- Bot 1 reads: `find_one_and_update({"_id":"user_gallery_hints"}, {"$set":{"value":{"$slice":[<arr>, n, 99999]}}}, return_document=AFTER)` returns the popped prefix; the doc now holds the remainder (FIFO eviction, atomic).
+
+### Rollout
+- Ships as **v12.34b**. No new env vars. No new collections. No new processes. Deploy = copy the affected 4 files over repo root, commit, push. Both Render services redeploy from the same commit.
+- Verification log signature post-deploy:
+  - BOT 0 Render: `🔔 bot0_hints: hint pushed gid=<N>` (debug; one per cold MISS write)
+  - BOT 1 Render: `v12.34b user-hints: popping <n> gid(s): <id1>,<id2>,…` once per sweep tick that had hints
+  - Channel dashboard: a new `user-hint` row under the per-sort block; only ticks UP when BOT 0 fires — confirms end-to-end.
+
+### Locked next task
+- Patch shipped + verified compile. Awaiting operator's next brief.

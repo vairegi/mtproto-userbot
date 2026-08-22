@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING, MongoClient, ReturnDocument
 from pymongo.errors import PyMongoError
 
 from .config import settings
@@ -100,6 +100,76 @@ def is_paused() -> bool:
 
 def set_paused(flag: bool) -> None:
     state_set("paused", bool(flag))
+
+
+# ---------------------------------------------------------------------------
+# v12.34b: cross-bot user-hint queue (BOT 0 writes; BOT 1 reads).
+#
+# Storage: single doc in `scraper1_state` keyed `_id = "user_gallery_hints"`,
+# `value` = FIFO list of numeric gallery IDs. Trimmed to 200 by gravity
+# inside bot0_hints.hint_push_gid prior to the push, so the consumer can
+# assume a bounded list. Pop returns the FIRST `n` entries and rewrites the
+# remainder back into the doc atomically (one round trip).
+# ---------------------------------------------------------------------------
+_HINTS_DOC_ID = "user_gallery_hints"
+
+
+def hint_pop_gids(n: int = 4) -> list:
+    """Atomically pop up to `n` gallery IDs from the BOT-0 hint queue.
+
+    Returns a list (possibly empty). Failures are logged and return []
+    so a Mongo blip never stalls the sweeper. Cross-region safe — the
+    hint queue is shared across all BOT 1 instances."""
+    n = max(0, int(n or 0))
+    if n == 0:
+        return []
+    d = db()
+    if d is None:
+        return []
+    try:
+        # $slice with positive start, very large end takes the FIRST n
+        # elements out of the array. The doc retains the tail automatically
+        # because array element removal with $slice resumes the rest.
+        doc = d[STATE_COLL].find_one_and_update(
+            {"_id": _HINTS_DOC_ID},
+            [
+                {"$set": {
+                    "value": {
+                        "$slice": [
+                            {"$ifNull": ["$value", []]},
+                            n,
+                            999999,
+                        ]
+                    },
+                    "updated_at": time.time(),
+                }},
+            ],
+            return_document=ReturnDocument.AFTER,
+        )
+        if not doc:
+            return []
+        v = doc.get("value") or []
+        if not isinstance(v, list):
+            return []
+        # Return at most n (the doc now contains the remainder).
+        return [str(x).strip() for x in v[:n] if x is not None]
+    except PyMongoError as e:
+        log.warning("hint_pop_gids failed: %s", e)
+        return []
+
+
+def hint_queue_size() -> int:
+    d = db()
+    if d is None:
+        return 0
+    try:
+        doc = d[STATE_COLL].find_one({"_id": _HINTS_DOC_ID}, {"value": 1})
+        if not doc:
+            return 0
+        v = doc.get("value") or []
+        return len(v) if isinstance(v, list) else 0
+    except PyMongoError:
+        return 0
 
 
 # ---------------------------------------------------------------------------

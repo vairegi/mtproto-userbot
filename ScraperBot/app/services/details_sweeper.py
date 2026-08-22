@@ -247,8 +247,35 @@ async def _work_page(
     return tally
 
 
+async def _work_external_hints(
+    client: httpx.AsyncClient, gids: List[str]
+) -> Dict[str, int]:
+    """v12.34b: hydrate galleries the user just opened from the Mini App.
+
+    Each gid is one gallery the user actually clicked, so warming it
+    converts the next user's cold MISS into a HIT without any extra
+    round-robin traffic. source_sort="user-hint" makes the new-galleries
+    counter roll up under a dedicated row in the channel dashboard so we
+    can see it (and only it) trend up.
+    """
+    tally = {"ok": 0, "hit": 0, "skip": 0, "rate": 0, "error": 0, "no_ids": 0}
+    for gid in gids:
+        if mongo_client.is_paused():
+            break
+        res = await _fetch_one_gallery(client, gid, source_sort="user-hint")
+        tally[res if res in tally else "error"] += 1
+        if res in ("ok", "rate", "error"):
+            await asyncio.sleep(settings.details_rest_sec)
+    return tally
+
+
 async def sweep_once() -> Dict[str, Any]:
-    """One tick: hydrate hint pages first, then one round-robin page."""
+    """One tick:
+        0) v12.34b: BOT 0 user-hint queue (highest priority — the user
+                      JUST clicked, latency is what they actually feel).
+        1) Priority: freshly-written list pages from list_sweeper.
+        2) Round-robin: one (sort, page) advance per tick.
+    """
     if mongo_client.is_paused():
         return {"skipped": "paused"}
 
@@ -257,6 +284,17 @@ async def sweep_once() -> Dict[str, Any]:
 
     client = await hf_scraper_lite.make_client()
     try:
+        # 0) v12.34b: BOT 0 cross-bot user-hint queue.
+        per_tick = max(1, int(settings.details_per_tick or 5))
+        external = mongo_client.hint_pop_gids(min(per_tick, 4))
+        if external:
+            log.info("v12.34b user-hints: popping %d gid(s): %s",
+                     len(external), ",".join(external))
+            t = await _work_external_hints(client, external)
+            for k, v in t.items():
+                combined[k] = combined.get(k, 0) + v
+            combined["external_hints"] = len(external)
+
         # 1) Priority: freshly-written list pages from list_sweeper.
         hints = await list_sweeper.drain_details_hints()
         for (sort, page) in hints[:4]:  # cap per tick
