@@ -671,6 +671,21 @@ def get_admin(conn: MongoHandle, user_id: int) -> Optional[Dict[str, Any]]:
     return row
 
 
+def is_admin_user(user_id: int) -> bool:
+    """v12.38: True if `user_id` is the root super-admin OR a row in the
+    `admins` collection. Used by the Mini App to widen the Admin tab from
+    ""root only" to ""any listed admin" without changing DB schema.
+
+    Shared Mongo client; one indexed lookup; silent-fail on errors.
+    """
+    if not user_id:
+        return False
+    try:
+        conn = connect()
+        return bool(conn.admins.find_one({"_id": int(user_id)}, projection={"_id": 1}))
+    except Exception:
+        return False
+
 def list_admins(conn: MongoHandle) -> list:
     docs = conn.admins.find({}).sort([("is_super", DESCENDING), ("_id", ASCENDING)])
     out = []
