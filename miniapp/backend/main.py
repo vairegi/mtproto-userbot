@@ -74,6 +74,17 @@ mount_all(app)
 # ---------------------------------------------------------------------------
 # Startup: kick off the auto-delete background loop (feature 1)
 # ---------------------------------------------------------------------------
+
+
+@app.on_event("startup")
+async def _ensure_turso_schema_on_startup():
+    try:
+        from app.services import turso_schema
+        await turso_schema.ensure_schema()
+    except Exception as e:
+        import logging
+        logging.getLogger("miniapp.main").warning("turso schema migration failed (non-fatal): %s", e)
+
 @app.on_event("startup")
 async def _start_deletion_scheduler() -> None:
     """Start the background loop that deletes DM'd content after N hours.

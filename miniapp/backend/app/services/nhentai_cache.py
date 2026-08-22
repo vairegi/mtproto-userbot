@@ -36,6 +36,9 @@ from typing import Any, Optional
 
 log = logging.getLogger("miniapp.nhentai_cache")
 
+# v0.39 architecture: Mongo is durable store only. Cache goes Turso.
+_TURSO_ONLY = os.environ.get("BOT0_NH_MONGO_WRITES", "0").strip() not in ("0", "", "false", "False", "no")
+
 # v12.4: Turso-first cache layer. Import lazily so a missing package can
 # never crash the mini-app; turso_client.turso_available() gates all use.
 try:
@@ -229,6 +232,8 @@ def _mongo_get(key: str, allow_stale: bool) -> Optional[dict]:
     if conn is None:
         return None
     try:
+        if _TURSO_ONLY:
+            return None
         doc = conn.nhentai_cache.find_one({"_id": key})
     except Exception:  # noqa: BLE001
         return None
@@ -387,6 +392,8 @@ def _mongo_put(key: str, payload: Any, ttl: int) -> bool:
         "cached_at":  _now_dt(),
         "ttl_sec":    stored_ttl,
     }
+    if _TURSO_ONLY:
+        return True
     try:
         conn.nhentai_cache.replace_one({"_id": key}, doc, upsert=True)
         return True
@@ -458,6 +465,10 @@ def invalidate(key: str) -> None:
     if conn is None:
         return
     try:
+        if _TURSO_ONLY:
+            return
+        if _TURSO_ONLY:
+            return
         conn.nhentai_cache.delete_one({"_id": key})
     except Exception:  # noqa: BLE001
         pass
@@ -532,10 +543,14 @@ def promote_chip_tag_sentinel() -> dict:
             chip_re = _re.compile(r"^search:[^|:]+:page\d+$")
             # Tag/typed: search:q=...|sort=...|page=N
             tag_re = _re.compile(r"^search:q=.*\|sort=.*\|page=\d+$")
+            if _TURSO_ONLY:
+                return False
             r1 = conn.nhentai_cache.update_many(
                 {"_id": chip_re, "expires_at": {"$ne": 0}},
                 {"$set": {"expires_at": 0, "ttl_sec": 0}},
             )
+            if _TURSO_ONLY:
+                return False
             r2 = conn.nhentai_cache.update_many(
                 {"_id": tag_re, "expires_at": {"$ne": 0}},
                 {"$set": {"expires_at": 0, "ttl_sec": 0}},
@@ -1072,6 +1087,8 @@ def renormalize_existing_rows(dry_run: bool = False,
                 if _take() == 0:
                     break
                 try:
+                    if _TURSO_ONLY:
+                        continue
                     cur = conn.nhentai_cache.find(
                         {"_id": {"$regex": "^" + prefix}},
                         {"_id": 1, "payload": 1},
@@ -1202,3 +1219,52 @@ def shape_audit(batch: int = 25, prefix: Optional[str] = None) -> dict:
 
 # (v12.24's shape_audit tail block removed in v12.26 — the streamed version
 # above replaces it in place.)
+
+
+# v0.39: per-gid bookmark cover bytes — stored ONCE in Turso so per-user
+# bookmark rows in Mongo stay tiny (user_id, gid, created_at).
+async def bm_cover_get(gid: str):
+    key = f"bm:cover:{gid}"
+    try:
+        from . import turso_client as _tc
+        if _tc.turso_available():
+            row = await _tc.get(key)
+            if row:
+                import json as _json
+                return _json.loads(row.decode("utf-8") if isinstance(row, (bytes, bytearray)) else row)
+    except Exception as e:
+        log.debug("bm_cover_get turso miss: %s", e)
+    if _TURSO_ONLY:
+        return None
+    try:
+        conn = _midb.connect()
+        doc = conn.miniapp_bm_cover.find_one({"_id": str(gid)})
+        return doc or None
+    except Exception:
+        return None
+
+
+async def bm_cover_put(gid: str, payload: dict, ttl_sec: int = 30 * 86400) -> bool:
+    import json as _json
+    key = f"bm:cover:{gid}"
+    raw = _json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    try:
+        from . import turso_client as _tc
+        if _tc.turso_available():
+            ok = await _tc.put(key, raw, ttl_sec)
+            if ok:
+                return True
+    except Exception as e:
+        log.debug("bm_cover_put turso fail: %s", e)
+    if _TURSO_ONLY:
+        return False
+    try:
+        conn = _midb.connect()
+        conn.miniapp_bm_cover.update_one(
+            {"_id": str(gid)},
+            {"$set": {"payload": raw, "expires_at": time.time() + ttl_sec}},
+            upsert=True,
+        )
+        return True
+    except Exception:
+        return False
