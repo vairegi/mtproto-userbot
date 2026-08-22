@@ -113,3 +113,11 @@ The first v12.33 `worker.py` main loop still ran jobs **serially**: `await proce
 
 ### Rollout
 - Ships as **v12.34** (`config.VERSION = "v12.34"`). No new env vars. No new processes. Deploy = push to `main`, both Render services redeploy from the same commit.
+
+## v12.39.5 — nhentai_cache import-depth fix (2026-08-22)
+
+- Symptom: dedup sweep tick logs every ~6 min `⚠️ turso: nhentai_cache import failed: cannot import name 'db' from 'miniapp.backend.app.services'`; turso scanned/removed counters frozen at 0 (Turso-side dedup silently disabled, false-positive "everything fresh").
+- Root cause: v12.39 bm_cover helpers used `from . import db as _midb` — `.` resolves to `miniapp.backend.app.services` (no db module). The Mongo shim lives one level up at `miniapp.backend.app.db`.
+- Fix: one line, `miniapp/backend/app/services/nhentai_cache.py:38` → `from .. import db as _midb`.
+- Verification: `py_compile` OK; `from miniapp.backend.app.services.nhentai_cache import bm_cover_get, bm_cover_put` OK.
+- Commit: `19e2546` (local; push to main pending operator GitHub auth — sandbox has no credentials).
