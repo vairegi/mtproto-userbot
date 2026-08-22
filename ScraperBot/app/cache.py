@@ -94,7 +94,8 @@ def ttl_for_key(key: str) -> int:
 # rewrite; instead we stamp expires_at=0 on write and BOT 0's read path
 # (nhentai_cache.py v12.20) treats that as "always fresh, never call
 # nhentai".
-NEVER_EXPIRE_CHIP_TAG = _os_ne.environ.get(
+# Fixed Code:
+NEVER_EXPIRE_CHIP_TAG = os.environ.get(
     "NHCACHE_CHIP_TAG_NEVER_EXPIRE", "1").strip() not in ("0", "false", "False", "")
 
 
