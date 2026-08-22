@@ -28,6 +28,15 @@ import sys
 from typing import Awaitable, Callable, Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+# v12.34g: Markdown-safe interpolation. Defensive import with a local
+# fallback so an unexpected PTB version can never break handler import.
+try:
+    from telegram.helpers import escape_markdown as _escape_md
+except Exception:  # noqa: BLE001
+    def _escape_md(text: str, version: int = 1) -> str:  # minimal v1 escaper
+        for ch in ("_", "*", "`", "["):
+            text = text.replace(ch, "\\" + ch)
+        return text
 # v12.33 fix: ParseMode promoted to top-level import. Previously it was a
 # function-local import inside one handler (F821 in CI lint for /checkram).
 from telegram.constants import ChatAction, ParseMode
@@ -977,6 +986,16 @@ async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try: conn.close()
         except Exception: pass
 
+    # v12.34g: `meta_title` comes from scraped gallery metadata and routinely
+    # contains Markdown specials ([ ] _ * ` etc. — every doujin title is
+    # "[Circle (Artist)] Title ..."). Interpolating it raw under
+    # parse_mode="Markdown" made Telegram reject the message with
+    # "Can't parse entities: can't find end of the entity starting at byte
+    # offset N", which crashed the handler AFTER the Mongo write had already
+    # succeeded — so /verify worked but reported nothing. Escape it.
+    safe_title = _escape_md(
+        str(meta_title or "(unavailable)"), version=1
+    )
     await msg.reply_text(
         "✅ Gallery verified & bound.\n\n"
         f"• gallery_id  : `{gid}`\n"
@@ -984,7 +1003,7 @@ async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"• cover_msg_id: `{cover_msg_id}`"
         + (f"\n• pdf_msg_id  : `{pdf_msg_id}`" if pdf_msg_id is not None else "")
         + f"\n• open_link   : {open_link}\n"
-        f"• title       : {meta_title or '(unavailable)'}\n"
+        f"• title       : {safe_title}\n"
         f"• queue rows purged     : {purged_queue}\n"
         f"• processed_urls purged : {purged_processed}\n\n"
         "The mini-app will now forward directly from the DB channel when "
