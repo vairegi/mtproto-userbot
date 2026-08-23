@@ -245,10 +245,17 @@
  * into showActionLoader(); card-actions.js now uses this smaller pill for
  * the DB->DM and /api/queue paths.
  * =========================================================================*/
+/* v12.34i: inline-loader repositioned to TOP-CENTER (near the "Discover"
+   header) to match toast placement (v12.34h). Was anchored bottom-right
+   above the tab bar which stacked awkwardly on top of card actions and
+   was off-screen on tall phones. Uses --du-safe-top for iOS notch /
+   Android status-bar clearance; entry/exit slide is now downward-in /
+   upward-out to match the new anchor direction. */
 .inline-loader {
   position: fixed;
-  right: max(12px, env(safe-area-inset-right, 0px));
-  bottom: calc(var(--du-tabbar-h, 56px) + var(--du-safe-bot, 0px) + 12px);
+  left: 50%;
+  top: calc(var(--du-safe-top, env(safe-area-inset-top, 0px)) + 12px);
+  transform: translate(-50%, 0);
   z-index: calc(var(--du-z-tabbar, 40) + 5);
   display: flex;
   align-items: center;
@@ -267,13 +274,17 @@
   max-width: min(78vw, 320px);
   pointer-events: none;         /* never blocks card taps */
   opacity: 1;
-  transform: translateY(0);
   transition: opacity 160ms var(--du-ease, cubic-bezier(.2,.8,.2,1)),
               transform 160ms var(--du-ease, cubic-bezier(.2,.8,.2,1));
+  animation: du-inline-in 200ms var(--du-ease, cubic-bezier(.2,.8,.2,1));
+}
+@keyframes du-inline-in {
+  from { opacity: 0; transform: translate(-50%, -8px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
 }
 .inline-loader.is-leaving {
   opacity: 0;
-  transform: translateY(6px);
+  transform: translate(-50%, -8px);
 }
 .inline-loader__spinner {
   width: 14px;

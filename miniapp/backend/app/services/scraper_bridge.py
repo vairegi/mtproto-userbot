@@ -1025,6 +1025,133 @@ def gallery_detail(gallery_id: str) -> dict:
     return {}
 
 
+# ---------------------------------------------------------------------------
+# v12.34i: gallery_suggestions(gid, limit) — "Similar to this" backend.
+#
+# nhentai's /api/v2/galleries/<id>?include=suggestions embeds the SAME
+# structure a search hit returns, so we can normalise each entry with the
+# same title/cover/tags builders used by _direct_nhentai_search + _direct_
+# nhentai_detail and hand the frontend a list ready for the existing card
+# component.
+#
+# Cache: `suggest:<gid>` key, TTL_SUGGEST_SEC (3 d by default; 0 when
+# NHCACHE_NEVER_EXPIRE_ALL=1). One 429 back-off cache shared with search.
+# Fail-open on every branch so the detail sheet never blocks on an error.
+# ---------------------------------------------------------------------------
+def gallery_suggestions(gallery_id: str, limit: int = 6) -> list[dict]:
+    """Return up to `limit` card dicts for galleries similar to `gallery_id`.
+
+    Uses nhentai's `?include=suggestions` payload. On any failure returns
+    []; the frontend hides the row when the list is empty.
+    """
+    gid = str(gallery_id or "").strip()
+    if not gid.isdigit():
+        return []
+    limit = max(1, min(int(limit or 6), 12))
+
+    # ---- Turso READ -------------------------------------------------------
+    _key = f"suggest:{gid}"
+    _nhc = _sb_turso_cache()
+    if _nhc is not None:
+        try:
+            _hit = _nhc.get(_key, allow_stale=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("nhc.get(%s) raised: %s", _key, e)
+            _hit = None
+        if isinstance(_hit, list) and _hit:
+            log.info(_LOG_HIT, _key)
+            return _hit[:limit]
+
+    # ---- Rate-limit back-off (piggy-back on _direct_nhentai_detail's) ----
+    cache_key = ("suggest", gid)
+    now = _time.time()
+    ban = _RATE_LIMIT_CACHE.get(cache_key)
+    if ban and ban > now:
+        return []
+
+    # ---- Upstream fetch --------------------------------------------------
+    try:
+        r = httpx.get(
+            f"{_NH_API}/galleries/{gid}",
+            params={"include": "suggestions"},
+            headers={
+                "User-Agent": _UA,
+                "Accept": "application/json",
+                "Referer": "https://nhentai.net/",
+            },
+            timeout=15,
+        )
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After") if hasattr(r, "headers") else None
+            dur = _rate_limit_backoff_sec(cache_key, retry_after)
+            _rl_cache_set(cache_key, now + dur)
+            log.warning(
+                "nhentai HTTP 429 for /galleries/%s?include=suggestions — "
+                "backing off for %ss%s",
+                gid, dur,
+                f" (Retry-After={retry_after})" if retry_after else "",
+            )
+            return []
+        if 200 <= r.status_code < 300:
+            _RATE_LIMIT_STRIKES.pop(cache_key, None)
+        r.raise_for_status()
+        detail = r.json() or {}
+    except httpx.HTTPStatusError as e:
+        log.warning(
+            "nhentai suggestions HTTP %s for id=%r: %s",
+            getattr(e.response, "status_code", "?"), gid, e,
+        )
+        return []
+    except Exception as e:  # noqa: BLE001
+        log.warning("nhentai suggestions network fail id=%r: %s", gid, e)
+        return []
+
+    raw = detail.get("suggestions") or []
+    if not isinstance(raw, list):
+        return []
+
+    # ---- Normalise into card-dict shape ---------------------------------
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            sid = str(item.get("id") or "").strip()
+            if not sid or sid == gid:
+                continue
+            out.append({
+                "id":    item.get("id"),
+                "title": _title_from_item(item),
+                "title_en_clean": _title_en_clean_from_item(item),
+                "cover": _thumb_url_from_item(item),
+                "pages": item.get("num_pages"),
+                "tags":  [{"name": t.get("name"), "type": t.get("type")}
+                          for t in item.get("tags") or [] if isinstance(t, dict)],
+            })
+        except Exception as e:  # noqa: BLE001
+            log.debug("suggestion item skip: %s", e)
+            continue
+
+    # ---- Turso WRITE (best-effort, gates on never-expire kill-switch) ---
+    if out and _nhc is not None:
+        try:
+            import json as _json
+            _bytes = len(_json.dumps(out, default=str))
+        except Exception:  # noqa: BLE001
+            _bytes = -1
+        log.info(_LOG_MISS, _key)
+        try:
+            _ok = _nhc.put(_key, out)
+            if _ok == "unchanged":
+                log.info(_LOG_DEDUP, _key)
+            elif _ok:
+                log.info(_LOG_WRITE, _key, _bytes)
+        except Exception as e:  # noqa: BLE001
+            log.debug("turso write failed for %s: %s", _key, e)
+
+    return out[:limit]
+
+
 def route_status() -> dict:
     """Diagnostics for /api/admin/diag."""
     info: dict[str, Any] = {"have_hf": HAVE_HF}

@@ -344,6 +344,145 @@ function paintFull(root, d) {
     } catch (_) { savesVal.textContent = "0"; }
   })();
   if (!firstRow) root.appendChild(card);   // only render when it has content
+
+  // v12.34i: "Similar to this" row. Fires AFTER the metadata card so a
+  // 429 / cold-miss never blocks the sheet paint. Uses /api/gallery/<id>/
+  // suggestions (backed by nhentai_cache 3-day TTL / never-expire) so the
+  // second open of any gallery is instant. Hides itself on empty response.
+  mountSimilarRow(root, d.id);
+}
+
+function mountSimilarRow(root, gid) {
+  if (!gid) return;
+  const section = h("div", {
+    class: "d-similar",
+    style: {
+      marginTop: "14px",
+      paddingTop: "12px",
+      borderTop: "1px solid var(--du-divider, rgba(255,255,255,0.06))",
+      display: "none",   // shown only after we know we have items
+    },
+  });
+  const heading = h("div", {
+    class: "d-similar-heading",
+    style: {
+      fontSize: "12px",
+      fontWeight: "700",
+      color: "var(--du-ink-lo)",
+      textTransform: "uppercase",
+      letterSpacing: "0.4px",
+      marginBottom: "8px",
+    },
+  }, "Similar to this");
+  const strip = h("div", {
+    class: "d-similar-strip",
+    style: {
+      display: "grid",
+      gridAutoFlow: "column",
+      gridAutoColumns: "minmax(120px, 42vw)",
+      gap: "10px",
+      overflowX: "auto",
+      overflowY: "hidden",
+      scrollSnapType: "x mandatory",
+      WebkitOverflowScrolling: "touch",
+      paddingBottom: "6px",
+    },
+  });
+  section.append(heading, strip);
+  root.appendChild(section);
+
+  (async () => {
+    let items = [];
+    try {
+      const r = await api.get(
+        `/api/gallery/${encodeURIComponent(gid)}/suggestions?limit=6`
+      );
+      items = (r && Array.isArray(r.items)) ? r.items : [];
+    } catch (_) { items = []; }
+    if (!items.length) return;   // section stays display:none
+
+    for (const s of items) {
+      if (!s || !s.id) continue;
+      const card = h("div", {
+        class: "d-similar-card",
+        style: {
+          scrollSnapAlign: "start",
+          borderRadius: "10px",
+          overflow: "hidden",
+          background: "var(--du-bg-1)",
+          border: "1px solid var(--du-border)",
+          cursor: "pointer",
+          display: "flex",
+          flexDirection: "column",
+          position: "relative",
+        },
+      });
+      const cover = s.cover
+        ? h("img", {
+            class: "d-similar-cover",
+            src: s.cover,
+            alt: s.title || `#${s.id}`,
+            style: {
+              width: "100%",
+              aspectRatio: "3 / 4",
+              objectFit: "cover",
+              display: "block",
+            },
+            loading: "lazy",
+          })
+        : h("div", {
+            class: "d-similar-cover skeleton",
+            style: { width: "100%", aspectRatio: "3 / 4" },
+          });
+      const title = h("div", {
+        class: "d-similar-title",
+        style: {
+          fontSize: "11px",
+          lineHeight: "1.25",
+          padding: "6px 8px",
+          color: "var(--du-ink-mid)",
+          display: "-webkit-box",
+          WebkitLineClamp: "2",
+          WebkitBoxOrient: "vertical",
+          overflow: "hidden",
+        },
+      }, s.title_en_clean || s.title || `#${s.id}`);
+      // Cached-badge pill (mirrors main grid).
+      if (s.is_cached === true) {
+        card.appendChild(h("span", {
+          class: "status-pill cached",
+          style: {
+            position: "absolute",
+            top: "6px", right: "6px",
+            padding: "2px 6px",
+            background: "rgba(0,0,0,0.6)",
+            borderRadius: "10px",
+            fontSize: "10px",
+            pointerEvents: "none",
+          },
+        }, "⚡⚡"));
+      } else if (s.is_cached === false) {
+        card.appendChild(h("span", {
+          class: "status-pill uncached",
+          style: {
+            position: "absolute",
+            top: "6px", right: "6px",
+            padding: "2px 6px",
+            background: "rgba(0,0,0,0.6)",
+            borderRadius: "10px",
+            fontSize: "10px",
+            pointerEvents: "none",
+          },
+        }, "📥"));
+      }
+      card.append(cover, title);
+      card.addEventListener("click", () => {
+        try { openGalleryDetail(s); } catch (_) { /* no-op */ }
+      });
+      strip.appendChild(card);
+    }
+    section.style.display = "";
+  })();
 }
 
 function fmtNum(n) {
