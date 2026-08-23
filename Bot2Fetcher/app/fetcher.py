@@ -1,5 +1,9 @@
 """
 fetcher.py — the Bot2Fetcher pipeline.
+
+v12.40c: producer switched to paged Turso scan (list_gallery_ids +
+list_recent_search_ids), payload fetched on-demand per job via
+turso.get_gallery_row(gid). No more 15k-row mem_hrana_response blowups.
 """
 from __future__ import annotations
 
@@ -72,7 +76,6 @@ class Fetcher:
         self._stop = asyncio.Event()
         self._channel = None
         self._bot2 = None
-        self._cache_by_gid: Dict[str, dict] = {}
 
     async def start(self) -> None:
         for i, sess in enumerate(self.s.sessions, 1):
@@ -96,45 +99,31 @@ class Fetcher:
             except Exception:
                 pass
 
-    def _ordered_ids(self, rows: list[dict]) -> list[str]:
-        recent_ids: list[str] = []
-        gallery_rows: list[dict] = []
-        search_recent: list[tuple[int, dict]] = []
-        for r in rows:
-            k = r["key"]
-            if k.startswith("gallery:"):
-                gallery_rows.append(r)
-            elif k.startswith("search:") and "recent" in k:
-                page = 0
-                tail = k.rsplit("page", 1)[-1]
-                try:
-                    page = int("".join(ch for ch in tail if ch.isdigit()) or 0)
-                except ValueError:
-                    page = 0
-                search_recent.append((page, r))
-        for _, r in sorted(search_recent, key=lambda t: t[0]):
-            p = r.get("payload") or {}
-            items = p.get("result") if isinstance(p, dict) else None
-            if isinstance(items, list):
-                for it in items:
-                    gid = str((it or {}).get("id") or "")
-                    if gid.isdigit():
-                        recent_ids.append(gid)
-        gallery_rows.sort(key=lambda r: r.get("cached_at") or 0, reverse=True)
-        seen = set(recent_ids)
-        ordered = list(recent_ids)
-        self._cache_by_gid = {}
-        for r in gallery_rows:
-            gid = r["key"].split(":", 1)[1]
-            self._cache_by_gid[gid] = r
+    async def _build_queue_order(self) -> list[str]:
+        """Newest-first: cached recent-sort pages, then every gallery:* row
+        newest-cached-first, deduped."""
+        recent_ids = await self.turso.list_recent_search_ids()
+        gallery_rows = await self.turso.list_gallery_ids()
+        gallery_rows.sort(key=lambda r: r["cached_at"], reverse=True)
+        seen: set = set()
+        ordered: list[str] = []
+        for gid in recent_ids:
             if gid not in seen:
-                ordered.append(gid)
+                seen.add(gid); ordered.append(gid)
+        for r in gallery_rows:
+            gid = r["gid"]
+            if gid not in seen:
+                seen.add(gid); ordered.append(gid)
         return ordered
 
     async def _producer(self) -> None:
         while not self._stop.is_set():
-            rows = await self.turso.scan_cache()
-            ids = self._ordered_ids(rows)
+            try:
+                ids = await self._build_queue_order()
+            except Exception as e:
+                log.exception("producer scan failed: %s", e)
+                await asyncio.sleep(30)
+                continue
             self.stats.scanned = len(ids)
             log.info("scan: %d candidate galleries", len(ids))
             for gid in ids:
@@ -181,7 +170,7 @@ class Fetcher:
         self.stats.in_flight[gid] = f"slot{idx}"
         log.info("slot %d claimed %s", idx, gid)
         try:
-            cache_row = self._cache_by_gid.get(gid)
+            cache_row = await self.turso.get_gallery_row(gid)
             m = meta_mod.meta_from_cache(gid, cache_row)
             if m is None:
                 m = await meta_mod.meta_from_upstream(gid)

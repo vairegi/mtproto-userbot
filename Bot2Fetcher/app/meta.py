@@ -1,8 +1,5 @@
 """
 meta.py — gallery metadata for the cover post.
-
-Primary source: the Turso `gallery:<id>` cache row BOT 1 already wrote.
-Fallback: nhentai's public JSON endpoint (only when cache row is missing).
 """
 from __future__ import annotations
 

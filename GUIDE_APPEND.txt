@@ -1,39 +1,37 @@
 APPEND THE SECTION BELOW TO GUIDE.md
 ========================================================================
 
-## v12.40a — Bot2Fetcher turso row-parser fix (2026-08-23)
+## v12.40c — Bot2Fetcher paged Turso scan (2026-08-23)
 
-### Symptom
-First deploy log:
-    WARNING bot2fetcher.turso: turso execute failed (SELECT): 'result'
-    INFO    bot2fetcher.fetcher: scan: 0 candidate galleries
-
-The bot booted, connected to Mongo, authorised the userbot, then found
-zero work to do and idled. Cache has 15 065 rows — should have been
-7 251 candidates.
+### Symptom (v12.40b log)
+    turso stmt error (SELECT): Resource exhausted: mem_hrana_response
+    scan_cache: execute returned None
+    scan: 0 candidate galleries
 
 ### Root cause
-`turso_store.py::scan_cache` did:
-    for k, payload, cached_at in rows:
-libsql_client 0.3.x returns Row objects that support MAPPING access
-(row["key"]) OR sequence unpacking depending on build. On the Render
-instance the tuple-unpack path raised `KeyError: 'result'` from inside
-libsql_client's own row wrapper, which the generic `except Exception`
-swallowed as an "execute failed" warning. Result: 0 rows.
+v12.40b's scan pulled `SELECT key,payload,cached_at FROM nhentai_cache`
+for every gallery:* AND search:* row (~15 k rows, ~40 MB of JSON). Turso
+caps a single Hrana response at ~8 MB and returned SQLITE_UNKNOWN
+`Resource exhausted: mem_hrana_response`.
 
 ### Fix
-`turso_store.py` — new `_row_to_dict(row, columns)` helper tries mapping
-access first, then positional, then attribute — always returns a plain
-dict keyed by column name. `execute()` now returns
-`{"columns": [...], "rows": [dict, ...]}` and every caller reads by
-column name, immune to the client's row-shape choices. Also decodes
-bytes payloads and coerces `cached_at` safely.
+`turso_store.py` split into three thin queries:
+- `list_gallery_ids()`       — `SELECT "key", cached_at ... LIKE 'gallery:%'`
+                               (id + timestamp only, ~7 k rows, tiny)
+- `list_recent_search_ids()` — `LIMIT 200` on `search:%recent%` for the
+                               newest-first seed
+- `get_gallery_row(gid)`     — payload fetched on demand when a slot
+                               actually claims that id
 
-### Verify after deploy
-Log should show `bot2fetcher.turso: scan_cache: read 15065 rows` and
-`bot2fetcher.fetcher: scan: 7251 candidate galleries`, followed by
-`slot 1 claimed <gid>` and completed jobs.
+`fetcher.py` producer rewritten around the new API. libsql-client dropped
+in v12.40b in favour of raw HTTP `/v2/pipeline` — no Python driver, no
+version drift; same pattern as ScraperBot.
+
+### Verified against the live DB before shipping
+    gallery ids listed: 7384
+    recent search ids seeded: 26
+    get_gallery_row(...) OK — payload keys: id, title, title_english, ...
 
 ### Rollout
-Copy `Bot2Fetcher/` over the existing folder, push, Manual Deploy on
-Render. No env changes.
+Copy `Bot2Fetcher/` over the existing folder, push, Manual Deploy.
+Env unchanged. libsql-client removed from requirements.
