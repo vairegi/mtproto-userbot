@@ -505,8 +505,15 @@ form.search-bar { margin: 0; width: 100%; }
 /* ============================================================
    TOAST
    ============================================================ */
+/* v12.34h: toast anchored to TOP-CENTER (near the "Discover" header).
+   Was bottom-anchored above the tab bar, which stacked awkwardly on top
+   of card action buttons. Uses --du-safe-top to clear Telegram's own
+   header on iOS notch / Android status-bar; --du-space-4 gives a small
+   gap so the toast sits just under the app title. The toast-in
+   keyframe below still slides FROM below — for a top toast a small
+   downward slide-in looks more natural (translateY(-8px) → 0). */
 #toast-root {
-  position: fixed; left: 50%; bottom: calc(var(--du-tabbar-h) + var(--du-safe-bot) + var(--du-space-4));
+  position: fixed; left: 50%; top: calc(var(--du-safe-top) + var(--du-space-4));
   transform: translateX(-50%);
   z-index: var(--du-z-toast);
   display: flex; flex-direction: column; gap: var(--du-space-2);
@@ -525,7 +532,9 @@ form.search-bar { margin: 0; width: 100%; }
 .toast.success { border-color: var(--du-success); }
 .toast.error   { border-color: var(--du-danger); }
 @keyframes toast-in {
-  from { opacity: 0; transform: translateY(8px); }
+  /* v12.34h: enters from slightly above so the motion reads as
+     "dropping in from the top" now that the anchor is top-of-viewport. */
+  from { opacity: 0; transform: translateY(-8px); }
   to   { opacity: 1; transform: translateY(0); }
 }
 
