@@ -1,22 +1,11 @@
 """
-fetcher.py — the Bot2Fetcher pipeline.
+fetcher.py — the Bot2Fetcher pipeline (v12.40k, unchanged from v12.40j
+except no direct dashboard-posting via userbot).
 
-v12.40j — per-slot peer resolution.
-
-BUG in v12.40i: only slot 1's client resolved the DB channel and
-@Gallery_DLBot. Slot 2 was handed slot 1's Entity object, but Telethon's
-peer table is per-session — a peer slot 1 knows can be
-PeerIdInvalidError on slot 2 until slot 2 has seen it in a dialog. Every
-slot 2 job crashed with:
-    PeerIdInvalidError: An invalid Peer was used
-
-Fix: each slot now
-  1. iter_dialogs(limit=200) once on startup — warms its own peer cache
-  2. get_input_entity(...) on ITS OWN client — cached as
-     self._channel_per_slot[idx] / self._bot2_per_slot[idx]
-Every subsequent send_message / send_file / forward_messages uses the
-input-entity that belongs to the slot doing the call. No cross-session
-peer sharing anywhere.
+Per-slot peer resolution: each Telethon session warms its own peer
+cache via iter_dialogs() + get_input_entity() before the slot loop
+starts. All Bot 0 / DB channel / @Gallery_DLBot calls use per-slot
+input entities so slot 2 can NEVER PeerIdInvalidError.
 """
 from __future__ import annotations
 
@@ -112,7 +101,6 @@ class Fetcher:
         self._channel_lock = asyncio.Lock()
         self._queue: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
-        # Per-slot resolved input entities (Telethon peer table is per session)
         self._channel_per_slot: dict[int, Any] = {}
         self._bot2_per_slot: dict[int, Any] = {}
 
@@ -138,9 +126,6 @@ class Fetcher:
                 pass
 
     async def _warm_and_resolve(self, idx: int, client: TelegramClient) -> None:
-        """Warm this slot's peer cache with iter_dialogs, then resolve BOTH
-        the DB channel and @Gallery_DLBot as input entities on THIS client.
-        This is the fix for v12.40i PeerIdInvalidError on slot 2."""
         try:
             n = 0
             async for _ in client.iter_dialogs(limit=200):
@@ -156,8 +141,7 @@ class Fetcher:
         except Exception as e:
             raise RuntimeError(
                 f"slot {idx}: cannot resolve DB_CHANNEL_ID={self.s.db_channel_id!r} — {e}. "
-                f"Make sure this userbot account is a MEMBER of the channel "
-                f"(admin is fine, membership is what registers the peer)."
+                f"Make sure this userbot is a MEMBER of the channel."
             ) from e
         try:
             self._bot2_per_slot[idx] = await client.get_input_entity(self.s.bot2_username)
@@ -166,8 +150,7 @@ class Fetcher:
         except Exception as e:
             raise RuntimeError(
                 f"slot {idx}: cannot resolve BOT2_USERNAME=@{self.s.bot2_username} — {e}. "
-                f"Have this userbot DM @{self.s.bot2_username} once from the "
-                f"Telegram app (any /start), then restart the service."
+                f"Have this userbot DM @{self.s.bot2_username} once, then restart."
             ) from e
 
     async def start(self) -> None:
@@ -182,8 +165,6 @@ class Fetcher:
             if self.dash:
                 self.dash.set_account(i, uname)
             self.clients.append(c)
-            # Per-slot peer resolution — MUST happen before the slot loop
-            # starts sending anything.
             await self._warm_and_resolve(i, c)
 
     async def stop(self) -> None:
@@ -311,14 +292,14 @@ class Fetcher:
                           pages=m.get("pages") or 0, step="waiting @Gallery_DLBot")
             pdf_msg = await self._request_pdf(client, bot2, gid, timeout)
             if pdf_msg is None:
-                log.error("⏰ %s — @Gallery_DLBot timed out (%ds) — dropping, no cover posted",
+                log.error("⏰ %s — @Gallery_DLBot timed out (%ds) — dropping",
                           gid, int(timeout))
                 self.galleries.drop_claim(gid)
                 self.stats.dropped += 1
                 self._d_event(idx, "dropped", gid)
                 return True
             if isinstance(pdf_msg, str):
-                log.error("🤖❌ %s — Bot 2 hard error, dropping (no cover posted): %s",
+                log.error("🤖❌ %s — Bot 2 hard error, dropping: %s",
                           gid, pdf_msg[:150])
                 self.galleries.drop_claim(gid)
                 self.stats.dropped += 1
@@ -337,8 +318,7 @@ class Fetcher:
                 cover_msg_id = await self._post_cover(client, channel, m,
                                                      caption, img_bytes, ext)
                 if not cover_msg_id:
-                    log.error("❌ %s — cover post failed AFTER PDF was in hand — dropping",
-                              gid)
+                    log.error("❌ %s — cover post failed", gid)
                     self.galleries.drop_claim(gid)
                     self.stats.failed += 1
                     self._d_event(idx, "failed", gid)
@@ -346,8 +326,7 @@ class Fetcher:
                 log.info("🖼 %s — spoiler cover posted (msg_id=%d)", gid, cover_msg_id)
                 pdf_msg_id = await self._post_pdf(client, channel, bot2, pdf_msg, m)
                 if not pdf_msg_id:
-                    log.error("❌ %s — PDF forward failed after cover; deleting cover",
-                              gid)
+                    log.error("❌ %s — PDF forward failed; deleting cover", gid)
                     try:
                         await client.delete_messages(channel, [cover_msg_id])
                     except Exception as de:

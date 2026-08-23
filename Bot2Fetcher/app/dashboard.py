@@ -1,20 +1,38 @@
 """
-dashboard.py — v12.40j detailed live dashboard for the log channel.
+dashboard.py — v12.40k Bot API log dashboard.
 
-v12.40j: resolve peer via get_dialogs() FIRST so the send/edit does not
-raise PeerIdInvalidError on a fresh session. When resolve fails the
-reason is logged loudly and the dashboard disables itself instead of
-sitting silent forever.
+Instead of asking a userbot to post/edit into the log channel (which
+was flaky because Telethon's peer table is per-session and had trouble
+resolving freshly-added private channels), the dashboard now speaks the
+Bot API directly via httpx. A dedicated Bot account (env var
+BOT_2_PDF_FECTHER — kept verbatim) is admin in the log channel and owns
+ONE merged status message that is edited in place every 30 s.
+
+Layout — one Markdown message with GLOBAL + every slot in sections.
+
+If BOT_2_PDF_FECTHER is unset, dashboard is disabled and we log why.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from typing import Any, Dict, Optional
+
+import httpx
 
 log = logging.getLogger("bot2fetcher.dashboard")
 
 EDIT_EVERY_S = 30
+_API = "https://api.telegram.org"
+
+# Markdown special chars that must NOT be inside our field values.
+# We escape them so titles like `[Foo] Bar_Baz` don't break rendering.
+_MD_ESC = str.maketrans({c: "\\" + c for c in r"_*[]()~`>#+-=|{}.!"})
+
+
+def _md(s: str) -> str:
+    return (s or "").translate(_MD_ESC)
 
 
 def _fmt_uptime(secs: int) -> str:
@@ -31,58 +49,115 @@ def _progress_bar(done: int, total: int, width: int = 14) -> str:
     return "[" + "█" * filled + "░" * (width - filled) + f"] {pct}%"
 
 
-def _global_card(stats, scan_info: dict, mongo_counts: dict) -> str:
+class LogBot:
+    """Tiny async Bot API client via httpx."""
+
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self._me: Optional[Dict[str, Any]] = None
+
+    async def _call(self, method: str, payload: dict) -> Optional[dict]:
+        url = f"{_API}/bot{self.token}/{method}"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as h:
+                r = await h.post(url, json=payload)
+                data = r.json()
+        except Exception as e:
+            log.warning("📊 bot api %s: %s", method, e)
+            return None
+        if not data.get("ok"):
+            desc = data.get("description", "")
+            # "message is not modified" is harmless — edit called with same text.
+            if "message is not modified" in desc.lower():
+                return {"ok": True, "no_op": True}
+            log.warning("📊 bot api %s failed: %s", method, desc)
+            return None
+        return data.get("result")
+
+    async def check(self) -> bool:
+        me = await self._call("getMe", {})
+        if not me:
+            return False
+        self._me = me
+        log.info("📊 log bot ready: @%s (id=%s)",
+                 me.get("username"), me.get("id"))
+        return True
+
+    async def send_markdown(self, text: str) -> Optional[int]:
+        r = await self._call("sendMessage", {
+            "chat_id": self.chat_id, "text": text,
+            "parse_mode": "Markdown", "disable_web_page_preview": True,
+        })
+        if r and "message_id" in r:
+            return int(r["message_id"])
+        return None
+
+    async def edit_markdown(self, msg_id: int, text: str) -> bool:
+        r = await self._call("editMessageText", {
+            "chat_id": self.chat_id, "message_id": int(msg_id),
+            "text": text, "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        })
+        return r is not None
+
+
+def _build_message(stats, scan_info: dict, mongo_counts: dict,
+                   slots: Dict[int, dict], accounts: Dict[int, str]) -> str:
     s = stats.snapshot()
     total_cache = scan_info.get("cache_total", 0)
     completed_db = mongo_counts.get("COMPLETED", 0) + mongo_counts.get("PARTIAL", 0)
     failed_db = sum(v for k, v in mongo_counts.items()
                     if isinstance(k, str) and k.startswith("FAILED"))
     remaining = max(0, total_cache - completed_db - s["claimed"])
+
     lines = [
-        "🤖 **Bot2Fetcher — GLOBAL**",
+        "🤖 **Bot2Fetcher — Live**",
         "",
-        f"📡 Phase: {scan_info.get('phase', 'scanning')}",
+        f"📡 Phase: `{_md(scan_info.get('phase', 'scanning'))}`",
         f"🗂 Turso cache: **{total_cache}** galleries",
         f"✅ In DB channel: **{completed_db}**",
         f"❌ Failed-before (Mongo): **{failed_db}**",
         f"📋 Remaining: **{remaining}**",
-        f"📊 Progress: {_progress_bar(completed_db, total_cache)}",
+        f"📊 Progress: `{_progress_bar(completed_db, total_cache)}`",
         "",
-        f"🔄 Cycles: {s['cycles']}   🎯 Claimed: {s['claimed']}",
-        f"✅ Done: {s['completed']}   ❌ Failed: {s['failed']}   🧹 Dropped: {s['dropped']}",
-        f"⏭ Already done: {s['skipped_done']}   🚫 Failed-before: {s['skipped_failed']}   🔒 Busy: {s['skipped_busy']}",
-        f"⏱ Uptime: {_fmt_uptime(s['uptime_s'])}   🕒 {time.strftime('%H:%M:%S UTC', time.gmtime())}",
-    ]
-    return "\n".join(lines)
-
-
-def _slot_card(idx: int, account: str, slot: dict) -> str:
-    state = slot.get("state", "idle")
-    state_emoji = {"idle": "😴", "working": "⚙️", "waiting_pdf": "⏳",
-                   "posting": "📤", "resting": "⏸"}.get(state, "❓")
-    lines = [
-        f"🧵 **Slot {idx}** — @{account}",
+        f"🔄 Cycles: **{s['cycles']}**   🎯 Claimed: **{s['claimed']}**",
+        f"✅ Done: **{s['completed']}**   ❌ Failed: **{s['failed']}**   🧹 Dropped: **{s['dropped']}**",
+        f"⏭ Already done: **{s['skipped_done']}**   🚫 Failed-before: **{s['skipped_failed']}**   🔒 Busy: **{s['skipped_busy']}**",
+        f"⏱ Uptime: **{_fmt_uptime(s['uptime_s'])}**   🕒 `{time.strftime('%H:%M:%S UTC', time.gmtime())}`",
         "",
-        f"State: {state_emoji} {state}",
+        "━━━━━━━━━━━━━━━━━━━━",
     ]
-    cur = slot.get("current")
-    if cur:
+
+    for idx in sorted(slots.keys()):
+        slot = slots[idx]
+        state = slot.get("state", "idle")
+        state_emoji = {"idle": "😴", "working": "⚙️", "waiting_pdf": "⏳",
+                       "posting": "📤", "resting": "⏸"}.get(state, "❓")
+        acct = accounts.get(idx, "?")
         lines += [
-            f"🎯 Now: **#{cur['gid']}**",
-            f"   📖 {cur.get('title', '')[:60]}",
-            f"   📄 {cur.get('pages', 0)} pages · step: {cur.get('step', '')}",
+            "",
+            f"🧵 **Slot {idx}** — @{_md(acct)}",
+            f"State: {state_emoji} `{state}`",
         ]
-    lines += [
-        "",
-        f"✅ {slot.get('completed', 0)}   ❌ {slot.get('failed', 0)}   🧹 {slot.get('dropped', 0)}   🚧 FloodWaits: {slot.get('floodwaits', 0)}",
-    ]
-    recent = slot.get("recent") or []
-    if recent:
-        lines.append("")
-        lines.append("Last jobs:")
-        for r in recent[-3:]:
-            lines.append(f"  {r}")
-    lines.append(f"🕒 {time.strftime('%H:%M:%S UTC', time.gmtime())}")
+        cur = slot.get("current")
+        if cur:
+            title = (cur.get("title") or "")[:60]
+            lines += [
+                f"🎯 Now: **#{_md(str(cur['gid']))}**",
+                f"   📖 _{_md(title)}_",
+                f"   📄 {cur.get('pages', 0)} pages · step: `{_md(cur.get('step', ''))}`",
+            ]
+        lines.append(
+            f"✅ **{slot.get('completed', 0)}**   ❌ **{slot.get('failed', 0)}**   "
+            f"🧹 **{slot.get('dropped', 0)}**   🚧 FloodWaits: **{slot.get('floodwaits', 0)}**"
+        )
+        recent = slot.get("recent") or []
+        if recent:
+            lines.append("Last jobs:")
+            for r in recent[-3:]:
+                lines.append(f"  `{_md(r)}`")
+
     return "\n".join(lines)
 
 
@@ -91,12 +166,12 @@ class Dashboard:
         self.s = settings
         self.turso = turso
         self.stats = stats
-        self.msg_ids: dict = {}
-        self.channel = None
+        self.msg_id: int = 0
         self.scan_info: dict = {"phase": "booting", "cache_total": 0}
-        self.slots: dict = {}
-        self.accounts: dict = {}
+        self.slots: Dict[int, dict] = {}
+        self.accounts: Dict[int, str] = {}
         self.galleries = None
+        self.bot: Optional[LogBot] = None
 
     def set_account(self, idx: int, username: str) -> None:
         self.accounts[idx] = username
@@ -133,53 +208,40 @@ class Dashboard:
             d["recent"].append(f"{mark} #{gid}")
             d["recent"] = d["recent"][-3:]
 
-    async def _resolve_channel(self, client) -> bool:
-        """Warm the peer cache, then resolve LOG_CHANNEL_ID via
-        get_input_entity so the very first send does not
-        PeerIdInvalidError. Return True on success."""
-        raw = self.s.log_channel_id
-        try:
-            # Warm the peer cache — critical for freshly-imported sessions.
-            async for _ in client.iter_dialogs(limit=200):
-                pass
-        except Exception as e:
-            log.warning("📊 iter_dialogs failed while warming peer cache: %s", e)
-        try:
-            key = int(raw) if raw.lstrip("-").isdigit() else raw
-            self.channel = await client.get_input_entity(key)
-            log.info("📊 log channel resolved: %r", raw)
-            return True
-        except Exception as e:
-            log.error("📊 dashboard: cannot resolve LOG_CHANNEL_ID %r — %s. "
-                      "DASHBOARD DISABLED. Fix: make sure the userbot is a "
-                      "MEMBER of the channel (admin is fine, but membership "
-                      "is what registers the peer). If you just added it, "
-                      "restart the Render service so the session warms up.",
-                      raw, e)
-            self.channel = None
-            return False
-
     async def run(self, fetcher) -> None:
         if not self.s.log_channel_id:
             log.info("📭 dashboard disabled (LOG_CHANNEL_ID unset)")
             return
-        client = fetcher.clients[0]
-        if not await self._resolve_channel(client):
+        if not self.s.log_bot_token:
+            log.error("📊 dashboard disabled — BOT_2_PDF_FECTHER (log bot "
+                      "token) is not set. Create a Telegram bot via "
+                      "@BotFather, add it as admin to the log channel, and "
+                      "set BOT_2_PDF_FECTHER in Render.")
             return
+        self.bot = LogBot(self.s.log_bot_token, self.s.log_channel_id)
+        if not await self.bot.check():
+            log.error("📊 dashboard disabled — BOT_2_PDF_FECTHER token "
+                      "rejected by Telegram. Double-check the token value.")
+            return
+
         saved = await self.turso.get_state("_dashboard")
         if saved:
-            self.msg_ids = {k: int(v) for k, v in saved.items()
-                            if isinstance(v, int) or (isinstance(v, str) and v.isdigit())}
-        log.info("📊 dashboard started (msg ids: %s)", self.msg_ids or "will post new")
+            v = saved.get("bot_msg_id") or saved.get("global")
+            try:
+                self.msg_id = int(v) if v else 0
+            except (TypeError, ValueError):
+                self.msg_id = 0
+        log.info("📊 dashboard started via Bot API (msg id: %s)",
+                 self.msg_id or "will post new")
 
         while not fetcher._stop.is_set():
             try:
-                await self._tick(client, len(fetcher.clients))
+                await self._tick(len(fetcher.clients))
             except Exception as e:
                 log.warning("📊 dashboard tick failed: %s", e)
             await asyncio.sleep(EDIT_EVERY_S)
 
-    async def _tick(self, client, n_slots: int) -> None:
+    async def _tick(self, n_slots: int) -> None:
         mongo_counts = {}
         if self.galleries is not None:
             try:
@@ -187,27 +249,22 @@ class Dashboard:
                     None, self.galleries.count_by_status)
             except Exception:
                 mongo_counts = {}
-        global_text = _global_card(self.stats, self.scan_info, mongo_counts)
-        await self._upsert(client, "global", global_text)
         for idx in range(1, n_slots + 1):
-            acct = self.accounts.get(idx, "?")
-            slot = self.slots.get(idx, {"state": "idle", "completed": 0,
+            self.slots.setdefault(idx, {"state": "idle", "completed": 0,
                                         "failed": 0, "dropped": 0,
                                         "floodwaits": 0, "recent": []})
-            await self._upsert(client, f"slot{idx}", _slot_card(idx, acct, slot))
+        text = _build_message(self.stats, self.scan_info, mongo_counts,
+                              self.slots, self.accounts)
+        # Telegram caps at 4096 chars.
+        if len(text) > 4000:
+            text = text[:3990] + "\n…"
 
-    async def _upsert(self, client, key: str, text: str) -> None:
-        mid = self.msg_ids.get(key, 0)
-        try:
-            if mid:
-                await client.edit_message(self.channel, mid, text)
+        if self.msg_id:
+            if await self.bot.edit_markdown(self.msg_id, text):
                 return
-        except Exception as e:
-            log.warning("📊 edit %s failed (%s) — reposting", key, e)
-            self.msg_ids[key] = 0
-        try:
-            msg = await client.send_message(self.channel, text)
-            self.msg_ids[key] = int(msg.id)
-            await self.turso.put_state("_dashboard", dict(self.msg_ids))
-        except Exception as e:
-            log.warning("📊 send %s failed: %s", key, e)
+            log.info("📊 edit failed — reposting")
+            self.msg_id = 0
+        new_id = await self.bot.send_markdown(text)
+        if new_id:
+            self.msg_id = new_id
+            await self.turso.put_state("_dashboard", {"bot_msg_id": self.msg_id})

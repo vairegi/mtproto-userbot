@@ -49,6 +49,7 @@ class Settings:
     db_channel_id: str
     bot2_username: str
     log_channel_id: str
+    log_bot_token: str
     fetch_gap_min: int
     fetch_gap_max: int
     stale_processing_s: int
@@ -79,6 +80,11 @@ def load() -> Settings:
         db_channel_id=_req("DB_CHANNEL_ID", "DATABASE_CHANNEL_ID"),
         bot2_username=_first("BOT2_USERNAME") or "Gallery_DLBot",
         log_channel_id=_first("LOG_CHANNEL_ID"),
+        # v12.40k: preferred log-channel transport is a Bot API bot.
+        # Env var name per operator: BOT_2_PDF_FECTHER (kept verbatim).
+        # Aliases also accepted so a rename never breaks the deploy.
+        log_bot_token=_first("BOT_2_PDF_FECTHER", "LOG_BOT_TOKEN",
+                             "DASHBOARD_BOT_TOKEN", "TELEGRAM_LOG_BOT_TOKEN"),
         fetch_gap_min=_int("FETCH_GAP_MIN_S", 3),
         fetch_gap_max=_int("FETCH_GAP_MAX_S", 8),
         stale_processing_s=_int("STALE_PROCESSING_S", 900),
