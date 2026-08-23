@@ -145,7 +145,6 @@ class Galleries:
         self.drop_claim(gid)
 
     def count_by_status(self) -> dict:
-        """Aggregate total galleries by status — used by the dashboard."""
         try:
             pipe = [{"$group": {"_id": "$status", "n": {"$sum": 1}}}]
             return {r["_id"]: r["n"] for r in self.coll.aggregate(pipe)}

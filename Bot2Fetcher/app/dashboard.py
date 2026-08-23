@@ -1,19 +1,10 @@
 """
-dashboard.py — v12.40i detailed live dashboard for the log channel.
+dashboard.py — v12.40j detailed live dashboard for the log channel.
 
-Layout (ALL messages edited in place, never re-posted):
-  MSG 1 — GLOBAL: scan phase, queue position, cache totals, Mongo
-          status breakdown, lifetime counters, uptime
-  MSG 2 — SLOT 1 card: account, state (idle/working/resting), current
-          gid + title + pages, its own counters, last 3 finished jobs
-  MSG 3 — SLOT 2 card (only posted when a second session exists)
-
-Message ids are persisted in Turso bot2_fetch_state['_dashboard'] as
-{"global": id, "slot1": id, "slot2": id} so restarts keep editing.
-
-If LOG_CHANNEL_ID is unset OR the userbot can't post to the channel,
-the failure is logged LOUDLY once (not silently) so Render logs show
-why the dashboard is missing.
+v12.40j: resolve peer via get_dialogs() FIRST so the send/edit does not
+raise PeerIdInvalidError on a fresh session. When resolve fails the
+reason is logged loudly and the dashboard disables itself instead of
+sitting silent forever.
 """
 from __future__ import annotations
 
@@ -53,6 +44,7 @@ def _global_card(stats, scan_info: dict, mongo_counts: dict) -> str:
         f"📡 Phase: {scan_info.get('phase', 'scanning')}",
         f"🗂 Turso cache: **{total_cache}** galleries",
         f"✅ In DB channel: **{completed_db}**",
+        f"❌ Failed-before (Mongo): **{failed_db}**",
         f"📋 Remaining: **{remaining}**",
         f"📊 Progress: {_progress_bar(completed_db, total_cache)}",
         "",
@@ -104,9 +96,8 @@ class Dashboard:
         self.scan_info: dict = {"phase": "booting", "cache_total": 0}
         self.slots: dict = {}
         self.accounts: dict = {}
-        self.galleries = None  # set from main after connect
+        self.galleries = None
 
-    # ---- public API called by fetcher ---------------------------------
     def set_account(self, idx: int, username: str) -> None:
         self.accounts[idx] = username
         self.slots.setdefault(idx, {"state": "idle", "completed": 0,
@@ -130,7 +121,6 @@ class Dashboard:
             d["current"]["step"] = step or d["current"].get("step", "")
 
     def slot_event(self, idx: int, kind: str, gid: str) -> None:
-        """kind: completed|failed|dropped|floodwait"""
         d = self.slots.setdefault(idx, {"state": "idle", "completed": 0,
                                         "failed": 0, "dropped": 0,
                                         "floodwaits": 0, "recent": []})
@@ -143,20 +133,38 @@ class Dashboard:
             d["recent"].append(f"{mark} #{gid}")
             d["recent"] = d["recent"][-3:]
 
-    # ---- main loop ------------------------------------------------------
+    async def _resolve_channel(self, client) -> bool:
+        """Warm the peer cache, then resolve LOG_CHANNEL_ID via
+        get_input_entity so the very first send does not
+        PeerIdInvalidError. Return True on success."""
+        raw = self.s.log_channel_id
+        try:
+            # Warm the peer cache — critical for freshly-imported sessions.
+            async for _ in client.iter_dialogs(limit=200):
+                pass
+        except Exception as e:
+            log.warning("📊 iter_dialogs failed while warming peer cache: %s", e)
+        try:
+            key = int(raw) if raw.lstrip("-").isdigit() else raw
+            self.channel = await client.get_input_entity(key)
+            log.info("📊 log channel resolved: %r", raw)
+            return True
+        except Exception as e:
+            log.error("📊 dashboard: cannot resolve LOG_CHANNEL_ID %r — %s. "
+                      "DASHBOARD DISABLED. Fix: make sure the userbot is a "
+                      "MEMBER of the channel (admin is fine, but membership "
+                      "is what registers the peer). If you just added it, "
+                      "restart the Render service so the session warms up.",
+                      raw, e)
+            self.channel = None
+            return False
+
     async def run(self, fetcher) -> None:
         if not self.s.log_channel_id:
             log.info("📭 dashboard disabled (LOG_CHANNEL_ID unset)")
             return
         client = fetcher.clients[0]
-        raw = self.s.log_channel_id
-        try:
-            self.channel = await client.get_entity(
-                int(raw) if raw.lstrip("-").isdigit() else raw)
-        except Exception as e:
-            log.error("📊 dashboard: cannot resolve LOG_CHANNEL_ID %r — %s. "
-                      "Dashboard DISABLED. Add the userbot to the log channel "
-                      "with post rights and restart.", raw, e)
+        if not await self._resolve_channel(client):
             return
         saved = await self.turso.get_state("_dashboard")
         if saved:

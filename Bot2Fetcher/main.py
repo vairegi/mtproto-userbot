@@ -69,7 +69,7 @@ def _run_api() -> None:
 
 
 async def _main() -> None:
-    log.info("🚀 Bot2Fetcher v12.40i booting (%d slot(s))", len(settings.sessions))
+    log.info("🚀 Bot2Fetcher v12.40j booting (%d slot(s))", len(settings.sessions))
     await turso.ensure_schema()
     dash_task = asyncio.create_task(dashboard.run(fetcher))
     try:

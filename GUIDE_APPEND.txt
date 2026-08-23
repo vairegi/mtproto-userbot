@@ -1,49 +1,65 @@
 APPEND THE SECTION BELOW TO GUIDE.md
 ========================================================================
 
-## v12.40i — Bot2Fetcher detailed log-channel dashboard (2026-08-23)
+## v12.40j — Bot2Fetcher per-slot peer resolution (2026-08-23)
 
-### What changed
-Dashboard rewritten. Instead of one small message it now maintains
-UP TO 3 edited-in-place messages in the log channel:
+### Symptoms (v12.40i log)
+1. LOG_CHANNEL_ID was set and correct in Render, userbot was admin in
+   the log channel — but the dashboard never posted anything.
+2. As soon as STRING_SESSION_2 was added, EVERY slot 2 job crashed:
+       💥 slot 2 job 573785 crashed:
+       telethon.errors.rpcerrorlist.PeerIdInvalidError: An invalid Peer
+       was used ... (caused by SendMessageRequest)
+   Slot 1 kept working fine, slot 2 crashed on its first send_message.
 
-  MSG 1 — GLOBAL card
-    • current phase (reading recent pages / listing cache / fetching /
-      queue drained)
-    • Turso cache total, # already in DB channel (from Mongo
-      count_by_status), remaining count, ASCII progress bar
-    • lifetime counters: cycles / claimed / done / failed / dropped /
-      skipped-done / skipped-failed / busy
-    • uptime + UTC clock
+### Root cause (same bug, two visible faces)
+Telethon's peer table is PER SESSION. A peer that session A has cached
+can still `PeerIdInvalidError` on session B until B has seen that peer
+in a dialog. v12.40i resolved the DB channel and @Gallery_DLBot with
+`client.get_entity(...)` on **slot 1's client only**, then handed the
+resulting Entity object to slot 2 and to the dashboard.
 
-  MSG 2 — SLOT 1 card
-    • account username, state emoji (😴 idle / ⚙️ working / ⏳ waiting_pdf /
-      📤 posting / ⏸ resting)
-    • current gid + title + pages + step
-    • per-slot counters (completed/failed/dropped/FloodWaits)
-    • last 3 finished jobs with ✅/❌/🧹
+Result:
+* slot 2's very first `send_message(bot2_entity, url)` -> PeerIdInvalid.
+* dashboard's `send_message(log_channel_entity, text)` -> caught in a
+  broad except, logged only at WARNING (invisible in the log).
 
-  MSG 3 — SLOT 2 card (only when STRING_SESSION_2 exists)
+### Fix
+`fetcher._warm_and_resolve(idx, client)` now runs at startup FOR EACH
+slot:
+    async for _ in client.iter_dialogs(limit=200):    # warm peer cache
+        pass
+    self._channel_per_slot[idx] = await client.get_input_entity(DB_CHANNEL_ID)
+    self._bot2_per_slot[idx]    = await client.get_input_entity(BOT2_USERNAME)
 
-Message ids persist in Turso bot2_fetch_state['_dashboard'] so restarts
-keep editing the same messages. Edits every 30 s.
+Every `send_message` / `send_file` / `forward_messages` in `_do_job`
+now uses the input-entity for **that slot's own** client. No entity is
+ever shared across sessions.
 
-### Fetcher wiring
-Every state transition in the slot loop calls dashboard.slot_state() /
-slot_event() — all no-ops when LOG_CHANNEL_ID is unset, so the pipeline
-hot path is unchanged.
+`dashboard.py::_resolve_channel` does the same on slot 1 —
+iter_dialogs() first, then `get_input_entity(LOG_CHANNEL_ID)`. If it
+fails, dashboard logs at ERROR (not WARNING) and disables itself, so
+Render logs tell you exactly why.
 
-### Duplicate-work guarantee (unchanged, now documented in fetcher header)
-Mongo claim insert_one(_id=gid) is atomic — exactly one of {Bot 0,
-slot 1, slot 2} can win a gid. Each slot DMs @Gallery_DLBot from its own
-account and polls its own inbox, so PDFs can't cross-match. Channel
-writes serialise through one global asyncio lock.
+### Startup requirement
+Both userbot accounts must be MEMBERS of every channel they touch. Admin
+is sufficient, but *admin without member* on a private channel is not:
+membership is what registers the peer in that session. If a session was
+generated before joining, either re-generate it after joining, or just
+restart the service — the first `iter_dialogs()` will register it.
 
-### Failure visibility
-If LOG_CHANNEL_ID can't be resolved (userbot not a member / wrong id),
-the dashboard logs an ERROR at startup explaining exactly that, instead
-of failing silently.
+### Verify after deploy
+Boot log should now include:
+    🧭 slot 1 peer cache warmed (N dialogs)
+    📺 slot 1 resolved DB channel: -100...
+    🤖 slot 1 resolved downloader bot: @Gallery_DLBot
+    🧭 slot 2 peer cache warmed (N dialogs)
+    📺 slot 2 resolved DB channel: -100...
+    🤖 slot 2 resolved downloader bot: @Gallery_DLBot
+    📊 log channel resolved: -100...
+
+And slot 2's very first job should complete without PeerIdInvalidError.
+Dashboard messages appear in the log channel within 30s of boot.
 
 ### Rollout
-Copy `Bot2Fetcher/` over, push, Manual Deploy. Env: set LOG_CHANNEL_ID
-and add the userbot account(s) to the log channel with post rights.
+Copy `Bot2Fetcher/` over, push, Manual Deploy. Env unchanged.
