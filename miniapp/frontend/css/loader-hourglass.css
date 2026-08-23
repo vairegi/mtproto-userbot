@@ -251,12 +251,18 @@
    was off-screen on tall phones. Uses --du-safe-top for iOS notch /
    Android status-bar clearance; entry/exit slide is now downward-in /
    upward-out to match the new anchor direction. */
+/* v12.34l: raised z-index ABOVE the detail sheet (--du-z-sheet=200) so
+   the "Sending to your DM…" pill overlays the sheet instead of being
+   painted below it (previous tabbar+5 = 55 lost to sheet's 201). Now
+   matches the success-toast layer (--du-z-toast=300) so both the
+   in-flight pill AND the final "📨 Sent to your DM" toast stack at the
+   same top-center layer above the sheet backdrop. */
 .inline-loader {
   position: fixed;
   left: 50%;
   top: calc(var(--du-safe-top, env(safe-area-inset-top, 0px)) + 12px);
   transform: translate(-50%, 0);
-  z-index: calc(var(--du-z-tabbar, 40) + 5);
+  z-index: calc(var(--du-z-toast, 300) + 1);
   display: flex;
   align-items: center;
   gap: 8px;

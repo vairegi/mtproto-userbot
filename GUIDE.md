@@ -250,3 +250,17 @@ type error and re-fetched upstream — even though Turso had it.
   redeploys (nothing in `ScraperBot/` changed). After the redeploy,
   run the purge script ONCE with `MONGO_URI` in your Render shell (or
   locally) to clear the stale collection.
+
+## v12.34l — inline-loader z-index fix (2026-08-23)
+
+### Symptom
+Detail sheet open → tap Download Now → "Sending to your DM…" pill rendered BEHIND the sheet backdrop instead of overlaying it.
+
+### Root cause
+`.inline-loader` z-index was `calc(var(--du-z-tabbar, 40) + 5)` = 55, but the detail sheet sits at `--du-z-sheet` = 200. The pill painted under the backdrop.
+
+### Fix
+One line: `z-index: calc(var(--du-z-toast, 300) + 1)` = 301 in `miniapp/frontend/css/loader-hourglass.css`. Pill now overlays the sheet at the same top-center layer as the "📨 Sent to your DM" toast.
+
+### Rollout
+Copy file over repo, commit, push. BOT 0 redeploys. No env changes.

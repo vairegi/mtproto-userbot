@@ -1,12 +1,13 @@
-# v12.34d — Checkpoint Ledger (per RULES.txt §6)
+# v12.34l — Checkpoint Ledger (per RULES.txt §6)
 
 | % | What was added | File-wrapper URL | AI Drive mirror |
 |---|---|---|---|
-| 50% | Patch applied: `_mongo_get` coerces every expires_at shape to epoch float (int/float/naive-datetime/aware-datetime); commit d64edee; py_compile OK; import smoke OK; purge script DRY_RUN smoke OK | (see final chat message) | pending (session-ephemeral) |
-| 100% | Final bundle: patched nhentai_cache.py + new purge script + GUIDE.md v12.34d section + this ledger | (see final chat message) | pending (session-ephemeral) |
+| 10% | Baseline loader-hourglass.css zipped + uploaded | https://www.genspark.ai/api/files/s/f5QnXSoN | pending |
+| 25% | Patched file (z-index 55→301) zipped + uploaded; user restored from this URL after sandbox recycle | https://www.genspark.ai/api/files/s/7QXFULEd | pending |
+| 50% | Local commit 20429c8-equivalent + 50% recovery zip | (see chat) | pending |
+| 100% | Final bundle: patched CSS + GUIDE.md v12.34l + this ledger | (see final chat message) | pending |
 
 ## Notes
-- Push to GitHub main pending operator auth (sandbox has no GitHub credentials).
-- Working repo: github.com/vairegi/mtproto-userbot @ HEAD c4c13e0 → d64edee+.
-- Deploy = copy 2 files to their existing paths + commit + push. Only BOT 0 redeploys.
-- Post-deploy: run `MONGO_URI=... python scripts/purge_mongo_nhentai_cache.py` ONCE.
+- Sandbox recycled twice; user explicitly restored from the 25% file-wrapper URL per RULE 4.
+- Working repo: github.com/vairegi/mtproto-userbot @ HEAD a0d8534.
+- Task A ("SIMILAR TO THIS" not rendering) requires a Render Manual Deploy of HEAD a0d8534 — no code change needed (verified all v12.34i/k artifacts in HEAD).
