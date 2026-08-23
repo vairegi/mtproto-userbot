@@ -1,59 +1,49 @@
 APPEND THE SECTION BELOW TO GUIDE.md
 ========================================================================
 
-## v12.40h — Bot2Fetcher PDF-first pipeline (2026-08-23)
+## v12.40i — Bot2Fetcher detailed log-channel dashboard (2026-08-23)
 
-### Change requested
-Cover MUST NOT be posted until the PDF is confirmed to be in hand.
-Rationale: with old ordering (cover -> DM link -> wait), if @Gallery_DLBot
-errored or timed out the cover sat orphaned in the DB channel. That
-raced Bot 0's own COMPLETED-check: Bot 0 could see the channel has a
-cover-labelled msg for that gid and think it's a done pair.
+### What changed
+Dashboard rewritten. Instead of one small message it now maintains
+UP TO 3 edited-in-place messages in the log channel:
 
-### New per-job order
-    1. claim gid in Mongo
-    2. meta from Turso (cache-only)
-    3. DM link to @Gallery_DLBot
-    4. wait for PDF document
-         hard error / timeout -> `galleries.drop_claim(gid)` (delete
-           the Mongo doc; gallery becomes fresh again, nothing hits
-           the DB channel), move to next job
-         PDF received -> continue
-    5. download + normalise cover bytes
-    6. inside channel-write lock, back-to-back:
-         cover photo (spoiler)  -> cover_msg_id
-         PDF forward / re-upload -> pdf_msg_id
-    7. mark_completed with both ids + open_link
+  MSG 1 — GLOBAL card
+    • current phase (reading recent pages / listing cache / fetching /
+      queue drained)
+    • Turso cache total, # already in DB channel (from Mongo
+      count_by_status), remaining count, ASCII progress bar
+    • lifetime counters: cycles / claimed / done / failed / dropped /
+      skipped-done / skipped-failed / busy
+    • uptime + UTC clock
 
-If cover post succeeds but PDF forward fails, the just-posted cover is
-deleted so the channel stays clean.
+  MSG 2 — SLOT 1 card
+    • account username, state emoji (😴 idle / ⚙️ working / ⏳ waiting_pdf /
+      📤 posting / ⏸ resting)
+    • current gid + title + pages + step
+    • per-slot counters (completed/failed/dropped/FloodWaits)
+    • last 3 finished jobs with ✅/❌/🧹
 
-### mongo_state.py new API
-    drop_claim(gid)  — hard-delete the PROCESSING doc, but only if it
-                       has source=='bot2fetcher'. Never touches another
-                       worker's row.
-    release_claim(gid) — alias, kept for back-compat.
+  MSG 3 — SLOT 2 card (only when STRING_SESSION_2 exists)
 
-### Stats
-Added `dropped` counter (Bot 2 error / timeout / no meta), separate from
-`failed` (channel-write failure after PDF was received). `/status` and
-the dashboard both show it.
+Message ids persist in Turso bot2_fetch_state['_dashboard'] so restarts
+keep editing the same messages. Edits every 30 s.
 
-### Verify after deploy
-Log per successful job:
-    🎯 slot 1 claimed <gid> — starting job
-    🔍 gallery:<gid> — meta OK from Turso: ...
-    📄 <gid> — <pages> pages, PDF wait budget <s>s
-    📨 DMing @Gallery_DLBot: https://nhentai.net/g/<gid>/
-    ⏳ <gid> — waiting for PDF (Xs left) · Bot 2: '...'
-    📥 <gid> — PDF received from @Gallery_DLBot
-    🖼 <gid> — spoiler cover posted (msg_id=NNN)
-    📤 <gid> — PDF posted (msg_id=NNN)
-    ✅ <gid> DONE — cover=... pdf=...
+### Fetcher wiring
+Every state transition in the slot loop calls dashboard.slot_state() /
+slot_event() — all no-ops when LOG_CHANNEL_ID is unset, so the pipeline
+hot path is unchanged.
 
-Log per dropped job (nothing in DB channel):
-    ⏰ <gid> — @Gallery_DLBot timed out — dropping, no cover posted
-    🧹 dropped claim for <gid> (no cover posted)
+### Duplicate-work guarantee (unchanged, now documented in fetcher header)
+Mongo claim insert_one(_id=gid) is atomic — exactly one of {Bot 0,
+slot 1, slot 2} can win a gid. Each slot DMs @Gallery_DLBot from its own
+account and polls its own inbox, so PDFs can't cross-match. Channel
+writes serialise through one global asyncio lock.
+
+### Failure visibility
+If LOG_CHANNEL_ID can't be resolved (userbot not a member / wrong id),
+the dashboard logs an ERROR at startup explaining exactly that, instead
+of failing silently.
 
 ### Rollout
-Copy `Bot2Fetcher/` over, push, Manual Deploy. Env unchanged.
+Copy `Bot2Fetcher/` over, push, Manual Deploy. Env: set LOG_CHANNEL_ID
+and add the userbot account(s) to the log channel with post rights.

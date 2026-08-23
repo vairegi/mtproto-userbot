@@ -1,5 +1,19 @@
 """
-dashboard.py — optional live status message in a Telegram log channel.
+dashboard.py — v12.40i detailed live dashboard for the log channel.
+
+Layout (ALL messages edited in place, never re-posted):
+  MSG 1 — GLOBAL: scan phase, queue position, cache totals, Mongo
+          status breakdown, lifetime counters, uptime
+  MSG 2 — SLOT 1 card: account, state (idle/working/resting), current
+          gid + title + pages, its own counters, last 3 finished jobs
+  MSG 3 — SLOT 2 card (only posted when a second session exists)
+
+Message ids are persisted in Turso bot2_fetch_state['_dashboard'] as
+{"global": id, "slot1": id, "slot2": id} so restarts keep editing.
+
+If LOG_CHANNEL_ID is unset OR the userbot can't post to the channel,
+the failure is logged LOUDLY once (not silently) so Render logs show
+why the dashboard is missing.
 """
 from __future__ import annotations
 
@@ -9,23 +23,75 @@ import time
 
 log = logging.getLogger("bot2fetcher.dashboard")
 
+EDIT_EVERY_S = 30
 
-def _fmt(stats: dict) -> str:
-    up = stats["uptime_s"]
-    h, rem = divmod(up, 3600)
+
+def _fmt_uptime(secs: int) -> str:
+    h, rem = divmod(int(secs), 3600)
     m, _ = divmod(rem, 60)
-    return (
-        "🤖 Bot2Fetcher — live\n"
-        f"⏱ uptime: {h}h{m:02d}m   🔄 cycles: {stats['cycles']}\n"
-        f"📚 scanned: {stats['scanned']}\n"
-        f"✅ completed: {stats['completed']}   ❌ failed: {stats['failed']}\n"
-        f"⏭ already done: {stats['skipped_done']}   "
-        f"🚫 failed-before: {stats['skipped_failed']}   "
-        f"🔒 busy: {stats['skipped_busy']}\n"
-        f"📥 in flight: {len(stats['in_flight'])}"
-        + (f"  ({', '.join(stats['in_flight'].keys())})" if stats["in_flight"] else "")
-        + f"\n🕒 updated: {time.strftime('%H:%M:%S UTC', time.gmtime())}"
-    )
+    return f"{h}h{m:02d}m"
+
+
+def _progress_bar(done: int, total: int, width: int = 14) -> str:
+    if total <= 0:
+        return "[" + "░" * width + "] 0%"
+    filled = int(width * done / total)
+    pct = int(100 * done / total)
+    return "[" + "█" * filled + "░" * (width - filled) + f"] {pct}%"
+
+
+def _global_card(stats, scan_info: dict, mongo_counts: dict) -> str:
+    s = stats.snapshot()
+    total_cache = scan_info.get("cache_total", 0)
+    completed_db = mongo_counts.get("COMPLETED", 0) + mongo_counts.get("PARTIAL", 0)
+    failed_db = sum(v for k, v in mongo_counts.items()
+                    if isinstance(k, str) and k.startswith("FAILED"))
+    remaining = max(0, total_cache - completed_db - s["claimed"])
+    lines = [
+        "🤖 **Bot2Fetcher — GLOBAL**",
+        "",
+        f"📡 Phase: {scan_info.get('phase', 'scanning')}",
+        f"🗂 Turso cache: **{total_cache}** galleries",
+        f"✅ In DB channel: **{completed_db}**",
+        f"📋 Remaining: **{remaining}**",
+        f"📊 Progress: {_progress_bar(completed_db, total_cache)}",
+        "",
+        f"🔄 Cycles: {s['cycles']}   🎯 Claimed: {s['claimed']}",
+        f"✅ Done: {s['completed']}   ❌ Failed: {s['failed']}   🧹 Dropped: {s['dropped']}",
+        f"⏭ Already done: {s['skipped_done']}   🚫 Failed-before: {s['skipped_failed']}   🔒 Busy: {s['skipped_busy']}",
+        f"⏱ Uptime: {_fmt_uptime(s['uptime_s'])}   🕒 {time.strftime('%H:%M:%S UTC', time.gmtime())}",
+    ]
+    return "\n".join(lines)
+
+
+def _slot_card(idx: int, account: str, slot: dict) -> str:
+    state = slot.get("state", "idle")
+    state_emoji = {"idle": "😴", "working": "⚙️", "waiting_pdf": "⏳",
+                   "posting": "📤", "resting": "⏸"}.get(state, "❓")
+    lines = [
+        f"🧵 **Slot {idx}** — @{account}",
+        "",
+        f"State: {state_emoji} {state}",
+    ]
+    cur = slot.get("current")
+    if cur:
+        lines += [
+            f"🎯 Now: **#{cur['gid']}**",
+            f"   📖 {cur.get('title', '')[:60]}",
+            f"   📄 {cur.get('pages', 0)} pages · step: {cur.get('step', '')}",
+        ]
+    lines += [
+        "",
+        f"✅ {slot.get('completed', 0)}   ❌ {slot.get('failed', 0)}   🧹 {slot.get('dropped', 0)}   🚧 FloodWaits: {slot.get('floodwaits', 0)}",
+    ]
+    recent = slot.get("recent") or []
+    if recent:
+        lines.append("")
+        lines.append("Last jobs:")
+        for r in recent[-3:]:
+            lines.append(f"  {r}")
+    lines.append(f"🕒 {time.strftime('%H:%M:%S UTC', time.gmtime())}")
+    return "\n".join(lines)
 
 
 class Dashboard:
@@ -33,30 +99,107 @@ class Dashboard:
         self.s = settings
         self.turso = turso
         self.stats = stats
-        self.msg_id = 0
+        self.msg_ids: dict = {}
         self.channel = None
+        self.scan_info: dict = {"phase": "booting", "cache_total": 0}
+        self.slots: dict = {}
+        self.accounts: dict = {}
+        self.galleries = None  # set from main after connect
 
+    # ---- public API called by fetcher ---------------------------------
+    def set_account(self, idx: int, username: str) -> None:
+        self.accounts[idx] = username
+        self.slots.setdefault(idx, {"state": "idle", "completed": 0,
+                                    "failed": 0, "dropped": 0,
+                                    "floodwaits": 0, "recent": []})
+
+    def set_scan_info(self, **kw) -> None:
+        self.scan_info.update(kw)
+
+    def slot_state(self, idx: int, state: str, gid: str = "",
+                   title: str = "", pages: int = 0, step: str = "") -> None:
+        d = self.slots.setdefault(idx, {"state": "idle", "completed": 0,
+                                        "failed": 0, "dropped": 0,
+                                        "floodwaits": 0, "recent": []})
+        d["state"] = state
+        if gid:
+            d["current"] = {"gid": gid, "title": title, "pages": pages, "step": step}
+        elif state == "idle":
+            d.pop("current", None)
+        elif "current" in d:
+            d["current"]["step"] = step or d["current"].get("step", "")
+
+    def slot_event(self, idx: int, kind: str, gid: str) -> None:
+        """kind: completed|failed|dropped|floodwait"""
+        d = self.slots.setdefault(idx, {"state": "idle", "completed": 0,
+                                        "failed": 0, "dropped": 0,
+                                        "floodwaits": 0, "recent": []})
+        if kind == "floodwait":
+            d["floodwaits"] += 1
+            return
+        if kind in ("completed", "failed", "dropped"):
+            d[kind] += 1
+            mark = {"completed": "✅", "failed": "❌", "dropped": "🧹"}[kind]
+            d["recent"].append(f"{mark} #{gid}")
+            d["recent"] = d["recent"][-3:]
+
+    # ---- main loop ------------------------------------------------------
     async def run(self, fetcher) -> None:
         if not self.s.log_channel_id:
             log.info("📭 dashboard disabled (LOG_CHANNEL_ID unset)")
             return
         client = fetcher.clients[0]
         raw = self.s.log_channel_id
-        self.channel = await client.get_entity(int(raw) if raw.lstrip("-").isdigit() else raw)
+        try:
+            self.channel = await client.get_entity(
+                int(raw) if raw.lstrip("-").isdigit() else raw)
+        except Exception as e:
+            log.error("📊 dashboard: cannot resolve LOG_CHANNEL_ID %r — %s. "
+                      "Dashboard DISABLED. Add the userbot to the log channel "
+                      "with post rights and restart.", raw, e)
+            return
         saved = await self.turso.get_state("_dashboard")
-        if saved and saved.get("msg_id"):
-            self.msg_id = int(saved["msg_id"])
-        log.info("📊 dashboard started (msg_id=%d)", self.msg_id)
+        if saved:
+            self.msg_ids = {k: int(v) for k, v in saved.items()
+                            if isinstance(v, int) or (isinstance(v, str) and v.isdigit())}
+        log.info("📊 dashboard started (msg ids: %s)", self.msg_ids or "will post new")
+
         while not fetcher._stop.is_set():
-            text = _fmt(self.stats.snapshot())
             try:
-                if self.msg_id:
-                    await client.edit_message(self.channel, self.msg_id, text)
-                else:
-                    msg = await client.send_message(self.channel, text)
-                    self.msg_id = int(msg.id)
-                    await self.turso.put_state("_dashboard", {"msg_id": self.msg_id})
+                await self._tick(client, len(fetcher.clients))
             except Exception as e:
-                log.warning("📊 dashboard update failed: %s", e)
-                self.msg_id = 0
-            await asyncio.sleep(60)
+                log.warning("📊 dashboard tick failed: %s", e)
+            await asyncio.sleep(EDIT_EVERY_S)
+
+    async def _tick(self, client, n_slots: int) -> None:
+        mongo_counts = {}
+        if self.galleries is not None:
+            try:
+                mongo_counts = await asyncio.get_event_loop().run_in_executor(
+                    None, self.galleries.count_by_status)
+            except Exception:
+                mongo_counts = {}
+        global_text = _global_card(self.stats, self.scan_info, mongo_counts)
+        await self._upsert(client, "global", global_text)
+        for idx in range(1, n_slots + 1):
+            acct = self.accounts.get(idx, "?")
+            slot = self.slots.get(idx, {"state": "idle", "completed": 0,
+                                        "failed": 0, "dropped": 0,
+                                        "floodwaits": 0, "recent": []})
+            await self._upsert(client, f"slot{idx}", _slot_card(idx, acct, slot))
+
+    async def _upsert(self, client, key: str, text: str) -> None:
+        mid = self.msg_ids.get(key, 0)
+        try:
+            if mid:
+                await client.edit_message(self.channel, mid, text)
+                return
+        except Exception as e:
+            log.warning("📊 edit %s failed (%s) — reposting", key, e)
+            self.msg_ids[key] = 0
+        try:
+            msg = await client.send_message(self.channel, text)
+            self.msg_ids[key] = int(msg.id)
+            await self.turso.put_state("_dashboard", dict(self.msg_ids))
+        except Exception as e:
+            log.warning("📊 send %s failed: %s", key, e)

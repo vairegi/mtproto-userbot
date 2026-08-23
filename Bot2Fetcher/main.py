@@ -30,8 +30,9 @@ stats = Stats()
 _db = mongo_connect(settings.mongo_uri, settings.mongo_db)
 galleries = Galleries(_db, settings.stale_processing_s)
 turso = Turso(settings.turso_url, settings.turso_token)
-fetcher = Fetcher(settings, galleries, turso, stats)
 dashboard = Dashboard(settings, turso, stats)
+dashboard.galleries = galleries
+fetcher = Fetcher(settings, galleries, turso, stats, dashboard=dashboard)
 
 app = FastAPI(title="Bot2Fetcher")
 
@@ -68,7 +69,7 @@ def _run_api() -> None:
 
 
 async def _main() -> None:
-    log.info("🚀 Bot2Fetcher v12.40h booting (%d slot(s))", len(settings.sessions))
+    log.info("🚀 Bot2Fetcher v12.40i booting (%d slot(s))", len(settings.sessions))
     await turso.ensure_schema()
     dash_task = asyncio.create_task(dashboard.run(fetcher))
     try:

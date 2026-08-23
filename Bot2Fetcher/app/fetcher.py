@@ -1,25 +1,18 @@
 """
 fetcher.py — the Bot2Fetcher pipeline.
 
-v12.40h — PDF-FIRST ORDER.
-Per-job order is now:
-  1) claim in Mongo (atomic vs Bot 0 + our other slot)
-  2) load meta from Turso (cache-only, no upstream)
-  3) DM the link to @Gallery_DLBot   <-- upstream first
-  4) WAIT for the PDF document (adaptive timeout)
-     * on hard error / timeout  -> drop the claim (delete Mongo doc),
-                                   NOTHING is posted to the DB channel,
-                                   move to next job
-     * on PDF received:
-  5) download + normalise cover bytes
-  6) enter channel critical-section lock and post them BACK-TO-BACK:
-        cover photo (spoiler)  ->  msg_id A
-        PDF forwarded / re-uploaded -> msg_id B
-  7) mark_completed in Mongo with A + B + open_link so Bot 0 forwards
-     for any user click after this instant.
+v12.40i — dashboard wiring. Every state change in a slot loop calls
+dashboard.slot_state()/slot_event() so the Telegram log channel shows a
+per-slot live card + a global progress card. Order of work unchanged
+from v12.40h (PDF-first, cover only after PDF in hand).
 
-This eliminates the race: if we can't produce a PDF, no cover goes into
-the channel, so Bot 0 never sees a half-done gallery from us.
+Anti-jumble guarantees (unchanged, restated for the operator):
+  * Mongo claim is atomic: insert_one on _id=gid — exactly ONE worker
+    (Bot 0, slot 1, or slot 2) can win a gid. Losers skip.
+  * Each slot DMs @Gallery_DLBot from its OWN account and polls its OWN
+    DM inbox — PDFs can't cross-match between slots.
+  * Channel writes (cover + PDF pair) are serialised through one global
+    asyncio lock, so pairs are always adjacent in the DB channel.
 """
 from __future__ import annotations
 
@@ -105,17 +98,41 @@ class Stats:
 
 
 class Fetcher:
-    def __init__(self, settings, galleries, turso, stats: Stats):
+    def __init__(self, settings, galleries, turso, stats: Stats, dashboard=None):
         self.s = settings
         self.galleries = galleries
         self.turso = turso
         self.stats = stats
+        self.dash = dashboard
         self.clients: list[TelegramClient] = []
         self._channel_lock = asyncio.Lock()
         self._queue: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
         self._channel = None
         self._bot2 = None
+
+    # ---- dashboard helpers (no-ops when dashboard disabled) ------------
+    def _d_state(self, idx: int, state: str, gid: str = "",
+                 title: str = "", pages: int = 0, step: str = "") -> None:
+        if self.dash:
+            try:
+                self.dash.slot_state(idx, state, gid, title, pages, step)
+            except Exception:
+                pass
+
+    def _d_event(self, idx: int, kind: str, gid: str) -> None:
+        if self.dash:
+            try:
+                self.dash.slot_event(idx, kind, gid)
+            except Exception:
+                pass
+
+    def _d_scan(self, **kw) -> None:
+        if self.dash:
+            try:
+                self.dash.set_scan_info(**kw)
+            except Exception:
+                pass
 
     async def start(self) -> None:
         for i, sess in enumerate(self.s.sessions, 1):
@@ -126,6 +143,8 @@ class Fetcher:
             me = await c.get_me()
             uname = getattr(me, "username", None) or "(no username)"
             log.info("🤖 slot %d authorized as @%s (id=%s)", i, uname, me.id)
+            if self.dash:
+                self.dash.set_account(i, uname)
             self.clients.append(c)
         ch = self.s.db_channel_id
         self._channel = await self.clients[0].get_entity(int(ch) if ch.lstrip("-").isdigit() else ch)
@@ -142,7 +161,9 @@ class Fetcher:
                 pass
 
     async def _build_queue_order(self) -> list[str]:
+        self._d_scan(phase="reading recent pages…")
         recent_ids = await self.turso.list_recent_search_ids()
+        self._d_scan(phase="listing cache…")
         gallery_rows = await self.turso.list_gallery_ids()
         gallery_rows.sort(key=lambda r: r["cached_at"], reverse=True)
         seen: set = set()
@@ -165,6 +186,8 @@ class Fetcher:
                 await asyncio.sleep(30)
                 continue
             self.stats.scanned = len(ids)
+            self._d_scan(phase=f"fetching (cycle {self.stats.cycles + 1})",
+                         cache_total=len(ids))
             log.info("📡 scan cycle %d: %d candidate galleries queued",
                      self.stats.cycles + 1, len(ids))
             for gid in ids:
@@ -174,16 +197,19 @@ class Fetcher:
             self.stats.cycles += 1
             while not self._queue.empty() and not self._stop.is_set():
                 await asyncio.sleep(10)
+            self._d_scan(phase="queue drained — idle")
             log.info("💤 queue drained — sleeping %ds before next scan",
                      self.s.rescan_sleep_s)
             await asyncio.sleep(self.s.rescan_sleep_s)
 
     async def _slot_loop(self, idx: int, client: TelegramClient) -> None:
         log.info("🧵 slot %d worker started", idx)
+        self._d_state(idx, "idle")
         while not self._stop.is_set():
             try:
                 gid = await asyncio.wait_for(self._queue.get(), timeout=15)
             except asyncio.TimeoutError:
+                self._d_state(idx, "idle")
                 continue
             did_work = False
             try:
@@ -192,6 +218,8 @@ class Fetcher:
                 wait = int(getattr(fw, "seconds", 30)) + 5
                 log.warning("🚧 slot %d FloodWait %ss on %s — sleeping, will retry",
                             idx, wait, gid)
+                self._d_event(idx, "floodwait", gid)
+                self._d_state(idx, "resting", gid, step=f"FloodWait {wait}s")
                 self.galleries.drop_claim(gid)
                 await asyncio.sleep(wait)
                 await self._queue.put(gid)
@@ -200,13 +228,16 @@ class Fetcher:
                 log.exception("💥 slot %d job %s crashed: %s", idx, gid, e)
                 self.galleries.drop_claim(gid)
                 self.stats.failed += 1
+                self._d_event(idx, "failed", gid)
                 did_work = True
             finally:
                 self._queue.task_done()
             if did_work:
                 gap = random.uniform(self.s.fetch_gap_min, self.s.fetch_gap_max)
                 log.info("⏸ slot %d resting %ds", idx, int(gap))
+                self._d_state(idx, "resting", step=f"rest {int(gap)}s")
                 await asyncio.sleep(gap)
+                self._d_state(idx, "idle")
 
     async def _do_job(self, idx: int, client: TelegramClient, gid: str) -> bool:
         decision = self.galleries.claim(gid)
@@ -226,42 +257,46 @@ class Fetcher:
         self.stats.in_flight[gid] = f"slot{idx}"
         log.info("🎯 slot %d claimed %s — starting job", idx, gid)
         try:
-            # ---- (2) META (Turso only) --------------------------------
+            self._d_state(idx, "working", gid, step="loading meta")
             cache_row = await self.turso.get_gallery_row(gid)
             m = meta_mod.meta_from_cache(gid, cache_row)
             if m is None:
                 log.warning("⚠️ %s — no cached meta, dropping claim", gid)
                 self.galleries.drop_claim(gid)
                 self.stats.dropped += 1
+                self._d_event(idx, "dropped", gid)
                 return True
             timeout = compute_pdf_timeout(m.get("pages") or 0)
             caption = meta_mod.caption_for(m)
             log.info("📄 %s — %d pages, PDF wait budget %ds",
                      gid, m.get("pages") or 0, int(timeout))
 
-            # ---- (3) DM link  ->  (4) WAIT for PDF (BEFORE cover) -----
+            self._d_state(idx, "waiting_pdf", gid, title=m["title"],
+                          pages=m.get("pages") or 0, step="waiting @Gallery_DLBot")
             pdf_msg = await self._request_pdf(client, gid, timeout)
             if pdf_msg is None:
                 log.error("⏰ %s — @Gallery_DLBot timed out (%ds) — dropping, no cover posted",
                           gid, int(timeout))
                 self.galleries.drop_claim(gid)
                 self.stats.dropped += 1
+                self._d_event(idx, "dropped", gid)
                 return True
             if isinstance(pdf_msg, str):
                 log.error("🤖❌ %s — Bot 2 hard error, dropping (no cover posted): %s",
                           gid, pdf_msg[:150])
                 self.galleries.drop_claim(gid)
                 self.stats.dropped += 1
+                self._d_event(idx, "dropped", gid)
                 return True
             log.info("📥 %s — PDF received from @Gallery_DLBot", gid)
 
-            # ---- (5) COVER BYTES (only after PDF confirmed) -----------
+            self._d_state(idx, "working", gid, title=m["title"],
+                          pages=m.get("pages") or 0, step="downloading cover")
             img_bytes, ext = await self._fetch_cover_bytes(m)
-            # cover bytes are optional — text-only caption is a valid
-            # fallback and still lets us mark_completed with the pair
             self.galleries.refresh_claim(gid)
 
-            # ---- (6) CHANNEL WRITE: cover + PDF back-to-back ----------
+            self._d_state(idx, "posting", gid, title=m["title"],
+                          pages=m.get("pages") or 0, step="posting to DB channel")
             async with self._channel_lock:
                 cover_msg_id = await self._post_cover(client, m, caption,
                                                      img_bytes, ext)
@@ -270,12 +305,11 @@ class Fetcher:
                               gid)
                     self.galleries.drop_claim(gid)
                     self.stats.failed += 1
+                    self._d_event(idx, "failed", gid)
                     return True
                 log.info("🖼 %s — spoiler cover posted (msg_id=%d)", gid, cover_msg_id)
                 pdf_msg_id = await self._post_pdf(client, pdf_msg, m)
                 if not pdf_msg_id:
-                    # Cover is in the channel but PDF forward failed —
-                    # try to delete the cover so nothing dangles.
                     log.error("❌ %s — PDF forward failed after cover; deleting cover",
                               gid)
                     try:
@@ -284,10 +318,10 @@ class Fetcher:
                         log.warning("cover cleanup failed: %s", de)
                     self.galleries.drop_claim(gid)
                     self.stats.failed += 1
+                    self._d_event(idx, "failed", gid)
                     return True
                 log.info("📤 %s — PDF posted (msg_id=%d)", gid, pdf_msg_id)
 
-            # ---- (7) MARK COMPLETED -----------------------------------
             link = channel_link(int(self.s.db_channel_id), cover_msg_id)
             self.galleries.mark_completed(
                 gid, title=m["title"], cover_msg_id=cover_msg_id,
@@ -298,6 +332,7 @@ class Fetcher:
             })
             self.stats.completed += 1
             self.stats.last_finished_at = time.time()
+            self._d_event(idx, "completed", gid)
             log.info("✅ %s DONE — cover=%s pdf=%s (total completed: %d)",
                      gid, cover_msg_id, pdf_msg_id, self.stats.completed)
             return True

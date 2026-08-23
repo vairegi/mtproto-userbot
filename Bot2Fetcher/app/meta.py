@@ -21,7 +21,7 @@ _META_ROW_ORDER = [
     ("artist",    "Artists"),
     ("character", "Characters"),
     ("language",  "Languages"),
-    ("category", "Categories"),
+    ("category",  "Categories"),
 ]
 
 
