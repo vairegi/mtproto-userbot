@@ -60,6 +60,23 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Mounted at /static — matches every `/static/css/...` and `/static/js/...`
 # reference in index.html and the importmap.
+#
+# v12.34j: no-cache middleware for /static. index.html already ships
+# no-store (see _serve_index below), but the JS/CSS MODULES it imports
+# were served with default headers — Telegram's WebView heuristic-caches
+# those for days, so a deployed frontend change (v12.34i "Similar to
+# this", v12.34h toast move, ...) never reached users until they
+# hard-refreshed. This middleware stamps the same no-cache headers on
+# every /static response so any deploy is live on the next app open.
+@app.middleware("http")
+async def _no_cache_static(request: Request, call_next):
+    resp = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
+
 if FRONTEND_DIR.is_dir():
     app.mount(
         "/static",
