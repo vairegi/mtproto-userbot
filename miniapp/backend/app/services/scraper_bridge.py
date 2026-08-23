@@ -1128,6 +1128,15 @@ def gallery_suggestions(gallery_id: str, limit: int = 6) -> list[dict]:
     # "scan latest N" is a sound approximation because BOT 1 walks the
     # popular sorts newest-first.
     SCAN_CAP = 2000
+    # v12.34k-fix: local import of turso_client (module-level import is
+    # deliberately avoided in this file to keep the httpx-fallback path
+    # free of a hard turso dep; other Turso-touching functions in this
+    # module use the same lazy pattern via _sb_turso_cache()).
+    try:
+        from . import turso_client as _turso   # noqa: WPS433
+    except Exception as e:  # noqa: BLE001
+        log.warning("similar(%s): turso_client import failed: %s", gid, e)
+        return []
     try:
         rs = _turso.execute(
             "SELECT key, payload FROM nhentai_cache "
