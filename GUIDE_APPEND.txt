@@ -1,0 +1,37 @@
+APPEND THE SECTION BELOW TO GUIDE.md (new "## v12.40" entry at the end)
+========================================================================
+
+## v12.40 — Bot2Fetcher service (2026-08-23)
+
+### What
+New third service `Bot2Fetcher/` in repo root. Standalone Render web
+service (own account) that mass-warms the DB channel: scans the shared
+Turso `nhentai_cache` (recent search pages first, then every `gallery:*`
+key newest-cached first), claims never-tried galleries in the shared
+Mongo `galleries` collection, DMs the URL to @Gallery_DLBot from its own
+userbot slot(s), and posts cover+PDF into the DB channel.
+
+### Contract it honours (do not break)
+- Mongo `galleries` doc fields are byte-compatible with gallery_state.py
+  v12.34l: `_id` str, `status`, `db_cover_msg_id`, `db_pdf_msg_id`,
+  `open_link`. Bot 0 forwards from these fields unchanged. Extra field
+  `source: "bot2fetcher"` marks its rows.
+- Claim is atomic (insert_one / find_one_and_update on claim_expires) so
+  Bot 0's worker and both fetcher slots can race a gid; exactly one wins.
+  Never-tried only: COMPLETED/PARTIAL/FAILED_* docs are never retried.
+- Cover+PDF post under one global asyncio lock (v12.34 atomic pairing —
+  no orphan covers).
+- Turso: READS `nhentai_cache` only; WRITES only its own
+  `bot2_fetch_state` table. Never touches `nhentai_ratelimit`.
+- Adaptive PDF wait: 90s + 1.7s/page clamped [180, 900] (v11.3 lesson).
+- FloodWait -> sleep e.seconds+5, job re-queued once.
+- Multi-slot: STRING_SESSION + optional STRING_SESSION_2, one active job
+  per slot, per-slot DM polling so PDFs never cross-match.
+
+### Deploy
+Render Web Service, root dir `Bot2Fetcher`, start `python main.py`.
+Env: API_ID, API_HASH, STRING_SESSION(_2), MONGO_URI, MONGO_DB_NAME,
+TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, DB_CHANNEL_ID; optional
+BOT2_USERNAME, LOG_CHANNEL_ID, FETCH_GAP_*, STALE_PROCESSING_S,
+RESCAN_SLEEP_S. Both userbot accounts must be admins (post rights) in
+the DB channel and members of the log channel if the dashboard is used.

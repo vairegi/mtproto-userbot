@@ -1,0 +1,7 @@
+telethon>=1.36
+pymongo>=4.6
+libsql-client>=0.3.1
+fastapi>=0.110
+uvicorn>=0.29
+httpx>=0.27
+python-dotenv>=1.0
