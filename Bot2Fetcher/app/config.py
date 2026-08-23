@@ -1,29 +1,5 @@
 """
 config.py — Bot2Fetcher env loader.
-
-Mirrors repo-root config.py conventions: short env aliases, secrets never
-echoed, .env optional (real env wins). All knobs have safe defaults so the
-service boots with only the required five groups set.
-
-Required on Render:
-    API_ID  API_HASH            Telegram app creds (same app the session
-                                strings were generated with)
-    STRING_SESSION              userbot session #1 (DMs @Gallery_DLBot)
-    MONGO_URI                   Bot 0's Mongo (relaybot db) — read/claim/
-                                complete the SAME `galleries` collection
-    TURSO_DATABASE_URL          shared cache DB (turso:// or https:// both OK)
-    TURSO_AUTH_TOKEN
-    DB_CHANNEL_ID               private DB channel (same value Bot 0 uses)
-
-Optional:
-    STRING_SESSION_2            userbot session #2 (second parallel fetcher)
-    BOT2_USERNAME               default @Gallery_DLBot
-    LOG_CHANNEL_ID              Telegram log channel for live dashboard msg
-    MONGO_DB_NAME               default relaybot
-    FETCH_GAP_MIN_S / MAX_S     pause between jobs per slot (default 20/60)
-    STALE_PROCESSING_S          re-claim window for stuck PROCESSING (900)
-    RESCAN_SLEEP_S              sleep after a full Turso scan (300)
-    PORT                        injected by Render automatically
 """
 from __future__ import annotations
 
@@ -34,7 +10,7 @@ from pathlib import Path
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
-except Exception:  # dotenv optional
+except Exception:
     pass
 
 
@@ -65,12 +41,12 @@ def _int(name: str, default: int) -> int:
 class Settings:
     api_id: int
     api_hash: str
-    sessions: tuple           # 1..N string sessions
+    sessions: tuple
     mongo_uri: str
     mongo_db: str
     turso_url: str
     turso_token: str
-    db_channel_id: str        # kept raw; resolved to int at connect time
+    db_channel_id: str
     bot2_username: str
     log_channel_id: str
     fetch_gap_min: int
@@ -79,7 +55,7 @@ class Settings:
     rescan_sleep_s: int
     port: int
 
-    def __repr__(self) -> str:  # never echo secrets
+    def __repr__(self) -> str:
         return (f"Settings(api_id={self.api_id}, sessions={len(self.sessions)}, "
                 f"db_channel={self.db_channel_id}, bot2={self.bot2_username!r})")
 

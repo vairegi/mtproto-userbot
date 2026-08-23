@@ -1,12 +1,8 @@
 """
 meta.py — gallery metadata for the cover post.
 
-Primary source: the Turso `gallery:<id>` cache row BOT 1 already wrote
-(title, cover, pages, tags — no upstream call, no rate-limit cost).
-
-Fallback: nhentai's public JSON endpoint, used only when the cache row is
-missing/broken. This is the ONLY upstream call this bot can make and it
-is off the hot path.
+Primary source: the Turso `gallery:<id>` cache row BOT 1 already wrote.
+Fallback: nhentai's public JSON endpoint (only when cache row is missing).
 """
 from __future__ import annotations
 
@@ -78,4 +74,4 @@ def caption_for(meta: Dict[str, Any]) -> str:
         lines.append(f"📄 {meta['pages']} pages")
     if meta.get("tags"):
         lines.append("🏷 " + ", ".join(meta["tags"]))
-    return "\n".join(lines)[:1024]  # Telegram caption limit
+    return "\n".join(lines)[:1024]

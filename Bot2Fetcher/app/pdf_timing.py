@@ -1,8 +1,5 @@
 """
 pdf_timing.py — adaptive wait for @Gallery_DLBot's PDF reply.
-
-Lesson from BOT 0 v11.3: @Gallery_DLBot needs ~1.6 s per page to build the
-PDF; a flat 60/480 s cap timed out 200-page galleries. Same formula here.
 """
 from __future__ import annotations
 

@@ -1,11 +1,5 @@
 """
 dashboard.py — optional live status message in a Telegram log channel.
-
-Posts ONE message via userbot slot 1 and edits it every 60 s. The message
-id is persisted in Turso bot2_fetch_state['_dashboard'] so restarts keep
-editing the same message instead of spamming new ones.
-
-Disabled entirely when LOG_CHANNEL_ID is unset.
 """
 from __future__ import annotations
 
@@ -63,5 +57,5 @@ class Dashboard:
                     await self.turso.put_state("_dashboard", {"msg_id": self.msg_id})
             except Exception as e:
                 log.warning("dashboard update failed: %s", e)
-                self.msg_id = 0  # repost next tick
+                self.msg_id = 0
             await asyncio.sleep(60)

@@ -1,28 +1,5 @@
 """
-mongo_state.py — Bot 0 `galleries` collection state machine (self-contained).
-
-THIS IS A DELIBERATE COPY of repo-root gallery_state.py semantics
-(v12.34l). Bot2Fetcher does NOT import repo-root modules so it can deploy
-standalone on its own Render service; the COLLECTION NAME, FIELD NAMES and
-STATUS VALUES below are the contract and must never drift:
-
-    collection : galleries
-    _id        : str(gallery_id)
-    status     : PROCESSING | COMPLETED | PARTIAL | FAILED_TIMEOUT |
-                 FAILED_BOT2_ERROR | FAILED_SCRAPE | FAILED_OTHER
-    on done    : db_cover_msg_id, db_pdf_msg_id, open_link  (Bot 0 reads
-                 these three to forward instantly — nothing else matters)
-
-Claim policy for this bot: NEVER-TRIED ONLY.
-  * no doc                    -> claim (insert PROCESSING)
-  * PROCESSING, claim expired -> re-claim (stuck job from a crashed worker)
-  * PROCESSING, fresh         -> someone (Bot 0 or our other slot) is on it
-  * COMPLETED / PARTIAL       -> already in DB channel, skip
-  * FAILED_*                  -> operator said: never retry, skip
-
-All writes are find_one_and_update / insert_one with DuplicateKey handling
-— atomic, so Bot 0's worker and both of our slots can race the same gid
-and exactly ONE wins.
+mongo_state.py — Bot 0 `galleries` collection state machine.
 """
 from __future__ import annotations
 
@@ -51,7 +28,6 @@ _client: Optional[MongoClient] = None
 
 
 def connect(uri: str, db_name: str):
-    """One process-wide client (same pattern as repo-root db.py)."""
     global _client
     with _lock:
         if _client is None:
@@ -69,9 +45,7 @@ class Galleries:
         self.coll = db["galleries"]
         self.stale_s = stale_s
 
-    # ------------------------------------------------------------------
     def claim(self, gid: str) -> str:
-        """Return 'claimed' | 'done' | 'failed' | 'busy'."""
         gid = str(gid)
         now = time.time()
         doc = {
@@ -99,7 +73,7 @@ class Galleries:
             return "failed"
         if st == STATUS_PROCESSING:
             exp = float(existing.get("claim_expires") or 0)
-            if exp < now:  # stale -> atomic re-claim
+            if exp < now:
                 res = self.coll.find_one_and_update(
                     {"_id": gid, "status": STATUS_PROCESSING, "claim_expires": {"$lt": now}},
                     {"$set": {
@@ -121,7 +95,6 @@ class Galleries:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
     def mark_completed(self, gid: str, *, title: str, cover_msg_id: int,
                        pdf_msg_id: int, open_link: str, pages: int = 0) -> None:
         now = time.time()
@@ -157,7 +130,6 @@ class Galleries:
         )
 
     def release_claim(self, gid: str) -> None:
-        """Give up a claim without tombstoning (e.g. shutdown mid-job)."""
         try:
             self.coll.delete_one({"_id": str(gid), "status": STATUS_PROCESSING,
                                   "source": "bot2fetcher"})

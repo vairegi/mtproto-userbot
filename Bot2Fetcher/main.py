@@ -1,16 +1,5 @@
 """
 main.py — Bot2Fetcher entrypoint (Render web service).
-
-Boots three things in ONE process:
-  1. FastAPI on $PORT        — /healthz (Render health check),
-                               /status (JSON), / (tiny HTML page)
-  2. Fetcher                 — N userbot slots pulling gallery ids from the
-                               shared Turso cache, claiming in Mongo, and
-                               posting cover+PDF into the DB channel
-  3. Dashboard               — optional Telegram log-channel live message
-
-Run:  python -m Bot2Fetcher.main      (from repo root)
-  or: cd Bot2Fetcher && python main.py
 """
 from __future__ import annotations
 

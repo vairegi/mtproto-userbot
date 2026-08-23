@@ -1,37 +1,39 @@
-APPEND THE SECTION BELOW TO GUIDE.md (new "## v12.40" entry at the end)
+APPEND THE SECTION BELOW TO GUIDE.md
 ========================================================================
 
-## v12.40 — Bot2Fetcher service (2026-08-23)
+## v12.40a — Bot2Fetcher turso row-parser fix (2026-08-23)
 
-### What
-New third service `Bot2Fetcher/` in repo root. Standalone Render web
-service (own account) that mass-warms the DB channel: scans the shared
-Turso `nhentai_cache` (recent search pages first, then every `gallery:*`
-key newest-cached first), claims never-tried galleries in the shared
-Mongo `galleries` collection, DMs the URL to @Gallery_DLBot from its own
-userbot slot(s), and posts cover+PDF into the DB channel.
+### Symptom
+First deploy log:
+    WARNING bot2fetcher.turso: turso execute failed (SELECT): 'result'
+    INFO    bot2fetcher.fetcher: scan: 0 candidate galleries
 
-### Contract it honours (do not break)
-- Mongo `galleries` doc fields are byte-compatible with gallery_state.py
-  v12.34l: `_id` str, `status`, `db_cover_msg_id`, `db_pdf_msg_id`,
-  `open_link`. Bot 0 forwards from these fields unchanged. Extra field
-  `source: "bot2fetcher"` marks its rows.
-- Claim is atomic (insert_one / find_one_and_update on claim_expires) so
-  Bot 0's worker and both fetcher slots can race a gid; exactly one wins.
-  Never-tried only: COMPLETED/PARTIAL/FAILED_* docs are never retried.
-- Cover+PDF post under one global asyncio lock (v12.34 atomic pairing —
-  no orphan covers).
-- Turso: READS `nhentai_cache` only; WRITES only its own
-  `bot2_fetch_state` table. Never touches `nhentai_ratelimit`.
-- Adaptive PDF wait: 90s + 1.7s/page clamped [180, 900] (v11.3 lesson).
-- FloodWait -> sleep e.seconds+5, job re-queued once.
-- Multi-slot: STRING_SESSION + optional STRING_SESSION_2, one active job
-  per slot, per-slot DM polling so PDFs never cross-match.
+The bot booted, connected to Mongo, authorised the userbot, then found
+zero work to do and idled. Cache has 15 065 rows — should have been
+7 251 candidates.
 
-### Deploy
-Render Web Service, root dir `Bot2Fetcher`, start `python main.py`.
-Env: API_ID, API_HASH, STRING_SESSION(_2), MONGO_URI, MONGO_DB_NAME,
-TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, DB_CHANNEL_ID; optional
-BOT2_USERNAME, LOG_CHANNEL_ID, FETCH_GAP_*, STALE_PROCESSING_S,
-RESCAN_SLEEP_S. Both userbot accounts must be admins (post rights) in
-the DB channel and members of the log channel if the dashboard is used.
+### Root cause
+`turso_store.py::scan_cache` did:
+    for k, payload, cached_at in rows:
+libsql_client 0.3.x returns Row objects that support MAPPING access
+(row["key"]) OR sequence unpacking depending on build. On the Render
+instance the tuple-unpack path raised `KeyError: 'result'` from inside
+libsql_client's own row wrapper, which the generic `except Exception`
+swallowed as an "execute failed" warning. Result: 0 rows.
+
+### Fix
+`turso_store.py` — new `_row_to_dict(row, columns)` helper tries mapping
+access first, then positional, then attribute — always returns a plain
+dict keyed by column name. `execute()` now returns
+`{"columns": [...], "rows": [dict, ...]}` and every caller reads by
+column name, immune to the client's row-shape choices. Also decodes
+bytes payloads and coerces `cached_at` safely.
+
+### Verify after deploy
+Log should show `bot2fetcher.turso: scan_cache: read 15065 rows` and
+`bot2fetcher.fetcher: scan: 7251 candidate galleries`, followed by
+`slot 1 claimed <gid>` and completed jobs.
+
+### Rollout
+Copy `Bot2Fetcher/` over the existing folder, push, Manual Deploy on
+Render. No env changes.
