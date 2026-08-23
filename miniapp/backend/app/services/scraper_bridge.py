@@ -1041,16 +1041,30 @@ def gallery_detail(gallery_id: str) -> dict:
 def gallery_suggestions(gallery_id: str, limit: int = 6) -> list[dict]:
     """Return up to `limit` card dicts for galleries similar to `gallery_id`.
 
-    Uses nhentai's `?include=suggestions` payload. On any failure returns
-    []; the frontend hides the row when the list is empty.
+    v12.34k: TURSO-ONLY tag-overlap ranker. NEVER calls nhentai.
+
+    Design (operator decision 2026-08-23):
+      1. Read the target gallery's tag_groups from Turso (already cached
+         as `gallery:<gid>` — the sheet just opened, so this is a HIT).
+      2. Build a signal-set from content-heavy tag types only
+         (tag, parody, character, artist, group). language/category are
+         omitted because they'd match ~half the corpus (english/doujinshi).
+      3. Scan Turso `nhentai_cache` for every other `gallery:*` row,
+         parse its payload, count overlap. Cap the scan at 2000 rows so
+         one call never exceeds ~400ms even on a warm 10k+ corpus.
+      4. Sort by (overlap desc, favorites desc) so ties break on quality.
+      5. Return top `limit` as card dicts. Cache the result at
+         `similar:<gid>` so a re-open is an instant HIT.
+
+    Fail-open: any error returns [] and the sheet hides the row.
     """
     gid = str(gallery_id or "").strip()
     if not gid.isdigit():
         return []
     limit = max(1, min(int(limit or 6), 12))
 
-    # ---- Turso READ -------------------------------------------------------
-    _key = f"suggest:{gid}"
+    # ---- Cache READ (memoised result) ------------------------------------
+    _key = f"similar:{gid}"
     _nhc = _sb_turso_cache()
     if _nhc is not None:
         try:
@@ -1062,84 +1076,122 @@ def gallery_suggestions(gallery_id: str, limit: int = 6) -> list[dict]:
             log.info(_LOG_HIT, _key)
             return _hit[:limit]
 
-    # ---- Rate-limit back-off (piggy-back on _direct_nhentai_detail's) ----
-    cache_key = ("suggest", gid)
-    now = _time.time()
-    ban = _RATE_LIMIT_CACHE.get(cache_key)
-    if ban and ban > now:
+    # ---- Load TARGET gallery from Turso (must already be cached) --------
+    if _nhc is None:
         return []
-
-    # ---- Upstream fetch --------------------------------------------------
     try:
-        r = httpx.get(
-            f"{_NH_API}/galleries/{gid}",
-            params={"include": "suggestions"},
-            headers={
-                "User-Agent": _UA,
-                "Accept": "application/json",
-                "Referer": "https://nhentai.net/",
-            },
-            timeout=15,
-        )
-        if r.status_code == 429:
-            retry_after = r.headers.get("Retry-After") if hasattr(r, "headers") else None
-            dur = _rate_limit_backoff_sec(cache_key, retry_after)
-            _rl_cache_set(cache_key, now + dur)
-            log.warning(
-                "nhentai HTTP 429 for /galleries/%s?include=suggestions — "
-                "backing off for %ss%s",
-                gid, dur,
-                f" (Retry-After={retry_after})" if retry_after else "",
-            )
-            return []
-        if 200 <= r.status_code < 300:
-            _RATE_LIMIT_STRIKES.pop(cache_key, None)
-        r.raise_for_status()
-        detail = r.json() or {}
-    except httpx.HTTPStatusError as e:
-        log.warning(
-            "nhentai suggestions HTTP %s for id=%r: %s",
-            getattr(e.response, "status_code", "?"), gid, e,
-        )
-        return []
+        target = _nhc.get(f"gallery:{gid}", allow_stale=True)
     except Exception as e:  # noqa: BLE001
-        log.warning("nhentai suggestions network fail id=%r: %s", gid, e)
+        log.warning("nhc.get(gallery:%s) raised: %s", gid, e)
+        return []
+    if not isinstance(target, dict) or not target.get("id"):
+        # Target not in Turso — the sheet must have just opened it, so it
+        # WILL be cached on the very next call. Return empty this time;
+        # the row hides itself, and the next open lands a HIT.
+        log.info("similar(%s): target not yet in Turso; skipping", gid)
         return []
 
-    raw = detail.get("suggestions") or []
-    if not isinstance(raw, list):
+    # ---- Build target signal-set ----------------------------------------
+    HEAVY_TYPES = {"tag", "parody", "character", "artist", "group"}
+    def _signal_set(g: dict) -> set:
+        s: set = set()
+        tg = g.get("tag_groups") or {}
+        if isinstance(tg, dict):
+            for typ, names in tg.items():
+                if typ not in HEAVY_TYPES:
+                    continue
+                if isinstance(names, list):
+                    for n in names:
+                        n = str(n).strip().lower()
+                        if n:
+                            s.add(f"{typ}:{n}")
+        # Fallback for older cached shapes that only have flat `tags`.
+        if not s:
+            for t in g.get("tags") or []:
+                if not isinstance(t, dict):
+                    continue
+                typ = str(t.get("type") or "tag").strip().lower()
+                nm  = str(t.get("name") or "").strip().lower()
+                if typ in HEAVY_TYPES and nm:
+                    s.add(f"{typ}:{nm}")
+        return s
+
+    target_signals = _signal_set(target)
+    if not target_signals:
+        log.info("similar(%s): target has no heavy-tag signals", gid)
         return []
 
-    # ---- Normalise into card-dict shape ---------------------------------
-    out: list[dict] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
+    # ---- Turso scan: pull all gallery:* keys, then their payloads -------
+    # Scan cap is deliberate; 2000 rows keeps the whole scoring loop under
+    # ~400ms on a p95 request. When the corpus grows past 20k rows we can
+    # add a sample-N-random-rows pass here; for the current ~10k-row scale
+    # "scan latest N" is a sound approximation because BOT 1 walks the
+    # popular sorts newest-first.
+    SCAN_CAP = 2000
+    try:
+        rs = _turso.execute(
+            "SELECT key, payload FROM nhentai_cache "
+            "WHERE key LIKE 'gallery:%' AND key != ? "
+            "ORDER BY cached_at DESC LIMIT ?",
+            [f"gallery:{gid}", SCAN_CAP],
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("similar(%s): turso scan raised: %s", gid, e)
+        return []
+    if rs is None or not getattr(rs, "rows", None):
+        log.info("similar(%s): turso scan returned no rows", gid)
+        return []
+
+    # ---- Score every candidate ------------------------------------------
+    import json as _json
+    scored: list = []   # (overlap, favorites, item_id, card_dict)
+    for row in rs.rows:
         try:
-            sid = str(item.get("id") or "").strip()
-            if not sid or sid == gid:
+            payload_str = row[1]
+            if not payload_str:
                 continue
-            out.append({
-                "id":    item.get("id"),
-                "title": _title_from_item(item),
-                "title_en_clean": _title_en_clean_from_item(item),
-                "cover": _thumb_url_from_item(item),
-                "pages": item.get("num_pages"),
-                "tags":  [{"name": t.get("name"), "type": t.get("type")}
-                          for t in item.get("tags") or [] if isinstance(t, dict)],
-            })
-        except Exception as e:  # noqa: BLE001
-            log.debug("suggestion item skip: %s", e)
+            g = _json.loads(payload_str)
+            if not isinstance(g, dict) or not g.get("id"):
+                continue
+            cand_signals = _signal_set(g)
+            if not cand_signals:
+                continue
+            overlap = len(target_signals & cand_signals)
+            if overlap == 0:
+                continue
+            favs = int(g.get("favorites") or 0)
+            card = {
+                "id":    g.get("id"),
+                "title": g.get("title") or f"#{g.get('id')}",
+                "title_en_clean": g.get("title_english") or g.get("title") or "",
+                "cover": g.get("cover") or g.get("page1_url") or "",
+                "pages": g.get("pages"),
+                "tags":  g.get("tags") or [],
+            }
+            scored.append((overlap, favs, str(g.get("id")), card))
+        except Exception:  # noqa: BLE001
             continue
 
-    # ---- Turso WRITE (best-effort, gates on never-expire kill-switch) ---
+    if not scored:
+        log.info("similar(%s): 0 tag-overlap matches in %d scanned rows",
+                 gid, len(rs.rows))
+        return []
+
+    # Sort: overlap desc, then favorites desc for tie-break.
+    scored.sort(key=lambda t: (-t[0], -t[1]))
+    out = [t[3] for t in scored[:limit]]
+
+    log.info(
+        "similar(%s): scanned=%d matched=%d returned=%d top_overlap=%d",
+        gid, len(rs.rows), len(scored), len(out), scored[0][0],
+    )
+
+    # ---- Cache the ranked result ----------------------------------------
     if out and _nhc is not None:
         try:
-            import json as _json
             _bytes = len(_json.dumps(out, default=str))
         except Exception:  # noqa: BLE001
             _bytes = -1
-        log.info(_LOG_MISS, _key)
         try:
             _ok = _nhc.put(_key, out)
             if _ok == "unchanged":
@@ -1149,7 +1201,7 @@ def gallery_suggestions(gallery_id: str, limit: int = 6) -> list[dict]:
         except Exception as e:  # noqa: BLE001
             log.debug("turso write failed for %s: %s", _key, e)
 
-    return out[:limit]
+    return out
 
 
 def route_status() -> dict:
