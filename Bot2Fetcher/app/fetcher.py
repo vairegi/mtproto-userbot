@@ -1,22 +1,25 @@
 """
 fetcher.py — the Bot2Fetcher pipeline.
 
-v12.40g — PDF-WAIT FIX. Previous version treated @Gallery_DLBot's
-progress messages ("Starting upload...", "📤 Uploading PDF...", the
-title-echo confirmation, the "‣ Status: Uploading ‣ Progress: […]"
-progress bar) as errors and bailed after ~5s, so the PDF never arrived
-in the DB channel.
+v12.40h — PDF-FIRST ORDER.
+Per-job order is now:
+  1) claim in Mongo (atomic vs Bot 0 + our other slot)
+  2) load meta from Turso (cache-only, no upstream)
+  3) DM the link to @Gallery_DLBot   <-- upstream first
+  4) WAIT for the PDF document (adaptive timeout)
+     * on hard error / timeout  -> drop the claim (delete Mongo doc),
+                                   NOTHING is posted to the DB channel,
+                                   move to next job
+     * on PDF received:
+  5) download + normalise cover bytes
+  6) enter channel critical-section lock and post them BACK-TO-BACK:
+        cover photo (spoiler)  ->  msg_id A
+        PDF forwarded / re-uploaded -> msg_id B
+  7) mark_completed in Mongo with A + B + open_link so Bot 0 forwards
+     for any user click after this instant.
 
-New behaviour of _request_pdf():
-  * poll every 3s for messages FROM the bot (out=False) received AFTER
-    our DM
-  * if any message carries a document -> return it, done
-  * if the newest text message matches a HARD ERROR pattern (❌, ⚠️,
-    'error:', 'failed', 'not found', 'invalid', 'sorry') -> stop and
-    tombstone as FAILED_BOT2_ERROR
-  * anything else (title echoes, "Starting upload…", progress bars,
-    percent updates, etc.) is IGNORED — keep waiting for the document
-    until the adaptive timeout fires
+This eliminates the race: if we can't produce a PDF, no cover goes into
+the channel, so Bot 0 never sees a half-done gallery from us.
 """
 from __future__ import annotations
 
@@ -52,7 +55,6 @@ _COVER_HEADERS = {
     "Referer": "https://nhentai.net/",
 }
 
-# Real error signals from @Gallery_DLBot. Case-insensitive substring match.
 _HARD_ERROR_PATTERNS = re.compile(
     r"(❌|⛔|🚫|\berror\b|\bfailed\b|not found|"
     r"invalid|unavailable|forbidden|blocked|removed|"
@@ -78,6 +80,7 @@ class Stats:
         self.claimed = 0
         self.completed = 0
         self.failed = 0
+        self.dropped = 0
         self.in_flight: Dict[str, str] = {}
         self.started_at = time.time()
         self.last_finished_at = 0.0
@@ -92,6 +95,7 @@ class Stats:
             "claimed": self.claimed,
             "completed": self.completed,
             "failed": self.failed,
+            "dropped": self.dropped,
             "skipped_done": self.skipped_done,
             "skipped_failed": self.skipped_failed,
             "skipped_busy": self.skipped_busy,
@@ -188,11 +192,13 @@ class Fetcher:
                 wait = int(getattr(fw, "seconds", 30)) + 5
                 log.warning("🚧 slot %d FloodWait %ss on %s — sleeping, will retry",
                             idx, wait, gid)
+                self.galleries.drop_claim(gid)
                 await asyncio.sleep(wait)
                 await self._queue.put(gid)
                 did_work = False
             except Exception as e:
                 log.exception("💥 slot %d job %s crashed: %s", idx, gid, e)
+                self.galleries.drop_claim(gid)
                 self.stats.failed += 1
                 did_work = True
             finally:
@@ -220,57 +226,68 @@ class Fetcher:
         self.stats.in_flight[gid] = f"slot{idx}"
         log.info("🎯 slot %d claimed %s — starting job", idx, gid)
         try:
+            # ---- (2) META (Turso only) --------------------------------
             cache_row = await self.turso.get_gallery_row(gid)
             m = meta_mod.meta_from_cache(gid, cache_row)
             if m is None:
-                log.warning("⚠️ %s — no cached meta, marking FAILED_SCRAPE", gid)
-                self.galleries.mark_failed(gid, status="FAILED_SCRAPE",
-                                           error="no Turso cache row / no cover")
-                await self.turso.put_state(gid, {"status": "FAILED_SCRAPE"})
-                self.stats.failed += 1
+                log.warning("⚠️ %s — no cached meta, dropping claim", gid)
+                self.galleries.drop_claim(gid)
+                self.stats.dropped += 1
                 return True
             timeout = compute_pdf_timeout(m.get("pages") or 0)
             caption = meta_mod.caption_for(m)
             log.info("📄 %s — %d pages, PDF wait budget %ds",
                      gid, m.get("pages") or 0, int(timeout))
 
+            # ---- (3) DM link  ->  (4) WAIT for PDF (BEFORE cover) -----
+            pdf_msg = await self._request_pdf(client, gid, timeout)
+            if pdf_msg is None:
+                log.error("⏰ %s — @Gallery_DLBot timed out (%ds) — dropping, no cover posted",
+                          gid, int(timeout))
+                self.galleries.drop_claim(gid)
+                self.stats.dropped += 1
+                return True
+            if isinstance(pdf_msg, str):
+                log.error("🤖❌ %s — Bot 2 hard error, dropping (no cover posted): %s",
+                          gid, pdf_msg[:150])
+                self.galleries.drop_claim(gid)
+                self.stats.dropped += 1
+                return True
+            log.info("📥 %s — PDF received from @Gallery_DLBot", gid)
+
+            # ---- (5) COVER BYTES (only after PDF confirmed) -----------
+            img_bytes, ext = await self._fetch_cover_bytes(m)
+            # cover bytes are optional — text-only caption is a valid
+            # fallback and still lets us mark_completed with the pair
+            self.galleries.refresh_claim(gid)
+
+            # ---- (6) CHANNEL WRITE: cover + PDF back-to-back ----------
             async with self._channel_lock:
-                cover_msg_id = await self._post_cover(client, m, caption)
+                cover_msg_id = await self._post_cover(client, m, caption,
+                                                     img_bytes, ext)
                 if not cover_msg_id:
-                    log.error("❌ %s — cover post failed", gid)
-                    self.galleries.mark_failed(gid, status="FAILED_OTHER",
-                                               error="cover post failed")
+                    log.error("❌ %s — cover post failed AFTER PDF was in hand — dropping",
+                              gid)
+                    self.galleries.drop_claim(gid)
                     self.stats.failed += 1
                     return True
-                log.info("🖼 %s — spoiler cover posted to DB channel (msg_id=%d)",
-                         gid, cover_msg_id)
-                self.galleries.refresh_claim(gid)
-                pdf_msg = await self._request_pdf(client, gid, timeout)
-                if pdf_msg is None:
-                    log.error("⏰ %s — @Gallery_DLBot timed out (%ds)", gid, int(timeout))
-                    self.galleries.mark_failed(gid, status="FAILED_TIMEOUT",
-                                               error=f"no PDF within {int(timeout)}s")
-                    await self.turso.put_state(gid, {"status": "FAILED_TIMEOUT"})
-                    self.stats.failed += 1
-                    return True
-                if isinstance(pdf_msg, str):
-                    log.error("🤖❌ %s — Bot 2 hard error: %s", gid, pdf_msg[:150])
-                    self.galleries.mark_failed(gid, status="FAILED_BOT2_ERROR",
-                                               error=pdf_msg)
-                    await self.turso.put_state(gid, {"status": "FAILED_BOT2_ERROR"})
-                    self.stats.failed += 1
-                    return True
-                log.info("📥 %s — PDF received from @Gallery_DLBot", gid)
+                log.info("🖼 %s — spoiler cover posted (msg_id=%d)", gid, cover_msg_id)
                 pdf_msg_id = await self._post_pdf(client, pdf_msg, m)
                 if not pdf_msg_id:
-                    log.error("❌ %s — PDF forward to DB channel failed", gid)
-                    self.galleries.mark_failed(gid, status="FAILED_OTHER",
-                                               error="pdf forward failed")
+                    # Cover is in the channel but PDF forward failed —
+                    # try to delete the cover so nothing dangles.
+                    log.error("❌ %s — PDF forward failed after cover; deleting cover",
+                              gid)
+                    try:
+                        await client.delete_messages(self._channel, [cover_msg_id])
+                    except Exception as de:
+                        log.warning("cover cleanup failed: %s", de)
+                    self.galleries.drop_claim(gid)
                     self.stats.failed += 1
                     return True
-                log.info("📤 %s — PDF posted to DB channel (msg_id=%d)",
-                         gid, pdf_msg_id)
+                log.info("📤 %s — PDF posted (msg_id=%d)", gid, pdf_msg_id)
 
+            # ---- (7) MARK COMPLETED -----------------------------------
             link = channel_link(int(self.s.db_channel_id), cover_msg_id)
             self.galleries.mark_completed(
                 gid, title=m["title"], cover_msg_id=cover_msg_id,
@@ -287,8 +304,7 @@ class Fetcher:
         finally:
             self.stats.in_flight.pop(gid, None)
 
-    async def _post_cover(self, client: TelegramClient, m: Dict[str, Any],
-                          caption: str) -> int:
+    async def _fetch_cover_bytes(self, m: Dict[str, Any]) -> tuple[bytes, str]:
         img_bytes: bytes = b""
         ext = ".jpg"
         try:
@@ -299,12 +315,16 @@ class Fetcher:
                     img_bytes = r.content
         except Exception as e:
             log.warning("🖼 cover download %s failed: %s", m["id"], e)
+        if img_bytes:
+            norm, ext = normalise_cover_bytes(img_bytes, source_url=m["cover"])
+            if norm:
+                img_bytes = norm
+        return img_bytes, ext
 
+    async def _post_cover(self, client: TelegramClient, m: Dict[str, Any],
+                          caption: str, img_bytes: bytes, ext: str) -> int:
         try:
             if img_bytes:
-                norm, ext = normalise_cover_bytes(img_bytes, source_url=m["cover"])
-                if norm:
-                    img_bytes = norm
                 buf = io.BytesIO(img_bytes)
                 buf.name = f"cover_{m['id']}{ext or '.jpg'}"
                 try:
@@ -333,15 +353,6 @@ class Fetcher:
             return 0
 
     async def _request_pdf(self, client: TelegramClient, gid: str, timeout: float):
-        """DM the URL and wait for a document reply.
-        Returns:
-          Telethon Message  -> the PDF message
-          str               -> hard error from Bot 2 (tombstone as BOT2_ERROR)
-          None              -> timed out with no document
-        Progress/status messages ("Starting upload...", "Uploading PDF...",
-        "‣ Status: … ‣ Progress: …", title echoes, etc.) are IGNORED and
-        polling continues until the doc arrives or the timeout hits.
-        """
         log.info("📨 DMing @%s: https://nhentai.net/g/%s/",
                  self.s.bot2_username, gid)
         sent = await client.send_message(self._bot2, f"https://nhentai.net/g/{gid}/")
@@ -356,8 +367,6 @@ class Fetcher:
                 raise
             except Exception:
                 continue
-
-            # scan newest -> oldest, only messages FROM the bot AFTER our DM
             latest_incoming = None
             for msg in msgs or []:
                 mid = int(getattr(msg, "id", 0) or 0)
@@ -365,22 +374,16 @@ class Fetcher:
                     continue
                 if getattr(msg, "out", False):
                     continue
-                # First: check for the document across ALL new messages —
-                # not just the newest — in case a text update came in after.
                 doc = getattr(msg, "document", None)
                 if doc is not None:
                     return msg
                 if latest_incoming is None:
                     latest_incoming = msg
-
-            # No document yet. Only inspect the latest incoming text.
             if latest_incoming is not None:
                 text = (getattr(latest_incoming, "raw_text", "") or "").strip()
                 if text:
-                    # Only HARD ERROR patterns abort the wait.
                     if _HARD_ERROR_PATTERNS.search(text):
                         return text[:300]
-                    # Otherwise it's progress/status — throttle-log and wait.
                     now = time.monotonic()
                     if now - last_progress_log > 30:
                         head = text.replace("\n", " ")[:80]

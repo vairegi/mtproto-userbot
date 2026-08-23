@@ -1,5 +1,11 @@
 """
 mongo_state.py — Bot 0 `galleries` collection state machine.
+
+v12.40h: added `drop_claim(gid)` — hard-delete the claim doc (only if
+we own it) so a Bot-2 error/timeout does NOT tombstone the gallery.
+This is the mechanic behind "no cover posted until PDF is confirmed":
+if Bot 2 never returns a PDF, the job disappears from Mongo entirely
+and can be reattempted later, and nothing lands in the DB channel.
 """
 from __future__ import annotations
 
@@ -129,9 +135,21 @@ class Galleries:
             upsert=True,
         )
 
-    def release_claim(self, gid: str) -> None:
+    def drop_claim(self, gid: str) -> None:
+        """Delete our PROCESSING claim so the gallery is untouched in Mongo.
+        Only deletes if this bot owns the doc — never touches another
+        worker's row."""
         try:
-            self.coll.delete_one({"_id": str(gid), "status": STATUS_PROCESSING,
-                                  "source": "bot2fetcher"})
+            r = self.coll.delete_one({
+                "_id": str(gid),
+                "status": STATUS_PROCESSING,
+                "source": "bot2fetcher",
+            })
+            if r.deleted_count:
+                log.info("🧹 dropped claim for %s (no cover posted)", gid)
         except Exception:
             pass
+
+    def release_claim(self, gid: str) -> None:
+        # alias kept for backward-compat with earlier versions
+        self.drop_claim(gid)

@@ -1,50 +1,59 @@
 APPEND THE SECTION BELOW TO GUIDE.md
 ========================================================================
 
-## v12.40g — Bot2Fetcher PDF-wait fix (2026-08-23)
+## v12.40h — Bot2Fetcher PDF-first pipeline (2026-08-23)
 
-### Symptom (v12.40f log)
-Cover posted OK to DB channel every time — but PDF never arrived. After
-~5s the bot logged one of these and tombstoned the job as FAILED_BOT2:
-    🤖❌ 386520 — Bot 2 error: Yowai 200 Chai Okitsune-chan...
-    🤖❌ 334026 — Bot 2 error: Starting upload...
-    🤖❌ 498489 — Bot 2 error: ‣ Status: Uploading ‣ Progress: [
-    🤖❌ 489843 — Bot 2 error: 📤 Uploading PDF...
+### Change requested
+Cover MUST NOT be posted until the PDF is confirmed to be in hand.
+Rationale: with old ordering (cover -> DM link -> wait), if @Gallery_DLBot
+errored or timed out the cover sat orphaned in the DB channel. That
+raced Bot 0's own COMPLETED-check: Bot 0 could see the channel has a
+cover-labelled msg for that gid and think it's a done pair.
 
-### Root cause
-`_request_pdf` blacklisted only these keywords as "progress" —
-    wait / download / process / queue / ⏳
-— and treated everything else as an error. But @Gallery_DLBot's real
-progress stream contains:
-  * the title echo (confirmation)
-  * "Starting upload..."
-  * "📤 Uploading PDF..."
-  * "‣ Status: Uploading ‣ Progress: [====]"
-None of those match the blacklist, so the bot bailed ~5s after DMing
-the link, before the actual PDF document arrived.
+### New per-job order
+    1. claim gid in Mongo
+    2. meta from Turso (cache-only)
+    3. DM link to @Gallery_DLBot
+    4. wait for PDF document
+         hard error / timeout -> `galleries.drop_claim(gid)` (delete
+           the Mongo doc; gallery becomes fresh again, nothing hits
+           the DB channel), move to next job
+         PDF received -> continue
+    5. download + normalise cover bytes
+    6. inside channel-write lock, back-to-back:
+         cover photo (spoiler)  -> cover_msg_id
+         PDF forward / re-upload -> pdf_msg_id
+    7. mark_completed with both ids + open_link
 
-### Fix
-Inverted the logic. Now:
-  * Poll every 3s. Loop over ALL new messages from the bot.
-  * If ANY of them has a document -> that's the PDF, return it.
-  * If none has a document, look at the newest text message.
-      - If it matches _HARD_ERROR_PATTERNS (❌ / ⛔ / 🚫 / "error" /
-        "failed" / "not found" / "invalid" / "unavailable" /
-        "forbidden" / "blocked" / "removed" / "unsupported" /
-        "can't find" / "can't download" / "can't process" / starts
-        with "sorry" / "please try again"), abort as BOT2_ERROR.
-      - Otherwise: it's progress/status; log a throttled "⏳ waiting"
-        line every 30s and keep polling until the adaptive timeout.
+If cover post succeeds but PDF forward fails, the just-posted cover is
+deleted so the channel stays clean.
+
+### mongo_state.py new API
+    drop_claim(gid)  — hard-delete the PROCESSING doc, but only if it
+                       has source=='bot2fetcher'. Never touches another
+                       worker's row.
+    release_claim(gid) — alias, kept for back-compat.
+
+### Stats
+Added `dropped` counter (Bot 2 error / timeout / no meta), separate from
+`failed` (channel-write failure after PDF was received). `/status` and
+the dashboard both show it.
 
 ### Verify after deploy
-Log will now show, per job:
-    🖼 <gid> — spoiler cover posted...
+Log per successful job:
+    🎯 slot 1 claimed <gid> — starting job
+    🔍 gallery:<gid> — meta OK from Turso: ...
+    📄 <gid> — <pages> pages, PDF wait budget <s>s
     📨 DMing @Gallery_DLBot: https://nhentai.net/g/<gid>/
-    ⏳ <gid> — waiting for PDF (Xs left) · Bot 2: 'Starting upload...'
-    ⏳ <gid> — waiting for PDF (Xs left) · Bot 2: '📤 Uploading PDF...'
+    ⏳ <gid> — waiting for PDF (Xs left) · Bot 2: '...'
     📥 <gid> — PDF received from @Gallery_DLBot
-    📤 <gid> — PDF posted to DB channel (msg_id=NNN)
-    ✅ <gid> DONE — cover=... pdf=... (total completed: N)
+    🖼 <gid> — spoiler cover posted (msg_id=NNN)
+    📤 <gid> — PDF posted (msg_id=NNN)
+    ✅ <gid> DONE — cover=... pdf=...
+
+Log per dropped job (nothing in DB channel):
+    ⏰ <gid> — @Gallery_DLBot timed out — dropping, no cover posted
+    🧹 dropped claim for <gid> (no cover posted)
 
 ### Rollout
 Copy `Bot2Fetcher/` over, push, Manual Deploy. Env unchanged.
