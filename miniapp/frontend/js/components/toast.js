@@ -16,8 +16,10 @@ register("toast", ({ text, kind = "", duration = 2400 }) => {
   if (kind === "success") haptic("success");
   else if (kind === "error") haptic("error");
   setTimeout(() => {
+    // v12.34h: toast is anchored to TOP-CENTER (CSS #toast-root uses top:).
+    // Slide out UPWARD so the exit motion mirrors the top-anchored entry.
     el.style.opacity = "0";
-    el.style.transform = "translateY(8px)";
+    el.style.transform = "translateY(-8px)";
     setTimeout(() => el.remove(), 220);
   }, duration);
   return el;
