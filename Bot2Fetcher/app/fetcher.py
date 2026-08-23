@@ -1,9 +1,22 @@
 """
 fetcher.py — the Bot2Fetcher pipeline.
 
-v12.40f: rest window shortened to 3-8s AND applied ONLY after real work
-(claim + fetch), never after a skip. Skips loop instantly to the next
-queue item.
+v12.40g — PDF-WAIT FIX. Previous version treated @Gallery_DLBot's
+progress messages ("Starting upload...", "📤 Uploading PDF...", the
+title-echo confirmation, the "‣ Status: Uploading ‣ Progress: […]"
+progress bar) as errors and bailed after ~5s, so the PDF never arrived
+in the DB channel.
+
+New behaviour of _request_pdf():
+  * poll every 3s for messages FROM the bot (out=False) received AFTER
+    our DM
+  * if any message carries a document -> return it, done
+  * if the newest text message matches a HARD ERROR pattern (❌, ⚠️,
+    'error:', 'failed', 'not found', 'invalid', 'sorry') -> stop and
+    tombstone as FAILED_BOT2_ERROR
+  * anything else (title echoes, "Starting upload…", progress bars,
+    percent updates, etc.) is IGNORED — keep waiting for the document
+    until the adaptive timeout fires
 """
 from __future__ import annotations
 
@@ -11,6 +24,7 @@ import asyncio
 import io
 import logging
 import random
+import re
 import time
 from typing import Any, Dict
 
@@ -26,7 +40,7 @@ from .pdf_timing import compute_pdf_timeout
 
 log = logging.getLogger("bot2fetcher.fetcher")
 
-POLL_EVERY_S = 5.0
+POLL_EVERY_S = 3.0
 
 _UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -37,6 +51,15 @@ _COVER_HEADERS = {
     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     "Referer": "https://nhentai.net/",
 }
+
+# Real error signals from @Gallery_DLBot. Case-insensitive substring match.
+_HARD_ERROR_PATTERNS = re.compile(
+    r"(❌|⛔|🚫|\berror\b|\bfailed\b|not found|"
+    r"invalid|unavailable|forbidden|blocked|removed|"
+    r"unsupported|can(?:not|'t) (?:find|download|process)|"
+    r"^sorry\b|please try again)",
+    re.IGNORECASE,
+)
 
 
 def channel_link(channel_id: int, msg_id: int) -> str:
@@ -171,18 +194,15 @@ class Fetcher:
             except Exception as e:
                 log.exception("💥 slot %d job %s crashed: %s", idx, gid, e)
                 self.stats.failed += 1
-                did_work = True   # actual work attempted + failed -> pace it
+                did_work = True
             finally:
                 self._queue.task_done()
-            # Rest ONLY after a real job (claim + work). Skips loop instantly.
             if did_work:
                 gap = random.uniform(self.s.fetch_gap_min, self.s.fetch_gap_max)
                 log.info("⏸ slot %d resting %ds", idx, int(gap))
                 await asyncio.sleep(gap)
 
     async def _do_job(self, idx: int, client: TelegramClient, gid: str) -> bool:
-        """Return True if a real fetch was attempted (=> rest afterwards),
-        False if it was a skip (loop instantly to next)."""
         decision = self.galleries.claim(gid)
         if decision == "done":
             self.stats.skipped_done += 1
@@ -234,7 +254,7 @@ class Fetcher:
                     self.stats.failed += 1
                     return True
                 if isinstance(pdf_msg, str):
-                    log.error("🤖❌ %s — Bot 2 error: %s", gid, pdf_msg[:100])
+                    log.error("🤖❌ %s — Bot 2 hard error: %s", gid, pdf_msg[:150])
                     self.galleries.mark_failed(gid, status="FAILED_BOT2_ERROR",
                                                error=pdf_msg)
                     await self.turso.put_state(gid, {"status": "FAILED_BOT2_ERROR"})
@@ -313,32 +333,61 @@ class Fetcher:
             return 0
 
     async def _request_pdf(self, client: TelegramClient, gid: str, timeout: float):
-        log.info("📨 DMing @%s: https://nhentai.net/g/%s/", self.s.bot2_username, gid)
+        """DM the URL and wait for a document reply.
+        Returns:
+          Telethon Message  -> the PDF message
+          str               -> hard error from Bot 2 (tombstone as BOT2_ERROR)
+          None              -> timed out with no document
+        Progress/status messages ("Starting upload...", "Uploading PDF...",
+        "‣ Status: … ‣ Progress: …", title echoes, etc.) are IGNORED and
+        polling continues until the doc arrives or the timeout hits.
+        """
+        log.info("📨 DMing @%s: https://nhentai.net/g/%s/",
+                 self.s.bot2_username, gid)
         sent = await client.send_message(self._bot2, f"https://nhentai.net/g/{gid}/")
         sent_id = int(getattr(sent, "id", 0) or 0)
         deadline = time.monotonic() + timeout
+        last_progress_log = 0.0
         while time.monotonic() < deadline:
             await asyncio.sleep(POLL_EVERY_S)
             try:
-                msgs = await client.get_messages(self._bot2, limit=10)
+                msgs = await client.get_messages(self._bot2, limit=15)
             except FloodWaitError:
                 raise
             except Exception:
                 continue
+
+            # scan newest -> oldest, only messages FROM the bot AFTER our DM
+            latest_incoming = None
             for msg in msgs or []:
-                if int(getattr(msg, "id", 0) or 0) <= sent_id:
+                mid = int(getattr(msg, "id", 0) or 0)
+                if mid <= sent_id:
                     continue
                 if getattr(msg, "out", False):
                     continue
+                # First: check for the document across ALL new messages —
+                # not just the newest — in case a text update came in after.
                 doc = getattr(msg, "document", None)
                 if doc is not None:
                     return msg
-                text = (getattr(msg, "raw_text", "") or "").strip()
+                if latest_incoming is None:
+                    latest_incoming = msg
+
+            # No document yet. Only inspect the latest incoming text.
+            if latest_incoming is not None:
+                text = (getattr(latest_incoming, "raw_text", "") or "").strip()
                 if text:
-                    low = text.lower()
-                    if any(w in low for w in ("wait", "download", "process", "queue", "⏳")):
-                        continue
-                    return text[:300]
+                    # Only HARD ERROR patterns abort the wait.
+                    if _HARD_ERROR_PATTERNS.search(text):
+                        return text[:300]
+                    # Otherwise it's progress/status — throttle-log and wait.
+                    now = time.monotonic()
+                    if now - last_progress_log > 30:
+                        head = text.replace("\n", " ")[:80]
+                        remain = int(deadline - now)
+                        log.info("⏳ %s — waiting for PDF (%ds left) · Bot 2: %r",
+                                 gid, remain, head)
+                        last_progress_log = now
         return None
 
     async def _post_pdf(self, client: TelegramClient, pdf_msg, m: Dict[str, Any]) -> int:

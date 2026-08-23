@@ -1,24 +1,50 @@
 APPEND THE SECTION BELOW TO GUIDE.md
 ========================================================================
 
-## v12.40f — Bot2Fetcher rest only after real work (2026-08-23)
+## v12.40g — Bot2Fetcher PDF-wait fix (2026-08-23)
 
-### Symptom (v12.40e log)
-    🚫 619612 previously failed — skipped
-    ⏸ slot 1 resting 27s
-    🚫 571509 previously failed — skipped
-    ⏸ slot 1 resting 48s
+### Symptom (v12.40f log)
+Cover posted OK to DB channel every time — but PDF never arrived. After
+~5s the bot logged one of these and tombstoned the job as FAILED_BOT2:
+    🤖❌ 386520 — Bot 2 error: Yowai 200 Chai Okitsune-chan...
+    🤖❌ 334026 — Bot 2 error: Starting upload...
+    🤖❌ 498489 — Bot 2 error: ‣ Status: Uploading ‣ Progress: [
+    🤖❌ 489843 — Bot 2 error: 📤 Uploading PDF...
 
-With ~10 tombstoned galleries at the head of the queue the slot sat idle
-for ~5 min chewing through skips at 20-60 s each.
+### Root cause
+`_request_pdf` blacklisted only these keywords as "progress" —
+    wait / download / process / queue / ⏳
+— and treated everything else as an error. But @Gallery_DLBot's real
+progress stream contains:
+  * the title echo (confirmation)
+  * "Starting upload..."
+  * "📤 Uploading PDF..."
+  * "‣ Status: Uploading ‣ Progress: [====]"
+None of those match the blacklist, so the bot bailed ~5s after DMing
+the link, before the actual PDF document arrived.
 
 ### Fix
-1. `_do_job` now returns bool: True = real work attempted, False = skip.
-2. Slot loop rests ONLY when did_work == True. Skips (done / failed /
-   busy) loop to the next queue item instantly.
-3. Default rest window is now 3-8 s (was 20-60 s). Env overrides:
-   FETCH_GAP_MIN_S=3, FETCH_GAP_MAX_S=8. Existing operators can raise
-   these via Render env if they want a slower cadence.
+Inverted the logic. Now:
+  * Poll every 3s. Loop over ALL new messages from the bot.
+  * If ANY of them has a document -> that's the PDF, return it.
+  * If none has a document, look at the newest text message.
+      - If it matches _HARD_ERROR_PATTERNS (❌ / ⛔ / 🚫 / "error" /
+        "failed" / "not found" / "invalid" / "unavailable" /
+        "forbidden" / "blocked" / "removed" / "unsupported" /
+        "can't find" / "can't download" / "can't process" / starts
+        with "sorry" / "please try again"), abort as BOT2_ERROR.
+      - Otherwise: it's progress/status; log a throttled "⏳ waiting"
+        line every 30s and keep polling until the adaptive timeout.
+
+### Verify after deploy
+Log will now show, per job:
+    🖼 <gid> — spoiler cover posted...
+    📨 DMing @Gallery_DLBot: https://nhentai.net/g/<gid>/
+    ⏳ <gid> — waiting for PDF (Xs left) · Bot 2: 'Starting upload...'
+    ⏳ <gid> — waiting for PDF (Xs left) · Bot 2: '📤 Uploading PDF...'
+    📥 <gid> — PDF received from @Gallery_DLBot
+    📤 <gid> — PDF posted to DB channel (msg_id=NNN)
+    ✅ <gid> DONE — cover=... pdf=... (total completed: N)
 
 ### Rollout
 Copy `Bot2Fetcher/` over, push, Manual Deploy. Env unchanged.

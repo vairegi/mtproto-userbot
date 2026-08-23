@@ -1,8 +1,5 @@
 """
 config.py — Bot2Fetcher env loader.
-
-v12.40f: default rest window shortened to 3-8s (was 20-60s). Rest only
-applies AFTER a real job (claim + work), never after a skip.
 """
 from __future__ import annotations
 
