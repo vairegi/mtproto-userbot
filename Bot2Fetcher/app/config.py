@@ -1,5 +1,8 @@
 """
 config.py — Bot2Fetcher env loader.
+
+v12.40f: default rest window shortened to 3-8s (was 20-60s). Rest only
+applies AFTER a real job (claim + work), never after a skip.
 """
 from __future__ import annotations
 
@@ -79,8 +82,8 @@ def load() -> Settings:
         db_channel_id=_req("DB_CHANNEL_ID", "DATABASE_CHANNEL_ID"),
         bot2_username=_first("BOT2_USERNAME") or "Gallery_DLBot",
         log_channel_id=_first("LOG_CHANNEL_ID"),
-        fetch_gap_min=_int("FETCH_GAP_MIN_S", 20),
-        fetch_gap_max=_int("FETCH_GAP_MAX_S", 60),
+        fetch_gap_min=_int("FETCH_GAP_MIN_S", 3),
+        fetch_gap_max=_int("FETCH_GAP_MAX_S", 8),
         stale_processing_s=_int("STALE_PROCESSING_S", 900),
         rescan_sleep_s=_int("RESCAN_SLEEP_S", 300),
         port=_int("PORT", 8080),

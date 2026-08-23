@@ -1,16 +1,9 @@
 """
 fetcher.py — the Bot2Fetcher pipeline.
 
-v12.40e: cover post now replicates Bot 0's cover_poster exactly —
-  * bytes downloaded with browser UA + nhentai Referer
-  * normalised to JPEG (cover_normalise) so Telegram accepts the photo
-  * uploaded via client.upload_file + InputMediaUploadedPhoto(spoiler=True)
-  * sent with force_document=False  ->  real PHOTO with SPOILER, never an
-    "unnamed file" document
-  * fallback chain: spoiler photo -> plain photo -> text-only caption
-  * caption built by meta.caption_for — Bot-0 byte-compatible format
-PDF delivery unchanged: forward with drop_author, fallback download +
-re-upload with the clean title as caption.
+v12.40f: rest window shortened to 3-8s AND applied ONLY after real work
+(claim + fetch), never after a skip. Skips loop instantly to the next
+queue item.
 """
 from __future__ import annotations
 
@@ -165,37 +158,44 @@ class Fetcher:
                 gid = await asyncio.wait_for(self._queue.get(), timeout=15)
             except asyncio.TimeoutError:
                 continue
+            did_work = False
             try:
-                await self._do_job(idx, client, gid)
+                did_work = await self._do_job(idx, client, gid)
             except FloodWaitError as fw:
                 wait = int(getattr(fw, "seconds", 30)) + 5
                 log.warning("🚧 slot %d FloodWait %ss on %s — sleeping, will retry",
                             idx, wait, gid)
                 await asyncio.sleep(wait)
                 await self._queue.put(gid)
+                did_work = False
             except Exception as e:
                 log.exception("💥 slot %d job %s crashed: %s", idx, gid, e)
                 self.stats.failed += 1
+                did_work = True   # actual work attempted + failed -> pace it
             finally:
                 self._queue.task_done()
-            gap = random.uniform(self.s.fetch_gap_min, self.s.fetch_gap_max)
-            log.info("⏸ slot %d resting %ds", idx, int(gap))
-            await asyncio.sleep(gap)
+            # Rest ONLY after a real job (claim + work). Skips loop instantly.
+            if did_work:
+                gap = random.uniform(self.s.fetch_gap_min, self.s.fetch_gap_max)
+                log.info("⏸ slot %d resting %ds", idx, int(gap))
+                await asyncio.sleep(gap)
 
-    async def _do_job(self, idx: int, client: TelegramClient, gid: str) -> None:
+    async def _do_job(self, idx: int, client: TelegramClient, gid: str) -> bool:
+        """Return True if a real fetch was attempted (=> rest afterwards),
+        False if it was a skip (loop instantly to next)."""
         decision = self.galleries.claim(gid)
         if decision == "done":
             self.stats.skipped_done += 1
             log.info("⏭ %s already in DB channel — skipped", gid)
-            return
+            return False
         if decision == "failed":
             self.stats.skipped_failed += 1
             log.info("🚫 %s previously failed — skipped", gid)
-            return
+            return False
         if decision == "busy":
             self.stats.skipped_busy += 1
             log.info("🔒 %s claimed by another worker — skipped", gid)
-            return
+            return False
         self.stats.claimed += 1
         self.stats.in_flight[gid] = f"slot{idx}"
         log.info("🎯 slot %d claimed %s — starting job", idx, gid)
@@ -208,7 +208,7 @@ class Fetcher:
                                            error="no Turso cache row / no cover")
                 await self.turso.put_state(gid, {"status": "FAILED_SCRAPE"})
                 self.stats.failed += 1
-                return
+                return True
             timeout = compute_pdf_timeout(m.get("pages") or 0)
             caption = meta_mod.caption_for(m)
             log.info("📄 %s — %d pages, PDF wait budget %ds",
@@ -221,7 +221,7 @@ class Fetcher:
                     self.galleries.mark_failed(gid, status="FAILED_OTHER",
                                                error="cover post failed")
                     self.stats.failed += 1
-                    return
+                    return True
                 log.info("🖼 %s — spoiler cover posted to DB channel (msg_id=%d)",
                          gid, cover_msg_id)
                 self.galleries.refresh_claim(gid)
@@ -232,14 +232,14 @@ class Fetcher:
                                                error=f"no PDF within {int(timeout)}s")
                     await self.turso.put_state(gid, {"status": "FAILED_TIMEOUT"})
                     self.stats.failed += 1
-                    return
+                    return True
                 if isinstance(pdf_msg, str):
                     log.error("🤖❌ %s — Bot 2 error: %s", gid, pdf_msg[:100])
                     self.galleries.mark_failed(gid, status="FAILED_BOT2_ERROR",
                                                error=pdf_msg)
                     await self.turso.put_state(gid, {"status": "FAILED_BOT2_ERROR"})
                     self.stats.failed += 1
-                    return
+                    return True
                 log.info("📥 %s — PDF received from @Gallery_DLBot", gid)
                 pdf_msg_id = await self._post_pdf(client, pdf_msg, m)
                 if not pdf_msg_id:
@@ -247,7 +247,7 @@ class Fetcher:
                     self.galleries.mark_failed(gid, status="FAILED_OTHER",
                                                error="pdf forward failed")
                     self.stats.failed += 1
-                    return
+                    return True
                 log.info("📤 %s — PDF posted to DB channel (msg_id=%d)",
                          gid, pdf_msg_id)
 
@@ -263,14 +263,12 @@ class Fetcher:
             self.stats.last_finished_at = time.time()
             log.info("✅ %s DONE — cover=%s pdf=%s (total completed: %d)",
                      gid, cover_msg_id, pdf_msg_id, self.stats.completed)
+            return True
         finally:
             self.stats.in_flight.pop(gid, None)
 
     async def _post_cover(self, client: TelegramClient, m: Dict[str, Any],
                           caption: str) -> int:
-        """Bot-0-exact: download -> normalise JPEG -> upload_file ->
-        InputMediaUploadedPhoto(spoiler=True) -> send force_document=False.
-        Fallback: plain photo, then text-only caption."""
         img_bytes: bytes = b""
         ext = ".jpg"
         try:

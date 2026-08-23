@@ -1,38 +1,24 @@
 APPEND THE SECTION BELOW TO GUIDE.md
 ========================================================================
 
-## v12.40e — Bot2Fetcher spoiler cover + Bot-0 caption format (2026-08-23)
+## v12.40f — Bot2Fetcher rest only after real work (2026-08-23)
 
-### Symptom (v12.40d, screenshot from operator)
-1. Coverpost landed in the DB channel as an "unnamed 29 KB application/*"
-   FILE, not an image.
-2. No spoiler blur on the cover.
-3. Caption was the old custom format (📖 title / 🆔 / 🔗 URL / 📄 pages)
-   instead of Bot 0's house format.
-4. PDF not forwarded in some jobs.
+### Symptom (v12.40e log)
+    🚫 619612 previously failed — skipped
+    ⏸ slot 1 resting 27s
+    🚫 571509 previously failed — skipped
+    ⏸ slot 1 resting 48s
 
-### Root cause
-`_post_cover` passed raw CDN bytes + a filename to `send_file`, which
-Telegram treated as a document upload. Webp/gif covers made it worse
-(v11.2 lesson: InputMediaUploadedPhoto rejects non-JPEG). Caption builder
-was my own format, not cover_poster._format_caption.
+With ~10 tombstoned galleries at the head of the queue the slot sat idle
+for ~5 min chewing through skips at 20-60 s each.
 
-### Fix — replicates repo-root cover_poster.py v12.34l exactly
-- New `app/cover_normalise.py`: Pillow convert to RGB JPEG before upload
-  (same job as cover_image_normalise.py).
-- `_post_cover`: download with browser UA + nhentai Referer → normalise
-  → `client.upload_file` → `InputMediaUploadedPhoto(spoiler=True)` →
-  `send_file(force_document=False)`. Fallbacks: plain photo → text-only
-  caption. Photo + spoiler every time bytes are available.
-- `meta.caption_for` rewritten byte-compatible with
-  cover_poster._format_caption: bold clean title (event prefix + trailing
-  brackets stripped), '➤ #<gid>', aligned meta rows Groups → Parodies →
-  Artists → Characters → Languages → Categories, trailing '➤ Tags:' row,
-  NO nhentai URL, NO pages line. Tags stay typed ({name,type}) from the
-  Turso payload so grouping matches Bot 0.
-- PDF: forward with drop_author=True; fallback download + re-upload as
-  document with clean bold title caption. requirements.txt gains pillow.
+### Fix
+1. `_do_job` now returns bool: True = real work attempted, False = skip.
+2. Slot loop rests ONLY when did_work == True. Skips (done / failed /
+   busy) loop to the next queue item instantly.
+3. Default rest window is now 3-8 s (was 20-60 s). Env overrides:
+   FETCH_GAP_MIN_S=3, FETCH_GAP_MAX_S=8. Existing operators can raise
+   these via Render env if they want a slower cadence.
 
 ### Rollout
-Copy `Bot2Fetcher/` over the existing folder, push, Manual Deploy.
-Env unchanged.
+Copy `Bot2Fetcher/` over, push, Manual Deploy. Env unchanged.

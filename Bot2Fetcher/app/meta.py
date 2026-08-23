@@ -1,12 +1,5 @@
 """
 meta.py — gallery metadata + Bot-0-exact caption builder.
-
-v12.40e: caption is now byte-compatible with repo-root cover_poster.py
-`_format_caption` (v12.34l): bold clean title, blank line, '➤ #<gid>',
-blank line, aligned meta rows (Groups → Parodies → Artists → Characters
-→ Languages → Categories), blank line, '➤ Tags:' row. NO nhentai URL,
-NO pages line, NO 🆔 emoji. Tags keep their {'name','type'} shape from
-the Turso cache payload so grouping works exactly like Bot 0.
 """
 from __future__ import annotations
 
@@ -64,7 +57,6 @@ def _group_tags_by_type(tags) -> dict:
 
 
 def caption_for(meta: Dict[str, Any]) -> str:
-    """Bot-0-exact cover caption (see cover_poster._format_caption)."""
     lines: List[str] = []
     clean = _clean_title(meta.get("title") or "") or "(untitled)"
     lines.append(f"**{clean}**")
@@ -105,8 +97,6 @@ def caption_for(meta: Dict[str, Any]) -> str:
 
 
 def meta_from_cache(gid: str, cache_row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Build meta from the Turso gallery:<id> payload. CACHE-ONLY — never
-    call nhentai. Returns None (caller marks FAILED_SCRAPE) when unusable."""
     if not cache_row:
         log.info("🔍 gallery:%s — no Turso cache row", gid)
         return None
@@ -118,7 +108,6 @@ def meta_from_cache(gid: str, cache_row: Optional[Dict[str, Any]]) -> Optional[D
         log.warning("🔍 gallery:%s — payload has no .id; keys: %s", gid, list(p.keys())[:10])
         return None
 
-    # Keep tags TYPED (name+type) so caption grouping matches Bot 0.
     tags_typed: List[Dict[str, str]] = []
     for t in (p.get("tags") or []):
         if isinstance(t, dict):
