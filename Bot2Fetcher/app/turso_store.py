@@ -1,8 +1,5 @@
 """
 turso_store.py — shared Turso access via the raw HTTP /v2/pipeline API.
-
-v12.40d: same paged-scan structure as v12.40c, but with emoji logging
-throughout so the Render log shows the pipeline working at a glance.
 """
 from __future__ import annotations
 
@@ -212,9 +209,7 @@ class Turso:
         try:
             if isinstance(raw, (bytes, bytearray)):
                 raw = raw.decode("utf-8", "ignore")
-            parsed = json.loads(raw)
-            log.debug("🔍 gallery:%s — payload parsed, keys=%s", gid, list(parsed.keys())[:8])
-            return {"payload": parsed}
+            return {"payload": json.loads(raw)}
         except Exception as e:
             log.warning("🔍 gallery:%s — payload JSON parse failed: %s", gid, e)
             return None

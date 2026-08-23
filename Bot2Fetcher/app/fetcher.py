@@ -1,13 +1,21 @@
 """
 fetcher.py — the Bot2Fetcher pipeline.
 
-v12.40d: CACHE-ONLY META. No upstream nhentai calls (Render IP is 403'd).
-Missing cache row -> FAILED_SCRAPE, move on. Full emoji logging so the
-Render log tells the story at a glance.
+v12.40e: cover post now replicates Bot 0's cover_poster exactly —
+  * bytes downloaded with browser UA + nhentai Referer
+  * normalised to JPEG (cover_normalise) so Telegram accepts the photo
+  * uploaded via client.upload_file + InputMediaUploadedPhoto(spoiler=True)
+  * sent with force_document=False  ->  real PHOTO with SPOILER, never an
+    "unnamed file" document
+  * fallback chain: spoiler photo -> plain photo -> text-only caption
+  * caption built by meta.caption_for — Bot-0 byte-compatible format
+PDF delivery unchanged: forward with drop_author, fallback download +
+re-upload with the clean title as caption.
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import random
 import time
@@ -17,20 +25,32 @@ import httpx
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
+from telethon.tl.types import InputMediaUploadedPhoto
 
 from . import meta as meta_mod
+from .cover_normalise import normalise_cover_bytes
 from .pdf_timing import compute_pdf_timeout
 
 log = logging.getLogger("bot2fetcher.fetcher")
 
 POLL_EVERY_S = 5.0
 
+_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+_COVER_HEADERS = {
+    "User-Agent": _UA,
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "Referer": "https://nhentai.net/",
+}
+
 
 def channel_link(channel_id: int, msg_id: int) -> str:
-    raw = str(channel_id)
-    if raw.startswith("-100"):
-        raw = raw[4:]
-    return f"https://t.me/c/{raw}/{msg_id}"
+    s = str(abs(int(channel_id)))
+    if s.startswith("100"):
+        s = s[3:]
+    return f"https://t.me/c/{s}/{int(msg_id)}"
 
 
 class Stats:
@@ -190,18 +210,19 @@ class Fetcher:
                 self.stats.failed += 1
                 return
             timeout = compute_pdf_timeout(m.get("pages") or 0)
+            caption = meta_mod.caption_for(m)
             log.info("📄 %s — %d pages, PDF wait budget %ds",
                      gid, m.get("pages") or 0, int(timeout))
 
             async with self._channel_lock:
-                cover_msg_id = await self._post_cover(client, m)
+                cover_msg_id = await self._post_cover(client, m, caption)
                 if not cover_msg_id:
                     log.error("❌ %s — cover post failed", gid)
                     self.galleries.mark_failed(gid, status="FAILED_OTHER",
                                                error="cover post failed")
                     self.stats.failed += 1
                     return
-                log.info("🖼 %s — cover posted to DB channel (msg_id=%d)",
+                log.info("🖼 %s — spoiler cover posted to DB channel (msg_id=%d)",
                          gid, cover_msg_id)
                 self.galleries.refresh_claim(gid)
                 pdf_msg = await self._request_pdf(client, gid, timeout)
@@ -245,21 +266,48 @@ class Fetcher:
         finally:
             self.stats.in_flight.pop(gid, None)
 
-    async def _post_cover(self, client: TelegramClient, m: Dict[str, Any]) -> int:
+    async def _post_cover(self, client: TelegramClient, m: Dict[str, Any],
+                          caption: str) -> int:
+        """Bot-0-exact: download -> normalise JPEG -> upload_file ->
+        InputMediaUploadedPhoto(spoiler=True) -> send force_document=False.
+        Fallback: plain photo, then text-only caption."""
+        img_bytes: bytes = b""
+        ext = ".jpg"
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as h:
-                r = await h.get(m["cover"], headers={"User-Agent": "Mozilla/5.0"})
-                if r.status_code != 200 or len(r.content) < 1000:
-                    log.warning("🖼 cover download failed for %s: HTTP %d (%d bytes)",
-                                m["id"], r.status_code, len(r.content))
-                    return 0
-                img = r.content
-            msg = await client.send_file(
-                self._channel, img,
-                caption=meta_mod.caption_for(m),
-                file_name=f"cover_{m['id']}.jpg",
-            )
-            return int(getattr(msg, "id", 0) or 0)
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True,
+                                         headers=_COVER_HEADERS) as h:
+                r = await h.get(m["cover"])
+                if r.status_code == 200 and len(r.content) >= 200:
+                    img_bytes = r.content
+        except Exception as e:
+            log.warning("🖼 cover download %s failed: %s", m["id"], e)
+
+        try:
+            if img_bytes:
+                norm, ext = normalise_cover_bytes(img_bytes, source_url=m["cover"])
+                if norm:
+                    img_bytes = norm
+                buf = io.BytesIO(img_bytes)
+                buf.name = f"cover_{m['id']}{ext or '.jpg'}"
+                try:
+                    uploaded = await client.upload_file(buf, file_name=buf.name)
+                    spoiler_media = InputMediaUploadedPhoto(
+                        file=uploaded, spoiler=True)
+                    sent = await client.send_file(
+                        self._channel, file=spoiler_media,
+                        caption=caption, force_document=False)
+                except FloodWaitError:
+                    raise
+                except Exception as e:
+                    log.warning("🖼 spoiler upload failed (%s) — plain photo fallback", e)
+                    buf.seek(0)
+                    sent = await client.send_file(
+                        self._channel, file=buf,
+                        caption=caption, force_document=False)
+            else:
+                log.warning("🖼 %s — no cover bytes, text-only caption", m["id"])
+                sent = await client.send_message(self._channel, caption)
+            return int(getattr(sent, "id", 0) or 0)
         except FloodWaitError:
             raise
         except Exception as e:
@@ -306,21 +354,22 @@ class Fetcher:
         except FloodWaitError:
             raise
         except Exception as e:
-            log.warning("pdf forward failed (%s) — trying download+reupload", e)
+            log.warning("📤 pdf forward failed (%s) — trying download+reupload", e)
         try:
             data = await client.download_media(pdf_msg, bytes)
             if not data:
                 return 0
             msg = await client.send_file(
                 self._channel, data,
-                caption=f"📖 {m['title']}\n🆔 {m['id']}",
+                caption=f"**{meta_mod._clean_title(m['title'])}**",
                 file_name=f"{m['id']}.pdf",
+                force_document=True,
             )
             return int(getattr(msg, "id", 0) or 0)
         except FloodWaitError:
             raise
         except Exception as e:
-            log.warning("pdf reupload failed: %s", e)
+            log.warning("📤 pdf reupload failed: %s", e)
             return 0
 
     async def run(self) -> None:

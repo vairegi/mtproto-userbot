@@ -1,47 +1,37 @@
 APPEND THE SECTION BELOW TO GUIDE.md
 ========================================================================
 
-## v12.40d — Bot2Fetcher cache-only meta + emoji logging (2026-08-23)
+## v12.40e — Bot2Fetcher spoiler cover + Bot-0 caption format (2026-08-23)
 
-### Symptom (v12.40c log)
-Bot worked (scan 7411 galleries, claiming jobs) but every job failed:
-    GET https://nhentai.net/api/gallery/619612 "HTTP/1.1 403 Forbidden"
-    upstream meta 619612 -> HTTP 403
+### Symptom (v12.40d, screenshot from operator)
+1. Coverpost landed in the DB channel as an "unnamed 29 KB application/*"
+   FILE, not an image.
+2. No spoiler blur on the cover.
+3. Caption was the old custom format (📖 title / 🆔 / 🔗 URL / 📄 pages)
+   instead of Bot 0's house format.
+4. PDF not forwarded in some jobs.
 
 ### Root cause
-`meta_from_cache` was rejecting good Turso payloads (shape check too
-strict — `p.get("id")` failed on some rows) so the bot fell through to
-the live nhentai API on every job. Render's IP is 403'd by nhentai, so
-every job died at the meta step.
+`_post_cover` passed raw CDN bytes + a filename to `send_file`, which
+Telegram treated as a document upload. Webp/gif covers made it worse
+(v11.2 lesson: InputMediaUploadedPhoto rejects non-JPEG). Caption builder
+was my own format, not cover_poster._format_caption.
 
-### Fix
-1. **Cache-only mode.** nhentai upstream fallback REMOVED entirely.
-   Render can't reach nhentai reliably, and Bot 1's Turso cache is the
-   authoritative source. Missing cache row → FAILED_SCRAPE, move on.
-2. **Looser meta check.** Accepts cover, cover_url, or thumb_url. Logs
-   the exact reason a row is rejected (no row / not dict / no id / no
-   cover) with the payload keys so the next miss is diagnosable from the
-   log alone.
-3. **Full emoji logging.** Every pipeline step now logs with an emoji:
-   🚀 boot, 🤖 slot auth, 📺 channel resolve, 📚 gallery list, 🔥 recent
-   seed, 📡 scan cycle, 🧵 worker start, 🎯 claim, 🔍 meta lookup,
-   📄 page count, 🖼 cover post, 📨 DM sent, 📥 PDF received, 📤 PDF
-   posted, ✅ done, ❌ failed, ⏭ already done, 🔒 busy, ⏰ timeout,
-   🚧 FloodWait, ⏸ rest, 💤 queue drained, 🚨 Turso error.
-   `grep "✅"` shows completions; `grep "❌"` shows failures.
-
-### Verify after deploy
-    📚 list_gallery_ids: 7385 galleries in Turso cache
-    🔥 list_recent_search_ids: 26 ids from 5 recent pages
-    📡 scan cycle 1: 7411 candidate galleries queued
-    🎯 slot 1 claimed 619612 — starting job
-    🔍 gallery:619612 — meta OK from Turso: 'Some Title', 30 pages, cover https://...
-    📄 619612 — 30 pages, PDF wait budget 141s
-    🖼 619612 — cover posted to DB channel (msg_id=1234)
-    📨 DMing @Gallery_DLBot: https://nhentai.net/g/619612/
-    📥 619612 — PDF received from @Gallery_DLBot
-    📤 619612 — PDF posted to DB channel (msg_id=1235)
-    ✅ 619612 DONE — cover=1234 pdf=1235 (total completed: 1)
+### Fix — replicates repo-root cover_poster.py v12.34l exactly
+- New `app/cover_normalise.py`: Pillow convert to RGB JPEG before upload
+  (same job as cover_image_normalise.py).
+- `_post_cover`: download with browser UA + nhentai Referer → normalise
+  → `client.upload_file` → `InputMediaUploadedPhoto(spoiler=True)` →
+  `send_file(force_document=False)`. Fallbacks: plain photo → text-only
+  caption. Photo + spoiler every time bytes are available.
+- `meta.caption_for` rewritten byte-compatible with
+  cover_poster._format_caption: bold clean title (event prefix + trailing
+  brackets stripped), '➤ #<gid>', aligned meta rows Groups → Parodies →
+  Artists → Characters → Languages → Categories, trailing '➤ Tags:' row,
+  NO nhentai URL, NO pages line. Tags stay typed ({name,type}) from the
+  Turso payload so grouping matches Bot 0.
+- PDF: forward with drop_author=True; fallback download + re-upload as
+  document with clean bold title caption. requirements.txt gains pillow.
 
 ### Rollout
 Copy `Bot2Fetcher/` over the existing folder, push, Manual Deploy.
