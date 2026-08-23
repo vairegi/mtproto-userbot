@@ -1,9 +1,9 @@
 """
 fetcher.py — the Bot2Fetcher pipeline.
 
-v12.40c: producer switched to paged Turso scan (list_gallery_ids +
-list_recent_search_ids), payload fetched on-demand per job via
-turso.get_gallery_row(gid). No more 15k-row mem_hrana_response blowups.
+v12.40d: CACHE-ONLY META. No upstream nhentai calls (Render IP is 403'd).
+Missing cache row -> FAILED_SCRAPE, move on. Full emoji logging so the
+Render log tells the story at a glance.
 """
 from __future__ import annotations
 
@@ -85,11 +85,13 @@ class Fetcher:
                 raise RuntimeError(f"STRING_SESSION slot {i} is not authorized")
             me = await c.get_me()
             uname = getattr(me, "username", None) or "(no username)"
-            log.info("slot %d authorized as @%s (%s)", i, uname, me.id)
+            log.info("🤖 slot %d authorized as @%s (id=%s)", i, uname, me.id)
             self.clients.append(c)
         ch = self.s.db_channel_id
         self._channel = await self.clients[0].get_entity(int(ch) if ch.lstrip("-").isdigit() else ch)
         self._bot2 = await self.clients[0].get_entity(self.s.bot2_username)
+        log.info("📺 DB channel: %s | downloader bot: @%s",
+                 self.s.db_channel_id, self.s.bot2_username)
 
     async def stop(self) -> None:
         self._stop.set()
@@ -100,8 +102,6 @@ class Fetcher:
                 pass
 
     async def _build_queue_order(self) -> list[str]:
-        """Newest-first: cached recent-sort pages, then every gallery:* row
-        newest-cached-first, deduped."""
         recent_ids = await self.turso.list_recent_search_ids()
         gallery_rows = await self.turso.list_gallery_ids()
         gallery_rows.sort(key=lambda r: r["cached_at"], reverse=True)
@@ -121,11 +121,12 @@ class Fetcher:
             try:
                 ids = await self._build_queue_order()
             except Exception as e:
-                log.exception("producer scan failed: %s", e)
+                log.exception("🚨 producer scan crashed: %s", e)
                 await asyncio.sleep(30)
                 continue
             self.stats.scanned = len(ids)
-            log.info("scan: %d candidate galleries", len(ids))
+            log.info("📡 scan cycle %d: %d candidate galleries queued",
+                     self.stats.cycles + 1, len(ids))
             for gid in ids:
                 if self._stop.is_set():
                     break
@@ -133,9 +134,12 @@ class Fetcher:
             self.stats.cycles += 1
             while not self._queue.empty() and not self._stop.is_set():
                 await asyncio.sleep(10)
+            log.info("💤 queue drained — sleeping %ds before next scan",
+                     self.s.rescan_sleep_s)
             await asyncio.sleep(self.s.rescan_sleep_s)
 
     async def _slot_loop(self, idx: int, client: TelegramClient) -> None:
+        log.info("🧵 slot %d worker started", idx)
         while not self._stop.is_set():
             try:
                 gid = await asyncio.wait_for(self._queue.get(), timeout=15)
@@ -145,70 +149,86 @@ class Fetcher:
                 await self._do_job(idx, client, gid)
             except FloodWaitError as fw:
                 wait = int(getattr(fw, "seconds", 30)) + 5
-                log.warning("slot %d FloodWait %ss on %s — sleeping", idx, wait, gid)
+                log.warning("🚧 slot %d FloodWait %ss on %s — sleeping, will retry",
+                            idx, wait, gid)
                 await asyncio.sleep(wait)
                 await self._queue.put(gid)
             except Exception as e:
-                log.exception("slot %d job %s crashed: %s", idx, gid, e)
+                log.exception("💥 slot %d job %s crashed: %s", idx, gid, e)
                 self.stats.failed += 1
             finally:
                 self._queue.task_done()
-            await asyncio.sleep(random.uniform(self.s.fetch_gap_min, self.s.fetch_gap_max))
+            gap = random.uniform(self.s.fetch_gap_min, self.s.fetch_gap_max)
+            log.info("⏸ slot %d resting %ds", idx, int(gap))
+            await asyncio.sleep(gap)
 
     async def _do_job(self, idx: int, client: TelegramClient, gid: str) -> None:
         decision = self.galleries.claim(gid)
         if decision == "done":
             self.stats.skipped_done += 1
+            log.info("⏭ %s already in DB channel — skipped", gid)
             return
         if decision == "failed":
             self.stats.skipped_failed += 1
+            log.info("🚫 %s previously failed — skipped", gid)
             return
         if decision == "busy":
             self.stats.skipped_busy += 1
+            log.info("🔒 %s claimed by another worker — skipped", gid)
             return
         self.stats.claimed += 1
         self.stats.in_flight[gid] = f"slot{idx}"
-        log.info("slot %d claimed %s", idx, gid)
+        log.info("🎯 slot %d claimed %s — starting job", idx, gid)
         try:
             cache_row = await self.turso.get_gallery_row(gid)
             m = meta_mod.meta_from_cache(gid, cache_row)
             if m is None:
-                m = await meta_mod.meta_from_upstream(gid)
-            if m is None or not m.get("cover"):
+                log.warning("⚠️ %s — no cached meta, marking FAILED_SCRAPE", gid)
                 self.galleries.mark_failed(gid, status="FAILED_SCRAPE",
-                                           error="no meta / cover")
+                                           error="no Turso cache row / no cover")
                 await self.turso.put_state(gid, {"status": "FAILED_SCRAPE"})
                 self.stats.failed += 1
                 return
             timeout = compute_pdf_timeout(m.get("pages") or 0)
+            log.info("📄 %s — %d pages, PDF wait budget %ds",
+                     gid, m.get("pages") or 0, int(timeout))
 
             async with self._channel_lock:
                 cover_msg_id = await self._post_cover(client, m)
                 if not cover_msg_id:
+                    log.error("❌ %s — cover post failed", gid)
                     self.galleries.mark_failed(gid, status="FAILED_OTHER",
                                                error="cover post failed")
                     self.stats.failed += 1
                     return
+                log.info("🖼 %s — cover posted to DB channel (msg_id=%d)",
+                         gid, cover_msg_id)
                 self.galleries.refresh_claim(gid)
                 pdf_msg = await self._request_pdf(client, gid, timeout)
                 if pdf_msg is None:
+                    log.error("⏰ %s — @Gallery_DLBot timed out (%ds)", gid, int(timeout))
                     self.galleries.mark_failed(gid, status="FAILED_TIMEOUT",
                                                error=f"no PDF within {int(timeout)}s")
                     await self.turso.put_state(gid, {"status": "FAILED_TIMEOUT"})
                     self.stats.failed += 1
                     return
                 if isinstance(pdf_msg, str):
+                    log.error("🤖❌ %s — Bot 2 error: %s", gid, pdf_msg[:100])
                     self.galleries.mark_failed(gid, status="FAILED_BOT2_ERROR",
                                                error=pdf_msg)
                     await self.turso.put_state(gid, {"status": "FAILED_BOT2_ERROR"})
                     self.stats.failed += 1
                     return
+                log.info("📥 %s — PDF received from @Gallery_DLBot", gid)
                 pdf_msg_id = await self._post_pdf(client, pdf_msg, m)
                 if not pdf_msg_id:
+                    log.error("❌ %s — PDF forward to DB channel failed", gid)
                     self.galleries.mark_failed(gid, status="FAILED_OTHER",
                                                error="pdf forward failed")
                     self.stats.failed += 1
                     return
+                log.info("📤 %s — PDF posted to DB channel (msg_id=%d)",
+                         gid, pdf_msg_id)
 
             link = channel_link(int(self.s.db_channel_id), cover_msg_id)
             self.galleries.mark_completed(
@@ -220,8 +240,8 @@ class Fetcher:
             })
             self.stats.completed += 1
             self.stats.last_finished_at = time.time()
-            log.info("slot %d COMPLETED %s (cover=%s pdf=%s)",
-                     idx, gid, cover_msg_id, pdf_msg_id)
+            log.info("✅ %s DONE — cover=%s pdf=%s (total completed: %d)",
+                     gid, cover_msg_id, pdf_msg_id, self.stats.completed)
         finally:
             self.stats.in_flight.pop(gid, None)
 
@@ -230,6 +250,8 @@ class Fetcher:
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as h:
                 r = await h.get(m["cover"], headers={"User-Agent": "Mozilla/5.0"})
                 if r.status_code != 200 or len(r.content) < 1000:
+                    log.warning("🖼 cover download failed for %s: HTTP %d (%d bytes)",
+                                m["id"], r.status_code, len(r.content))
                     return 0
                 img = r.content
             msg = await client.send_file(
@@ -241,10 +263,11 @@ class Fetcher:
         except FloodWaitError:
             raise
         except Exception as e:
-            log.warning("cover post %s failed: %s", m.get("id"), e)
+            log.warning("🖼 cover post %s failed: %s", m.get("id"), e)
             return 0
 
     async def _request_pdf(self, client: TelegramClient, gid: str, timeout: float):
+        log.info("📨 DMing @%s: https://nhentai.net/g/%s/", self.s.bot2_username, gid)
         sent = await client.send_message(self._bot2, f"https://nhentai.net/g/{gid}/")
         sent_id = int(getattr(sent, "id", 0) or 0)
         deadline = time.monotonic() + timeout

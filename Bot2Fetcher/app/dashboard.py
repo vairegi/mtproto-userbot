@@ -38,7 +38,7 @@ class Dashboard:
 
     async def run(self, fetcher) -> None:
         if not self.s.log_channel_id:
-            log.info("dashboard disabled (LOG_CHANNEL_ID unset)")
+            log.info("📭 dashboard disabled (LOG_CHANNEL_ID unset)")
             return
         client = fetcher.clients[0]
         raw = self.s.log_channel_id
@@ -46,6 +46,7 @@ class Dashboard:
         saved = await self.turso.get_state("_dashboard")
         if saved and saved.get("msg_id"):
             self.msg_id = int(saved["msg_id"])
+        log.info("📊 dashboard started (msg_id=%d)", self.msg_id)
         while not fetcher._stop.is_set():
             text = _fmt(self.stats.snapshot())
             try:
@@ -56,6 +57,6 @@ class Dashboard:
                     self.msg_id = int(msg.id)
                     await self.turso.put_state("_dashboard", {"msg_id": self.msg_id})
             except Exception as e:
-                log.warning("dashboard update failed: %s", e)
+                log.warning("📊 dashboard update failed: %s", e)
                 self.msg_id = 0
             await asyncio.sleep(60)

@@ -1,37 +1,48 @@
 APPEND THE SECTION BELOW TO GUIDE.md
 ========================================================================
 
-## v12.40c — Bot2Fetcher paged Turso scan (2026-08-23)
+## v12.40d — Bot2Fetcher cache-only meta + emoji logging (2026-08-23)
 
-### Symptom (v12.40b log)
-    turso stmt error (SELECT): Resource exhausted: mem_hrana_response
-    scan_cache: execute returned None
-    scan: 0 candidate galleries
+### Symptom (v12.40c log)
+Bot worked (scan 7411 galleries, claiming jobs) but every job failed:
+    GET https://nhentai.net/api/gallery/619612 "HTTP/1.1 403 Forbidden"
+    upstream meta 619612 -> HTTP 403
 
 ### Root cause
-v12.40b's scan pulled `SELECT key,payload,cached_at FROM nhentai_cache`
-for every gallery:* AND search:* row (~15 k rows, ~40 MB of JSON). Turso
-caps a single Hrana response at ~8 MB and returned SQLITE_UNKNOWN
-`Resource exhausted: mem_hrana_response`.
+`meta_from_cache` was rejecting good Turso payloads (shape check too
+strict — `p.get("id")` failed on some rows) so the bot fell through to
+the live nhentai API on every job. Render's IP is 403'd by nhentai, so
+every job died at the meta step.
 
 ### Fix
-`turso_store.py` split into three thin queries:
-- `list_gallery_ids()`       — `SELECT "key", cached_at ... LIKE 'gallery:%'`
-                               (id + timestamp only, ~7 k rows, tiny)
-- `list_recent_search_ids()` — `LIMIT 200` on `search:%recent%` for the
-                               newest-first seed
-- `get_gallery_row(gid)`     — payload fetched on demand when a slot
-                               actually claims that id
+1. **Cache-only mode.** nhentai upstream fallback REMOVED entirely.
+   Render can't reach nhentai reliably, and Bot 1's Turso cache is the
+   authoritative source. Missing cache row → FAILED_SCRAPE, move on.
+2. **Looser meta check.** Accepts cover, cover_url, or thumb_url. Logs
+   the exact reason a row is rejected (no row / not dict / no id / no
+   cover) with the payload keys so the next miss is diagnosable from the
+   log alone.
+3. **Full emoji logging.** Every pipeline step now logs with an emoji:
+   🚀 boot, 🤖 slot auth, 📺 channel resolve, 📚 gallery list, 🔥 recent
+   seed, 📡 scan cycle, 🧵 worker start, 🎯 claim, 🔍 meta lookup,
+   📄 page count, 🖼 cover post, 📨 DM sent, 📥 PDF received, 📤 PDF
+   posted, ✅ done, ❌ failed, ⏭ already done, 🔒 busy, ⏰ timeout,
+   🚧 FloodWait, ⏸ rest, 💤 queue drained, 🚨 Turso error.
+   `grep "✅"` shows completions; `grep "❌"` shows failures.
 
-`fetcher.py` producer rewritten around the new API. libsql-client dropped
-in v12.40b in favour of raw HTTP `/v2/pipeline` — no Python driver, no
-version drift; same pattern as ScraperBot.
-
-### Verified against the live DB before shipping
-    gallery ids listed: 7384
-    recent search ids seeded: 26
-    get_gallery_row(...) OK — payload keys: id, title, title_english, ...
+### Verify after deploy
+    📚 list_gallery_ids: 7385 galleries in Turso cache
+    🔥 list_recent_search_ids: 26 ids from 5 recent pages
+    📡 scan cycle 1: 7411 candidate galleries queued
+    🎯 slot 1 claimed 619612 — starting job
+    🔍 gallery:619612 — meta OK from Turso: 'Some Title', 30 pages, cover https://...
+    📄 619612 — 30 pages, PDF wait budget 141s
+    🖼 619612 — cover posted to DB channel (msg_id=1234)
+    📨 DMing @Gallery_DLBot: https://nhentai.net/g/619612/
+    📥 619612 — PDF received from @Gallery_DLBot
+    📤 619612 — PDF posted to DB channel (msg_id=1235)
+    ✅ 619612 DONE — cover=1234 pdf=1235 (total completed: 1)
 
 ### Rollout
 Copy `Bot2Fetcher/` over the existing folder, push, Manual Deploy.
-Env unchanged. libsql-client removed from requirements.
+Env unchanged.

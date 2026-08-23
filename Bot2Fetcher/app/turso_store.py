@@ -1,19 +1,8 @@
 """
 turso_store.py — shared Turso access via the raw HTTP /v2/pipeline API.
 
-v12.40c: paged scan.
-  v12.40  used libsql-client, which raised 'result' KeyError on Render.
-  v12.40a  fixed row-shape parsing (still on libsql-client, still broke).
-  v12.40b  switched to HTTP /v2/pipeline (works!) but tried to SELECT the
-           full payload of every gallery+search row in one call — Turso
-           replied `Resource exhausted: mem_hrana_response` (server-side
-           response-size cap).
-  v12.40c  scans in TWO layers:
-    (1) pull ONLY key + cached_at for gallery:*     — tiny, ~15k rows OK
-    (2) pull ONLY key + payload for search:*recent*  in small batches,
-        so the queue seeds "newest first" without loading everything
-    (3) when a slot actually claims a gid, `get_gallery_row(gid)` fetches
-        just that one row's payload on demand.
+v12.40d: same paged-scan structure as v12.40c, but with emoji logging
+throughout so the Render log shows the pipeline working at a glance.
 """
 from __future__ import annotations
 
@@ -27,7 +16,7 @@ import httpx
 log = logging.getLogger("bot2fetcher.turso")
 
 STATE_TABLE = "bot2_fetch_state"
-_MAX_SEARCH_ROWS = 200      # cached search:* pages we peek at per scan
+_MAX_SEARCH_ROWS = 200
 
 
 def _normalise_url(raw: str) -> str:
@@ -105,20 +94,20 @@ class Turso:
             async with httpx.AsyncClient(timeout=45.0) as h:
                 r = await h.post(self.endpoint, headers=headers, json=body)
             if r.status_code != 200:
-                log.warning("turso HTTP %s: %s", r.status_code, r.text[:200])
+                log.warning("🚨 turso HTTP %s: %s", r.status_code, r.text[:200])
                 return None
             data = r.json()
         except Exception as e:
-            log.warning("turso request failed (%s): %s", sql.split(None, 1)[0], e)
+            log.warning("🚨 turso request failed (%s): %s", sql.split(None, 1)[0], e)
             return None
         results = data.get("results") or []
         if not results:
-            log.warning("turso no results: %s", str(data)[:200])
+            log.warning("🚨 turso no results: %s", str(data)[:200])
             return None
         first = results[0]
         if first.get("type") != "ok":
             err = first.get("error") or first
-            log.warning("turso stmt error (%s): %s",
+            log.warning("🚨 turso stmt error (%s): %s",
                         sql.split(None, 1)[0], str(err)[:200])
             return None
         return (first.get("response") or {}).get("result") or {}
@@ -147,18 +136,13 @@ class Turso:
         )
         self._ready = True
 
-    # ------------------------------------------------------------------
-    # PAGED SCAN — safe against Turso's mem_hrana_response cap
-    # ------------------------------------------------------------------
     async def list_gallery_ids(self) -> List[Dict[str, Any]]:
-        """Return [{gid, cached_at}] for every gallery:* row. Tiny query
-        (no payload), safe at 15k+ rows."""
         result = await self.execute(
             'SELECT "key", cached_at FROM nhentai_cache '
             "WHERE \"key\" LIKE 'gallery:%'"
         )
         if not result:
-            log.warning("list_gallery_ids: execute returned None")
+            log.warning("🚨 list_gallery_ids: execute returned None")
             return []
         out: List[Dict[str, Any]] = []
         for r in result["rows"]:
@@ -171,13 +155,10 @@ class Turso:
             except (TypeError, ValueError):
                 ca = 0
             out.append({"gid": gid, "cached_at": ca})
-        log.info("list_gallery_ids: %d rows", len(out))
+        log.info("📚 list_gallery_ids: %d galleries in Turso cache", len(out))
         return out
 
     async def list_recent_search_ids(self) -> List[str]:
-        """Peek at cached search:*recent* pages (small batch) so the queue
-        starts newest-first. Returns gallery ids in the order they appear
-        on the popular/recent pages."""
         result = await self.execute(
             'SELECT "key", payload FROM nhentai_cache '
             "WHERE \"key\" LIKE 'search:%' AND \"key\" LIKE '%recent%' "
@@ -213,30 +194,31 @@ class Turso:
                     gid = str((it or {}).get("id") or "")
                     if gid.isdigit():
                         ids.append(gid)
-        log.info("list_recent_search_ids: %d ids from %d pages",
+        log.info("🔥 list_recent_search_ids: %d ids from %d recent pages",
                  len(ids), len(pages))
         return ids
 
     async def get_gallery_row(self, gid: str) -> Optional[Dict[str, Any]]:
-        """On-demand fetch of ONE gallery row's payload."""
         result = await self.execute(
             'SELECT payload FROM nhentai_cache WHERE "key" = ?',
             [f"gallery:{gid}"])
         if not result or not result["rows"]:
+            log.info("🔍 gallery:%s — no row in Turso", gid)
             return None
         raw = result["rows"][0].get("payload")
         if raw is None:
+            log.warning("🔍 gallery:%s — row found but payload is NULL", gid)
             return None
         try:
             if isinstance(raw, (bytes, bytearray)):
                 raw = raw.decode("utf-8", "ignore")
-            return {"payload": json.loads(raw)}
-        except Exception:
+            parsed = json.loads(raw)
+            log.debug("🔍 gallery:%s — payload parsed, keys=%s", gid, list(parsed.keys())[:8])
+            return {"payload": parsed}
+        except Exception as e:
+            log.warning("🔍 gallery:%s — payload JSON parse failed: %s", gid, e)
             return None
 
-    # ------------------------------------------------------------------
-    # Own state table
-    # ------------------------------------------------------------------
     async def put_state(self, key: str, payload: Dict[str, Any]) -> None:
         await self.ensure_schema()
         await self.execute(

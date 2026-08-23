@@ -36,7 +36,7 @@ def connect(uri: str, db_name: str):
                 socketTimeoutMS=10000, retryWrites=True, maxPoolSize=8,
             )
             _client.admin.command("ping")
-            log.info("mongo connected (db=%s)", db_name)
+            log.info("✅ mongo connected (db=%s)", db_name)
     return _client[db_name]
 
 

@@ -68,6 +68,7 @@ def _run_api() -> None:
 
 
 async def _main() -> None:
+    log.info("🚀 Bot2Fetcher v12.40d booting (%d slot(s))", len(settings.sessions))
     await turso.ensure_schema()
     dash_task = asyncio.create_task(dashboard.run(fetcher))
     try:
@@ -80,8 +81,7 @@ async def _main() -> None:
 if __name__ == "__main__":
     t = threading.Thread(target=_run_api, daemon=True)
     t.start()
-    log.info("web status on :%d — starting fetcher (%d slot(s))",
-             settings.port, len(settings.sessions))
+    log.info("🌐 web status on :%d — starting fetcher", settings.port)
     try:
         asyncio.run(_main())
     except KeyboardInterrupt:
