@@ -171,6 +171,9 @@ async def _fetch_one_gallery(
     if await _gallery_is_fresh(gid):
         _stats_bump(hits=1)
         channel_dashboard.record_cached_gallery(source_sort or "popular")
+        # v1.22: attribute the gid to its sort/tag for the /health
+        # "cached: N" per-row total (deduped, rolling).
+        channel_dashboard.record_gid_seen(source_sort or "popular", gid)
         return "hit"   # already in cache — NOT counted as new
 
     if not await cache.try_consume(key):
@@ -211,6 +214,8 @@ async def _fetch_one_gallery(
     # Attribute NEW gallery to its source sort/tag so the summary line
     # "New in <label>: N" ticks up on the right row.
     channel_dashboard.record_new_gallery(source_sort or "popular")
+    # v1.22: also add to the deduped per-key set backing /health cached: N.
+    channel_dashboard.record_gid_seen(source_sort or "popular", gid)
     channel_dashboard.record_activity(last_gid=str(gid))
     return "ok"
 

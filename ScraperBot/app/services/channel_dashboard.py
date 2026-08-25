@@ -133,27 +133,45 @@ def _save_activity(a: Dict[str, Any]) -> None:
 # Public counter mutations
 # ---------------------------------------------------------------------------
 
+# v1.22: per-key 24h rings + unique-gid sets so /health can show real
+# "+24h" and "cached" numbers per sort/tag (not just per-phase counters).
+_PER_KEY_RING_CAP = 500     # per (sort|tag) — enough headroom for 24h burst
+_PER_KEY_GIDS_CAP = 5000    # per (sort|tag) — bounds Mongo doc size
+
+
+def _prune_ring(ring: List[Any], cutoff: float) -> List[float]:
+    return [float(ts) for ts in ring
+            if isinstance(ts, (int, float)) and ts >= cutoff]
+
+
 def record_new_gallery(sort_or_tag: str) -> None:
+    now = time.time()
     c = _counters()
     per_sort = c.get("per_sort") or {}
     per_sort[sort_or_tag] = int(per_sort.get(sort_or_tag, 0)) + 1
     c["per_sort"] = per_sort
     c["new_galleries"] = int(c.get("new_galleries", 0)) + 1
-    c["last_write_at"] = time.time()
+    c["last_write_at"] = now
     _save_counters(c)
 
     t = _totals()
     t["total_galleries"] = int(t.get("total_galleries", 0)) + 1
-    now = time.time()
-    ring = [ts for ts in (t.get("ring_24h") or [])
-            if isinstance(ts, (int, float)) and now - ts < 86400]
+    ring = _prune_ring(t.get("ring_24h") or [], now - 86400)
     ring.append(now)
     t["ring_24h"] = ring[-20000:]
 
-    hring = [ts for ts in (t.get("ring_hb") or [])
-             if isinstance(ts, (int, float)) and now - ts < _HEARTBEAT_SEC]
+    hring = _prune_ring(t.get("ring_hb") or [], now - _HEARTBEAT_SEC)
     hring.append(now)
     t["ring_hb"] = hring[-20000:]
+
+    # v1.22: per-key 24h ring, so /health can show "+24h: N" per sort/tag.
+    by_key = t.get("ring24h_by_key") or {}
+    if not isinstance(by_key, dict):
+        by_key = {}
+    kring = _prune_ring(by_key.get(sort_or_tag) or [], now - 86400)
+    kring.append(now)
+    by_key[sort_or_tag] = kring[-_PER_KEY_RING_CAP:]
+    t["ring24h_by_key"] = by_key
     _save_totals(t)
 
 
@@ -164,6 +182,72 @@ def record_cached_gallery(sort_or_tag: str) -> None:
     c["per_cached"] = pc
     c["last_write_at"] = time.time()
     _save_counters(c)
+
+
+def record_gid_seen(sort_or_tag: str, gid: Any) -> None:
+    """v1.22: track distinct galleries seen (cached OR newly written) under
+    each sort/tag. Backs the "cached: N" number on /health — the true live
+    total per key, not the per-phase counter.
+
+    Storage is in `dash_counters.per_sort_gids` (dict of list-of-str, deduped
+    per call). Capped at _PER_KEY_GIDS_CAP entries per key to bound the
+    Mongo doc size. Order is not meaningful."""
+    if not sort_or_tag:
+        return
+    try:
+        sgid = str(gid).strip()
+    except Exception:
+        return
+    if not sgid:
+        return
+    c = _counters()
+    m = c.get("per_sort_gids") or {}
+    if not isinstance(m, dict):
+        m = {}
+    lst = m.get(sort_or_tag) or []
+    if not isinstance(lst, list):
+        lst = []
+    if sgid in lst:
+        return  # already counted for this key
+    lst.append(sgid)
+    if len(lst) > _PER_KEY_GIDS_CAP:
+        lst = lst[-_PER_KEY_GIDS_CAP:]
+    m[sort_or_tag] = lst
+    c["per_sort_gids"] = m
+    _save_counters(c)
+
+
+def per_key_new_24h() -> Dict[str, int]:
+    """v1.22: {sort_or_tag: count of new galleries in the last 24h}.
+    Live read of the per-key ring; empty when the ring hasn't warmed yet."""
+    t = _totals()
+    by_key = t.get("ring24h_by_key") or {}
+    if not isinstance(by_key, dict):
+        return {}
+    cutoff = time.time() - 86400
+    out: Dict[str, int] = {}
+    for k, ring in by_key.items():
+        if not isinstance(ring, list):
+            continue
+        n = sum(1 for ts in ring
+                if isinstance(ts, (int, float)) and ts >= cutoff)
+        if n:
+            out[str(k)] = n
+    return out
+
+
+def per_key_cached_totals() -> Dict[str, int]:
+    """v1.22: {sort_or_tag: distinct gallery count ever seen under it}.
+    Reads the deduped gid sets written by record_gid_seen."""
+    c = _counters()
+    m = c.get("per_sort_gids") or {}
+    if not isinstance(m, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for k, lst in m.items():
+        if isinstance(lst, list):
+            out[str(k)] = len(lst)
+    return out
 
 
 def record_search_page_written() -> None:
@@ -222,8 +306,15 @@ async def start_phase() -> None:
     phase = _phase_num() + 1
     mongo_client.state_set(_K_MSG_ID, 0)
     mongo_client.state_set(_K_PHASE, phase)
+    # v1.22: PRESERVE per_sort_gids across phases — it's a rolling total,
+    # not per-phase. Per-phase fields still reset.
+    prev = _counters()
+    preserved_gids = prev.get("per_sort_gids") or {}
+    if not isinstance(preserved_gids, dict):
+        preserved_gids = {}
     _save_counters({
         "new_galleries": 0, "per_sort": {}, "per_cached": {},
+        "per_sort_gids": preserved_gids,
         "search_pages": 0, "errors": 0, "skips": 0,
         "started_at": time.time(),
     })

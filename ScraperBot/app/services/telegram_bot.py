@@ -91,28 +91,96 @@ def _status_text() -> str:
     )
 
 
+# v1.22: hard cap on the /health message body (Telegram limit is 4096; we
+# stay well under to leave room for HTML markup + a trailing "…" tail).
+_HEALTH_HARD_LIMIT = 3900
+
+
 def _health_text() -> str:
     from .. import mongo_client, turso_client
     from . import channel_dashboard as cd
+    import html as _html
     import time as _t
+    from ..config import settings as _s
+
     t = cd._totals()
     now = _t.time()
     ring = t.get("ring_24h") or []
-    new_24h = sum(1 for ts in ring if isinstance(ts,(int,float)) and now-ts<86400)
+    new_24h = sum(1 for ts in ring
+                  if isinstance(ts, (int, float)) and now - ts < 86400)
     hring = t.get("ring_hb") or []
-    new_2h = sum(1 for ts in hring if isinstance(ts,(int,float)) and now-ts<7200)
+    new_2h = sum(1 for ts in hring
+                 if isinstance(ts, (int, float)) and now - ts < 7200)
     mongo_ok = mongo_client.db() is not None
     turso_ok = turso_client.turso_available()
     paused = mongo_client.is_paused()
     banner = "🟢 running" if not paused else "⏸️ paused"
-    return (
+
+    # v1.22: live per-key numbers (both dicts are read live from Mongo).
+    per_new_24h = cd.per_key_new_24h()
+    per_cached_total = cd.per_key_cached_totals()
+
+    # --- header block (matches the previous /health output verbatim) ---
+    header = (
         f"<b>ScraperBot health</b> — {banner}\n"
-        f"• Mongo: {'✅' if mongo_ok else '❌'}   Turso: {'✅' if turso_ok else '❌'}\n"
-        f"• Total galleries: {int(t.get('total_galleries',0))}\n"
+        f"• Mongo: {'✅' if mongo_ok else '❌'}   "
+        f"Turso: {'✅' if turso_ok else '❌'}\n"
+        f"• Total galleries: {int(t.get('total_galleries', 0))}\n"
         f"• New last 2h: {new_2h}\n"
         f"• New last 24h: {new_24h}\n"
         f"• Phase: #{cd._phase_num()}"
     )
+
+    # --- SORTS: fixed 4 chip sorts, always in this order ---
+    sort_label = {
+        "popular-today": "Popular Today",
+        "date":          "Recent",
+        "popular-week":  "Popular Week",
+        "popular":       "Popular",
+    }
+    sort_lines: list[str] = ["", "➜ <b>SORTS</b>"]
+    for key in ("popular-today", "date", "popular-week", "popular"):
+        n = int(per_new_24h.get(key, 0))
+        c = int(per_cached_total.get(key, 0))
+        sort_lines.append(f"• {sort_label[key]}")
+        sort_lines.append(f"    +24h: {n}   cached: {c}")
+
+    # --- TRENDING TAGS: same set the channel dashboard leads with ---
+    #   union of settings.extra_tag_sorts + Mongo trending_tags (order preserved,
+    #   deduped). We do NOT dump every tag ever seen — user asked for trending
+    #   only, matching the log-channel behaviour.
+    configured = [str(x).strip() for x in getattr(_s, "extra_tag_sorts", []) or []
+                  if str(x).strip()]
+    trending = mongo_client.state_get("trending_tags", []) or []
+    trending = [str(x).strip() for x in trending
+                if isinstance(x, str) and str(x).strip()]
+    tag_names: list[str] = []
+    for name in configured + trending:
+        if name and name not in tag_names:
+            tag_names.append(name)
+
+    tag_lines: list[str] = ["", "➜ <b>TRENDING TAGS</b>"]
+    if not tag_names:
+        tag_lines.append("• (none yet — trending harvest is warming)")
+    else:
+        for name in tag_names:
+            key = f"tag:{name}"
+            n = int(per_new_24h.get(key, 0))
+            c = int(per_cached_total.get(key, 0))
+            tag_lines.append(f"• tag: {_html.escape(name)}")
+            tag_lines.append(f"    +24h: {n}   cached: {c}")
+
+    body = header + "\n" + "\n".join(sort_lines) + "\n" + "\n".join(tag_lines)
+
+    # v1.22: warming note the first day, when the per-key ring is still empty
+    # everywhere. Prevents the "why are all +24h zero?" question.
+    if not per_new_24h:
+        body += ("\n\n<i>note: per-key +24h ring is warming — real numbers "
+                 "appear as the sweeper hits each sort/tag.</i>")
+
+    if len(body) > _HEALTH_HARD_LIMIT:
+        body = body[: _HEALTH_HARD_LIMIT - 3] + "\n…"
+    return body
 
 
 def _help_text() -> str:
