@@ -1,46 +1,44 @@
-## v12.42 — Bot2Fetcher: stop re-sending permanent "no images" galleries to @Gallery_DLBot
+## v12.43 — Bot2Fetcher: construct + download cover when payload has no URL
 
 Ship date: 2026-08-25
-Files: app/fetcher.py, app/mongo_state.py
+Files: app/meta.py, app/fetcher.py, app/mongo_state.py
+(contains v12.42 + v12.43 — self-contained, no other zip needed)
 
-Symptom (reported by Ryan): the userbot DMs https://nhentai.net/g/<id>/ to
-@Gallery_DLBot; the bot replies "An error occurred: No images found after
-download or ZIP extraction." — a PERMANENT failure for that gallery. But
-_do_job's hard-error branch called drop_claim(), which DELETES the galleries
-doc, so the next producer scan re-discovered the gid and re-sent it forever.
+Symptom (from Render log): EVERY claimed gallery was dropped:
+    meta: 🔍 gallery:672776 — no cover URL in payload; keys:
+          ['id', 'media_id', 'title', 'cover', 'thumbnail', ...]
+    fetcher: ⚠️ 672776 — no cached meta, dropping claim
+The Turso payloads DO carry cover/thumbnail keys, but legacy rows store
+them as CDN-relative paths or v1-style dicts ({"t": "j"}), not URL strings.
+meta_from_cache() returned None → claim dropped → gallery never delivered.
 
-Fix (exactly the rule Ryan asked: error more than 2 times on the same item
-→ never send again):
+Fix (Ryan's instruction: "if it does not find it, download itself like it
+used to do"):
 
-1) fetcher.py
-   * New _NO_IMAGES_PATTERN = /no images found/i — only this error class
-     counts toward the skip threshold. Other hard errors keep the old
-     drop_claim + retry-next-cycle behavior (correct for transient errors).
-   * The isinstance(pdf_msg, str) branch in _do_job now calls
-     galleries.note_bot2_no_images(gid, text) for this class:
-       - verdict "retry" (attempts 1-2): claim released, dashboard event
-         "dropped", stats.dropped +1 — same telemetry shape as before.
-       - verdict "skip" (attempt 3): stats.failed +1, event "failed",
-         gallery never re-sent.
+1) meta.py — new _construct_cover_url(). When extraction from `cover`
+   fails, build the nhentai CDN URL from the payload:
+     Pass 1: thumbnail/cover string or dict-with-path/url (either field;
+             empty dicts fall through — fixed a shadowing bug caught by
+             the smoke test).
+     Pass 2: v1-style {"t": "j"} dict + media_id → cover.<ext>.
+     Pass 3: bare media_id → canonical cover.jpg guess.
+   Only a payload with no media_id at all still returns None (truly
+   undeliverable — same as before).
 
-2) mongo_state.py — new Galleries.note_bot2_no_images(gid, error, max_retries=3):
-   * $inc bot2_no_images_count on the galleries doc (upsert, ReturnDocument
-     .AFTER). Persistent — survives claim release, restarts, redeploys.
-   * Attempts 1-2 ("retry"): sets claim_expires=0 instead of deleting the
-     row, so claim()'s existing stale-claim recovery path re-claims the gid
-     on the next scan cycle. Counter is preserved.
-   * Attempt >= 3 ("skip"): mark_failed(status=FAILED_BOT2_ERROR). claim()
-     already returns "failed" for any FAILED_* status, so the gid is
-     permanently skipped by every future scan.
-   * Old rows (no counter) get up to 3 fresh attempts, then skip — no
-     migration needed.
-   * On any Mongo error the method fails open to the pre-v12.42 drop_claim
-     path, so a Mongo hiccup never wedges a slot.
+2) fetcher.py — _fetch_cover_bytes() now retries the other nhentai cover
+   extensions (.jpg/.png/.webp/.gif) on the same base path when the
+   constructed URL's extension is a guess that 404s. Successful fallback
+   is logged: "cover OK via extension fallback".
 
-Admin surface: the gid appears in the existing Force Re-scrape admin list
-(FAILED_BOT2_ERROR is in rescrape.py's _FAILED_STATUSES), so Ryan can
-inspect/reset it with the existing tooling — force_rescrape() wipes the doc
-and the counter with it.
+3) No behavior change for healthy payloads — an existing URL string in
+   `cover` passes through byte-identical (smoke test 6).
 
-Rollback: git checkout HEAD -- Bot2Fetcher/app/fetcher.py Bot2Fetcher/app/mongo_state.py
-The bot2_no_images_count field on galleries docs is harmless to leave behind.
+Verified: py_compile + pyflakes clean; 6 payload shapes smoke-tested
+(thumbnail string, v2 dict path, v1 dict + media_id, media_id-only,
+no-media_id drop, URL passthrough).
+
+Note: this zip ALSO includes v12.42 (the no-images-after-3-attempts skip)
+in fetcher.py + mongo_state.py — if you already deployed v12.42, these
+files are a superset; if not, this zip alone covers both.
+
+Rollback: git checkout HEAD -- Bot2Fetcher/app/meta.py Bot2Fetcher/app/fetcher.py

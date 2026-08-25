@@ -15,6 +15,71 @@ _BRACKET_TAIL_RE = re.compile(r"(\[[^\]]*\])\s*$")
 _CAPTION_HARD_LIMIT = 1024
 _TAGS_ROW_MAX = 600
 
+# v12.43: nhentai CDN constants for cover-URL construction when the cached
+# payload has no usable cover URL (legacy rows store CDN-relative paths or
+# v1-style dicts instead of a URL string).
+_T_CDN = "https://t.nhentai.net"
+_NH_EXT_MAP = {"j": "jpg", "p": "png", "g": "gif", "w": "webp"}
+
+
+def _construct_cover_url(gid: str, p: Dict[str, Any]) -> str:
+    """Build the cover URL ourselves when extraction from `cover` failed.
+
+    Handles every payload shape seen in the wild:
+      * thumbnail / cover as string   — CDN-relative path or full URL
+      * thumbnail / cover as v2 dict  — {"path": "galleries/<mid>/cover.jpg"}
+      * thumbnail / cover as v1 dict  — {"t": "j"} + media_id on the payload
+      * nothing usable                — canonical guess from media_id
+        (https://t.nhentai.net/galleries/<media_id>/cover.jpg); the fetcher
+        retries other extensions if this 404s.
+    Returns "" only when there is no media_id to build from."""
+    media_id = str(p.get("media_id") or "").strip()
+
+    # Pass 1: explicit values win — string or dict-with-path/url, either
+    # field. An EMPTY dict ({} as in legacy rows) must NOT shadow a real
+    # value in the other field, so dicts with no path/url fall through.
+    for field in ("thumbnail", "cover"):
+        v = p.get(field)
+        if isinstance(v, str) and v.strip():
+            s = v.strip()
+            if s.startswith("//"):
+                return "https:" + s
+            if s.startswith("http"):
+                return s
+            return _T_CDN + "/" + s.lstrip("/")
+        if isinstance(v, dict):
+            path = str(v.get("path") or "").strip()
+            if path:
+                if path.startswith("//"):
+                    return "https:" + path
+                if path.startswith("http"):
+                    return path
+                return _T_CDN + "/" + path.lstrip("/")
+            url = str(v.get("url") or v.get("src") or "").strip()
+            if url:
+                if url.startswith("//"):
+                    return "https:" + url
+                if url.startswith("http"):
+                    return url
+                return _T_CDN + "/" + url.lstrip("/")
+
+    # Pass 2: v1-style {"t": "j"} dicts — need media_id to build the path.
+    if media_id:
+        for field in ("cover", "thumbnail"):
+            v = p.get(field)
+            if isinstance(v, dict) and v:
+                ext = _NH_EXT_MAP.get(
+                    str(v.get("t") or "j").strip().lower(), "jpg")
+                name = "cover" if field == "cover" else "thumb"
+                return f"{_T_CDN}/galleries/{media_id}/{name}.{ext}"
+
+    # Pass 3: bare media_id guess — fetcher retries other extensions.
+    if media_id:
+        log.info("🔍 gallery:%s — cover not in payload; constructed CDN "
+                 "URL from media_id=%s", gid, media_id)
+        return f"{_T_CDN}/galleries/{media_id}/cover.jpg"
+    return ""
+
 _META_ROW_ORDER = [
     ("group",     "Groups"),
     ("parody",    "Parodies"),
@@ -131,7 +196,13 @@ def meta_from_cache(gid: str, cache_row: Optional[Dict[str, Any]]) -> Optional[D
         cover = ""
 
     if not cover:
-        log.warning("🔍 gallery:%s — no cover URL in payload; keys: %s", gid, list(p.keys())[:10])
+        # v12.43: do NOT drop — construct the CDN URL from media_id (the
+        # "download it yourself" path). Only a payload with no media_id at
+        # all is still undeliverable.
+        cover = _construct_cover_url(str(p.get("id") or gid), p)
+    if not cover:
+        log.warning("🔍 gallery:%s — no cover URL and no media_id in "
+                    "payload; keys: %s", gid, list(p.keys())[:10])
         return None
 
     title = p.get("title_english") or p.get("title") or f"Gallery {gid}"

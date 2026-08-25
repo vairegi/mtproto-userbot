@@ -431,14 +431,37 @@ class Fetcher:
             self.stats.in_flight.pop(gid, None)
 
     async def _fetch_cover_bytes(self, m: Dict[str, Any]) -> tuple[bytes, str]:
+        # v12.43: meta may now return a CONSTRUCTED CDN URL whose extension
+        # is a guess (cover.jpg when the real file is cover.png). Try the
+        # given URL first, then the other common nhentai cover extensions
+        # on the same base path — this is the "download it yourself" half
+        # of the fix.
         img_bytes: bytes = b""
         ext = ".jpg"
+        url0 = m["cover"]
+        candidates = [url0]
+        tail = url0.rsplit("/", 1)[-1]
+        if "." in tail:
+            base = url0.rsplit(".", 1)[0]
+            for e in (".jpg", ".png", ".webp", ".gif"):
+                u = base + e
+                if u not in candidates:
+                    candidates.append(u)
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True,
                                          headers=_COVER_HEADERS) as h:
-                r = await h.get(m["cover"])
-                if r.status_code == 200 and len(r.content) >= 200:
-                    img_bytes = r.content
+                for url in candidates:
+                    try:
+                        r = await h.get(url)
+                    except Exception:
+                        continue
+                    if r.status_code == 200 and len(r.content) >= 200:
+                        img_bytes = r.content
+                        ext = "." + url.rsplit(".", 1)[-1]
+                        if url != url0:
+                            log.info("🖼 %s — cover OK via extension "
+                                     "fallback: %s", m["id"], url)
+                        break
         except Exception as e:
             log.warning("🖼 cover download %s failed: %s", m["id"], e)
         if img_bytes:
