@@ -118,8 +118,18 @@ def meta_from_cache(gid: str, cache_row: Optional[Dict[str, Any]]) -> Optional[D
             tags_typed.append({"name": str(t), "type": "tag"})
 
     cover = p.get("cover") or p.get("cover_url") or p.get("thumb_url") or ""
-    if cover and cover.startswith("//"):
-        cover = "https:" + cover
+
+    # Fix: Safely handle cover if dictionary object is returned
+    if isinstance(cover, dict):
+        cover = cover.get("url") or cover.get("src") or ""
+
+    # Fix: Ensure type string before performing startswith
+    if isinstance(cover, str):
+        if cover.startswith("//"):
+            cover = "https:" + cover
+    else:
+        cover = ""
+
     if not cover:
         log.warning("🔍 gallery:%s — no cover URL in payload; keys: %s", gid, list(p.keys())[:10])
         return None
