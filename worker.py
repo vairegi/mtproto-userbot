@@ -70,6 +70,15 @@ except Exception as _e_dp:  # noqa: BLE001
 else:
     _details_cron_import_err = None
 
+# v12.41: cron supervisor.
+try:
+    from miniapp.backend.app.services import cron_orchestrator as _cron_orch
+except Exception as _e_co:  # noqa: BLE001
+    _cron_orch = None
+    _cron_orch_import_err = _e_co
+else:
+    _cron_orch_import_err = None
+
 
 async def process_job(*args, **kwargs):
     """Thin passthrough to relay_v2.process_job.
@@ -287,81 +296,22 @@ async def _run_loop() -> int:
     fatal = asyncio.Event()         # set by a task on AuthKey/Unauthorized
     fatal_reason: list = []
 
-    # v12.4: spawn the Turso cache warmer as a background task. It runs
-    # in the same event loop as the worker so a bucket-exhaustion event
-    # from user traffic is immediately visible to the sweep (no IPC).
-    # A crash inside run_forever() is swallowed by prefetch_cron itself
-    # — see rule set: the mini-app never goes down because Turso is off.
-    if _prefetch_cron is not None:
+    # v12.41: all background crons run under ONE supervisor task. Each
+    # cron keeps its own run_forever() (cadence + toggles unchanged); the
+    # supervisor just respawns + loud-logs on an unexpected crash.
+    if _cron_orch is not None:
         try:
             asyncio.create_task(
-                _prefetch_cron.run_forever(),
-                name="prefetch_cron",
+                _cron_orch.run_forever(_prefetch_cron, _dedup_cron, _details_cron),
+                name="cron_orchestrator",
             )
-            log.info(
-                "prefetch_cron: spawned (interval=%ss, max_pages=%s, enabled=%s)",
-                _prefetch_cron.PREFETCH_INTERVAL_SEC,
-                _prefetch_cron.PREFETCH_MAX_PAGES,
-                _prefetch_cron._enabled(),
-            )
+            log.info("cron_orchestrator: spawned (prefetch+dedup+details supervised)")
         except Exception as e:  # noqa: BLE001
-            log.warning("prefetch_cron: spawn failed (%s) — continuing without warmer", e)
+            log.warning("cron_orchestrator: spawn failed (%s) — crons NOT started", e)
     else:
         log.warning(
-            "prefetch_cron: not spawned — import failed at boot (%s)",
-            _prefetch_cron_import_err,
-        )
-
-    # v12.10 (#1): dedup_cron background sweep (every 12 h by default).
-    # Spawned right after prefetch_cron so a dedup import failure never
-    # affects the warmer. Alerts the admin via Telegram when duplicates
-    # were removed OR when a Turso failure needs to be disclosed.
-    if _dedup_cron is not None:
-        try:
-            asyncio.create_task(
-                _dedup_cron.run_forever(),
-                name="dedup_cron",
-            )
-            log.info(
-                "dedup_cron: spawned (interval=%ss, enabled=%s, alerts=%s)",
-                _dedup_cron.DEDUP_INTERVAL_SEC,
-                _dedup_cron.DEDUP_ENABLED,
-                _dedup_cron.DEDUP_ALERT_ENABLED,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("dedup_cron: spawn failed (%s) — continuing without dedup", e)
-    else:
-        log.warning(
-            "dedup_cron: not spawned — import failed at boot (%s)",
-            _dedup_cron_import_err,
-        )
-
-    # v12.11 (#1): details_prefetch_cron — walks every cached search page
-    # (popular-today first, then date / popular-week / popular) and
-    # scrapes DETAILS for each card into Turso under gallery:<id>. The
-    # detail endpoint then serves a straight cache hit instead of an
-    # upstream fetch. Pauses itself during the day window when a
-    # non-admin user is active; admin activity never pauses it.
-    if _details_cron is not None:
-        try:
-            asyncio.create_task(
-                _details_cron.run_forever(),
-                name="details_prefetch_cron",
-            )
-            log.info(
-                "details_prefetch_cron: spawned (night=%s-%s IST, day_tick=%ss, night_tick=%ss, enabled=%s)",
-                _details_cron.NIGHT_START,
-                _details_cron.NIGHT_END,
-                _details_cron.DAY_TICK_SEC,
-                _details_cron.NIGHT_TICK_SEC,
-                _details_cron.ENABLED,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("details_prefetch_cron: spawn failed (%s) — continuing without scraper", e)
-    else:
-        log.warning(
-            "details_prefetch_cron: not spawned — import failed at boot (%s)",
-            _details_cron_import_err,
+            "cron_orchestrator: not spawned — import failed at boot (%s)",
+            _cron_orch_import_err,
         )
 
     log.info("worker started, entering main loop (concurrent dispatch, max=%d)",

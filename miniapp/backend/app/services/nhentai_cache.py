@@ -42,6 +42,11 @@ log = logging.getLogger("miniapp.nhentai_cache")
 # v0.39 architecture: Mongo is durable store only. Cache goes Turso.
 _TURSO_ONLY = os.environ.get("BOT0_NH_MONGO_WRITES", "0").strip() not in ("0", "", "false", "False", "no")
 
+# v12.41: gate the Mongo read-fallback inside get(). With both Mongo mirrors
+# off, a Turso miss can never be rescued by Mongo, so skip the round-trip.
+_MONGO_READ_FALLBACK = os.environ.get(
+    "BOT0_CACHE_MONGO_READ_FALLBACK", "0").strip() in ("1", "true", "yes")
+
 # v12.4: Turso-first cache layer. Import lazily so a missing package can
 # never crash the mini-app; turso_client.turso_available() gates all use.
 try:
@@ -389,6 +394,15 @@ def get(key: str, allow_stale: bool = False) -> Optional[dict]:
     if payload is not None:
         _hm_record(key, True)
         return payload
+    # v12.41: on a Turso MISS, the Mongo read below is almost always wasted
+    # when both Mongo-write mirrors are off (BOT0_NH_MONGO_WRITES=0 here and
+    # BOT1_CACHE_MONGO_MIRROR=0 on ScraperBot) — there is no writer left to
+    # have populated the row, so the fallback just adds a Mongo round-trip
+    # to every cold miss. Gate it: default OFF (skip Mongo), set
+    # BOT0_CACHE_MONGO_READ_FALLBACK=1 to restore the legacy behavior.
+    if not _MONGO_READ_FALLBACK:
+        _hm_record(key, False)
+        return None
     payload = _mongo_get(key, allow_stale)
     _hm_record(key, payload is not None)
     return payload

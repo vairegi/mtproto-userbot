@@ -422,7 +422,64 @@ def _has_pending_join_request(user_id: int, chat_id: int) -> bool:
     return status in ("pending", "approved")
 
 
+# v12.41: Mongo-only membership cache. getChatMember fires on EVERY delivery
+# attempt; with N force-join channels that's N Bot API calls per delivery.
+# Cache the verdict per (user_id, chat_id) in Mongo with a short TTL so
+# repeat deliveries within the window are one Mongo read instead of N HTTP
+# calls. Negative results are cached too — a non-member is the expensive
+# case (every attempt re-asks Telegram). The admin-bot 'I've joined'
+# callback (fj:check) bypasses this cache by calling _is_member_live
+# directly, so a just-joined user is never stuck behind a stale "False".
+_FORCE_JOIN_CACHE_TTL_SEC = int(os.environ.get("FORCE_JOIN_CACHE_TTL_SEC", "300"))
+
+
+def _fj_cache_col():
+    return _db.db()["miniapp_force_join_cache"]
+
+
+def _fj_cache_get(user_id: int, chat_id: int):
+    try:
+        doc = _fj_cache_col().find_one({"_id": f"{int(user_id)}:{int(chat_id)}"})
+        if not doc:
+            return None
+        if (time.time() - float(doc.get("checked_at", 0))) > _FORCE_JOIN_CACHE_TTL_SEC:
+            return None
+        return bool(doc.get("is_member"))
+    except Exception:
+        return None
+
+
+def _fj_cache_put(user_id: int, chat_id: int, is_member: bool) -> None:
+    try:
+        _fj_cache_col().update_one(
+            {"_id": f"{int(user_id)}:{int(chat_id)}"},
+            {"$set": {"is_member": bool(is_member), "checked_at": time.time()}},
+            upsert=True,
+        )
+    except Exception:
+        pass
+
+
+def invalidate_user(user_id: int) -> None:
+    """Drop all cached membership rows for a user (future admin 're-check'
+    button hook). Not wired to any UI in v12.41."""
+    try:
+        _fj_cache_col().delete_many({"_id": {"$regex": f"^{int(user_id)}:"}})
+    except Exception:
+        pass
+
+
 def _is_member(user_id: int, chat_id: int) -> bool:
+    # v12.41: cache-first. On miss/stale, do the live check and store it.
+    cached = _fj_cache_get(user_id, chat_id)
+    if cached is not None:
+        return cached
+    verdict = _is_member_live(user_id, chat_id)
+    _fj_cache_put(user_id, chat_id, verdict)
+    return verdict
+
+
+def _is_member_live(user_id: int, chat_id: int) -> bool:
     r = _sync_call("getChatMember",
                    {"chat_id": int(chat_id), "user_id": int(user_id)})
     if not r.get("ok"):

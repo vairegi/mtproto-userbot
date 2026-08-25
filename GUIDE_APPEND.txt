@@ -1,31 +1,33 @@
-## v12.41 — Bot2Fetcher: loud dashboard logging + per-slot InputPeer Mongo cache
+## v12.41 — BOT 0: cron supervisor + cache Mongo-read gate + force-join cache
 
 Ship date: 2026-08-25
-Files: app/dashboard.py, app/mongo_state.py, app/fetcher.py, main.py, app/turso_store.py, common/turso_http/*
+Files: worker.py, miniapp/backend/app/services/cron_orchestrator.py,
+       miniapp/backend/app/services/nhentai_cache.py,
+       miniapp/backend/app/services/force_join.py
 
-1) dashboard.py — port of ScraperBot v1.21 loud-logging. LogBot._call now logs
-   `bot api <method> failed [<error_code>]: <description>` (400-char cap) so a
-   400 storm is diagnosable from Render logs with one grep. Added
-   _coerce_chat_id so a numeric-string LOG_CHANNEL_ID is sent as int
-   (prevents silent "chat not found"). "message is not modified" whitelisted.
+1) Cron consolidation (#1). NEW cron_orchestrator.py supervises the three
+   background crons (prefetch_cron, dedup_cron, details_prefetch_cron) as
+   child tasks under ONE supervisor. worker.py now spawns one
+   `cron_orchestrator` task instead of three separate ones. Each cron keeps
+   its own run_forever() / cadence / env toggles UNCHANGED — this is
+   supervision, not a rewrite. A child crash is now loud-logged and respawned
+   after a 30s backoff instead of dying silently. rescrape.py is a library
+   (no run_forever) so it is not supervised.
 
-2) mongo_state.py — new PeerCache class (collection `bot2_peer_cache`).
-   Persists each slot's resolved Telethon InputPeer, keyed by
-   (slot_idx, kind, session_fingerprint). session_fingerprint = sha256 of the
-   slot's StringSession — rotating a session auto-invalidates the row (this is
-   what prevents regressing to the v12.40i cross-session PeerIdInvalidError).
+2) nhentai_cache.py (#2). get() already short-circuited on a Turso hit. The
+   change gates the Mongo read that ran on a Turso MISS: new env
+   BOT0_CACHE_MONGO_READ_FALLBACK (default "0" = skip Mongo). With both Mongo
+   mirrors off (BOT0_NH_MONGO_WRITES=0 here, BOT1_CACHE_MONGO_MIRROR=0 on
+   ScraperBot) a Turso miss can never be rescued by Mongo, so the fallback was
+   a wasted round-trip on every cold miss. Set the env to 1 to restore legacy.
 
-3) fetcher.py — _warm_and_resolve() now consults PeerCache first. On a warm
-   restart (same session) the entity loads in ONE Mongo read and the 200-dialog
-   iter_dialogs scan is SKIPPED. On any miss/mismatch/error it falls back to
-   the live resolution path, then writes the fresh entity back to the cache.
-   Cache is an optimization, never a hard dependency.
+3) force_join.py (#3). Mongo-only membership cache. getChatMember verdicts are
+   cached per (user_id, chat_id) in `miniapp_force_join_cache` with a TTL
+   (FORCE_JOIN_CACHE_TTL_SEC, default 300s). Repeat deliveries in the window
+   are one Mongo read instead of N Bot API calls. Negative results cached too.
+   The admin-bot 'I've joined' (fj:check) path bypasses the cache by calling
+   _is_member_live directly, so a just-joined user is never stuck behind a
+   stale False. Added invalidate_user(user_id) hook (not wired to UI yet).
 
-4) main.py — wires fetcher.peer_cache = PeerCache(_db).
-
-5) turso_store.py — _pipeline delegates to the NEW shared package
-   common/turso_http (see Overall #1). Falls back to the pre-v12.41 inline
-   path if the shared package isn't importable, so deploy is safe either way.
-
-Rollback: git checkout HEAD -- Bot2Fetcher. New Mongo collection
-`bot2_peer_cache` is harmless to leave behind.
+Rollback: git checkout HEAD -- worker.py miniapp/backend/app/services/.
+New Mongo collections (miniapp_force_join_cache) are harmless to leave behind.
