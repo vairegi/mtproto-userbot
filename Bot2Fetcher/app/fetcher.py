@@ -126,17 +126,66 @@ class Fetcher:
                 pass
 
     async def _warm_and_resolve(self, idx: int, client: TelegramClient) -> None:
-        try:
-            n = 0
-            async for _ in client.iter_dialogs(limit=200):
-                n += 1
-            log.info("🧭 slot %d peer cache warmed (%d dialogs)", idx, n)
-        except Exception as e:
-            log.warning("🧭 slot %d iter_dialogs failed: %s", idx, e)
+        # v12.41: optional PeerCache (injected by main.py as self.peer_cache;
+        # None = byte-identical to the pre-v12.41 live-resolution path).
+        peer_cache = getattr(self, "peer_cache", None)
+        fp = None
+        if peer_cache is not None:
+            try:
+                fp = peer_cache.fp(client)
+            except Exception as e:
+                log.warning("🧭 slot %d peer-cache fingerprint failed: %s", idx, e)
+                peer_cache = None
+
+        async def _get_entity(kind: str, key):
+            if peer_cache is not None and fp:
+                try:
+                    blob = peer_cache.get(slot=idx, kind=kind,
+                                          session_fingerprint=fp)
+                    if blob is not None:
+                        return peer_cache.loads(blob)
+                except Exception as e:
+                    log.warning("🧭 slot %d %s peer-cache read failed: %s",
+                                idx, kind, e)
+            ent = await client.get_input_entity(key)   # live resolution
+            if peer_cache is not None and fp:
+                try:
+                    peer_cache.put(slot=idx, kind=kind, entity=ent,
+                                   session_fingerprint=fp)
+                except Exception as e:
+                    log.warning("🧭 slot %d %s peer-cache write failed: %s",
+                                idx, kind, e)
+            return ent
+
         ch_key = self.s.db_channel_id
         try:
             ch_key = int(ch_key) if str(ch_key).lstrip("-").isdigit() else ch_key
-            self._channel_per_slot[idx] = await client.get_input_entity(ch_key)
+        except Exception:
+            pass
+
+        # Only run the expensive dialog warm-up if EITHER entity is cache-cold.
+        need_warm = True
+        if peer_cache is not None and fp:
+            try:
+                need_warm = not (
+                    peer_cache.has(slot=idx, kind="db_channel", session_fingerprint=fp)
+                    and peer_cache.has(slot=idx, kind="bot2_user", session_fingerprint=fp)
+                )
+            except Exception:
+                need_warm = True
+        if need_warm:
+            try:
+                n = 0
+                async for _ in client.iter_dialogs(limit=200):
+                    n += 1
+                log.info("🧭 slot %d peer cache warmed (%d dialogs)", idx, n)
+            except Exception as e:
+                log.warning("🧭 slot %d iter_dialogs failed: %s", idx, e)
+        else:
+            log.info("🧭 slot %d peer cache warm-hit — skipping iter_dialogs", idx)
+
+        try:
+            self._channel_per_slot[idx] = await _get_entity("db_channel", ch_key)
             log.info("📺 slot %d resolved DB channel: %s", idx, self.s.db_channel_id)
         except Exception as e:
             raise RuntimeError(
@@ -144,7 +193,7 @@ class Fetcher:
                 f"Make sure this userbot is a MEMBER of the channel."
             ) from e
         try:
-            self._bot2_per_slot[idx] = await client.get_input_entity(self.s.bot2_username)
+            self._bot2_per_slot[idx] = await _get_entity("bot2_user", self.s.bot2_username)
             log.info("🤖 slot %d resolved downloader bot: @%s",
                      idx, self.s.bot2_username)
         except Exception as e:

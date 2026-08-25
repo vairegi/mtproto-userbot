@@ -3,6 +3,14 @@ turso_store.py — shared Turso access via the raw HTTP /v2/pipeline API.
 """
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_ROOT = _os.path.abspath(_os.path.join(_HERE, "..", ".."))
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
+
+
 import json
 import logging
 import time
@@ -77,6 +85,22 @@ class Turso:
         self._ready = False
 
     async def _pipeline(self, sql: str, args: Optional[list] = None) -> Optional[Dict[str, Any]]:
+        # v12.41: delegate to the shared common.turso_http client so all
+        # three bots share ONE /v2/pipeline implementation. Fall back to the
+        # inline legacy path if the shared package isn't importable (e.g.
+        # the file was dropped from a deploy).
+        try:
+            from common.turso_http import TursoHttpClient  # noqa: WPS433
+        except Exception:
+            TursoHttpClient = None  # type: ignore
+        if TursoHttpClient is not None:
+            client = getattr(self, "_shared", None)
+            if client is None:
+                client = TursoHttpClient(self.base, self.token, timeout=45.0)
+                self._shared = client
+            return await client.execute_raw(sql, list(args or []))
+
+        # ---- legacy inline path (pre-v12.41), kept as fallback ----
         body = {
             "requests": [
                 {"type": "execute",

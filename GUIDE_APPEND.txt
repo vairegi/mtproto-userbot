@@ -1,116 +1,31 @@
-## v1.22 — ScraperBot: rich /health with live per-sort + trending-tag numbers
+## v12.41 — Bot2Fetcher: loud dashboard logging + per-slot InputPeer Mongo cache
 
-**Ship date:** 2026-08-25
-**Files touched (3, all inside `ScraperBot/app/services/`):**
-- `channel_dashboard.py`   — new per-key 24h ring + deduped per-key gid sets
-- `details_sweeper.py`     — one extra `record_gid_seen()` call on hit + ok paths
-- `telegram_bot.py`        — `_health_text()` rewritten to render SORTS + TRENDING TAGS
+Ship date: 2026-08-25
+Files: app/dashboard.py, app/mongo_state.py, app/fetcher.py, main.py, app/turso_store.py, common/turso_http/*
 
-**What changed in the user-visible /health output**
+1) dashboard.py — port of ScraperBot v1.21 loud-logging. LogBot._call now logs
+   `bot api <method> failed [<error_code>]: <description>` (400-char cap) so a
+   400 storm is diagnosable from Render logs with one grep. Added
+   _coerce_chat_id so a numeric-string LOG_CHANNEL_ID is sent as int
+   (prevents silent "chat not found"). "message is not modified" whitelisted.
 
-Old body: 6 lines, no per-sort/per-tag breakdown.
+2) mongo_state.py — new PeerCache class (collection `bot2_peer_cache`).
+   Persists each slot's resolved Telethon InputPeer, keyed by
+   (slot_idx, kind, session_fingerprint). session_fingerprint = sha256 of the
+   slot's StringSession — rotating a session auto-invalidates the row (this is
+   what prevents regressing to the v12.40i cross-session PeerIdInvalidError).
 
-New body (single message, HTML parse_mode, non-collapsible — NOT a Telegram
-`<blockquote>` because those render as expandable quotes on modern clients,
-which is exactly what Ryan said he did NOT want):
+3) fetcher.py — _warm_and_resolve() now consults PeerCache first. On a warm
+   restart (same session) the entity loads in ONE Mongo read and the 200-dialog
+   iter_dialogs scan is SKIPPED. On any miss/mismatch/error it falls back to
+   the live resolution path, then writes the fresh entity back to the cache.
+   Cache is an optimization, never a hard dependency.
 
-    ScraperBot health — 🟢 running
-    • Mongo: ✅   Turso: ✅
-    • Total galleries: 8258
-    • New last 2h: 87
-    • New last 24h: 932
-    • Phase: #138
+4) main.py — wires fetcher.peer_cache = PeerCache(_db).
 
-    ➜ SORTS
-    • Popular Today
-        +24h: 12   cached: 540
-    • Recent
-        +24h: 45   cached: 612
-    • Popular Week
-        +24h: 8    cached: 498
-    • Popular
-        +24h: 21   cached: 590
+5) turso_store.py — _pipeline delegates to the NEW shared package
+   common/turso_http (see Overall #1). Falls back to the pre-v12.41 inline
+   path if the shared package isn't importable, so deploy is safe either way.
 
-    ➜ TRENDING TAGS
-    • tag: <name>
-        +24h: N    cached: M
-    …
-
-`+24h` and `cached` are read LIVE from Mongo on every `/health` invocation —
-no caching, no debouncing. Any new gallery attributed by the details sweeper
-to a given (sort|tag) shows up on the next `/health` immediately.
-
-Body is hard-capped at 3900 chars (safe under Telegram's 4096) with `\n…` tail.
-
-**Data model (new keys under `scraper1_state`)**
-
-1. `dash_totals.ring24h_by_key`
-   `{ sort_or_tag: [epoch_ts, …] }` — pruned per write to keep only the
-   last 24h; cap 500 entries per key so a single burst can't blow the
-   Mongo doc size. Written in `record_new_gallery()`.
-
-2. `dash_counters.per_sort_gids`
-   `{ sort_or_tag: [gid_str, …] }` — deduped set-as-list of every gallery
-   id ever attributed to that sort/tag (across all phases). Cap 5000 per
-   key. Written by the new `record_gid_seen()`, called from
-   `details_sweeper._fetch_one_gallery()` on BOTH `hit` and `ok` paths.
-   `len(list)` = the "cached: N" number shown on /health, and it is a
-   TRUE running total, not a per-phase counter.
-
-3. `start_phase()` still resets `per_sort` / `per_cached` / etc., but now
-   PRESERVES `per_sort_gids` — that set is a rolling lifetime total, not a
-   phase-scoped counter.
-
-**Trending-tag list — same set the log-channel dashboard leads with**
-
-`_health_text()` unions:
-- `settings.extra_tag_sorts`  (manual pin list from env)
-- Mongo `trending_tags`       (auto-harvested every 24h by trending_tags.py)
-
-deduped, order preserved (manual pins first). No tag ever seen is added
-beyond that set — Ryan asked for trending only, not every tag ever swept.
-
-If both lists are empty (cold deploy), a placeholder line appears:
-`• (none yet — trending harvest is warming)`.
-
-**Cold-start behaviour — warming note**
-
-Both the per-key ring and the per-key gid set are empty on first deploy.
-For the first ~1 phase all rows will show `+24h: 0   cached: 0`. When
-`per_key_new_24h()` is entirely empty, `_health_text()` appends:
-
-    note: per-key +24h ring is warming — real numbers appear as the
-    sweeper hits each sort/tag.
-
-That note self-clears the moment any per-key ring gets its first tick.
-
-Existing counters (`total_galleries`, `New last 2h`, `New last 24h`,
-`Phase #N`) are unaffected — they use the pre-existing global rings so
-they show real numbers from second 1.
-
-**Backwards compatibility**
-
-- No schema migration required. New Mongo keys are created lazily on first
-  write; old deployments that don't have them yet just render `+24h: 0
-  cached: 0` for one warm-up period.
-- No new env vars, no new deps, no Turso schema change.
-- Old channel-dashboard rendering (`_render()`, `_heartbeat_text()`) still
-  reads the SAME `per_sort` / `per_cached` / `ring_24h` / `ring_hb` keys —
-  none of them were modified. The channel dashboard message is unchanged.
-
-**Verified before ship**
-
-    $ python3 -m py_compile ScraperBot/app/services/{channel_dashboard,details_sweeper,telegram_bot}.py
-    compile OK
-    $ python3 -m pyflakes ScraperBot/app/services/{channel_dashboard,details_sweeper}.py
-    (clean)
-
-`telegram_bot.py` still shows two pre-existing unused-import warnings
-(`json`, `typing.Optional`) that were there before this patch; not touching
-them per the "never rewrite from memory / edit only what's needed" rule.
-
-**Rollback**
-
-`git checkout HEAD -- ScraperBot/app/services/{channel_dashboard,details_sweeper,telegram_bot}.py`
-The new Mongo keys (`ring24h_by_key`, `per_sort_gids`) are harmless to leave
-in place — nothing else in the codebase reads them.
+Rollback: git checkout HEAD -- Bot2Fetcher. New Mongo collection
+`bot2_peer_cache` is harmless to leave behind.

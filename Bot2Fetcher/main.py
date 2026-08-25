@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
 from app.config import load
-from app.mongo_state import connect as mongo_connect, Galleries
+from app.mongo_state import connect as mongo_connect, Galleries, PeerCache
 from app.turso_store import Turso
 from app.fetcher import Fetcher, Stats
 from app.dashboard import Dashboard
@@ -33,6 +33,10 @@ turso = Turso(settings.turso_url, settings.turso_token)
 dashboard = Dashboard(settings, turso, stats)
 dashboard.galleries = galleries
 fetcher = Fetcher(settings, galleries, turso, stats, dashboard=dashboard)
+# v12.41: per-slot InputPeer cache (Mongo). Warm restarts skip the
+# 200-dialog iter_dialogs scan; session rotation auto-invalidates via
+# fingerprint mismatch. Falls back to live resolution on any miss.
+fetcher.peer_cache = PeerCache(_db)
 
 app = FastAPI(title="Bot2Fetcher")
 

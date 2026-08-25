@@ -151,3 +151,92 @@ class Galleries:
         except Exception as e:
             log.warning("count_by_status failed: %s", e)
             return {}
+
+# ---------------------------------------------------------------------------
+# v12.41: per-slot Telethon InputPeer cache.
+#
+# Telethon's peer table is PER SESSION — an InputPeer resolved under one
+# StringSession is meaningless (PeerIdInvalidError) under another. The
+# v12.40j fix made each slot warm its OWN cache via iter_dialogs() +
+# get_input_entity() at boot; that works but costs ~30 s per slot on a
+# cold restart (200-dialog scan + 2 entity lookups per slot).
+#
+# PeerCache persists the resolved entity in Mongo keyed by
+# (slot_idx, kind, session_fingerprint). session_fingerprint is a sha256 of
+# the slot's session string, so swapping a session INVALIDATES the row —
+# this is the linchpin that prevents regressing to the v12.40i cross-
+# session bug. On a warm restart (same session) the entity loads in one
+# Mongo read; on any miss / mismatch / error we fall back to the live
+# resolution path, so the cache is an optimization, never a hard dep.
+# ---------------------------------------------------------------------------
+import hashlib as _hashlib
+import pickle as _pickle
+
+
+class PeerCache:
+    COLL = "bot2_peer_cache"
+
+    def __init__(self, db):
+        self.coll = db[self.COLL]
+
+    @staticmethod
+    def fp(client) -> str:
+        """Fingerprint the slot's StringSession. Stable across restarts for
+        the SAME session; changes the moment the env STRING_SESSION is
+        rotated, which is exactly the invalidation trigger we want."""
+        try:
+            sess = client.session
+            save = getattr(sess, "save", None)
+            raw = save() if callable(save) else str(sess)
+        except Exception:
+            raw = repr(client)
+        return _hashlib.sha256(str(raw).encode("utf-8")).hexdigest()[:32]
+
+    def _id(self, slot: int, kind: str) -> str:
+        return f"slot{int(slot)}:{kind}"
+
+    def has(self, slot: int, kind: str, session_fingerprint: str) -> bool:
+        try:
+            doc = self.coll.find_one(
+                {"_id": self._id(slot, kind),
+                 "session_fingerprint": session_fingerprint},
+                {"_id": 1},
+            )
+            return doc is not None
+        except Exception:
+            return False
+
+    def get(self, slot: int, kind: str, session_fingerprint: str):
+        """Return the pickled-entity bytes for this slot/kind IF the stored
+        fingerprint matches the current session. None on miss/mismatch/err."""
+        try:
+            doc = self.coll.find_one({"_id": self._id(slot, kind)})
+            if not doc:
+                return None
+            if doc.get("session_fingerprint") != session_fingerprint:
+                return None
+            blob = doc.get("entity_blob")
+            return bytes(blob) if blob is not None else None
+        except Exception as e:
+            log.warning("peercache get(%s,%s) failed: %s", slot, kind, e)
+            return None
+
+    @staticmethod
+    def loads(blob: bytes):
+        return _pickle.loads(blob)
+
+    def put(self, slot: int, kind: str, entity, session_fingerprint: str) -> None:
+        try:
+            blob = _pickle.dumps(entity)
+            self.coll.update_one(
+                {"_id": self._id(slot, kind)},
+                {"$set": {
+                    "entity_blob": blob,
+                    "session_fingerprint": session_fingerprint,
+                    "resolved_at": time.time(),
+                }},
+                upsert=True,
+            )
+        except Exception as e:
+            log.warning("peercache put(%s,%s) failed: %s", slot, kind, e)
+

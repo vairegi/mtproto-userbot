@@ -49,29 +49,52 @@ def _progress_bar(done: int, total: int, width: int = 14) -> str:
     return "[" + "█" * filled + "░" * (width - filled) + f"] {pct}%"
 
 
+def _coerce_chat_id(v):
+    """Send numeric chat_id as int — Telegram sometimes rejects the string
+    form of a channel id ('-100...') as 'chat not found'. Mirrors BOT 1's
+    v1.21 helper so both bots behave identically on a numeric-string
+    LOG_CHANNEL_ID."""
+    if isinstance(v, int):
+        return v
+    s = str(v or "").strip()
+    if s.lstrip("-").isdigit():
+        try:
+            return int(s)
+        except ValueError:
+            return s
+    return s
+
+
 class LogBot:
     """Tiny async Bot API client via httpx."""
 
     def __init__(self, token: str, chat_id: str):
         self.token = token
-        self.chat_id = chat_id
+        # v12.41: coerce numeric-string channel ids to int at construction
+        # so send/edit never hit a silent "chat not found".
+        self.chat_id = _coerce_chat_id(chat_id)
         self._me: Optional[Dict[str, Any]] = None
 
     async def _call(self, method: str, payload: dict) -> Optional[dict]:
+        # v12.41: loud-logging port of ScraperBot v1.21 _tg_api. Every non-ok
+        # response logs method + error_code + full description (truncated to
+        # 400 chars) so a 400 storm is diagnosable from Render logs with one
+        # grep for "bot api". "message is not modified" stays whitelisted.
         url = f"{_API}/bot{self.token}/{method}"
         try:
             async with httpx.AsyncClient(timeout=15.0) as h:
                 r = await h.post(url, json=payload)
                 data = r.json()
         except Exception as e:
-            log.warning("📊 bot api %s: %s", method, e)
+            log.warning("📊 bot api %s transport error: %s", method, e)
             return None
         if not data.get("ok"):
-            desc = data.get("description", "")
+            desc = str(data.get("description", ""))[:400]
+            code = data.get("error_code")
             # "message is not modified" is harmless — edit called with same text.
             if "message is not modified" in desc.lower():
                 return {"ok": True, "no_op": True}
-            log.warning("📊 bot api %s failed: %s", method, desc)
+            log.warning("📊 bot api %s failed [%s]: %s", method, code, desc)
             return None
         return data.get("result")
 
