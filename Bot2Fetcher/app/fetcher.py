@@ -41,6 +41,13 @@ _COVER_HEADERS = {
     "Referer": "https://nhentai.net/",
 }
 
+# v12.42: the PERMANENT Bot2 failure Ryan reported — Gallery_DLBot replies
+# "An error occurred: No images found after download or ZIP extraction."
+# for galleries it can never produce a PDF for. Tracked separately so only
+# this class of error counts toward the skip-after-3 threshold; transient
+# hard errors keep the old drop-and-retry behavior.
+_NO_IMAGES_PATTERN = re.compile(r"no images found", re.IGNORECASE)
+
 _HARD_ERROR_PATTERNS = re.compile(
     r"(❌|⛔|🚫|\berror\b|\bfailed\b|not found|"
     r"invalid|unavailable|forbidden|blocked|removed|"
@@ -348,6 +355,26 @@ class Fetcher:
                 self._d_event(idx, "dropped", gid)
                 return True
             if isinstance(pdf_msg, str):
+                # v12.42: permanent "no images" failure — count it in Mongo.
+                # 1st/2nd time: release claim as immediately-stale so the next
+                # scan cycle re-claims and retries. 3rd time (>2): mark
+                # FAILED_BOT2_ERROR so claim() returns "failed" and the gid is
+                # NEVER sent to @Gallery_DLBot again.
+                if _NO_IMAGES_PATTERN.search(pdf_msg or ""):
+                    verdict = self.galleries.note_bot2_no_images(gid, pdf_msg)
+                    if verdict == "skip":
+                        log.error(
+                            "🚷 %s — Gallery_DLBot 'no images' x3 — "
+                            "marked FAILED_BOT2_ERROR, never re-sending", gid)
+                        self.stats.failed += 1
+                        self._d_event(idx, "failed", gid)
+                        return True
+                    log.warning(
+                        "🔁 %s — Gallery_DLBot 'no images' (attempt <3, "
+                        "will retry next cycle): %s", gid, pdf_msg[:120])
+                    self.stats.dropped += 1
+                    self._d_event(idx, "dropped", gid)
+                    return True
                 log.error("🤖❌ %s — Bot 2 hard error, dropping: %s",
                           gid, pdf_msg[:150])
                 self.galleries.drop_claim(gid)

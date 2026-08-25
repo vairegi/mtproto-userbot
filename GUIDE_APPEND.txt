@@ -1,33 +1,46 @@
-## v12.41 — BOT 0: cron supervisor + cache Mongo-read gate + force-join cache
+## v12.42 — Bot2Fetcher: stop re-sending permanent "no images" galleries to @Gallery_DLBot
 
 Ship date: 2026-08-25
-Files: worker.py, miniapp/backend/app/services/cron_orchestrator.py,
-       miniapp/backend/app/services/nhentai_cache.py,
-       miniapp/backend/app/services/force_join.py
+Files: app/fetcher.py, app/mongo_state.py
 
-1) Cron consolidation (#1). NEW cron_orchestrator.py supervises the three
-   background crons (prefetch_cron, dedup_cron, details_prefetch_cron) as
-   child tasks under ONE supervisor. worker.py now spawns one
-   `cron_orchestrator` task instead of three separate ones. Each cron keeps
-   its own run_forever() / cadence / env toggles UNCHANGED — this is
-   supervision, not a rewrite. A child crash is now loud-logged and respawned
-   after a 30s backoff instead of dying silently. rescrape.py is a library
-   (no run_forever) so it is not supervised.
+Symptom (reported by Ryan): the userbot DMs https://nhentai.net/g/<id>/ to
+@Gallery_DLBot; the bot replies "An error occurred: No images found after
+download or ZIP extraction." — a PERMANENT failure for that gallery. But
+_do_job's hard-error branch called drop_claim(), which DELETES the galleries
+doc, so the next producer scan re-discovered the gid and re-sent it forever.
 
-2) nhentai_cache.py (#2). get() already short-circuited on a Turso hit. The
-   change gates the Mongo read that ran on a Turso MISS: new env
-   BOT0_CACHE_MONGO_READ_FALLBACK (default "0" = skip Mongo). With both Mongo
-   mirrors off (BOT0_NH_MONGO_WRITES=0 here, BOT1_CACHE_MONGO_MIRROR=0 on
-   ScraperBot) a Turso miss can never be rescued by Mongo, so the fallback was
-   a wasted round-trip on every cold miss. Set the env to 1 to restore legacy.
+Fix (exactly the rule Ryan asked: error more than 2 times on the same item
+→ never send again):
 
-3) force_join.py (#3). Mongo-only membership cache. getChatMember verdicts are
-   cached per (user_id, chat_id) in `miniapp_force_join_cache` with a TTL
-   (FORCE_JOIN_CACHE_TTL_SEC, default 300s). Repeat deliveries in the window
-   are one Mongo read instead of N Bot API calls. Negative results cached too.
-   The admin-bot 'I've joined' (fj:check) path bypasses the cache by calling
-   _is_member_live directly, so a just-joined user is never stuck behind a
-   stale False. Added invalidate_user(user_id) hook (not wired to UI yet).
+1) fetcher.py
+   * New _NO_IMAGES_PATTERN = /no images found/i — only this error class
+     counts toward the skip threshold. Other hard errors keep the old
+     drop_claim + retry-next-cycle behavior (correct for transient errors).
+   * The isinstance(pdf_msg, str) branch in _do_job now calls
+     galleries.note_bot2_no_images(gid, text) for this class:
+       - verdict "retry" (attempts 1-2): claim released, dashboard event
+         "dropped", stats.dropped +1 — same telemetry shape as before.
+       - verdict "skip" (attempt 3): stats.failed +1, event "failed",
+         gallery never re-sent.
 
-Rollback: git checkout HEAD -- worker.py miniapp/backend/app/services/.
-New Mongo collections (miniapp_force_join_cache) are harmless to leave behind.
+2) mongo_state.py — new Galleries.note_bot2_no_images(gid, error, max_retries=3):
+   * $inc bot2_no_images_count on the galleries doc (upsert, ReturnDocument
+     .AFTER). Persistent — survives claim release, restarts, redeploys.
+   * Attempts 1-2 ("retry"): sets claim_expires=0 instead of deleting the
+     row, so claim()'s existing stale-claim recovery path re-claims the gid
+     on the next scan cycle. Counter is preserved.
+   * Attempt >= 3 ("skip"): mark_failed(status=FAILED_BOT2_ERROR). claim()
+     already returns "failed" for any FAILED_* status, so the gid is
+     permanently skipped by every future scan.
+   * Old rows (no counter) get up to 3 fresh attempts, then skip — no
+     migration needed.
+   * On any Mongo error the method fails open to the pre-v12.42 drop_claim
+     path, so a Mongo hiccup never wedges a slot.
+
+Admin surface: the gid appears in the existing Force Re-scrape admin list
+(FAILED_BOT2_ERROR is in rescrape.py's _FAILED_STATUSES), so Ryan can
+inspect/reset it with the existing tooling — force_rescrape() wipes the doc
+and the counter with it.
+
+Rollback: git checkout HEAD -- Bot2Fetcher/app/fetcher.py Bot2Fetcher/app/mongo_state.py
+The bot2_no_images_count field on galleries docs is harmless to leave behind.

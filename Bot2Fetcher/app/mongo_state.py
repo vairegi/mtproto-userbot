@@ -9,6 +9,7 @@ import time
 from typing import Optional
 
 from pymongo import MongoClient
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 log = logging.getLogger("bot2fetcher.mongo")
@@ -114,6 +115,54 @@ class Galleries:
             }},
             upsert=True,
         )
+
+    # v12.42: persistent counter for Gallery_DLBot's permanent
+    # "No images found after download or ZIP extraction" failure.
+    # Lives on the galleries doc so it survives the claim being released —
+    # unlike drop_claim(), which deletes the row and used to reset all
+    # memory of the failure (the infinite re-send loop Ryan reported).
+    def note_bot2_no_images(self, gid: str, error: str,
+                            max_retries: int = 3) -> str:
+        """Increment the per-gallery 'no images' counter.
+        Returns "retry" (attempts 1..max_retries-1: claim released as stale
+        so the next scan cycle re-claims it) or "skip" (attempt >=
+        max_retries: doc marked FAILED_BOT2_ERROR, never sent again)."""
+        gid = str(gid)
+        now = time.time()
+        try:
+            doc = self.coll.find_one_and_update(
+                {"_id": gid},
+                {"$inc": {"bot2_no_images_count": 1},
+                 "$set": {"bot2_last_error": (error or "")[:300],
+                          "updated_at": now}},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            count = int((doc or {}).get("bot2_no_images_count") or 1)
+        except Exception as e:
+            log.warning("note_bot2_no_images(%s) failed: %s — "
+                        "falling back to drop_claim", gid, e)
+            self.drop_claim(gid)
+            return "retry"
+        if count >= max_retries:
+            self.mark_failed(
+                gid, status=STATUS_FAILED_BOT2,
+                error=f"Gallery_DLBot: no images after {count} attempts: "
+                      f"{(error or '')[:200]}")
+            return "skip"
+        # Release the claim WITHOUT deleting the row: claim_expires=0 makes
+        # the doc immediately stale so claim()'s stale-recovery path
+        # re-claims it on the next scan cycle (counter preserved).
+        try:
+            self.coll.update_one(
+                {"_id": gid, "status": STATUS_PROCESSING,
+                 "source": "bot2fetcher"},
+                {"$set": {"claim_expires": 0, "updated_at": now}},
+            )
+        except Exception as e:
+            log.warning("note_bot2_no_images(%s) stale-release failed: %s",
+                        gid, e)
+        return "retry"
 
     def mark_failed(self, gid: str, *, status: str, error: str) -> None:
         now = time.time()
