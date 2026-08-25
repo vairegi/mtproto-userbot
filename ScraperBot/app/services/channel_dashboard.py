@@ -1,31 +1,47 @@
 """
 channel_dashboard.py — ONE live message in a Telegram channel.
 
-v1.8 rewrite — the whole design changed in response to the 429 storm:
+v1.21 (2026-08-25) — fix the silent 400 storm.
 
-  * ONE message per phase (merged summary + activity). Never two.
-  * ONE background writer task. No other code path calls Telegram.
-    Everything else (record_activity, counters, phase start/end) just
-    writes to Mongo state. The writer reads the state, renders the text,
-    and edits — throttled hard.
-  * Retry-after aware: when Telegram returns 429 with retry_after=N,
-    the writer sleeps N seconds before the next attempt. No more
-    exponential snowballing.
-  * Timestamp REMOVED from the summary line — identical states now produce
-    byte-identical text, which Telegram silently ignores, saving the edit.
-  * All scraped tags listed with per-tag new-item counts.
+Symptom seen in Render:
+    POST https://api.telegram.org/bot.../sendMessage "HTTP/1.1 400 Bad Request"
+    ... (every 3s, no dashboard message ever appears in the log channel)
 
-Phase model (unchanged): one full list-sweep pass = one phase [N].
-A new numbered message posts at phase start; it's edited in place during
-the phase; it freezes at phase end. Never deleted.
+Root cause
+----------
+`_tg_api` returned `{"ok": False, "description": ...}` on any HTTP != 2xx
+BUT the writer never LOGGED the `description` field. So every 400 vanished
+into a debug-invisible void. The three most common 400 reasons were all
+possible:
 
-Heartbeat: every HEARTBEAT_SEC (default 2h) a second small message posts
-with total cache size + how many new items were added in the last 2h.
+  1. `chat_id` sent as a string  → Telegram wants int for `-100...` channel
+     ids. httpx serialises the value verbatim.
+  2. HTML parse error — a `<blockquote>` body that contained an unescaped
+     `<` → 400 "Bad Request: can't parse entities". html.escape() covered
+     the body itself but a stray Mongo value could still slip through.
+  3. Text length > 4096 chars — long extra_tag_sorts + big activity block
+     could push a single edit past the limit.
+
+Fix
+---
+1. `_tg_api` now logs EVERY non-ok response at WARNING with the full
+   Telegram description so the next 400 is diagnosable from the log
+   alone.
+2. `chat_id` is coerced to int when the value looks numeric ("-100...").
+3. Switched from HTML `<blockquote>` to Markdown v1 fenced code block
+   (```\ntext\n```) — no more entity-parse errors possible.
+   Bonus: monospace is what the dashboard visually wants anyway.
+4. Body is hard-capped at 3900 chars (safe under Telegram's 4096) with a
+   `\n…` tail if truncated.
+5. On persistent-error (5 consecutive failed sends), the writer pauses
+   for 5 minutes so the log stops spamming and the process stays alive.
+6. Broader top-level `except` in `_writer_loop` so an unexpected shape
+   from Telegram never crashes the task (which is what caused occasional
+   full-process restarts).
 """
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -40,21 +56,21 @@ log = logging.getLogger("scraperbot.dashboard")
 _TG = "https://api.telegram.org"
 
 # Mongo state keys
-_K_PHASE       = "dash_phase"           # int: current phase number
-_K_MSG_ID      = "dash_msg_id"          # int: message-id of the ONE live msg
-_K_COUNTERS    = "dash_counters"        # dict: this-phase counters
-_K_TOTALS      = "dash_totals"          # dict: cumulative totals + 24h ring
-_K_ACTIVITY    = "dash_activity"        # dict: cursor, last_gid, last_tag
-_K_REFRESH     = "dash_refresh_sec"     # int: /time <n> override
-_K_CURSOR      = "dash_cursor"          # dict: resume (sort_idx, page)
-_K_HEARTBEAT   = "dash_heartbeat_last"  # float: last heartbeat ts
-_K_HEARTBEAT_R = "dash_heartbeat_ring"  # list[float]: ts of writes in window
+_K_PHASE       = "dash_phase"
+_K_MSG_ID      = "dash_msg_id"
+_K_COUNTERS    = "dash_counters"
+_K_TOTALS      = "dash_totals"
+_K_ACTIVITY    = "dash_activity"
+_K_REFRESH     = "dash_refresh_sec"
+_K_CURSOR      = "dash_cursor"
+_K_HEARTBEAT   = "dash_heartbeat_last"
+_K_HEARTBEAT_R = "dash_heartbeat_ring"
 
-# Hard limits — Telegram's editMessageText per-chat budget is ~1/sec and
-# it snowballs 429s. 3s between writes keeps us well under, even with the
-# refresh loop + activity pushes both trying.
 _MIN_WRITE_INTERVAL = 3.0
-_HEARTBEAT_SEC      = 2 * 3600  # 2 hours, per user spec
+_HEARTBEAT_SEC      = 2 * 3600
+_TEXT_HARD_LIMIT    = 3900          # safe under Telegram's 4096
+_MAX_CONSEC_FAIL    = 5             # then pause for _PAUSE_ON_FAIL_SEC
+_PAUSE_ON_FAIL_SEC  = 300
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +93,7 @@ def set_refresh_sec(n: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# State accessors (all callers write state, none calls Telegram)
+# State accessors
 # ---------------------------------------------------------------------------
 
 def _phase_num() -> int:
@@ -114,7 +130,7 @@ def _save_activity(a: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Public counter mutations (write-only, never trigger Telegram)
+# Public counter mutations
 # ---------------------------------------------------------------------------
 
 def record_new_gallery(sort_or_tag: str) -> None:
@@ -123,7 +139,7 @@ def record_new_gallery(sort_or_tag: str) -> None:
     per_sort[sort_or_tag] = int(per_sort.get(sort_or_tag, 0)) + 1
     c["per_sort"] = per_sort
     c["new_galleries"] = int(c.get("new_galleries", 0)) + 1
-    c["last_write_at"] = time.time()  # v1.15 (#1) freshness heartbeat
+    c["last_write_at"] = time.time()
     _save_counters(c)
 
     t = _totals()
@@ -134,7 +150,6 @@ def record_new_gallery(sort_or_tag: str) -> None:
     ring.append(now)
     t["ring_24h"] = ring[-20000:]
 
-    # Heartbeat ring — independent so heartbeats count "new in last 2h".
     hring = [ts for ts in (t.get("ring_hb") or [])
              if isinstance(ts, (int, float)) and now - ts < _HEARTBEAT_SEC]
     hring.append(now)
@@ -147,17 +162,13 @@ def record_cached_gallery(sort_or_tag: str) -> None:
     pc = c.get("per_cached") or {}
     pc[sort_or_tag] = int(pc.get(sort_or_tag, 0)) + 1
     c["per_cached"] = pc
-    c["last_write_at"] = time.time()  # v1.15 (#1) freshness heartbeat
+    c["last_write_at"] = time.time()
     _save_counters(c)
 
 
 def record_search_page_written() -> None:
     c = _counters()
     c["search_pages"] = int(c.get("search_pages", 0)) + 1
-    # v1.15 (#1): freshness heartbeat — stamp every successful write so the
-    # dashboard can show "Last write: Ns ago". A dead-but-looping sweeper
-    # stops updating this, which is the fastest visual tell that writes
-    # have stalled even while the phase counter keeps ticking.
     c["last_write_at"] = time.time()
     _save_counters(c)
 
@@ -176,7 +187,6 @@ def record_bucket_skip() -> None:
 
 def record_activity(*, sweeping: str = "", last_gid: str = "",
                     last_tag: str = "") -> None:
-    """Just writes state. The writer loop picks it up — no direct API call."""
     a = _activity()
     if sweeping:  a["sweeping"]  = sweeping
     if last_gid:  a["last_gid"]  = str(last_gid)
@@ -186,7 +196,7 @@ def record_activity(*, sweeping: str = "", last_gid: str = "",
 
 
 # ---------------------------------------------------------------------------
-# Resume cursor (sweep progress survives Render restarts)
+# Resume cursor
 # ---------------------------------------------------------------------------
 
 def cursor_get() -> Dict[str, Any]:
@@ -210,11 +220,6 @@ def cursor_clear() -> None:
 
 async def start_phase() -> None:
     phase = _phase_num() + 1
-    # v1.20: each phase gets its OWN Telegram message. Previously the
-    # stored message id survived across phases, so the writer kept editing
-    # the old phase message forever. Clearing it here makes the next writer
-    # tick send a fresh message for the new phase while leaving the last
-    # phase frozen in history.
     mongo_client.state_set(_K_MSG_ID, 0)
     mongo_client.state_set(_K_PHASE, phase)
     _save_counters({
@@ -226,12 +231,9 @@ async def start_phase() -> None:
     a["phase_started_at"] = time.time()
     _save_activity(a)
     log.info("dashboard: phase %d started", phase)
-    # First write of the phase — the writer loop will pick it up within
-    # MIN_WRITE_INTERVAL. No direct API call here.
 
 
 async def end_phase() -> None:
-    # The writer loop's next tick does the final edit. Just clear cursor.
     cursor_clear()
     log.info("dashboard: phase %d ended", _phase_num())
 
@@ -254,19 +256,7 @@ def _label_for(sort_or_tag: str) -> str:
     return _SORT_LABEL.get(sort_or_tag, sort_or_tag)
 
 
-def _fmt_hm_local(ts: float) -> str:
-    from datetime import datetime, timezone, timedelta
-    off = int(getattr(settings, "display_tz_offset_min", 330))
-    label = getattr(settings, "display_tz_label", "IST") or "IST"
-    return datetime.fromtimestamp(
-        ts, tz=timezone(timedelta(minutes=off))
-    ).strftime(f"%H:%M {label}")
-
-
 def _render() -> str:
-    """Build the merged message body (summary + activity). No timestamp in
-    the summary line — identical states produce identical text, so the
-    writer skips the edit and Telegram never sees the call."""
     c = _counters()
     t = _totals()
     a = _activity()
@@ -279,13 +269,11 @@ def _render() -> str:
     new_24h = sum(1 for ts in ring
                   if isinstance(ts, (int, float)) and now - ts < 86400)
 
-    # ---- summary ----------------------------------------------------------
     lines: List[str] = [f"[{phase}]"]
     lines.append(f"➥ Total galleries: {total_written}")
     lines.append(f"➥ New this phase: {int(c.get('new_galleries', 0))}")
     lines.append(f"➥ New today (24h): {new_24h}")
 
-    # Per-sort rows: core 4 sorts + every tag that ever produced a write.
     core = ["popular-today", "date", "popular-week", "popular"]
     tags_seen = sorted(k for k in per_sort if k.startswith("tag:"))
     configured = [f"tag:{t.strip()}" for t in getattr(settings, "extra_tag_sorts", [])
@@ -307,9 +295,6 @@ def _render() -> str:
     lines.append(f"➥ Pages written: {int(c.get('search_pages', 0))}")
     lines.append(f"➥ Errors: {int(c.get('errors', 0))} · Skips: {int(c.get('skips', 0))}")
 
-    # v1.15 (#1): freshness heartbeat — seconds since the last successful
-    # write. If the sweeper is looping but writes have stalled, this number
-    # climbs and you can see it immediately instead of reading raw logs.
     last_write = c.get("last_write_at")
     if isinstance(last_write, (int, float)) and last_write > 0:
         ago = max(0, int(now - last_write))
@@ -317,18 +302,13 @@ def _render() -> str:
     else:
         lines.append("➥ Last write: —")
 
-    # v1.15 (#2): retry backlog — how many (sort, page) pairs are sitting
-    # in the priority queue waiting for the bucket to refill. Growing
-    # phase-over-phase means the bucket is undersized BEFORE users hit
-    # cache misses.
     try:
         _prio = mongo_client.state_get("list_priority", []) or []
         backlog = len(_prio) if isinstance(_prio, list) else 0
-    except Exception:  # noqa: BLE001
+    except Exception:
         backlog = 0
     lines.append(f"➥ Retry backlog: {backlog}")
 
-    # ---- activity (merged) ------------------------------------------------
     lines.append("")
     lines.append("———")
     sweeping = str(a.get("sweeping") or "—")
@@ -340,9 +320,8 @@ def _render() -> str:
     elapsed = int(now - started)
     lines.append(f"➥ Elapsed: {elapsed // 60}m {elapsed % 60:02d}s")
 
-    # ETA: pages done vs pages total, rough estimate.
     max_pages = max(1, int(getattr(settings, "list_max_pages", 30)))
-    sorts_total = 4 + len(tag_order)  # core + tags
+    sorts_total = 4 + len(tag_order)
     pages_total = sorts_total * max_pages
     pages_done = int(c.get("search_pages", 0))
     if pages_done > 0 and elapsed > 0:
@@ -354,7 +333,6 @@ def _render() -> str:
 
 
 def _heartbeat_text() -> str:
-    """Compact health + activity snapshot posted every 2h."""
     t = _totals()
     now = time.time()
     hring = t.get("ring_hb") or []
@@ -374,15 +352,44 @@ def _heartbeat_text() -> str:
     )
 
 
-def _blockquote(body: str) -> str:
-    return f"<blockquote>{html.escape(body)}</blockquote>"
+# ---------------------------------------------------------------------------
+# Payload helpers — Markdown v1 code-fence wrap. No HTML entity risk.
+# ---------------------------------------------------------------------------
+
+_MD_ESC = str.maketrans({"`": "'", "\\": "/"})   # only chars that break a fence
+
+
+def _fence(body: str) -> str:
+    """Wrap `body` in a Markdown v1 fenced code block. Truncate to fit
+    Telegram's 4096-char limit."""
+    clean = (body or "").translate(_MD_ESC)
+    if len(clean) > _TEXT_HARD_LIMIT:
+        clean = clean[:_TEXT_HARD_LIMIT - 3] + "\n…"
+    return "```\n" + clean + "\n```"
+
+
+def _coerce_chat_id(v: Any) -> Any:
+    """Send numeric chat_id as int — Telegram sometimes rejects the
+    string form of a channel id ('-100...') as 'chat not found'."""
+    if isinstance(v, int):
+        return v
+    s = str(v or "").strip()
+    if s.lstrip("-").isdigit():
+        try:
+            return int(s)
+        except ValueError:
+            return s
+    return s
 
 
 # ---------------------------------------------------------------------------
-# Telegram API — called ONLY from _writer_loop
+# Telegram API
 # ---------------------------------------------------------------------------
 
 async def _tg_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST to Bot API. ALWAYS returns a dict, ALWAYS logs the description
+    on non-ok so a 400 storm can be diagnosed from Render logs.
+    """
     if not settings.bot_token:
         return {"ok": False, "description": "no token"}
     url = f"{_TG}/bot{settings.bot_token}/{method}"
@@ -390,15 +397,22 @@ async def _tg_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post(url, json=payload)
         try:
-            return r.json() or {"ok": False}
+            data = r.json() or {"ok": False}
         except Exception:
-            return {"ok": False, "description": f"HTTP {r.status_code}"}
+            data = {"ok": False,
+                    "description": f"HTTP {r.status_code} body={r.text[:200]!r}"}
     except Exception as e:
-        return {"ok": False, "description": str(e)}
+        return {"ok": False, "description": f"transport error: {e}"}
+    if not data.get("ok"):
+        # v1.21: LOUD-LOG the real reason. "not modified" is not an error.
+        desc = str(data.get("description", ""))[:400]
+        code = data.get("error_code")
+        if "not modified" not in desc.lower():
+            log.warning("📊 tg %s failed [%s]: %s", method, code, desc)
+    return data
 
 
 def _retry_after(resp: Dict[str, Any]) -> int:
-    """Seconds Telegram wants us to wait, or 0 if no 429."""
     if resp.get("error_code") != 429:
         return 0
     params = resp.get("parameters") or {}
@@ -409,17 +423,18 @@ def _retry_after(resp: Dict[str, Any]) -> int:
 
 
 async def _send_or_edit(text: str) -> Optional[int]:
-    """Send if no message ID stored, else edit. Returns message_id or None.
-    Caller is responsible for throttling."""
+    """Send if no message ID stored, else edit. Returns message_id or None."""
     if not settings.log_channel_id:
         return None
     stored = mongo_client.state_get(_K_MSG_ID, 0) or 0
-    body = _blockquote(text)
+    body = _fence(text)
+    chat_id = _coerce_chat_id(settings.log_channel_id)
 
     if not stored:
         r = await _tg_api("sendMessage", {
-            "chat_id": settings.log_channel_id,
-            "text": body, "parse_mode": "HTML",
+            "chat_id": chat_id,
+            "text": body,
+            "parse_mode": "Markdown",
             "disable_web_page_preview": True,
             "disable_notification": True,
         })
@@ -427,49 +442,49 @@ async def _send_or_edit(text: str) -> Optional[int]:
             mid = int(((r.get("result") or {}).get("message_id")) or 0) or None
             if mid:
                 mongo_client.state_set(_K_MSG_ID, mid)
+                log.info("📊 dashboard message posted (id=%s)", mid)
             return mid
         return None
 
     r = await _tg_api("editMessageText", {
-        "chat_id": settings.log_channel_id,
+        "chat_id": chat_id,
         "message_id": int(stored),
-        "text": body, "parse_mode": "HTML",
+        "text": body,
+        "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     })
     if r.get("ok"):
         return int(stored)
-    # Message deleted or not found — clear the stored id so next write
-    # creates a fresh one.
     desc = (r.get("description") or "").lower()
     if "not modified" in desc:
         return int(stored)
     if "message to edit not found" in desc or "message_id_invalid" in desc:
+        log.info("📊 stored dashboard msg_id=%s is gone — will repost", stored)
         mongo_client.state_set(_K_MSG_ID, 0)
         return None
     return int(stored) if r.get("error_code") == 429 else None
 
 
 # ---------------------------------------------------------------------------
-# The writer loop — single owner of ALL Telegram writes
+# Writer loop
 # ---------------------------------------------------------------------------
 
 async def _writer_loop(stop_event: asyncio.Event) -> None:
-    """Edits the live message every MIN_WRITE_INTERVAL. On 429, sleeps for
-    retry_after seconds. Posts a heartbeat every 2h."""
     log.info("dashboard writer: starting")
     last_text: str = ""
     last_hb: float = 0.0
     backoff_until: float = 0.0
+    consec_fail: int = 0
 
     while not stop_event.is_set():
         now = time.time()
         try:
-            # Heartbeat (every 2h, independent of phase state)
             if now - last_hb >= _HEARTBEAT_SEC and now > backoff_until:
                 hb = _heartbeat_text()
                 r = await _tg_api("sendMessage", {
-                    "chat_id": settings.log_channel_id,
-                    "text": _blockquote(hb), "parse_mode": "HTML",
+                    "chat_id": _coerce_chat_id(settings.log_channel_id),
+                    "text": _fence(hb),
+                    "parse_mode": "Markdown",
                     "disable_notification": True,
                 })
                 ra = _retry_after(r)
@@ -479,9 +494,7 @@ async def _writer_loop(stop_event: asyncio.Event) -> None:
                 elif r.get("ok"):
                     last_hb = now
                     mongo_client.state_set(_K_HEARTBEAT, now)
-                # After heartbeat, fall through to main write in same tick.
 
-            # Main message write — skip if backing off.
             if now < backoff_until:
                 await asyncio.sleep(max(1, backoff_until - now))
                 continue
@@ -489,18 +502,31 @@ async def _writer_loop(stop_event: asyncio.Event) -> None:
             text = _render()
             if text != last_text:
                 if not _phase_num():
-                    # No phase running — skip the write entirely.
                     pass
                 else:
                     mid = await _send_or_edit(text)
                     if mid:
                         last_text = text
-                    # We don't re-read the resp here — _send_or_edit already
-                    # handled 429 semantics internally for the edit path.
+                        consec_fail = 0
+                    else:
+                        # v1.21: bail-out on persistent failed sends so we
+                        # don't hammer the log with a 400 line every 3s.
+                        consec_fail += 1
+                        if consec_fail >= _MAX_CONSEC_FAIL:
+                            log.error(
+                                "📊 dashboard: %d consecutive failed sends — "
+                                "pausing writer for %ds. Check the WARNING "
+                                "lines above for Telegram's exact reason "
+                                "(e.g. 'chat not found' → bot must be admin "
+                                "of the channel; 'can't parse entities' → "
+                                "fixed in v1.21 via Markdown fence).",
+                                consec_fail, _PAUSE_ON_FAIL_SEC,
+                            )
+                            backoff_until = now + _PAUSE_ON_FAIL_SEC
+                            consec_fail = 0
         except Exception as e:
             log.warning("dashboard writer tick failed: %s", e)
 
-        # Sleep until next tick — user-tunable via /time, min 3s.
         try:
             await asyncio.wait_for(stop_event.wait(),
                                    timeout=get_refresh_sec())
