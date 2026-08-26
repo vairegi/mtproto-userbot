@@ -159,21 +159,24 @@ supervise "worker.py" "worker"
 sleep 2
 
 # --- 4. Foreground: Mini App backend (uvicorn) on ${PORT:-8000} ------------
-MINIAPP_ROOT="${APP_DIR}/miniapp"
-if [ ! -d "${MINIAPP_ROOT}" ]; then
-  log "FATAL: ${MINIAPP_ROOT} missing — cannot start Mini App backend"
+MINIAPP_BACKEND="${APP_DIR}/miniapp/backend"
+if [ ! -f "${MINIAPP_BACKEND}/main.py" ]; then
+  log "FATAL: ${MINIAPP_BACKEND}/main.py missing — cannot start Mini App backend"
   shutdown
   exit 1
 fi
-
 log "------------------------------------------------------------"
 log "starting Mini App backend (uvicorn) on port ${PORT:-8000} in the foreground"
 log "------------------------------------------------------------"
-
-cd "${MINIAPP_ROOT}"
-export PYTHONPATH="$(dirname "${MINIAPP_ROOT}"):${MINIAPP_ROOT}/backend:${PYTHONPATH:-}"
-
-exec uvicorn backend.main:app \
+# v12.52: boot from the backend dir so `app` is a REAL package and all
+# `from .. import db` relative imports resolve. The previous
+# `cd miniapp && uvicorn backend.main:app` loaded main under a namespace
+# package and killed every route module at import time.
+cd "${MINIAPP_BACKEND}"
+# backend first (app.* absolute imports), backend/app second so legacy
+# top-level `import db` in _badge.py / popup.py still resolves.
+export PYTHONPATH="${MINIAPP_BACKEND}:${MINIAPP_BACKEND}/app:${PYTHONPATH:-}"
+exec uvicorn main:app \
   --host 0.0.0.0 \
   --port "${PORT:-8000}" \
   --log-level "${MINIAPP_LOG_LEVEL:-info}"
