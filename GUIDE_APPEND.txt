@@ -1,44 +1,44 @@
-## v12.43 — Bot2Fetcher: construct + download cover when payload has no URL
+## v12.44 — Bot2Fetcher: bulletproof cache-field coercion + skip elimination
 
-Ship date: 2026-08-25
-Files: app/meta.py, app/fetcher.py, app/mongo_state.py
-(contains v12.42 + v12.43 — self-contained, no other zip needed)
+Ship date: 2026-08-26
+Files: app/meta.py, app/fetcher.py, app/mongo_state.py, app/turso_store.py
+(superset — includes v12.42 no-images skip and v12.43 cover construct)
 
-Symptom (from Render log): EVERY claimed gallery was dropped:
-    meta: 🔍 gallery:672776 — no cover URL in payload; keys:
-          ['id', 'media_id', 'title', 'cover', 'thumbnail', ...]
-    fetcher: ⚠️ 672776 — no cached meta, dropping claim
-The Turso payloads DO carry cover/thumbnail keys, but legacy rows store
-them as CDN-relative paths or v1-style dicts ({"t": "j"}), not URL strings.
-meta_from_cache() returned None → claim dropped → gallery never delivered.
+1) PERMANENT crash fix (meta.py)
+   Root cause: the same gallery:<id> Turso row can be written by THREE
+   different code paths (BOT 0 nhentai_cache.put, BOT 1 normalize_gallery,
+   BOT 1 search-card passthrough) plus legacy versions — so `pages` has
+   arrived as int, str, list AND dict. Each new shape crashed the reader.
+   Fix: new _coerce_int() accepts int/float/str/list/tuple/dict (nested
+   pages/num_pages/value/count/n keys), returns 0 only when nothing is
+   recoverable. `title` is also coerced from dict to string (legacy raw-v2
+   rows). The reader can no longer crash on ANY field shape, no matter
+   which writer produced the row. Smoke-tested against every shape from
+   the crash chain.
 
-Fix (Ryan's instruction: "if it does not find it, download itself like it
-used to do"):
+2) Skip elimination (fetcher.py + mongo_state.py)
+   Problem Ryan measured: 146 PDFs in 15h — slots were spending most of
+   their time re-claiming galleries already in the DB channel.
+   Fix: Fetcher keeps process-lifetime sets _known_done / _known_failed.
+   _build_queue_order() drops these gids BEFORE the queue, so slots never
+   touch known-finished work. Sets are fed by: claim()=="done"/"failed",
+   successful completion, v12.42 permanent skip, no-meta drop, and the
+   @Gallery_DLBot timeout drop (previously both re-queued forever).
+   New Galleries.get_known_states(gids) gives a ONE-round-trip batch
+   status lookup (wired for future use / restarts).
+   mark_completed() and mark_failed() now $unset the v12.42 retry counter
+   so finished rows are permanently clean.
 
-1) meta.py — new _construct_cover_url(). When extraction from `cover`
-   fails, build the nhentai CDN URL from the payload:
-     Pass 1: thumbnail/cover string or dict-with-path/url (either field;
-             empty dicts fall through — fixed a shadowing bug caught by
-             the smoke test).
-     Pass 2: v1-style {"t": "j"} dict + media_id → cover.<ext>.
-     Pass 3: bare media_id → canonical cover.jpg guess.
-   Only a payload with no media_id at all still returns None (truly
-   undeliverable — same as before).
+3) Root-cause fix: dead recent filter (turso_store.py)
+   list_recent_search_ids() filtered on key LIKE '%recent%' — which
+   matched ZERO rows because Recent is written as 'search:date:page<N>'
+   (nhentai's sort param is "date"). Recent-first ordering silently never
+   worked; the queue was always raw cached_at order. Now reads
+   search:date:* (and q=|sort=date| legacy), page-ordered, with a
+   popular-today fallback.
 
-2) fetcher.py — _fetch_cover_bytes() now retries the other nhentai cover
-   extensions (.jpg/.png/.webp/.gif) on the same base path when the
-   constructed URL's extension is a guess that 404s. Successful fallback
-   is logged: "cover OK via extension fallback".
+Verified: py_compile + pyflakes clean; _coerce_int smoke-tested on
+int/str/list/dict/nested/None plus two full meta_from_cache payloads
+matching both crash signatures (list, dict).
 
-3) No behavior change for healthy payloads — an existing URL string in
-   `cover` passes through byte-identical (smoke test 6).
-
-Verified: py_compile + pyflakes clean; 6 payload shapes smoke-tested
-(thumbnail string, v2 dict path, v1 dict + media_id, media_id-only,
-no-media_id drop, URL passthrough).
-
-Note: this zip ALSO includes v12.42 (the no-images-after-3-attempts skip)
-in fetcher.py + mongo_state.py — if you already deployed v12.42, these
-files are a superset; if not, this zip alone covers both.
-
-Rollback: git checkout HEAD -- Bot2Fetcher/app/meta.py Bot2Fetcher/app/fetcher.py
+Rollback: git checkout HEAD -- Bot2Fetcher/app

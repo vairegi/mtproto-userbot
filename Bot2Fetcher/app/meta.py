@@ -161,6 +161,58 @@ def caption_for(meta: Dict[str, Any]) -> str:
     return out
 
 
+# v12.44: bulletproof scalar coercion for fields read from Turso payloads.
+#
+# WHY THIS EXISTS (root cause of the v12.43→v12.44 crash chain): the same
+# gallery:<id> row can be written by THREE different code paths with three
+# different payload shapes —
+#   * BOT 0 / Mini App nhentai_cache.put        (BOT 0's own shape)
+#   * BOT 1 ScraperBot normalize_gallery         (normalized shape: pages=int)
+#   * BOT 1 ScraperBot normalize_card (search)   (raw v2 passthrough fields)
+# plus legacy rows from older versions. Depending on the writer, `pages` has
+# been observed as int, str, list AND dict — each new shape crashed
+# meta_from_cache with a TypeError until someone hand-patched that shape.
+# _coerce_int accepts every observed shape so the reader NEVER crashes again,
+# regardless of which writer produced the row.
+def _coerce_int(*vals) -> int:
+    """First value that can be coerced to int wins. Handles:
+    int / float / numeric str / [x, ...] (first coercible element) /
+    {"pages": x} / {"value": x} / {"count": x} / {"n": x} dicts.
+    Anything unrecoverable -> 0 (caller treats as unknown, never crashes)."""
+    def _one(v) -> int:
+        if v is None or isinstance(v, bool):
+            return 0
+        if isinstance(v, (int, float)):
+            return int(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if s.isdigit():
+                return int(s)
+            try:
+                return int(float(s))
+            except (TypeError, ValueError):
+                return 0
+        if isinstance(v, (list, tuple)):
+            for el in v:
+                n = _one(el)
+                if n:
+                    return n
+            return 0
+        if isinstance(v, dict):
+            for k in ("pages", "num_pages", "value", "count", "n"):
+                if k in v:
+                    n = _one(v[k])
+                    if n:
+                        return n
+            return 0
+        return 0
+    for v in vals:
+        n = _one(v)
+        if n:
+            return n
+    return 0
+
+
 def meta_from_cache(gid: str, cache_row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not cache_row:
         log.info("🔍 gallery:%s — no Turso cache row", gid)
@@ -206,13 +258,18 @@ def meta_from_cache(gid: str, cache_row: Optional[Dict[str, Any]]) -> Optional[D
         return None
 
     title = p.get("title_english") or p.get("title") or f"Gallery {gid}"
+    # v12.44: legacy raw-v2 rows carry title as a {"english","pretty",...}
+    # dict — coerce to string so the caption builder and log slicing
+    # (title[:40]) never crash.
+    if isinstance(title, dict):
+        title = (title.get("english") or title.get("pretty")
+                 or title.get("japanese") or f"Gallery {gid}")
+    title = str(title)
     
     # Naya logic jo pages ko safe banayega aur list aane par list ke andar ka number nikalega
-    raw_pages = p.get("pages") or p.get("num_pages") or 0
-    if isinstance(raw_pages, list):
-        raw_pages = raw_pages[0] if raw_pages else 0
-        
-    pages = int(raw_pages)
+    # v12.44: pages can be int / str / list / dict depending on which bot
+    # wrote the Turso row — _coerce_int handles all of them (0 = unknown).
+    pages = _coerce_int(p.get("pages"), p.get("num_pages"))
     
     log.info("🔍 gallery:%s — meta OK from Turso: %r, %d pages, %d typed tags",
              gid, title[:40], pages, len(tags_typed))

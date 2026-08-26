@@ -112,7 +112,10 @@ class Galleries:
                 "source": "bot2fetcher",
                 "completed_at": now,
                 "updated_at": now,
-            }},
+            },
+            # v12.44: successful delivery wipes the v12.42 retry counter
+            # so this gid is permanently clean.
+            "$unset": {"bot2_no_images_count": "", "bot2_last_error": ""}},
             upsert=True,
         )
 
@@ -174,7 +177,10 @@ class Galleries:
                 "source": "bot2fetcher",
                 "updated_at": now,
                 "failed_at": now,
-            }},
+            },
+            # v12.44: terminal failure rows clear the retry counter (a
+            # later force-rescrape recreates the doc from zero anyway).
+            "$unset": {"bot2_no_images_count": ""}},
             upsert=True,
         )
 
@@ -199,6 +205,21 @@ class Galleries:
             return {r["_id"]: r["n"] for r in self.coll.aggregate(pipe)}
         except Exception as e:
             log.warning("count_by_status failed: %s", e)
+            return {}
+
+    def get_known_states(self, gids: list) -> dict:
+        """v12.44: batch status lookup — ONE Mongo round-trip for a whole
+        scan cycle instead of one claim() attempt per gid. Returns
+        {gid: status} for rows that exist; missing gids are simply absent.
+        Used to pre-seed the producer's known-done / known-failed sets."""
+        ids = [str(g) for g in gids if g]
+        if not ids:
+            return {}
+        try:
+            cur = self.coll.find({"_id": {"$in": ids}}, {"status": 1})
+            return {str(d["_id"]): (d.get("status") or "") for d in cur}
+        except Exception as e:
+            log.warning("get_known_states failed: %s", e)
             return {}
 
 # ---------------------------------------------------------------------------

@@ -180,44 +180,60 @@ class Turso:
         return out
 
     async def list_recent_search_ids(self) -> List[str]:
-        result = await self.execute(
-            'SELECT "key", payload FROM nhentai_cache '
-            "WHERE \"key\" LIKE 'search:%' AND \"key\" LIKE '%recent%' "
-            "LIMIT ?", [_MAX_SEARCH_ROWS]
-        )
-        if not result:
-            return []
-        pages: List[tuple] = []
-        for r in result["rows"]:
-            k = r.get("key") or ""
-            payload_raw = r.get("payload")
-            if not k or payload_raw is None:
-                continue
-            try:
-                if isinstance(payload_raw, (bytes, bytearray)):
-                    payload_raw = payload_raw.decode("utf-8", "ignore")
-                payload = json.loads(payload_raw)
-            except Exception:
-                continue
-            page = 0
-            tail = k.rsplit("page", 1)[-1]
-            try:
-                page = int("".join(ch for ch in tail if ch.isdigit()) or 0)
-            except ValueError:
-                page = 0
-            pages.append((page, payload))
-        pages.sort(key=lambda t: t[0])
-        ids: List[str] = []
-        for _, payload in pages:
-            items = payload.get("result") if isinstance(payload, dict) else None
-            if isinstance(items, list):
-                for it in items:
-                    gid = str((it or {}).get("id") or "")
-                    if gid.isdigit():
-                        ids.append(gid)
-        log.info("🔥 list_recent_search_ids: %d ids from %d recent pages",
-                 len(ids), len(pages))
-        return ids
+        # v12.44: removed the '%recent%' key-name filter — it matched ZERO
+        # rows because BOT 0/BOT 1 write the Recent sort as
+        # 'search:date:page<N>' (nhentai's sort param is "date", not
+        # "recent"). So recent-first ordering silently never worked and the
+        # queue was always in raw cached_at order. Now: Recent (date) pages
+        # first in page order; fallback to popular-today if none cached.
+        out: List[str] = []
+        seen: set = set()
+
+        async def _ids_from(patterns: List[str]) -> int:
+            added = 0
+            for pat in patterns:
+                result = await self.execute(
+                    'SELECT "key", payload FROM nhentai_cache '
+                    'WHERE "key" LIKE ? LIMIT ?', [pat, _MAX_SEARCH_ROWS])
+                if not result:
+                    continue
+                pages: List[tuple] = []
+                for r in result["rows"]:
+                    k = r.get("key") or ""
+                    payload_raw = r.get("payload")
+                    if not k or payload_raw is None:
+                        continue
+                    try:
+                        if isinstance(payload_raw, (bytes, bytearray)):
+                            payload_raw = payload_raw.decode("utf-8", "ignore")
+                        payload = json.loads(payload_raw)
+                    except Exception:
+                        continue
+                    page = 0
+                    tail = k.rsplit("page", 1)[-1]
+                    try:
+                        page = int("".join(ch for ch in tail if ch.isdigit()) or 0)
+                    except ValueError:
+                        page = 0
+                    pages.append((page, payload))
+                pages.sort(key=lambda t: t[0])
+                for _, payload in pages:
+                    items = payload.get("result") if isinstance(payload, dict) else None
+                    if isinstance(items, list):
+                        for it in items:
+                            gid = str((it or {}).get("id") or "")
+                            if gid.isdigit() and gid not in seen:
+                                seen.add(gid)
+                                out.append(gid)
+                                added += 1
+            return added
+
+        n = await _ids_from(["search:date:%", "search:q=%|sort=date|%"])
+        if not n:
+            n = await _ids_from(["search:popular-today:%"])
+        log.info("🔥 list_recent_search_ids: %d ids (v12.44 recent-first fix)",
+                 len(out))
+        return out
 
     async def get_gallery_row(self, gid: str) -> Optional[Dict[str, Any]]:
         result = await self.execute(

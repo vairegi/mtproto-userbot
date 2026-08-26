@@ -106,6 +106,11 @@ class Fetcher:
         self.dash = dashboard
         self.clients: list[TelegramClient] = []
         self._channel_lock = asyncio.Lock()
+        # v12.44: process-lifetime memory of gids already delivered or
+        # permanently failed. The producer drops these BEFORE the queue so
+        # slots never spend claim+cache-read time on known-finished work.
+        self._known_done: set = set()
+        self._known_failed: set = set()
         self._queue: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
         self._channel_per_slot: dict[int, Any] = {}
@@ -246,6 +251,17 @@ class Fetcher:
             gid = r["gid"]
             if gid not in seen:
                 seen.add(gid); ordered.append(gid)
+        # v12.44: drop gids we already know are delivered / permanently
+        # failed. On a warm process this eliminates nearly every
+        # "⏭ already in DB channel — skipped" cycle (the 146-PDFs-in-15h
+        # problem: most slot time was being spent re-claiming known rows).
+        before = len(ordered)
+        ordered = [g for g in ordered
+                   if g not in self._known_done and g not in self._known_failed]
+        filtered = before - len(ordered)
+        if filtered:
+            log.info("🧹 queue: pre-filtered %d known-done/failed gids "
+                     "(%d candidates left)", filtered, len(ordered))
         return ordered
 
     async def _producer(self) -> None:
@@ -314,10 +330,12 @@ class Fetcher:
         decision = self.galleries.claim(gid)
         if decision == "done":
             self.stats.skipped_done += 1
+            self._known_done.add(gid)          # v12.44: never re-queue
             log.info("⏭ %s already in DB channel — skipped", gid)
             return False
         if decision == "failed":
             self.stats.skipped_failed += 1
+            self._known_failed.add(gid)        # v12.44: never re-queue
             log.info("🚫 %s previously failed — skipped", gid)
             return False
         if decision == "busy":
@@ -337,6 +355,9 @@ class Fetcher:
                 log.warning("⚠️ %s — no cached meta, dropping claim", gid)
                 self.galleries.drop_claim(gid)
                 self.stats.dropped += 1
+                # v12.44: drop_claim deletes the row, so without this the
+                # next scan cycle would re-claim and re-crash forever.
+                self._known_failed.add(gid)
                 self._d_event(idx, "dropped", gid)
                 return True
             timeout = compute_pdf_timeout(m.get("pages") or 0)
@@ -352,6 +373,9 @@ class Fetcher:
                           gid, int(timeout))
                 self.galleries.drop_claim(gid)
                 self.stats.dropped += 1
+                # v12.44: same re-claim loop fix as no-meta — do not feed
+                # this gid to slots again this process lifetime.
+                self._known_failed.add(gid)
                 self._d_event(idx, "dropped", gid)
                 return True
             if isinstance(pdf_msg, str):
@@ -367,6 +391,7 @@ class Fetcher:
                             "🚷 %s — Gallery_DLBot 'no images' x3 — "
                             "marked FAILED_BOT2_ERROR, never re-sending", gid)
                         self.stats.failed += 1
+                        self._known_failed.add(gid)   # v12.44
                         self._d_event(idx, "failed", gid)
                         return True
                     log.warning(
@@ -422,6 +447,7 @@ class Fetcher:
                 "pdf_msg_id": pdf_msg_id, "open_link": link,
             })
             self.stats.completed += 1
+            self._known_done.add(gid)          # v12.44: never re-queue
             self.stats.last_finished_at = time.time()
             self._d_event(idx, "completed", gid)
             log.info("✅ %s DONE — cover=%s pdf=%s (total completed: %d)",
