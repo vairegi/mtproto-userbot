@@ -184,6 +184,24 @@ class Galleries:
             upsert=True,
         )
 
+    def defer_claim(self, gid: str, cooldown_s: int = 3600) -> None:
+        """v12.45: park a claim instead of dropping it. Keeps the row with
+        claim_expires = now + cooldown so claim() returns 'busy' until the
+        cooldown lapses — used for transient upstream failures (403/429/
+        5xx) where drop_claim's row-DELETE would either hammer nhentai
+        every cycle or (pre-v12.44) lose all memory of the failure."""
+        try:
+            self.coll.update_one(
+                {"_id": str(gid), "status": STATUS_PROCESSING,
+                 "source": "bot2fetcher"},
+                {"$set": {"claim_expires": time.time() + int(cooldown_s),
+                          "updated_at": time.time()}},
+            )
+            log.info("⏳ deferred claim for %s (%ds cooldown)",
+                     gid, int(cooldown_s))
+        except Exception as e:
+            log.warning("defer_claim(%s) failed: %s", gid, e)
+
     def drop_claim(self, gid: str) -> None:
         try:
             r = self.coll.delete_one({

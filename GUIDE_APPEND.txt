@@ -1,44 +1,40 @@
-## v12.44 — Bot2Fetcher: bulletproof cache-field coercion + skip elimination
+## v12.45 — Bot2Fetcher: direct nhentai detail fetch when Turso has no row
 
 Ship date: 2026-08-26
-Files: app/meta.py, app/fetcher.py, app/mongo_state.py, app/turso_store.py
-(superset — includes v12.42 no-images skip and v12.43 cover construct)
+Files: app/fetcher.py, app/mongo_state.py
+(superset — includes v12.42, v12.43, v12.44)
 
-1) PERMANENT crash fix (meta.py)
-   Root cause: the same gallery:<id> Turso row can be written by THREE
-   different code paths (BOT 0 nhentai_cache.put, BOT 1 normalize_gallery,
-   BOT 1 search-card passthrough) plus legacy versions — so `pages` has
-   arrived as int, str, list AND dict. Each new shape crashed the reader.
-   Fix: new _coerce_int() accepts int/float/str/list/tuple/dict (nested
-   pages/num_pages/value/count/n keys), returns 0 only when nothing is
-   recoverable. `title` is also coerced from dict to string (legacy raw-v2
-   rows). The reader can no longer crash on ANY field shape, no matter
-   which writer produced the row. Smoke-tested against every shape from
-   the crash chain.
+Symptom (Render log): galleries from the NEW recent-first queue (v12.44)
+arrived with "no row in Turso" → "no cached meta, dropping claim". These
+are brand-new uploads whose detail pages BOT 1's details sweeper has not
+cached yet. The v12.43 cover-construction fix only runs AFTER a row exists
+— this was a different gap.
 
-2) Skip elimination (fetcher.py + mongo_state.py)
-   Problem Ryan measured: 146 PDFs in 15h — slots were spending most of
-   their time re-claiming galleries already in the DB channel.
-   Fix: Fetcher keeps process-lifetime sets _known_done / _known_failed.
-   _build_queue_order() drops these gids BEFORE the queue, so slots never
-   touch known-finished work. Sets are fed by: claim()=="done"/"failed",
-   successful completion, v12.42 permanent skip, no-meta drop, and the
-   @Gallery_DLBot timeout drop (previously both re-queued forever).
-   New Galleries.get_known_states(gids) gives a ONE-round-trip batch
-   status lookup (wired for future use / restarts).
-   mark_completed() and mark_failed() now $unset the v12.42 retry counter
-   so finished rows are permanently clean.
+Fix (Ryan's rule: if Bot 2 doesn't find it, fetch it itself):
 
-3) Root-cause fix: dead recent filter (turso_store.py)
-   list_recent_search_ids() filtered on key LIKE '%recent%' — which
-   matched ZERO rows because Recent is written as 'search:date:page<N>'
-   (nhentai's sort param is "date"). Recent-first ordering silently never
-   worked; the queue was always raw cached_at order. Now reads
-   search:date:* (and q=|sort=date| legacy), page-ordered, with a
-   popular-today fallback.
+1) fetcher.py — new _fetch_meta_direct(gid): on meta_from_cache() == None,
+   fetch GET https://nhentai.net/api/v2/galleries/<id> directly with a
+   browser UA, hoist v2 images.cover/thumbnail to top level (so meta's
+   _construct_cover_url gets exact extensions), and run the payload through
+   the SAME meta_from_cache + v12.44 coercion pipeline. Job then continues
+   normally (PDF request, cover post, DB channel post).
+   Outcome handling:
+     * 404            -> "dead": mark_failed(FAILED_SCRAPE), never retried.
+     * 403/429/5xx/net -> "defer": NEW Galleries.defer_claim() parks the row
+       for 1h (claim_expires = now+3600) instead of deleting it — no
+       hammering nhentai every scan cycle during a Cloudflare flap.
+     * unusable body  -> drop + known_failed (never re-queued this process).
+   Deliberately does NOT write the raw payload into the shared
+   nhentai_cache table — raw v2 JSON breaks the Mini App detail view; BOT 1
+   normalizes for that reason and will cache it properly on its own sweep.
+   Rate impact: worst case one request per uncached gid, ~4-8s apart per
+   slot — well under nhentai's 20/min /galleries anon limit. Steady state
+   is near zero because BOT 1 pre-caches most galleries.
 
-Verified: py_compile + pyflakes clean; _coerce_int smoke-tested on
-int/str/list/dict/nested/None plus two full meta_from_cache payloads
-matching both crash signatures (list, dict).
+2) mongo_state.py — new Galleries.defer_claim(gid, cooldown_s=3600).
 
-Rollback: git checkout HEAD -- Bot2Fetcher/app
+Verified: py_compile + pyflakes clean; full raw-v2 payload smoke-tested
+through meta_from_cache (title dict, {"t":"p"} cover dicts, cover URL
+construction, caption build all pass).
+
+Rollback: git checkout HEAD -- Bot2Fetcher/app/fetcher.py Bot2Fetcher/app/mongo_state.py

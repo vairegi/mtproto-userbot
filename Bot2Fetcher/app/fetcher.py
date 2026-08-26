@@ -352,14 +352,37 @@ class Fetcher:
             cache_row = await self.turso.get_gallery_row(gid)
             m = meta_mod.meta_from_cache(gid, cache_row)
             if m is None:
-                log.warning("⚠️ %s — no cached meta, dropping claim", gid)
-                self.galleries.drop_claim(gid)
-                self.stats.dropped += 1
-                # v12.44: drop_claim deletes the row, so without this the
-                # next scan cycle would re-claim and re-crash forever.
-                self._known_failed.add(gid)
-                self._d_event(idx, "dropped", gid)
-                return True
+                # v12.45: no Turso cache row — this is a brand-new gallery
+                # from a Recent page that BOT 1's details sweeper hasn't
+                # cached yet. Ryan's rule: if Bot 2 doesn't find it, fetch
+                # it itself. Direct /api/v2/galleries/<id> fetch, then
+                # continue the job normally.
+                outcome, m = await self._fetch_meta_direct(gid)
+                if outcome == "defer":
+                    # Transient upstream failure (403/429/5xx/network) —
+                    # park the gid for 1h instead of dropping, so a
+                    # Cloudflare flap doesn't waste cycles every scan.
+                    self.galleries.defer_claim(gid, 3600)
+                    self.stats.dropped += 1
+                    self._d_event(idx, "dropped", gid)
+                    return True
+                if outcome == "dead":
+                    # 404 — gallery is gone from nhentai; never retry.
+                    self.galleries.mark_failed(
+                        gid, status="FAILED_SCRAPE",
+                        error="nhentai 404 on direct detail fetch")
+                    self.stats.failed += 1
+                    self._known_failed.add(gid)
+                    self._d_event(idx, "failed", gid)
+                    return True
+                if m is None:
+                    log.warning("⚠️ %s — direct fetch gave unusable meta, "
+                                "dropping claim", gid)
+                    self.galleries.drop_claim(gid)
+                    self.stats.dropped += 1
+                    self._known_failed.add(gid)
+                    self._d_event(idx, "dropped", gid)
+                    return True
             timeout = compute_pdf_timeout(m.get("pages") or 0)
             caption = meta_mod.caption_for(m)
             log.info("📄 %s — %d pages, PDF wait budget %ds",
@@ -455,6 +478,63 @@ class Fetcher:
             return True
         finally:
             self.stats.in_flight.pop(gid, None)
+
+    async def _fetch_meta_direct(self, gid: str):
+        """v12.45: fetch gallery detail straight from nhentai when Turso has
+        no row. Returns (outcome, meta):
+          ("ok",    dict)  — meta ready, continue the job
+          ("defer", None)  — transient upstream failure; caller parks 1h
+          ("dead",  None)  — 404; caller marks failed permanently
+          ("ok",    None)  — fetch worked but payload unusable; caller drops
+        Deliberately does NOT write the raw payload into the shared
+        nhentai_cache table — raw v2 JSON breaks the Mini App detail view
+        (BOT 1 normalizes for exactly this reason). BOT 1's sweeper will
+        cache it properly later; this fetch only serves THIS job."""
+        url = f"https://nhentai.net/api/v2/galleries/{gid}"
+        headers = {
+            "User-Agent": _UA,
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://nhentai.net/",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0,
+                                         follow_redirects=True) as h:
+                r = await h.get(url, headers=headers)
+        except Exception as e:
+            log.warning("🌐 %s — direct detail fetch transport error: %s "
+                        "(defer 1h)", gid, e)
+            return ("defer", None)
+        if r.status_code == 404:
+            log.error("🌐 %s — nhentai 404 (gallery gone) — marking failed",
+                      gid)
+            return ("dead", None)
+        if r.status_code != 200:
+            log.warning("🌐 %s — direct detail fetch HTTP %s (defer 1h)",
+                        gid, r.status_code)
+            return ("defer", None)
+        try:
+            raw = r.json()
+        except Exception:
+            log.warning("🌐 %s — direct detail fetch non-JSON (defer 1h)", gid)
+            return ("defer", None)
+        if not isinstance(raw, dict) or not raw.get("id"):
+            log.warning("🌐 %s — direct detail fetch unusable payload", gid)
+            return ("ok", None)
+        # Hoist v2 images.cover/thumbnail to top level so meta's
+        # _construct_cover_url gets exact extensions (pass 2 of v12.43).
+        images = raw.get("images") or {}
+        if isinstance(images, dict):
+            if "cover" not in raw and images.get("cover"):
+                raw["cover"] = images["cover"]
+            if "thumbnail" not in raw and images.get("thumbnail"):
+                raw["thumbnail"] = images["thumbnail"]
+        m = meta_mod.meta_from_cache(gid, {"payload": raw})
+        if m is None:
+            return ("ok", None)
+        log.info("🌐 %s — meta fetched DIRECTLY from nhentai (%d pages, "
+                 "no Turso row)", gid, m.get("pages") or 0)
+        return ("ok", m)
 
     async def _fetch_cover_bytes(self, m: Dict[str, Any]) -> tuple[bytes, str]:
         # v12.43: meta may now return a CONSTRUCTED CDN URL whose extension
