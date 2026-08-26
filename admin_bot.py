@@ -2106,6 +2106,24 @@ async def cmd_description(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+
+
+# ---------------------------------------------------------------------------
+# v12.51: global error handler — prevents "No error handlers are registered"
+# spam when network blips or Telegram API hiccups occur in background loops.
+# Logs the exception once with context, never re-raises, never crashes app.
+# ---------------------------------------------------------------------------
+async def _global_error_handler(update, context) -> None:
+    import logging
+    lg = logging.getLogger("admin_bot.errors")
+    err = context.error if hasattr(context, "error") else None
+    lg.warning(
+        "telegram background error: %s | update=%s",
+        (type(err).__name__ if err else "unknown"),
+        (str(update)[:200] if update else "none"),
+        exc_info=err,
+    )
+
 async def _on_startup(app: Application) -> None:
     # Resume tracking any progress batches left over from before a restart.
     progress_tracker.ensure_tracker_running(app)
@@ -3177,6 +3195,7 @@ def build_app() -> Application:
         log.warning("deleteWebhook failed at boot (non-fatal): %s", _e)
 
     app = ApplicationBuilder().token(settings.admin_bot_token).post_init(_on_startup).build()
+    app.add_error_handler(_global_error_handler)
 
     _ensure_auto_queue_running(app)  # 👈 FIXED! 'app' banne ke BAAD call kiya
     _ensure_weekly_digest_running(app)   # v11.7: weekly digest scheduler

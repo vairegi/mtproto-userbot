@@ -1,53 +1,21 @@
-## v12.50 — Mini App "Similar to this": SQL-scored, Turso-only, flat RAM
-
+v12.51 — Cache bust, similar-to-this fix, admin/profile shim, telegram error handler, turso_schema fallback
 Ship date: 2026-08-26
-Files: miniapp/backend/app/services/similar_sql.py (new)
-       miniapp/backend/app/services/scraper_bridge.py (gallery_suggestions rewritten)
-       miniapp/frontend/js/plugins/detail-sheet.js (badges + visibility logging)
 
-WHY (three stacked breaks from diagnosis):
-  1. Frontend never called the endpoint — Ryan's Render log showed 6
-     gallery opens with ZERO /suggestions requests (WebView held a
-     pre-v12.34i bundle; this zip ships the current detail-sheet.js).
-  2. Pre-v12.46 the engine returned [] through the broken libsql driver.
-  3. The v12.34k engine SELECTed 2,000 FULL payloads into Python to score
-     — the mem_hrana_response pattern. Replaced with SQL-level scoring.
+Files:
+  miniapp/backend/main.py                    — turso_schema fallback, /js no-cache middleware
+  miniapp/backend/app/db.py                  — is_admin_user shim
+  miniapp/backend/app/services/__init__.py   — turso_schema re-export
+  miniapp/frontend/index.html                — all JS refs bumped to ?v=12.51
+  miniapp/frontend/js/plugins/detail-sheet.js — build marker + mountSimilarRow guard
+  admin_bot.py                               — global telegram error handler
 
-THE ENGINE (similar_sql.py — operator spec exactly):
-  * Weighted scoring inside ONE SQL query per stage via json1:
-    +10 artist/parody/group/character, +2 content tags. Noise metadata
-    tags stripped (translated/rewrite/extraneous ads/sample/incomplete/
-    missing cover/replaced/scanmark/watermarked); language & category
-    buckets never scored (separate tag_groups keys).
-  * Stage A: LIKE-prefiltered (high-tier names, ESCAPE'd, cap 4000)
-    candidates -> json_each COUNT(*) scoring -> score DESC, favorites
-    DESC, LIMIT 8. Python sees <= 8 rows x 6 scalar fields. RAM flat.
-  * Stage B (deeper-scan fallback): if < 4 results, re-run with
-    content-tag LIKE prefilter, excluding IDs already returned.
-  * Stage C: still < 4 -> same artist (else category) by favorites DESC,
-    top up to 8 — the row almost never renders empty again.
-  * All values bound parameters; "group" json path quoted (reserved word).
-  * A builder arg-ordering bug (prefilter args bound after score args
-    while prefilter placeholders sit textually earlier) was caught by the
-    live test and fixed before shipping.
+Why this fixes "Similar to this" not showing:
+  - backend suggestions route was mounted and healthy (log: Mounted route module: suggestions)
+  - frontend old bundle was cached; no /api/gallery/<id>/suggestions requests ever fired
+  - index.html ?v=12.51 forces the new detail-sheet.js to load
+  - /js/ now gets no-cache headers so future ships land instantly
 
-VERIFIED LIVE on production Turso before ship: Stage A returned 8 scored
-rows in ~1.2-1.5s on gallery:675415 and character-tier gallery:671070;
-E2E ladder on 3 cached galleries (675415, 671070, 271443) each produced 8
-cards with valid shapes (digit id, full-URL cover, int pages); uncached
-target (537071) correctly yields empty-once-then-caches behavior.
-
-HANDLER (scraper_bridge.py): gallery_suggestions() keeps signature,
-response shape, similar:<gid> result cache, fail-open contract; internals
-are now the staged SQL ladder. Route file untouched.
-
-FRONTEND (detail-sheet.js): [similar] console logs on fetch + result
-count (if the row is ever invisible again, the console says whether the
-browser even asked); each similar card gets the cached-status pill
-(⚡⚡ in DB channel = instant DM, 📥 needs queue — same is_cached contract
-as grid cards); strip fetches limit=8.
-
-No schema changes, no new env vars, no new dependencies.
-
-Rollback: git checkout HEAD -- miniapp/backend/app/services/scraper_bridge.py
-miniapp/frontend/js/plugins/detail-sheet.js; delete similar_sql.py.
+Deploy order:
+  1. Redeploy miniapp backend (main.py + db.py + services/__init__.py)
+  2. Redeploy admin bot (admin_bot.py)
+  3. Hard-refresh Telegram Mini App once on phone — new bundle downloads automatically

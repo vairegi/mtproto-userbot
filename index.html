@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f0b1a" />
+  <title>Doujinshi Universe</title>
+
+  <!-- Telegram WebApp SDK. Required for initData, theme sync, haptics, back button. -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+  <link rel="stylesheet" href="/static/css/theme.css" />
+  <link rel="stylesheet" href="/static/css/base.css" />
+  <link rel="stylesheet" href="/static/css/components.css" />
+  <!-- v10: admin-selectable background themes. MUST load after base.css
+       so the [data-bg-theme="…"] overrides win the cascade. -->
+  <link rel="stylesheet" href="/static/css/themes.css" />
+  <!-- v10: stylish button variants (btn-glow, btn-shine, btn-outline-slide,
+       btn-lift, btn-pill, btn-ripple, btn-icon-only). MUST load last so
+       its rules override the base .btn styles. -->
+  <link rel="stylesheet" href="/static/css/buttons.css" />
+  <!-- v11: instant hourglass loader shown on Download-Now click.
+       Loads after buttons.css so its .loader-overlay wins the cascade. -->
+  <link rel="stylesheet" href="/static/css/loader-hourglass.css" />
+
+  <!--
+    ES-modules import-map polyfill.
+    Telegram's Android WebView on many devices ships a Chromium build that
+    does NOT natively support <script type="importmap">. Without the
+    polyfill, every `import { x } from "core/y.js"` fails silently and the
+    whole app stays blank (top+bottom bars visible, middle empty — the
+    exact symptom you saw).
+
+    The polyfill script MUST load BEFORE the importmap AND before any
+    type="module" script that uses bare specifiers. es-module-shims does
+    exactly that and is <20 KB.
+  -->
+  <script async src="https://ga.jspm.io/npm:es-module-shims@1.10.0/dist/es-module-shims.js"></script>
+
+  <!--
+    NOTE: importmap type changed to "importmap-shim" is NOT needed — the
+    shim also intercepts standard "importmap" when the browser lacks native
+    support. Keep the standard type for forward compatibility.
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "core/":       "/static/js/core/",
+        "components/": "/static/js/components/",
+        "pages/":      "/static/js/pages/",
+        "plugins/":    "/static/js/plugins/",
+        "ui/":         "/static/js/ui/"
+      }
+    }
+  </script>
+
+  <!--
+    Global boot-error surface. If the module graph fails to load, we want
+    the user to see WHY, not a blank screen. This inline script installs a
+    fallback that populates #app-main with the actual error after 4s of
+    silence from app.js. Removed automatically once boot() succeeds.
+  -->
+  <script>
+    (function () {
+      window.__DU_BOOT_START__ = Date.now();
+      window.addEventListener("error", function (e) {
+        try {
+          var main = document.getElementById("app-main");
+          if (!main || main.dataset.booted) return;
+          main.innerHTML =
+            '<div style="padding:24px;color:#fff;font:14px system-ui;">' +
+            '<div style="font-size:32px">⚠️</div>' +
+            '<div style="margin:8px 0;font-weight:600">Mini App failed to boot</div>' +
+            '<pre style="white-space:pre-wrap;color:#ffb;font-size:12px;' +
+            'background:rgba(255,255,255,.06);padding:12px;border-radius:8px;">' +
+            (e.message || String(e)) + "\n\n" +
+            (e.filename ? e.filename + ":" + (e.lineno || "?") : "") +
+            "</pre></div>";
+        } catch (_) {}
+      });
+      // If nothing renders in 6 seconds, surface a friendly timeout note.
+      setTimeout(function () {
+        var main = document.getElementById("app-main");
+        if (main && !main.dataset.booted && !main.innerHTML.trim()) {
+          main.innerHTML =
+            '<div style="padding:24px;color:#fff;font:14px system-ui;text-align:center;">' +
+            '<div style="font-size:32px">⏳</div>' +
+            '<div style="margin:8px 0;font-weight:600">Still loading…</div>' +
+            '<div style="color:#aaa;font-size:12px">' +
+            'If this persists, tap the 3-dot menu → Reload.</div></div>';
+        }
+      }, 6000);
+    })();
+  </script>
+</head>
+<body>
+  <div id="app">
+    <header id="app-header" class="app-header"></header>
+    <main id="app-main" class="app-main"></main>
+    <nav id="app-tabbar" class="app-tabbar"></nav>
+  </div>
+
+  <div id="toast-root"></div>
+  <div id="sheet-root"></div>
+
+  <!--
+    type="module" boots our app. If es-module-shims loaded first, it also
+    handles this tag transparently on WebViews without native importmap.
+  -->
+  <script type="module" src="/static/js/core/app.js?v=12.51"></script>
+</body>
+</html>
