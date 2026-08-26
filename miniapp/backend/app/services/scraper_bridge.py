@@ -1039,31 +1039,24 @@ def gallery_detail(gallery_id: str) -> dict:
 # Fail-open on every branch so the detail sheet never blocks on an error.
 # ---------------------------------------------------------------------------
 def gallery_suggestions(gallery_id: str, limit: int = 6) -> list[dict]:
-    """Return up to `limit` card dicts for galleries similar to `gallery_id`.
+    """v12.50: SQL-scored "Similar to this" — Turso-only, flat RAM.
 
-    v12.34k: TURSO-ONLY tag-overlap ranker. NEVER calls nhentai.
+    The v12.34k implementation SELECTed 2,000 full payloads and scored in
+    Python (the mem_hrana_response pattern), and pre-v12.46 it silently
+    returned [] through the broken libsql driver — the two reasons the
+    frontend row never rendered. This version runs the weighted scoring
+    (+10 artist/parody/group/character, +2 content tags) entirely inside
+    Turso via json1; Python only ever sees <= `limit` card-sized rows.
 
-    Design (operator decision 2026-08-23):
-      1. Read the target gallery's tag_groups from Turso (already cached
-         as `gallery:<gid>` — the sheet just opened, so this is a HIT).
-      2. Build a signal-set from content-heavy tag types only
-         (tag, parody, character, artist, group). language/category are
-         omitted because they'd match ~half the corpus (english/doujinshi).
-      3. Scan Turso `nhentai_cache` for every other `gallery:*` row,
-         parse its payload, count overlap. Cap the scan at 2000 rows so
-         one call never exceeds ~400ms even on a warm 10k+ corpus.
-      4. Sort by (overlap desc, favorites desc) so ties break on quality.
-      5. Return top `limit` as card dicts. Cache the result at
-         `similar:<gid>` so a re-open is an instant HIT.
-
-    Fail-open: any error returns [] and the sheet hides the row.
+    Response contract unchanged: list of card dicts {id, title, cover,
+    pages, favorites, tags} (route adds is_cached), cached under
+    similar:<gid>. Fail-open: any error -> [].
     """
     gid = str(gallery_id or "").strip()
     if not gid.isdigit():
         return []
     limit = max(1, min(int(limit or 6), 12))
 
-    # ---- Cache READ (memoised result) ------------------------------------
     _key = f"similar:{gid}"
     _nhc = _sb_turso_cache()
     if _nhc is not None:
@@ -1076,7 +1069,6 @@ def gallery_suggestions(gallery_id: str, limit: int = 6) -> list[dict]:
             log.info(_LOG_HIT, _key)
             return _hit[:limit]
 
-    # ---- Load TARGET gallery from Turso (must already be cached) --------
     if _nhc is None:
         return []
     try:
@@ -1085,132 +1077,82 @@ def gallery_suggestions(gallery_id: str, limit: int = 6) -> list[dict]:
         log.warning("nhc.get(gallery:%s) raised: %s", gid, e)
         return []
     if not isinstance(target, dict) or not target.get("id"):
-        # Target not in Turso — the sheet must have just opened it, so it
-        # WILL be cached on the very next call. Return empty this time;
-        # the row hides itself, and the next open lands a HIT.
+        # First-ever open of a cold gallery — it caches on this request,
+        # the next open gets the row. Fail-open empty as before.
         log.info("similar(%s): target not yet in Turso; skipping", gid)
         return []
 
-    # ---- Build target signal-set ----------------------------------------
-    HEAVY_TYPES = {"tag", "parody", "character", "artist", "group"}
-    def _signal_set(g: dict) -> set:
-        s: set = set()
-        tg = g.get("tag_groups") or {}
-        if isinstance(tg, dict):
-            for typ, names in tg.items():
-                if typ not in HEAVY_TYPES:
-                    continue
-                if isinstance(names, list):
-                    for n in names:
-                        n = str(n).strip().lower()
-                        if n:
-                            s.add(f"{typ}:{n}")
-        # Fallback for older cached shapes that only have flat `tags`.
-        if not s:
-            for t in g.get("tags") or []:
-                if not isinstance(t, dict):
-                    continue
-                typ = str(t.get("type") or "tag").strip().lower()
-                nm  = str(t.get("name") or "").strip().lower()
-                if typ in HEAVY_TYPES and nm:
-                    s.add(f"{typ}:{nm}")
-        return s
-
-    target_signals = _signal_set(target)
-    if not target_signals:
-        log.info("similar(%s): target has no heavy-tag signals", gid)
-        return []
-
-    # ---- Turso scan: pull all gallery:* keys, then their payloads -------
-    # Scan cap is deliberate; 2000 rows keeps the whole scoring loop under
-    # ~400ms on a p95 request. When the corpus grows past 20k rows we can
-    # add a sample-N-random-rows pass here; for the current ~10k-row scale
-    # "scan latest N" is a sound approximation because BOT 1 walks the
-    # popular sorts newest-first.
-    SCAN_CAP = 2000
-    # v12.34k-fix: local import of turso_client (module-level import is
-    # deliberately avoided in this file to keep the httpx-fallback path
-    # free of a hard turso dep; other Turso-touching functions in this
-    # module use the same lazy pattern via _sb_turso_cache()).
     try:
-        from . import turso_client as _turso   # noqa: WPS433
+        from . import similar_sql as _ss      # noqa: WPS433
+        from . import turso_client as _turso  # noqa: WPS433
     except Exception as e:  # noqa: BLE001
-        log.warning("similar(%s): turso_client import failed: %s", gid, e)
-        return []
-    try:
-        rs = _turso.execute(
-            "SELECT key, payload FROM nhentai_cache "
-            "WHERE key LIKE 'gallery:%' AND key != ? "
-            "ORDER BY cached_at DESC LIMIT ?",
-            [f"gallery:{gid}", SCAN_CAP],
-        )
-    except Exception as e:  # noqa: BLE001
-        log.warning("similar(%s): turso scan raised: %s", gid, e)
-        return []
-    if rs is None or not getattr(rs, "rows", None):
-        log.info("similar(%s): turso scan returned no rows", gid)
+        log.warning("similar(%s): similar_sql/turso import failed: %s", gid, e)
         return []
 
-    # ---- Score every candidate ------------------------------------------
-    import json as _json
-    scored: list = []   # (overlap, favorites, item_id, card_dict)
-    for row in rs.rows:
+    def _run(sql, args) -> list:
+        if not sql:
+            return []
         try:
-            payload_str = row[1]
-            if not payload_str:
+            rs = _turso.execute(sql, list(args))
+        except Exception as e:  # noqa: BLE001
+            log.warning("similar(%s): stage query raised: %s", gid, e)
+            return []
+        if rs is None or not getattr(rs, "rows", None):
+            return []
+        cols = ["id", "title", "cover", "pages", "favorites", "score"]
+        out = []
+        for row in rs.rows:
+            try:
+                out.append(dict(zip(cols, list(row))))
+            except Exception:  # noqa: BLE001
                 continue
-            g = _json.loads(payload_str)
-            if not isinstance(g, dict) or not g.get("id"):
-                continue
-            cand_signals = _signal_set(g)
-            if not cand_signals:
-                continue
-            overlap = len(target_signals & cand_signals)
-            if overlap == 0:
-                continue
-            favs = int(g.get("favorites") or 0)
-            card = {
-                "id":    g.get("id"),
-                "title": g.get("title") or f"#{g.get('id')}",
-                "title_en_clean": g.get("title_english") or g.get("title") or "",
-                "cover": g.get("cover") or g.get("page1_url") or "",
-                "pages": g.get("pages"),
-                "tags":  g.get("tags") or [],
-            }
-            scored.append((overlap, favs, str(g.get("id")), card))
-        except Exception:  # noqa: BLE001
-            continue
+        return out
 
-    if not scored:
-        log.info("similar(%s): 0 tag-overlap matches in %d scanned rows",
-                 gid, len(rs.rows))
-        return []
+    sig = _ss._signals(target)
+    out_rows: list = []
+    seen: set = set()
 
-    # Sort: overlap desc, then favorites desc for tie-break.
-    scored.sort(key=lambda t: (-t[0], -t[1]))
-    out = [t[3] for t in scored[:limit]]
+    def _collect(rows) -> None:
+        for r in rows:
+            c = _ss.card_from_row(r)
+            if c and c["id"] not in seen:
+                seen.add(c["id"])
+                out_rows.append(c)
 
-    log.info(
-        "similar(%s): scanned=%d matched=%d returned=%d top_overlap=%d",
-        gid, len(rs.rows), len(scored), len(out), scored[0][0],
-    )
+    # ---- Stage A: high-tier prefilter + weighted score -------------------
+    sqlA, argsA = _ss.build_stage_a(gid, sig, limit)
+    rowsA = _run(sqlA, argsA)
+    _collect(rowsA)
+    stage_used = "A"
 
-    # ---- Cache the ranked result ----------------------------------------
-    if out and _nhc is not None:
+    # ---- Stage B: content-tag prefilter (deeper net) ----------------------
+    if len(out_rows) < _ss.MIN_RESULTS:
+        sqlB, argsB = _ss.build_stage_b(gid, sig, list(seen),
+                                        limit - len(out_rows))
+        _collect(_run(sqlB, argsB))
+        if out_rows:
+            stage_used = "A+B"
+
+    # ---- Stage C: same artist/category by favorites (never-empty guard) ---
+    if len(out_rows) < _ss.MIN_RESULTS:
+        sqlC, argsC = _ss.build_stage_c(gid, target, list(seen),
+                                        limit - len(out_rows))
+        _collect(_run(sqlC, argsC))
+        stage_used = stage_used + "+C"
+
+    log.info("similar(%s): stage=%s returned=%d", gid, stage_used,
+             len(out_rows))
+
+    if out_rows:
         try:
-            _bytes = len(_json.dumps(out, default=str))
-        except Exception:  # noqa: BLE001
-            _bytes = -1
-        try:
-            _ok = _nhc.put(_key, out)
+            _ok = _nhc.put(_key, out_rows)
             if _ok == "unchanged":
                 log.info(_LOG_DEDUP, _key)
             elif _ok:
-                log.info(_LOG_WRITE, _key, _bytes)
+                log.info(_LOG_WRITE, _key, -1)
         except Exception as e:  # noqa: BLE001
-            log.debug("turso write failed for %s: %s", _key, e)
-
-    return out
+            log.warning("nhc.put(%s) raised: %s", _key, e)
+    return out_rows[:limit]
 
 
 def route_status() -> dict:

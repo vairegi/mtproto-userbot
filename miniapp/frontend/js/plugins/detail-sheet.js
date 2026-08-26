@@ -394,11 +394,16 @@ function mountSimilarRow(root, gid) {
   (async () => {
     let items = [];
     try {
+      console.log("[similar] fetching suggestions for", gid);
       const r = await api.get(
-        `/api/gallery/${encodeURIComponent(gid)}/suggestions?limit=6`
+        `/api/gallery/${encodeURIComponent(gid)}/suggestions?limit=8`
       );
       items = (r && Array.isArray(r.items)) ? r.items : [];
-    } catch (_) { items = []; }
+    } catch (e) {
+      console.warn("[similar] fetch failed for", gid, e);
+      items = [];
+    }
+    console.log("[similar]", gid, "->", items.length, "items");
     if (!items.length) return;   // section stays display:none
 
     for (const s of items) {
@@ -434,6 +439,19 @@ function mountSimilarRow(root, gid) {
             class: "d-similar-cover skeleton",
             style: { width: "100%", aspectRatio: "3 / 4" },
           });
+      // v12.50: cached badge — same contract as grid cards
+      // (is_cached from the route's attach_is_cached).
+      if (s.is_cached === true || s.is_cached === false) {
+        const pill = h("div", {
+          class: "status-pill" + (s.is_cached ? "" : " pill-queue"),
+          style: {
+            position: "absolute", top: "6px", right: "6px",
+            fontSize: "11px", padding: "2px 6px", borderRadius: "8px",
+            background: "rgba(0,0,0,0.55)", zIndex: "2",
+          },
+        }, s.is_cached ? "⚡⚡" : "📥");
+        card.appendChild(pill);
+      }
       const title = h("div", {
         class: "d-similar-title",
         style: {
