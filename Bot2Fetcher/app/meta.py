@@ -206,7 +206,14 @@ def meta_from_cache(gid: str, cache_row: Optional[Dict[str, Any]]) -> Optional[D
         return None
 
     title = p.get("title_english") or p.get("title") or f"Gallery {gid}"
-    pages = int(p.get("pages") or p.get("num_pages") or 0)
+    
+    # Naya logic jo pages ko safe banayega aur list aane par list ke andar ka number nikalega
+    raw_pages = p.get("pages") or p.get("num_pages") or 0
+    if isinstance(raw_pages, list):
+        raw_pages = raw_pages[0] if raw_pages else 0
+        
+    pages = int(raw_pages)
+    
     log.info("🔍 gallery:%s — meta OK from Turso: %r, %d pages, %d typed tags",
              gid, title[:40], pages, len(tags_typed))
     return {
