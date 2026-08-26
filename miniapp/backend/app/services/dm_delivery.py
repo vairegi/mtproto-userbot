@@ -43,7 +43,11 @@ for _p in [
         sys.path.insert(0, _p)
 
 try:
-    import db as _bot_db            # type: ignore
+    try:  # v12.53: deterministic repo-root db load
+        from ..rootdb import load as _lrd
+    except ImportError:  # services imported as top-level package
+        from rootdb import load as _lrd
+    _bot_db = _lrd()
     import gallery_state as _gs     # type: ignore
     HAVE_GS = True
 except Exception as e:  # noqa: BLE001

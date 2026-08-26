@@ -145,7 +145,11 @@ def _handle():
     if _conn is not None:
         return _conn
     try:
-        import db as _db  # local import — sys.path is set by scraper_bridge
+        try:  # v12.53: deterministic repo-root db load
+            from ..rootdb import load as _lrd
+        except ImportError:  # services imported as top-level package
+            from rootdb import load as _lrd
+        _db = _lrd()
         _conn = _db.connect()
     except Exception as e:  # noqa: BLE001
         log.warning("nhentai_cache: mongo unavailable (%s) — cache disabled", e)

@@ -32,14 +32,10 @@ from typing import Any, List
 # `galleries` collection that relay_v2 writes to. Use the top-level
 # import and prepend the repo root first so we always pick that one,
 # regardless of where the request happens to be mounted.
-_HERE = __file__
-# __file__ = .../miniapp/backend/app/routes/_badge.py  →  repo root is 4 levels up
-_REPO_ROOT = __import__("os").path.abspath(
-    __import__("os").path.join(_HERE, "..", "..", "..", "..", "..")
-)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-import db as _midb  # noqa: E402,F401
+# v12.53: deterministic loader — never depends on sys.path ordering.
+from ..rootdb import load as _load_root_db  # noqa: E402
+
+_midb = _load_root_db()
 
 
 def attach_is_cached(items: List[Any]) -> None:
@@ -58,6 +54,8 @@ def attach_is_cached(items: List[Any]) -> None:
             if isinstance(it, dict) and it.get("id") is not None
         ]
         if not ids:
+            return
+        if _midb is None:
             return
         conn = _midb.connect()
         try:

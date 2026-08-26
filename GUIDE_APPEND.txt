@@ -1,21 +1,29 @@
-v12.51 — Cache bust, similar-to-this fix, admin/profile shim, telegram error handler, turso_schema fallback
+v12.53 — Restore overwritten root db.py + eliminate import shadowing
 Ship date: 2026-08-26
 
-Files:
-  miniapp/backend/main.py                    — turso_schema fallback, /js no-cache middleware
-  miniapp/backend/app/db.py                  — is_admin_user shim
-  miniapp/backend/app/services/__init__.py   — turso_schema re-export
-  miniapp/frontend/index.html                — all JS refs bumped to ?v=12.51
-  miniapp/frontend/js/plugins/detail-sheet.js — build marker + mountSimilarRow guard
-  admin_bot.py                               — global telegram error handler
+ROOT CAUSE (confirmed via git history):
+  Commit fa59cae ("Add files via upload") overwrote the repo-root db.py
+  (the bot's 1067-line MongoDB module) with the miniapp's app/db.py, which
+  uses a package-relative import invalid for a top-level module. Every
+  `import db` in the repo then crashed:
+    * admin_bot.py → crashed on boot (Telegram bot restart loop)
+    * worker.py    → crashed on boot (PDF pipeline restart loop)
+    * miniapp _badge.py/popup.py/services → killed search, recommendations,
+      bookmarks, random, popup at mount → Discover tab skeletons forever.
 
-Why this fixes "Similar to this" not showing:
-  - backend suggestions route was mounted and healthy (log: Mounted route module: suggestions)
-  - frontend old bundle was cached; no /api/gallery/<id>/suggestions requests ever fired
-  - index.html ?v=12.51 forces the new detail-sheet.js to load
-  - /js/ now gets no-cache headers so future ships land instantly
+FILES IN THIS PACK:
+  db.py                         — restored from commit 2e56b06 (original bot DB).
+  start.sh                      — PYTHONPATH = miniapp/backend + repo root;
+                                  backend/app REMOVED from the path.
+  miniapp/backend/app/rootdb.py — NEW: file-path loader for root db.py.
+  miniapp/backend/app/routes/_badge.py  — uses rootdb loader, tolerates missing DB.
+  miniapp/backend/app/routes/popup.py   — uses rootdb loader.
+  miniapp/backend/app/services/dedup_cron.py, dm_delivery.py, nhentai_cache.py,
+    progress.py, queue_bridge.py, rescrape.py — rootdb.load() (dual-context).
 
-Deploy order:
-  1. Redeploy miniapp backend (main.py + db.py + services/__init__.py)
-  2. Redeploy admin bot (admin_bot.py)
-  3. Hard-refresh Telegram Mini App once on phone — new bundle downloads automatically
+DEPLOY:
+  1. Copy files into repo at same relative paths. Commit + push.
+     Start Command stays `bash start.sh`.
+  2. Boot log should show ~15 "Mounted route module:" lines, no crash loops.
+  3. Verify /api/health/routes → "ok": true.
+  4. Open Mini App — Discover feed populates immediately.

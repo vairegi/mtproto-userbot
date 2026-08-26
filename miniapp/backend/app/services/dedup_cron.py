@@ -117,7 +117,11 @@ def _dedup_mongo() -> Tuple[int, int, Optional[str]]:
       2. Collapse rows sharing a non-empty `url_hash`.
     """
     try:
-        import db as _db  # bot-side db.py (has `galleries` accessor)
+        try:  # v12.53: deterministic repo-root db load
+            from ..rootdb import load as _lrd
+        except ImportError:  # services imported as top-level package
+            from rootdb import load as _lrd
+        _db = _lrd()
     except Exception as e:  # noqa: BLE001
         return 0, 0, f"db import failed: {e}"
 

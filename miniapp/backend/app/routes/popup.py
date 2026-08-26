@@ -26,7 +26,10 @@ from fastapi import APIRouter, Depends, Response
 
 from ..auth import get_current_user
 
-import db as _db
+# v12.53: deterministic repo-root db loader (bare `import db` could hit app/db.py)
+from ..rootdb import load as _load_root_db
+
+_db = _load_root_db()
 
 router = APIRouter(prefix="/api/popup", tags=["popup"])
 

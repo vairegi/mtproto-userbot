@@ -168,14 +168,16 @@ fi
 log "------------------------------------------------------------"
 log "starting Mini App backend (uvicorn) on port ${PORT:-8000} in the foreground"
 log "------------------------------------------------------------"
-# v12.52: boot from the backend dir so `app` is a REAL package and all
-# `from .. import db` relative imports resolve. The previous
-# `cd miniapp && uvicorn backend.main:app` loaded main under a namespace
-# package and killed every route module at import time.
+# v12.53: boot from the backend dir so `app` is a REAL package and all
+# `from .. import db` relative imports resolve.
+# PYTHONPATH order matters:
+#   1) backend/   — lets uvicorn import main:app and the app.* package
+#   2) repo root  — keeps the REAL root db.py importable
+# backend/app is deliberately NOT on PYTHONPATH: app/db.py must never be
+# importable as top-level `db` (only valid as app.db). Modules needing the
+# bot DB use app/rootdb.py (file-path loader, order-independent).
 cd "${MINIAPP_BACKEND}"
-# backend first (app.* absolute imports), backend/app second so legacy
-# top-level `import db` in _badge.py / popup.py still resolves.
-export PYTHONPATH="${MINIAPP_BACKEND}:${MINIAPP_BACKEND}/app:${PYTHONPATH:-}"
+export PYTHONPATH="${MINIAPP_BACKEND}:${APP_DIR}:${PYTHONPATH:-}"
 exec uvicorn main:app \
   --host 0.0.0.0 \
   --port "${PORT:-8000}" \

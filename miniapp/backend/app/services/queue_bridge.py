@@ -22,7 +22,11 @@ for p in [os.path.abspath(os.path.join(_HERE, "..", "..", "..")),
 
 try:
     import queue_service as _qs
-    import db as _bot_db
+    try:  # v12.53: deterministic repo-root db load
+        from ..rootdb import load as _lrd
+    except ImportError:  # services imported as top-level package
+        from rootdb import load as _lrd
+    _bot_db = _lrd()
     HAVE_BOT = True
 except Exception as e:  # noqa: BLE001
     _qs = None
