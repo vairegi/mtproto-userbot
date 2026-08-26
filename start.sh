@@ -61,15 +61,19 @@ if [ -n "${MISSING}" ]; then
 fi
 log "env check: all required variables are present"
 
+# --- MongoDB connection check (Fixed: direct pymongo ping without relative imports) ---
 log "checking MongoDB connection..."
 if ${PY} -c "
-import sys
+import sys, os
 try:
-    import db
-    db.init_db()
-    conn = db.connect()
-    print('[start.sh] MongoDB OK - database:', conn.db.name)
-    conn.close()
+    from pymongo import MongoClient
+    uri = os.environ.get('MONGO_URI') or os.environ.get('MONGODB_URI')
+    if not uri:
+        raise ValueError('MONGO_URI/MONGODB_URI not set')
+    client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+    client.admin.command('ping')
+    print('[start.sh] MongoDB OK - connection successful')
+    client.close()
 except Exception as e:
     print('[start.sh] MongoDB FAILED:', e, file=sys.stderr)
     sys.exit(1)
