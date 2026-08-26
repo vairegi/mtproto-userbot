@@ -1,69 +1,48 @@
-## v12.46 — BOT 0 Mini App: replace libsql-client with raw HTTP /v2/pipeline
+## v12.47 — shared canonical Turso write layer (all 3 bots) + migration script
 
 Ship date: 2026-08-26
-File: miniapp/backend/app/services/turso_client.py (full rewrite, drop-in)
+New: common/turso_cache/{__init__,normalize,writer}.py (BOT 0 repo-root)
+     ScraperBot/app/turso_cache/*  (BOT 1 subtree copy, byte-identical)
+     Bot2Fetcher/app/turso_cache/* (BOT 2 subtree copy, byte-identical)
+     scripts/migrate_turso_canonical.py, tests/test_turso_cache.py
+Edited: miniapp/backend/app/services/nhentai_cache.py (BOT 0 gate)
+        ScraperBot/app/cache.py (BOT 1 gate)
 
-ROOT CAUSE of "Mini App loads from nhentai instead of Turso" (2026-08-26):
+WHAT IT IS
+  One canonical payload schema for nhentai_cache, enforced at WRITE time:
+    gallery:<id> -> id str, title str, cover FULL https URL, pages int,
+                    favorites int, upload_date str, scanlator str,
+                    tags [{name,type}], tag_groups {type:[names]}
+    search:*     -> [ {id str, title str, title_en_clean str,
+                       cover FULL URL, pages int, tags []} ]
+  Every write passes through normalize_for_write(key, payload, source).
+  Invalid rows are REFUSED with a loud WARNING carrying source bot, key,
+  gallery id and the exact failing field. suggest:/trending:/bm:cover: and
+  all non-shared keys pass through untouched. Transports unchanged:
+  BOT 0 stays sync (v12.46 raw HTTP), BOT 1 stays async.
 
-  BOT 0's Mini App was the LAST service still driving Turso through the
-  `libsql-client` Python package — the same driver the handover documented
-  as broken on Render for this DB ("KeyError: 'result' inside the driver",
-  first hit on Bot2Fetcher v12.40). ScraperBot and Bot2Fetcher moved to raw
-  HTTP /v2/pipeline long ago; BOT 0 never did.
+WHY SUBTREE COPIES (per Ryan's Render screenshots): BOT 0 boots from repo
+root (imports common.turso_cache); BOT 1 and Bot2Fetcher boot with their
+subtree as root, so common/ is NOT importable there — they ship their own
+byte-identical copies under app/turso_cache/ (imported as app.turso_cache /
+.turso_cache). tests/test_turso_cache.py asserts all copies stay identical —
+run it after any future edit to the layer (python3 tests/test_turso_cache.py).
 
-  Verified against the live DB with Ryan's credentials:
-    * BOT 0 logged "📝 [TURSO WRITE] key=search:popular-today:page1
-      bytes=8320" at 04:36 — but the row's cached_at in Turso stayed at
-      BOT 1's sweep timestamp. The write NEVER LANDED.
-    * BOT 0's reads of the same key returned nothing (execute() -> None
-      through the broken driver), so the Mini App logged "[CACHE MISS]"
-      and fetched from nhentai on EVERY page view — burning the anon
-      10/min /search budget and getting 429s (see the kendoubu 429 in the
-      same log).
-    * Meanwhile BOT 1 wrote the same keys over raw HTTP all day without a
-      single failure. Same DB, same network — only the driver differed.
-  Bonus discovery: `libsql` is not even in requirements.txt — the module
-  was silently running with _HAVE_LIBSQL=False or a drifted version,
-  which is why this surfaced as silent cache misses instead of a crash.
+READER SAFETY NETS UNTOUCHED: Bot2Fetcher meta.py v12.43/v12.44 coercion
+stays exactly as deployed — it remains the net for legacy rows until the
+migration converges them.
 
-FIX: full rewrite of turso_client.py onto raw HTTP POST /v2/pipeline via
-httpx (already in requirements.txt — no new dependency, nothing to pin).
+MIGRATION (one-time, your Turso creds, dry-run by default):
+    python3 scripts/migrate_turso_canonical.py            # report only
+    python3 scripts/migrate_turso_canonical.py --apply    # write canonical
+  Payload-only UPDATEs — cached_at/expires_at/ttl_sec preserved. Rows that
+  fail validation are skipped and listed, never half-written. Bounded test
+  runs: MIGRATE_MAX_PAGES=6 for a quick check first.
 
-PUBLIC API UNCHANGED — zero caller changes needed:
-  * turso_available() -> bool
-  * execute(sql, args) -> SimpleNamespace(rows=[list-of-cells, ...]) —
-    positional cell access (row[0], row[1]) identical to libsql-client's
-    ResultSet; verified against nhentai_cache.py (14 call sites),
-    scraper_bridge.py (similar-galleries scan) and admin_bot.py
-    (/prefetch status health()).
-  * ensure_schema() -> bool   (same DDL: nhentai_cache + nhentai_ratelimit)
-  * health() -> dict          (same keys, plus driver="raw-http-v2-pipeline")
+VERIFIED: py_compile + pyflakes clean; 13-case behavior suite passes
+(raw v2 gallery incl. nested images.cover, pages as list/dict/str/float,
+refuse paths, canonical passthrough, search raw->cards, misc passthrough,
+writer builders); live dry-run against production Turso OK.
 
-Behaviour changes vs the old module:
-  * execute() is now truly synchronous (httpx.Client) — the old asyncio
-    bridge machinery (_run / _run_via_bridge / _run_in_fresh_loop /
-    _get_bridge_executor) is deleted. Nothing outside this module used it.
-  * Failures are LOUD: every non-ok pipeline response logs the server-side
-    error message at WARNING (the exact thing libsql-client swallowed).
-  * URL normalisation kept: libsql://, turso://, wss://, ws:// and bare
-    hostnames all normalise to https:// before use.
-  * read-your-writes: inherent — every pipeline POST hits the primary,
-    no replica lag window.
-
-VERIFIED LIVE against the production Turso DB before shipping:
-  1. SELECT on search:popular-today:page1 (the key Ryan's app kept
-     missing) -> 8,138 bytes, expires_at=0 — readable.
-  2. INSERT scratch key + immediate SELECT -> read-back OK (the exact
-     write-then-read pattern that was broken).
-  3. DELETE scratch key + health() -> available=True, latency ~300ms.
-  py_compile + pyflakes clean.
-
-DEPLOY: drop the file in, redeploy. No env changes, no new packages.
-First boot logs "turso: schema ready (nhentai_cache + nhentai_ratelimit)
-via raw HTTP /v2/pipeline". After that, /api/search for chip sorts
-(popular-today / date / popular-week / popular) should stop emitting
-[CACHE MISS] — those rows are BOT-1-written with expires_at=0 and are
-always fresh.
-
-Rollback: git checkout HEAD -- miniapp/backend/app/services/turso_client.py
-(but the old module will silently miss again — the driver is the bug).
+Rollback: revert the two edited files; the new packages are inert without
+them. Migration is additive (payload rewrites only).

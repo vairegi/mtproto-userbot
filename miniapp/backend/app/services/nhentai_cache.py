@@ -26,6 +26,21 @@ caller can fall through to the live upstream path.
 """
 from __future__ import annotations
 
+# v12.47: shared canonical payload layer. The Mini App service boots from
+# the REPO ROOT (Render root directory blank), so `common` is importable
+# after adding the repo root to sys.path (this file lives at
+# miniapp/backend/app/services/).
+import sys as _sys
+import os as _os
+_REPO_ROOT = _os.path.abspath(_os.path.join(
+    _os.path.dirname(__file__), "..", "..", "..", ".."))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
+try:
+    from common.turso_cache import normalize_for_write as _canonical_write
+except Exception:  # noqa: BLE001 — missing package must never break the app
+    _canonical_write = None
+
 import hashlib
 import json
 import logging
@@ -490,6 +505,21 @@ def put(key: str, payload: Any, ttl_sec: Optional[int] = None):
     Returns True if AT LEAST ONE write succeeded, "unchanged" if the
     existing payload matched byte-for-byte, False on hard failure."""
     ttl = int(ttl_sec if ttl_sec is not None else ttl_for_key(key))
+
+    # v12.47: canonical payload gate — gallery:/search: rows are normalised
+    # to the shared schema (pages int, title str, cover full URL) before
+    # they can touch Turso; invalid rows are REFUSED with a loud WARNING
+    # (source bot + key + gallery id + failing field) instead of poisoning
+    # the cache. Passthrough for suggest:/trending:/bm:cover: keys.
+    if _canonical_write is not None:
+        try:
+            _ok, payload = _canonical_write(key, payload, source="bot0-miniapp")
+            if not _ok:
+                return False
+        except Exception as _e:  # noqa: BLE001 — gate must never break writes
+            log.warning("nhentai_cache.put(%s): canonical gate raised %s — "
+                        "writing unnormalised", key, _e)
+
     # Guard against garbage payloads that would poison the cache.
     try:
         payload_json = json.dumps(payload, default=str)
