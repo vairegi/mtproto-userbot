@@ -1,40 +1,69 @@
-## v12.45 — Bot2Fetcher: direct nhentai detail fetch when Turso has no row
+## v12.46 — BOT 0 Mini App: replace libsql-client with raw HTTP /v2/pipeline
 
 Ship date: 2026-08-26
-Files: app/fetcher.py, app/mongo_state.py
-(superset — includes v12.42, v12.43, v12.44)
+File: miniapp/backend/app/services/turso_client.py (full rewrite, drop-in)
 
-Symptom (Render log): galleries from the NEW recent-first queue (v12.44)
-arrived with "no row in Turso" → "no cached meta, dropping claim". These
-are brand-new uploads whose detail pages BOT 1's details sweeper has not
-cached yet. The v12.43 cover-construction fix only runs AFTER a row exists
-— this was a different gap.
+ROOT CAUSE of "Mini App loads from nhentai instead of Turso" (2026-08-26):
 
-Fix (Ryan's rule: if Bot 2 doesn't find it, fetch it itself):
+  BOT 0's Mini App was the LAST service still driving Turso through the
+  `libsql-client` Python package — the same driver the handover documented
+  as broken on Render for this DB ("KeyError: 'result' inside the driver",
+  first hit on Bot2Fetcher v12.40). ScraperBot and Bot2Fetcher moved to raw
+  HTTP /v2/pipeline long ago; BOT 0 never did.
 
-1) fetcher.py — new _fetch_meta_direct(gid): on meta_from_cache() == None,
-   fetch GET https://nhentai.net/api/v2/galleries/<id> directly with a
-   browser UA, hoist v2 images.cover/thumbnail to top level (so meta's
-   _construct_cover_url gets exact extensions), and run the payload through
-   the SAME meta_from_cache + v12.44 coercion pipeline. Job then continues
-   normally (PDF request, cover post, DB channel post).
-   Outcome handling:
-     * 404            -> "dead": mark_failed(FAILED_SCRAPE), never retried.
-     * 403/429/5xx/net -> "defer": NEW Galleries.defer_claim() parks the row
-       for 1h (claim_expires = now+3600) instead of deleting it — no
-       hammering nhentai every scan cycle during a Cloudflare flap.
-     * unusable body  -> drop + known_failed (never re-queued this process).
-   Deliberately does NOT write the raw payload into the shared
-   nhentai_cache table — raw v2 JSON breaks the Mini App detail view; BOT 1
-   normalizes for that reason and will cache it properly on its own sweep.
-   Rate impact: worst case one request per uncached gid, ~4-8s apart per
-   slot — well under nhentai's 20/min /galleries anon limit. Steady state
-   is near zero because BOT 1 pre-caches most galleries.
+  Verified against the live DB with Ryan's credentials:
+    * BOT 0 logged "📝 [TURSO WRITE] key=search:popular-today:page1
+      bytes=8320" at 04:36 — but the row's cached_at in Turso stayed at
+      BOT 1's sweep timestamp. The write NEVER LANDED.
+    * BOT 0's reads of the same key returned nothing (execute() -> None
+      through the broken driver), so the Mini App logged "[CACHE MISS]"
+      and fetched from nhentai on EVERY page view — burning the anon
+      10/min /search budget and getting 429s (see the kendoubu 429 in the
+      same log).
+    * Meanwhile BOT 1 wrote the same keys over raw HTTP all day without a
+      single failure. Same DB, same network — only the driver differed.
+  Bonus discovery: `libsql` is not even in requirements.txt — the module
+  was silently running with _HAVE_LIBSQL=False or a drifted version,
+  which is why this surfaced as silent cache misses instead of a crash.
 
-2) mongo_state.py — new Galleries.defer_claim(gid, cooldown_s=3600).
+FIX: full rewrite of turso_client.py onto raw HTTP POST /v2/pipeline via
+httpx (already in requirements.txt — no new dependency, nothing to pin).
 
-Verified: py_compile + pyflakes clean; full raw-v2 payload smoke-tested
-through meta_from_cache (title dict, {"t":"p"} cover dicts, cover URL
-construction, caption build all pass).
+PUBLIC API UNCHANGED — zero caller changes needed:
+  * turso_available() -> bool
+  * execute(sql, args) -> SimpleNamespace(rows=[list-of-cells, ...]) —
+    positional cell access (row[0], row[1]) identical to libsql-client's
+    ResultSet; verified against nhentai_cache.py (14 call sites),
+    scraper_bridge.py (similar-galleries scan) and admin_bot.py
+    (/prefetch status health()).
+  * ensure_schema() -> bool   (same DDL: nhentai_cache + nhentai_ratelimit)
+  * health() -> dict          (same keys, plus driver="raw-http-v2-pipeline")
 
-Rollback: git checkout HEAD -- Bot2Fetcher/app/fetcher.py Bot2Fetcher/app/mongo_state.py
+Behaviour changes vs the old module:
+  * execute() is now truly synchronous (httpx.Client) — the old asyncio
+    bridge machinery (_run / _run_via_bridge / _run_in_fresh_loop /
+    _get_bridge_executor) is deleted. Nothing outside this module used it.
+  * Failures are LOUD: every non-ok pipeline response logs the server-side
+    error message at WARNING (the exact thing libsql-client swallowed).
+  * URL normalisation kept: libsql://, turso://, wss://, ws:// and bare
+    hostnames all normalise to https:// before use.
+  * read-your-writes: inherent — every pipeline POST hits the primary,
+    no replica lag window.
+
+VERIFIED LIVE against the production Turso DB before shipping:
+  1. SELECT on search:popular-today:page1 (the key Ryan's app kept
+     missing) -> 8,138 bytes, expires_at=0 — readable.
+  2. INSERT scratch key + immediate SELECT -> read-back OK (the exact
+     write-then-read pattern that was broken).
+  3. DELETE scratch key + health() -> available=True, latency ~300ms.
+  py_compile + pyflakes clean.
+
+DEPLOY: drop the file in, redeploy. No env changes, no new packages.
+First boot logs "turso: schema ready (nhentai_cache + nhentai_ratelimit)
+via raw HTTP /v2/pipeline". After that, /api/search for chip sorts
+(popular-today / date / popular-week / popular) should stop emitting
+[CACHE MISS] — those rows are BOT-1-written with expires_at=0 and are
+always fresh.
+
+Rollback: git checkout HEAD -- miniapp/backend/app/services/turso_client.py
+(but the old module will silently miss again — the driver is the bug).
