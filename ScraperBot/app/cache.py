@@ -19,6 +19,14 @@ from typing import Any, Optional
 from . import mongo_client, turso_client
 from .config import settings
 
+# v12.47: shared canonical payload layer. ScraperBot deploys as a SUBTREE
+# (Render root = ScraperBot/), so it imports its own byte-identical copy
+# under app/turso_cache/ instead of the repo-root common/ package.
+try:
+    from .turso_cache import normalize_for_write as _canonical_write
+except Exception:  # noqa: BLE001 — missing package must never break the bot
+    _canonical_write = None
+
 log = logging.getLogger("scraperbot.cache")
 
 # v1.20: Mongo cache mirror is rollback-only, OFF by default.
@@ -153,6 +161,19 @@ async def put(key: str, payload: Any) -> dict:
         ttl = 0
     else:
         ttl = ttl_for_key(key)
+    # v12.47: canonical gate (same layer BOT 0 uses) — refuse-with-loud-log
+    # on invalid gallery:/search: payloads; passthrough otherwise. BOT 1
+    # already normalised before this point, so this is a verified no-op
+    # for well-formed sweeps and a hard stop for anything that slips.
+    if _canonical_write is not None:
+        try:
+            _ok, payload = _canonical_write(key, payload, source="bot1-scraper")
+            if not _ok:
+                return {"turso": False, "mongo": False, "ttl": ttl,
+                        "refused": True}
+        except Exception as _e:  # noqa: BLE001
+            log.warning("cache.put(%s): canonical gate raised %s — "
+                        "writing unnormalised", key, _e)
     turso_ok = await turso_client.put(key, payload, ttl)
     mongo_ok = False if _TURSO_ONLY else mongo_client.cache_put_mongo(key, payload, ttl)
     return {"turso": bool(turso_ok), "mongo": bool(mongo_ok), "ttl": ttl}
