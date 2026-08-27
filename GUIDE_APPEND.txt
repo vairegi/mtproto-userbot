@@ -1,29 +1,49 @@
-v12.53 — Restore overwritten root db.py + eliminate import shadowing
-Ship date: 2026-08-26
+v12.54 — Similar-to-this: instrumentation + defensive paint + full cache-bust
+Ship date: 2026-08-27
 
-ROOT CAUSE (confirmed via git history):
-  Commit fa59cae ("Add files via upload") overwrote the repo-root db.py
-  (the bot's 1067-line MongoDB module) with the miniapp's app/db.py, which
-  uses a package-relative import invalid for a top-level module. Every
-  `import db` in the repo then crashed:
-    * admin_bot.py → crashed on boot (Telegram bot restart loop)
-    * worker.py    → crashed on boot (PDF pipeline restart loop)
-    * miniapp _badge.py/popup.py/services → killed search, recommendations,
-      bookmarks, random, popup at mount → Discover tab skeletons forever.
+WHY (evidence from latest Render log + live probe):
+  Backend is fully healthy: /api/health/routes → ok:true; the suggestions
+  endpoint answers 401 (auth-gated, alive); the served detail-sheet.js
+  contains mountSimilarRow and was freshly fetched by the phone (no-store
+  headers working). Yet across 3 gallery opens the log shows ZERO
+  /api/gallery/<id>/suggestions requests AND zero /api/bookmarks/count
+  requests. bookmarks/count fires inside paintFull at line ~339 — right
+  before mountSimilarRow — so paintFull itself never completed. The sheet
+  body you saw is renderBase; paintFull was silently throwing before either
+  network call (prime suspect: renderStarRating at paintFull line 271 —
+  a stale star-rating plugin with a mismatched export kills the whole body).
 
-FILES IN THIS PACK:
-  db.py                         — restored from commit 2e56b06 (original bot DB).
-  start.sh                      — PYTHONPATH = miniapp/backend + repo root;
-                                  backend/app REMOVED from the path.
-  miniapp/backend/app/rootdb.py — NEW: file-path loader for root db.py.
-  miniapp/backend/app/routes/_badge.py  — uses rootdb loader, tolerates missing DB.
-  miniapp/backend/app/routes/popup.py   — uses rootdb loader.
-  miniapp/backend/app/services/dedup_cron.py, dm_delivery.py, nhentai_cache.py,
-    progress.py, queue_bridge.py, rescrape.py — rootdb.load() (dual-context).
+FILES:
+  miniapp/frontend/index.html
+      — app.js entry already bumped to ?v=12.54.
+  miniapp/frontend/js/plugins/detail-sheet.js
+      — build marker: console.info('[detail-sheet] build=v12.54')
+      — paintFull: console.info on enter; renderStarRating moved into a
+        try/catch at the TOP of the function so it can never abort the
+        detail body (Saves row + Similar row) again.
+      — mountSimilarRow: console.info on entry + loud warn when skipped.
+  miniapp/frontend/js/core/app.js       — dynamic import bumped to ?v=12.54
+  miniapp/frontend/js/pages/search.js   — dynamic import bumped to ?v=12.54
+  miniapp/frontend/js/pages/profile.js  — static import bumped to ?v=12.54
+  miniapp/frontend/js/plugins/home-rows.js — static import bumped to ?v=12.54
+  (Importmap trailing-slash mappings can't carry query strings, so the
+   bust is applied at every import site instead.)
 
 DEPLOY:
-  1. Copy files into repo at same relative paths. Commit + push.
-     Start Command stays `bash start.sh`.
-  2. Boot log should show ~15 "Mounted route module:" lines, no crash loops.
-  3. Verify /api/health/routes → "ok": true.
-  4. Open Mini App — Discover feed populates immediately.
+  1. Commit these 6 files (frontend only), push, Render auto-deploys.
+  2. On the phone: fully CLOSE the Mini App (swipe away) and reopen once.
+  3. Open WebView DevTools console (chrome://inspect) — expected lines:
+        [detail-sheet] build=v12.54
+        [similar-to-this] paintFull enter, gid= 675xxx
+        [similar-to-this] mountSimilarRow called, gid= 675xxx root? true
+        [similar] fetching suggestions for 675xxx
+        [similar] 675xxx -> N items
+  4. The "Similar to this" row renders under the metadata card.
+
+IF STILL MISSING — the console lines now pinpoint the exact stop:
+  no 'build=v12.54'      → Telegram cache (force-close app, clear cache)
+  no 'paintFull enter'   → enrich() bail (gallery fetch failed client-side)
+  'paintFull enter' + '[detail-sheet] renderStarRating failed' → confirmed
+                           stale-plugin throw, now non-fatal — row appears
+  'mountSimilarRow called' but no '[similar] fetching' → api.get threw sync
+  '[similar] -> 0 items' → backend returned empty (Turso tag data thin)

@@ -692,7 +692,7 @@ function buildChipRow(state, refetch) {
     try {
       const g = await api.get("/api/random?respect_tags=1");
       if (g && g.id) {
-        const m = await import("plugins/detail-sheet.js");
+        const m = await import("plugins/detail-sheet.js?v=12.54");
         m.openGalleryDetail(g, undefined);
         if (g._reason) {
           try { make("toast", { text: `🎲 Picked because ${g._reason}`, kind: "success" }); } catch (_) {}

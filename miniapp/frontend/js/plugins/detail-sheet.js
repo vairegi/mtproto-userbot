@@ -1,3 +1,4 @@
+console.info('[detail-sheet] build=v12.54');
 /*
   detail-sheet.js — Rich gallery detail sheet
 
@@ -245,7 +246,13 @@ async function enrich(root, g) {
    share one code path. All metadata (incl. Uploaded) lives in ONE unified
    card per #3. */
 function paintFull(root, d) {
+  console.info('[similar-to-this] paintFull enter, gid=', d && d.id);
   root.innerHTML = "";
+  try {
+    } catch (e) {
+    // v12.54: a stale star-rating plugin must never abort the detail body.
+    console.warn('[detail-sheet] renderStarRating failed (non-fatal):', e);
+  }
   root.append(
     d.cover
       ? h("img", { class: "d-cover", src: d.cover, alt: d.title })
@@ -353,7 +360,8 @@ function paintFull(root, d) {
 }
 
 function mountSimilarRow(root, gid) {
-  if (!gid) return;
+  console.info('[similar-to-this] mountSimilarRow called, gid=', gid, 'root?', !!root);
+  if (!gid) { console.warn('[similar-to-this] skipped — no gid'); return; }
   const section = h("div", {
     class: "d-similar",
     style: {
