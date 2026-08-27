@@ -1,4 +1,4 @@
-console.info('[detail-sheet] build=v12.56');
+console.info('[detail-sheet] build=v12.57');
 /*
   detail-sheet.js — Rich gallery detail sheet
 
@@ -156,7 +156,10 @@ export function openGalleryDetail(g, me) {
 
   renderBase(body, g);
   sheet.open();
-  enrich(body, g);
+  // v12.57: pass the sheet root so enrich→paintFull can mount the
+  // "Similar to this" section AFTER the actions bar (Download/Save/Share),
+  // not inside the scroll body.
+  enrich(body, g, sheet.el);
   // v11.8 (#5): pre-fetch the global save count so the Save button label
   // shows "Save · 312" on the next render. Fire-and-forget.
   try { warmSaveCount(g.id); } catch (_) {}
@@ -175,7 +178,7 @@ function renderBase(root, g) {
   );
 }
 
-async function enrich(root, g) {
+async function enrich(root, g, sheetEl) {
   const key = String(g.id || "");
   // v11.9 (#3): ALWAYS kick off a prefetch — even if the card wasn't in
   // the viewport yet. This makes "tapped → details appear" the default.
@@ -186,7 +189,7 @@ async function enrich(root, g) {
   // v11.9 (#3): instant render from the prefetch cache when available.
   let d = _detailCache.get(key) || null;
   if (d) {
-    paintFull(root, d);
+    paintFull(root, d, sheetEl);
   } else {
     // No cache — swap the "Loading details…" line for a skeleton block so
     // the sheet doesn't feel frozen. We still refresh in the background.
@@ -210,7 +213,7 @@ async function enrich(root, g) {
         }
         _detailCache.set(key, fresh);
         d = fresh;
-        if (root.isConnected) paintFull(root, d);
+        if (root.isConnected) paintFull(root, d, sheetEl);
         return;
       }
     } catch (e) {
@@ -238,14 +241,14 @@ async function enrich(root, g) {
     if (l) l.remove();
     return;
   }
-  if (root.isConnected) paintFull(root, d);
+  if (root.isConnected) paintFull(root, d, sheetEl);
 }
 
 /* v11.8 (#2 + #3): single paint function — the full detail body is rebuilt
    from scratch each time, so cache-hit renders and background refreshes
    share one code path. All metadata (incl. Uploaded) lives in ONE unified
    card per #3. */
-function paintFull(root, d) {
+function paintFull(root, d, sheetEl) {
   console.info('[similar-to-this] paintFull enter, gid=', d && d.id);
   root.innerHTML = "";
   try {
@@ -352,119 +355,130 @@ function paintFull(root, d) {
   })();
   if (!firstRow) root.appendChild(card);   // only render when it has content
 
-  // v12.34i: "Similar to this" row. Fires AFTER the metadata card so a
-  // 429 / cold-miss never blocks the sheet paint. Uses /api/gallery/<id>/
-  // suggestions (backed by nhentai_cache 3-day TTL / never-expire) so the
-  // second open of any gallery is instant. Hides itself on empty response.
-  mountSimilarRow(root, d.id);
+  // v12.57: "Similar to this" is now anchored to the SHEET root (sheetEl),
+  // not the scroll body. That places it visually BELOW the actions bar
+  // (Download / Save / Share), which is what the user asked for.
+  // Fallback to body only if sheetEl is unavailable (defensive).
+  mountSimilarRow(sheetEl || root, d.id);
 }
 
-function mountSimilarRow(root, gid) {
-  console.info('[similar-to-this] mountSimilarRow called, gid=', gid, 'root?', !!root);
-  if (!gid) { console.warn('[similar-to-this] skipped — no gid'); return; }
+function mountSimilarRow(host, gid) {
+  console.info('[similar-to-this] mountSimilarRow v12.57 called, gid=', gid, 'host?', !!host);
+  if (!gid || !host) { console.warn('[similar-to-this] skipped — no gid or host'); return; }
+
+  // v12.57: guard against re-mount when paintFull runs twice (cache + fresh).
+  const prev = host.querySelector(":scope > .d-similar");
+  if (prev) prev.remove();
+
   const section = h("div", {
     class: "d-similar",
     style: {
-      // v12.56: bolder separation — reads as a distinct block, not a footnote.
-      marginTop: "22px",
-      paddingTop: "18px",
-      borderTop: "2px solid var(--du-divider, rgba(255,255,255,0.10))",
-      display: "none",   // shown only after we know we have items
+      // Sits directly under the actions bar; bold divider, comfortable pad.
+      marginTop: "14px",
+      paddingTop: "14px",
+      paddingBottom: "4px",
+      borderTop: "2px solid var(--du-divider, rgba(255,255,255,0.14))",
+      display: "none",
     },
   });
-  // v12.56: brighter, bigger heading + right-aligned "scroll →" hint so the
-  // user sees the label AND knows the strip is scrollable.
-  const scrollHint = h("span", {
-    class: "d-similar-hint",
-    style: {
-      fontSize: "11px", fontWeight: "500",
-      color: "var(--du-ink-lo)", letterSpacing: "0.2px",
-      textTransform: "none", opacity: "0.85",
-    },
-  }, "scroll →");
+
+  // Big, unambiguous section header — brighter than the metadata labels,
+  // with a small "swipe" hint on the right so the affordance is obvious.
   const heading = h("div", {
     class: "d-similar-heading",
     style: {
-      fontSize: "13px",
-      fontWeight: "800",
-      color: "var(--du-ink-mid)",
-      textTransform: "uppercase",
-      letterSpacing: "0.5px",
-      marginBottom: "10px",
       display: "flex",
       alignItems: "center",
       justifyContent: "space-between",
       gap: "8px",
+      marginBottom: "10px",
+      color: "var(--du-ink, #fff)",
+      fontSize: "14px",
+      fontWeight: "800",
+      letterSpacing: "0.6px",
+      textTransform: "uppercase",
     },
-  }, h("span", {}, "Similar to this"), scrollHint);
+  },
+    h("span", {}, "SIMILAR TO THIS"),
+    h("span", {
+      style: {
+        fontSize: "11px", fontWeight: "600",
+        color: "var(--du-ink-lo, #9aa)",
+        textTransform: "none",
+        letterSpacing: "0.2px",
+        opacity: "0.9",
+      },
+    }, "swipe →"),
+  );
+
   const strip = h("div", {
     class: "d-similar-strip",
     style: {
-      // v12.56: smooth, free-flowing horizontal scroll.
       display: "grid",
       gridAutoFlow: "column",
-      gridAutoColumns: "minmax(108px, 34vw)",   // smaller cards → next one peeks in
+      gridAutoColumns: "minmax(112px, 34vw)",
       gap: "10px",
       overflowX: "auto",
       overflowY: "hidden",
-      scrollSnapType: "x proximity",            // was "mandatory" (felt stuck)
-      scrollPaddingInline: "4px",
-      WebkitOverflowScrolling: "touch",         // iOS momentum
-      touchAction: "pan-x",                     // horizontal swipes go here
-      overscrollBehaviorX: "contain",           // don't fight sheet scroll
-      scrollbarWidth: "none",                   // hide scrollbar (Firefox)
-      msOverflowStyle: "none",                  // hide scrollbar (legacy Edge)
+      // v12.57: NO scroll-snap. Snap on Android WebViews inside a
+      // fixed bottom-sheet is the primary "stuck" culprit. Free scroll wins.
+      WebkitOverflowScrolling: "touch",
+      touchAction: "pan-x",
+      overscrollBehaviorX: "contain",
+      scrollbarWidth: "none",
+      msOverflowStyle: "none",
       paddingBottom: "6px",
     },
   });
-  // v12.56: wrap strip so we can layer a right-edge fade gradient on top
-  // (peek affordance) without breaking the scroll region. `contain: content`
-  // isolates layout/paint so the outer sheet never steals horizontal touches.
+
+  // Positioned wrapper so we can layer a right-edge fade on top of the
+  // strip (the "there's more" affordance) without breaking scroll.
   const stripWrap = h("div", {
     class: "d-similar-stripwrap",
     style: {
       position: "relative",
-      contain: "content",
+      contain: "content",   // isolate touch region from parent scroll
       touchAction: "pan-x",
     },
-  }, strip, h("div", {
-    class: "d-similar-fade",
-    style: {
-      position: "absolute",
-      top: "0", right: "0", bottom: "6px",
-      width: "28px",
-      pointerEvents: "none",
-      background: "linear-gradient(to left, var(--du-bg-0, rgba(0,0,0,0.55)), transparent)",
-    },
-  }));
+  },
+    strip,
+    h("div", {
+      class: "d-similar-fade",
+      style: {
+        position: "absolute",
+        top: "0", right: "0", bottom: "6px",
+        width: "28px",
+        pointerEvents: "none",
+        background: "linear-gradient(to left, rgba(0,0,0,0.55), transparent)",
+      },
+    }),
+  );
+
   section.append(heading, stripWrap);
-  root.appendChild(section);
+  host.appendChild(section);   // v12.57: appended to sheet.el, AFTER actions
 
   (async () => {
     let items = [];
     try {
       console.log("[similar] fetching suggestions for", gid);
-      const r = await api.get(
-        `/api/gallery/${encodeURIComponent(gid)}/suggestions?limit=8`
-      );
+      const r = await api.get(`/api/gallery/${encodeURIComponent(gid)}/suggestions?limit=8`);
       items = (r && Array.isArray(r.items)) ? r.items : [];
     } catch (e) {
       console.warn("[similar] fetch failed for", gid, e);
       items = [];
     }
     console.log("[similar]", gid, "->", items.length, "items");
-    if (!items.length) return;   // section stays display:none
+    if (!items.length) return;
 
     for (const s of items) {
       if (!s || !s.id) continue;
       const card = h("div", {
         class: "d-similar-card",
         style: {
-          scrollSnapAlign: "start",
           borderRadius: "10px",
           overflow: "hidden",
-          background: "var(--du-bg-1)",
-          border: "1px solid var(--du-border)",
+          background: "var(--du-bg-1, #1b1b1b)",
+          border: "1px solid var(--du-border, rgba(255,255,255,0.08))",
           cursor: "pointer",
           display: "flex",
           flexDirection: "column",
@@ -488,8 +502,6 @@ function mountSimilarRow(root, gid) {
             class: "d-similar-cover skeleton",
             style: { width: "100%", aspectRatio: "3 / 4" },
           });
-      // v12.50: cached badge — same contract as grid cards
-      // (is_cached from the route's attach_is_cached).
       if (s.is_cached === true || s.is_cached === false) {
         const pill = h("div", {
           class: "status-pill" + (s.is_cached ? "" : " pill-queue"),
@@ -514,41 +526,17 @@ function mountSimilarRow(root, gid) {
           overflow: "hidden",
         },
       }, s.title_en_clean || s.title || `#${s.id}`);
-      // Cached-badge pill (mirrors main grid).
-      if (s.is_cached === true) {
-        card.appendChild(h("span", {
-          class: "status-pill cached",
-          style: {
-            position: "absolute",
-            top: "6px", right: "6px",
-            padding: "2px 6px",
-            background: "rgba(0,0,0,0.6)",
-            borderRadius: "10px",
-            fontSize: "10px",
-            pointerEvents: "none",
-          },
-        }, "⚡⚡"));
-      } else if (s.is_cached === false) {
-        card.appendChild(h("span", {
-          class: "status-pill uncached",
-          style: {
-            position: "absolute",
-            top: "6px", right: "6px",
-            padding: "2px 6px",
-            background: "rgba(0,0,0,0.6)",
-            borderRadius: "10px",
-            fontSize: "10px",
-            pointerEvents: "none",
-          },
-        }, "📥"));
-      }
       card.append(cover, title);
-      card.addEventListener("click", () => {
+
+      card.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
         try { openGalleryDetail(s); } catch (_) { /* no-op */ }
       });
       strip.appendChild(card);
     }
-    section.style.display = "";
+
+    section.style.display = "block";
   })();
 }
 

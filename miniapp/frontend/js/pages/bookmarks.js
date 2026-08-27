@@ -59,5 +59,5 @@ function openDetail(g, me) {
       .then(st => { g.v2_status = st || { known: false }; })
       .catch(() => { g.v2_status = { known: false }; });
   }
-  import("plugins/detail-sheet.js?v=12.56").then(m => m.openGalleryDetail(g, me));
+  import("plugins/detail-sheet.js?v=12.57").then(m => m.openGalleryDetail(g, me));
 }

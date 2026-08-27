@@ -1,48 +1,39 @@
-v12.56 — "Similar to this" polish + Turso similar-cache disabled
+v12.57 — "Similar to this" BELOW actions + real horizontal scroll + visible header
 Ship date: 2026-08-27
 
-FRONTEND (detail-sheet.js):
-  * Heading brighter + bigger: 12px dim → 13px bold var(--du-ink-mid),
-    uppercase, with an inline "scroll →" hint on the right so users see
-    the label AND know the strip is scrollable.
-  * Section separation: marginTop 14→22px, paddingTop 12→18px,
-    borderTop 1px → 2px, brighter divider color. Reads as a distinct
-    block below the metadata/actions instead of a footnote.
-  * Strip wrapped in a positioned container:
-      - `contain: content` isolates layout/paint (fixes Android WebView
-        stealing horizontal touches),
-      - `touchAction: pan-x` on both wrapper and strip,
-      - right-edge fade gradient (28px, pointer-events:none) as a peek
-        affordance so more items are obviously off-screen.
-  * scrollSnapType stays "proximity" — no more "stuck" feel.
+WHAT WENT WRONG IN v12.56 (from your screenshots):
+  1. Section rendered INSIDE the sheet body → always appears above the
+     actions row (Download / Save / Share). sheet.js layout is:
+        [handle] [title] [body] [actions]
+     so anything you append to body is above actions by design.
+  2. Heading text was invisible on your theme (dim var(--du-ink-lo)).
+  3. `scrollSnapType: proximity` still locked scroll on Android WebView
+     inside a bottom sheet — snap of any kind is the "stuck" culprit.
 
-BACKEND (services/scraper_bridge.py):
-  * `similar:<gid>` Turso caching DISABLED.
-    - No cache read, no cache write on gallery_suggestions().
-    - Engine (Stage A/B/C) still runs and still logs
-      `similar(gid): stage=A returned=N`.
-    - Rationale:
-        + Turso SQL scoring already answers in ~1.2-1.5s.
-        + Caching burned ~500K writes/mo (one per opened gallery) for
-          data that stales as new galleries land.
-        + Users always get fresh recommendations reflecting the current
-          library.
-        + Frees ~1GB of Turso storage over time.
-    - `gallery:<gid>` and `search:*` caches are untouched (still 30-day
-      / 3-day TTL) — those are the ones that matter.
-
-VERSION BUMPS:
-  All detail-sheet.js import specifiers → ?v=12.56
-  (index.html app.js, app.js dynamic import, search.js Random chip +
-   card taps, bookmarks.js, profile.js, home-rows.js)
+FIXES IN v12.57:
+  a) DOM placement: mountSimilarRow now receives sheet.el (the sheet
+     ROOT), not the body. It appends the section AFTER the actions bar,
+     so "Similar to this" sits BELOW Download/Save/Share as requested.
+  b) Header: uppercase 14px 800-weight in var(--du-ink) (bright white on
+     dark), plus a small "swipe →" hint on the right. Impossible to miss.
+  c) Scroll: scrollSnapType removed entirely (was the sole cause of the
+     "frozen" feel). Free horizontal scroll with iOS momentum, isolated
+     touch region (contain: content), right-edge fade gradient as the
+     peek affordance.
+  d) Re-mount guard: if paintFull runs twice (cache paint + fresh paint),
+     the second call now removes the previous section before rebuilding
+     — no more duplicate rows.
 
 DEPLOY:
-  1. Copy the 8 files into the repo (frontend + one backend file), commit,
-     push — Render auto-deploys.
-  2. Fully close the Mini App once (swipe away), reopen.
-  3. Open any gallery — you should see:
-       * A clear "SIMILAR TO THIS   scroll →" heading in bright text.
-       * A distinct visual gap above the strip.
-       * Smooth horizontal swipe with a fade at the right edge.
-       * Log line `similar(<gid>): stage=A returned=N` — but NO
-         `[TURSO WRITE] key=similar:<gid>` line.
+  1. Copy the 7 files into the repo, commit, push — Render auto-deploys.
+  2. Fully close the Mini App (swipe it away), then reopen.
+  3. Open any gallery — expected:
+       * Download / Save / Share sits directly under the metadata table.
+       * Below the buttons: bright "SIMILAR TO THIS   swipe →" header.
+       * A row of card thumbnails that scrolls smoothly left-right,
+         with a fade on the right edge showing more items exist.
+  4. Console lines to verify the new build reached the phone:
+       [detail-sheet] build=v12.57
+       [similar-to-this] mountSimilarRow v12.57 called, gid= <n> host? true
+       [similar] fetching suggestions for <n>
+       [similar] <n> -> 8 items
