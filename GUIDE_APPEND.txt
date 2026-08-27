@@ -1,39 +1,142 @@
-v12.57 — "Similar to this" BELOW actions + real horizontal scroll + visible header
-Ship date: 2026-08-27
+================================================================================
+GUIDE_APPEND — v1.22 "BackupDB" (high-availability Database Channel)
+Shipped: 2026-08-27
+================================================================================
 
-WHAT WENT WRONG IN v12.56 (from your screenshots):
-  1. Section rendered INSIDE the sheet body → always appears above the
-     actions row (Download / Save / Share). sheet.js layout is:
-        [handle] [title] [body] [actions]
-     so anything you append to body is above actions by design.
-  2. Heading text was invisible on your theme (dim var(--du-ink-lo)).
-  3. `scrollSnapType: proximity` still locked scroll on Android WebView
-     inside a bottom sheet — snap of any kind is the "stuck" culprit.
+WHAT CHANGED AND WHY
+--------------------------------------------------------------------------------
+If the Main Database Channel ever gets deleted / banned / inaccessible, Mini
+App downloads would break for every gallery. v1.22 adds a secondary private
+channel (BackupDB) that holds a server-side-forwarded copy of every cover
+post + PDF, and records the BackupDB message ids on the SAME Mongo galleries
+doc (one canonical record per gallery — no separate mapping collection):
 
-FIXES IN v12.57:
-  a) DOM placement: mountSimilarRow now receives sheet.el (the sheet
-     ROOT), not the body. It appends the section AFTER the actions bar,
-     so "Similar to this" sits BELOW Download/Save/Share as requested.
-  b) Header: uppercase 14px 800-weight in var(--du-ink) (bright white on
-     dark), plus a small "swipe →" hint on the right. Impossible to miss.
-  c) Scroll: scrollSnapType removed entirely (was the sole cause of the
-     "frozen" feel). Free horizontal scroll with iOS momentum, isolated
-     touch region (contain: content), right-edge fade gradient as the
-     peek affordance.
-  d) Re-mount guard: if paintFull runs twice (cache paint + fresh paint),
-     the second call now removes the previous section before rebuilding
-     — no more duplicate rows.
+    backup_channel_id, backup_cover_msg_id, backup_pdf_msg_id,
+    backup_status ("ok"|"cover_only"|"missing_in_main"|"needs_review"),
+    backed_up_at
 
-DEPLOY:
-  1. Copy the 7 files into the repo, commit, push — Render auto-deploys.
-  2. Fully close the Mini App (swipe it away), then reopen.
-  3. Open any gallery — expected:
-       * Download / Save / Share sits directly under the metadata table.
-       * Below the buttons: bright "SIMILAR TO THIS   swipe →" header.
-       * A row of card thumbnails that scrolls smoothly left-right,
-         with a fade on the right edge showing more items exist.
-  4. Console lines to verify the new build reached the phone:
-       [detail-sheet] build=v12.57
-       [similar-to-this] mountSimilarRow v12.57 called, gid= <n> host? true
-       [similar] fetching suggestions for <n>
-       [similar] <n> -> 8 items
+Recovery is one admin command: /usebackupDB on  → Bot 0's delivery path
+(auto-DM / Mini App download) forwards from BackupDB instead of Main.
+Galleries without backup ids fall back to Main with a log line, so nothing
+breaks during the transition.
+
+FILES IN THIS ZIP (repo-relative paths — drag and drop onto the repo)
+--------------------------------------------------------------------------------
+    backup_db.py                          NEW  — shared helpers (Bot 0 side):
+                                                 state doc, galleries stamping,
+                                                 delivery_source(), mirror
+    relay_v2.py                           PATCH — Bot 0: after the locked
+                                                 cover+PDF write succeeds,
+                                                 best-effort mirror to
+                                                 BackupDB + stamp galleries
+                                                 doc; auto-DM read path
+                                                 honours the use_backup toggle
+    admin_bot.py                          PATCH — new command
+                                                 /usebackupDB on|off|status
+    config.py                             PATCH — optional env
+                                                 BACKUP_DB_CHANNEL_ID (0 =
+                                                 read id from Mongo
+                                                 backup_state instead)
+    db.py                                 PATCH — MongoHandle.backup_state
+                                                 collection accessor
+    Bot2Fetcher/app/fetcher.py            PATCH — after mark_completed,
+                                                 best-effort mirror to
+                                                 BackupDB (self-contained
+                                                 twin — Bot2Fetcher cannot
+                                                 import repo-root modules)
+    scripts/backfill_backup_channel.py    NEW  — one-time backfill, run on
+                                                 YOUR Windows PC
+    GUIDE.md                              PATCH — v1.22 log entry + promotion
+                                                 runbook
+    GUIDE_APPEND.txt                      THIS FILE
+
+DESIGN FACTS (why it is built this way)
+--------------------------------------------------------------------------------
+* Mongo-driven, NOT channel-history-driven: the backfill only touches
+  galleries docs that carry db_cover_msg_id/db_pdf_msg_id — i.e. Mini-App-era
+  posts ONLY. The 2,000+ legacy posts and old text messages in the channel
+  are never touched (they have no Mongo doc).
+* Integrity check before every forward: cover must be a photo (or caption
+  carries the gid); PDF must be application/pdf (or filename carries the
+  gid). A deleted/swapped message is NEVER forwarded as the wrong file —
+  it is marked "missing_in_main" or "needs_review" (see backfill_review.log).
+* Server-side forward (no download/re-upload) → fast, no bandwidth cost.
+* Mirror failure policy (operator-approved): log + counters ONLY, never
+  block or fail the user download.
+* Backfill is idempotent/resumable: any doc already stamped with
+  backup_cover_msg_id is skipped. Crash / laptop sleep / FloodWait → just
+  re-run the same command.
+* Runs in SMALL BATCHES (default 25 galleries, 1.2s between galleries,
+  30s pause between batches) so a Windows laptop CMD never gets stuck.
+  Tunable via BACKFILL_BATCH_SIZE / BACKFILL_MSG_SLEEP / BACKFILL_BATCH_SLEEP.
+
+DEPLOY STEPS
+--------------------------------------------------------------------------------
+1. Drag-and-drop this zip's files onto the repo (paths already correct),
+   commit, push. Render auto-deploys Bot 0 and Bot2Fetcher.
+2. NO new Render env var is required. Optional: after the first backfill
+   run prints the new channel id, pin BACKUP_DB_CHANNEL_ID=<id> on BOTH
+   Render services (Bot 0 and Bot2Fetcher) — otherwise the id is read
+   from Mongo backup_state, which is fine too.
+3. Run the backfill on your PC (steps below).
+4. Test: /usebackupDB status  → shows channel id + counters.
+   /usebackupDB on → download a gallery in the Mini App → file arrives
+   from BackupDB. /usebackupDB off when done testing.
+5. Disaster drill complete: if Main ever dies, flip /usebackupDB on and
+   users keep downloading. Then promote BackupDB → Main (runbook in
+   GUIDE.md) and create a fresh backup.
+
+HOW TO RUN THE BACKFILL ON WINDOWS 11 (CMD, step by step)
+--------------------------------------------------------------------------------
+1. Install Python 3.11+ from https://www.python.org/downloads/
+   IMPORTANT: tick "Add python.exe to PATH" during install.
+2. Open CMD (Win+R → cmd → Enter), then:
+       mkdir C:\backupdb
+       cd C:\backupdb
+3. Copy scripts\backfill_backup_channel.py from this zip into C:\backupdb.
+4. Install the two libraries:
+       pip install telethon pymongo
+5. Set the environment variables (one line each, in the SAME CMD window):
+       set API_ID=<your api_id from https://my.telegram.org>
+       set API_HASH=<your api_hash>
+       set STRING_SESSION=<your Telethon string session — same one as the
+                          STRING_SESSION var on the Bot 0 Render dashboard>
+       set MONGO_URI=<your MongoDB connection string>
+       set MONGO_DB_NAME=relaybot
+       set DATABASE_CHANNEL_ID=<your Main DB channel id, e.g. -100xxxxxxxxxx>
+   Optional tuning (defaults are already laptop-friendly):
+       set BACKFILL_BATCH_SIZE=25
+       set BACKFILL_MSG_SLEEP=1.2
+       set BACKFILL_BATCH_SLEEP=30
+6. DRY RUN FIRST (verifies + counts, forwards nothing, writes nothing):
+       python backfill_backup_channel.py --dry-run
+   Watch a few dozen lines: you should see "OK — would forward [...]".
+   Ctrl+C any time — nothing was written.
+7. REAL RUN:
+       python backfill_backup_channel.py
+   The script auto-creates "DU Database Backup" on first run and prints its
+   channel id — copy that id and (optionally) pin it as BACKUP_DB_CHANNEL_ID
+   on both Render services.
+8. If the laptop sleeps, CMD closes, or Telegram FloodWaits — just re-run
+   the same command. Already-backed-up galleries are skipped automatically.
+9. When it prints DONE: check the summary line
+   (ok / cover_only / missing_in_main / needs_review / failed) and review
+   backfill_review.log if needs_review > 0.
+
+VERIFICATION SIGNS
+--------------------------------------------------------------------------------
+* Mongo galleries docs gain backup_cover_msg_id / backup_pdf_msg_id /
+  backup_status="ok".
+* Mongo backup_state doc _id="state" holds backup_channel_id.
+* /usebackupDB status shows the channel id and mirrored_ok growing after
+  each new download (live mirror working).
+* With /usebackupDB on, a Mini App download delivers the PDF even if you
+  cannot open the Main channel.
+
+SECURITY NOTE
+--------------------------------------------------------------------------------
+The Turso token + Mongo URI shared in chat during planning are now exposed.
+Rotate the Turso token and change the Mongo user password, then update the
+Render env vars. Nothing in this zip hardcodes any credential — the script
+reads everything from env vars.
+================================================================================

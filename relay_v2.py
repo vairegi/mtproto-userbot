@@ -275,8 +275,17 @@ async def _auto_dm_requester(
                  user_id, len(missing))
         return
 
+    # v1.22 BackupDB: when /usebackupDB is ON and this gallery has backup
+    # ids, deliver from the Backup Database Channel instead of Main (the
+    # disaster-recovery path if Main ever gets banned/deleted).
     from_chat = int(getattr(settings, "database_channel_id", 0) or 0)
     msg_ids = [int(m) for m in (cover_msg_id, pdf_msg_id) if m]
+    try:
+        import backup_db as _bdb
+        from_chat, msg_ids = _bdb.delivery_source(
+            conn, str(gallery_id or ""), from_chat, cover_msg_id, pdf_msg_id)
+    except Exception as _be:  # noqa: BLE001
+        log.warning("backup_db delivery_source failed (using Main): %s", _be)
 
     # -------- 1) Primary path: Bot API copyMessage -------------------------
     if from_chat and _admin_bot_token():
@@ -893,6 +902,20 @@ async def process_job(
         if forwarded:
             m = forwarded[0] if isinstance(forwarded, list) else forwarded
             pdf_msg_id = int(getattr(m, "id", 0) or 0)
+
+        # ---- v1.22 BackupDB: best-effort mirror of the just-posted pair --
+        # Server-side forward into the Backup Database Channel and stamp the
+        # backup msg ids onto the same galleries doc. NEVER blocks the user
+        # download — failures are logged + counted only.
+        try:
+            import backup_db as _bdb
+            await _bdb.mirror_pair_to_backup(
+                client, conn, settings, gid, channel,
+                int(getattr(cover, "msg_id", 0) or 0), pdf_msg_id,
+                log_prefix="relay_v2",
+            )
+        except Exception as _be:  # noqa: BLE001
+            log.warning("backup_db relay_v2 mirror raised (non-fatal): %s", _be)
 
         db.record_processed(conn, url, url_hash)
 

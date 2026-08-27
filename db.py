@@ -211,6 +211,12 @@ class MongoHandle:
         return self.db["galleries"]
 
     @property
+    def backup_state(self):
+        """v1.22: BackupDB state doc (_id='state': use_backup toggle,
+        backup_channel_id). See backup_db.py."""
+        return self.db["backup_state"]
+
+    @property
     def nhentai_cache(self):
         """v12.2: long-TTL cache of upstream nhentai responses.
 

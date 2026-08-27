@@ -321,6 +321,43 @@ async def cmd_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
+# v1.22 BackupDB — manual disaster-recovery toggle. When ON, Bot 0's
+# delivery path (auto-DM / Mini App download) forwards cover+PDF from the
+# Backup Database Channel using the backup_*_msg_id fields stamped on the
+# galleries doc by the live mirror / backfill script. Galleries without
+# backup ids silently fall back to Main. Persisted in Mongo backup_state.
+async def cmd_usebackupdb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await update.effective_message.reply_text("⛔ Admins only.")
+        return
+    import backup_db as _bdb
+    conn = db.connect()
+    try:
+        arg = (ctx.args[0].lower() if ctx.args else "status")
+        if arg == "on":
+            _bdb.set_use_backup(conn, True)
+            txt = ("✅ BackupDB delivery ON — downloads now forward from the "
+                   "Backup Database Channel. Galleries without backup ids "
+                   "still fall back to Main.")
+        elif arg == "off":
+            _bdb.set_use_backup(conn, False)
+            txt = "⏹ BackupDB delivery OFF — downloads use the Main Database Channel."
+        else:
+            st = _bdb.get_state(conn)
+            c = _bdb.get_counters(conn)
+            txt = (
+                "🗄 BackupDB status\n"
+                f"• use_backup: {'ON ✅' if st.get('use_backup') else 'OFF ⏹'}\n"
+                f"• backup_channel_id: {st.get('backup_channel_id') or 'not set — run the backfill script'}\n"
+                f"• mirrored_ok: {c.get('mirrored_ok', 0)}   mirrored_fail: {c.get('mirrored_fail', 0)}\n"
+                "Usage: /usebackupDB on | off | status"
+            )
+    finally:
+        conn.close()
+    await update.effective_message.reply_text(txt)
+
+
 async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     conn = db.connect()
     try:
@@ -3225,6 +3262,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("coverpost", cmd_coverpost))
     app.add_handler(CommandHandler("verify", cmd_verify))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("usebackupdb", cmd_usebackupdb))
+    app.add_handler(CommandHandler("usebackupDB", cmd_usebackupdb))
     app.add_handler(CommandHandler("last", cmd_last))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("help", cmd_help))

@@ -264,3 +264,28 @@ One line: `z-index: calc(var(--du-z-toast, 300) + 1)` = 301 in `miniapp/frontend
 
 ### Rollout
 Copy file over repo, commit, push. BOT 0 redeploys. No env changes.
+
+================================================================================
+v1.22 — BackupDB: high-availability Database Channel (2026-08-27)
+================================================================================
+Secondary private channel (BackupDB) mirrors every cover+PDF posted to the
+Main Database Channel; BackupDB message ids are stamped onto the SAME Mongo
+galleries doc (backup_channel_id / backup_cover_msg_id / backup_pdf_msg_id /
+backup_status / backed_up_at). New files: backup_db.py (Bot 0 helpers),
+scripts/backfill_backup_channel.py (one-time, runs on operator's PC,
+Mongo-driven, batched, resumable, integrity-checked). Patched: relay_v2.py
+(mirror after locked write + use_backup-aware auto-DM), admin_bot.py
+(/usebackupDB on|off|status), config.py (BACKUP_DB_CHANNEL_ID optional),
+db.py (backup_state accessor), Bot2Fetcher/app/fetcher.py (self-contained
+mirror twin — it cannot import repo-root modules).
+
+DISASTER RECOVERY: /usebackupDB on → delivery forwards from BackupDB.
+PROMOTION RUNBOOK (BackupDB → new Main): 1) /usebackupDB on (users keep
+downloading). 2) Set DATABASE_CHANNEL_ID=<BackupDB id> on Bot 0 and
+DB_CHANNEL_ID=<BackupDB id> on Bot2Fetcher env vars. 3) /usebackupDB off.
+4) Unset BACKUP_DB_CHANNEL_ID everywhere and clear Mongo backup_state
+backup_channel_id. 5) Re-run scripts/backfill_backup_channel.py — it
+auto-creates a FRESH BackupDB against the new Main; galleries already
+stamped get a new backup copy (clear backup_* fields first if you want a
+full re-mirror). 6) Re-pin BACKUP_DB_CHANNEL_ID with the new id.
+================================================================================

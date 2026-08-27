@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import random
 import re
 import time
@@ -469,6 +470,14 @@ class Fetcher:
                 "status": "COMPLETED", "cover_msg_id": cover_msg_id,
                 "pdf_msg_id": pdf_msg_id, "open_link": link,
             })
+            # ---- v1.22 BackupDB: best-effort mirror (NEVER fails job) ----
+            try:
+                await self._mirror_to_backup(client, channel, gid,
+                                             cover_msg_id, pdf_msg_id)
+            except Exception as be:  # noqa: BLE001
+                log.warning("🗄 %s backup mirror failed (non-fatal): %s",
+                            gid, be)
+
             self.stats.completed += 1
             self._known_done.add(gid)          # v12.44: never re-queue
             self.stats.last_finished_at = time.time()
@@ -677,6 +686,48 @@ class Fetcher:
         except Exception as e:
             log.warning("📤 pdf reupload failed: %s", e)
             return 0
+
+    async def _mirror_to_backup(self, client, channel, gid: str,
+                                cover_msg_id: int, pdf_msg_id: int) -> None:
+        """v1.22 BackupDB live mirror (Bot2Fetcher side).
+
+        Bot2Fetcher deploys with Root Directory = `Bot2Fetcher`, so it
+        CANNOT import the repo-root backup_db.py — this is the deliberate,
+        minimal twin of backup_db.mirror_pair_to_backup(). Same failure
+        policy: log + counter only, never block the user download.
+        """
+        from pymongo import MongoClient  # lazy: only when mirror runs
+        mdb = MongoClient(os.environ["MONGO_URI"])[
+            (os.environ.get("MONGO_DB_NAME") or "relaybot").strip()]
+        state = mdb["backup_state"].find_one({"_id": "state"}) or {}
+        bch_id = int(os.environ.get("BACKUP_DB_CHANNEL_ID", "") or 0) or int(
+            state.get("backup_channel_id") or 0)
+        if not bch_id:
+            return  # no backup channel configured yet — silent no-op
+        res = await client.forward_messages(
+            bch_id, [int(cover_msg_id), int(pdf_msg_id)], channel,
+            drop_author=True)
+        msgs = res if isinstance(res, list) else [res]
+        bc = int(getattr(msgs[0], "id", 0) or 0) if len(msgs) > 0 else 0
+        bp = int(getattr(msgs[1], "id", 0) or 0) if len(msgs) > 1 else 0
+        if bc or bp:
+            upd = {"backup_channel_id": bch_id,
+                   "backup_status": "ok" if bp else "cover_only",
+                   "backed_up_at": time.time()}
+            if bc:
+                upd["backup_cover_msg_id"] = bc
+            if bp:
+                upd["backup_pdf_msg_id"] = bp
+            mdb["galleries"].update_one({"_id": str(gid)}, {"$set": upd})
+            mdb["counters"].update_one({"_id": "backupdb"},
+                                       {"$inc": {"mirrored_ok": 1}},
+                                       upsert=True)
+            log.info("🗄 %s mirrored to BackupDB cover=%s pdf=%s", gid, bc, bp)
+        else:
+            mdb["counters"].update_one({"_id": "backupdb"},
+                                       {"$inc": {"mirrored_fail": 1}},
+                                       upsert=True)
+            log.warning("🗄 %s backup forward returned no ids", gid)
 
     async def run(self) -> None:
         await self.start()

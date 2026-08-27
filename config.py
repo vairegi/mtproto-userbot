@@ -130,6 +130,11 @@ class Settings:
     database_channel_id: int
     doujinshibot_username: str
 
+    # v1.22 BackupDB — high-availability mirror of the Database Channel.
+    # Optional: when 0, falls back to Mongo backup_state.backup_channel_id
+    # (written by scripts/backfill_backup_channel.py on first run).
+    backup_db_channel_id: int
+
     # Database (NEW — replaces the local SQLite file)
     mongo_uri: str
     mongo_db_name: str
@@ -218,6 +223,7 @@ def load_settings() -> Settings:
         bot1_username=(_opt("BOT1_USERNAME") or "").lstrip("@"),
         bot2_username=_req("BOT2_USERNAME").lstrip("@"),
         database_channel_id=_int_req("DATABASE_CHANNEL_ID", "CHANNEL_ID"),
+        backup_db_channel_id=_int("BACKUP_DB_CHANNEL_ID", 0),
         # Correct spelling is Doug-in-shibot (with a 'g'), NOT Dou-jin-shibot.
         # The 'j' variant is a different bot; sending /mpost there does nothing.
         doujinshibot_username=(_opt("DOUJINSHIBOT_USERNAME", default="Douginshibot") or "").lstrip("@"),
