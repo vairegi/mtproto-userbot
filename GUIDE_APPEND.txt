@@ -1,49 +1,36 @@
-v12.54 — Similar-to-this: instrumentation + defensive paint + full cache-bust
+v12.55 — One detail sheet for the whole app + smooth "Similar to this" scroll
 Ship date: 2026-08-27
 
-WHY (evidence from latest Render log + live probe):
-  Backend is fully healthy: /api/health/routes → ok:true; the suggestions
-  endpoint answers 401 (auth-gated, alive); the served detail-sheet.js
-  contains mountSimilarRow and was freshly fetched by the phone (no-store
-  headers working). Yet across 3 gallery opens the log shows ZERO
-  /api/gallery/<id>/suggestions requests AND zero /api/bookmarks/count
-  requests. bookmarks/count fires inside paintFull at line ~339 — right
-  before mountSimilarRow — so paintFull itself never completed. The sheet
-  body you saw is renderBase; paintFull was silently throwing before either
-  network call (prime suspect: renderStarRating at paintFull line 271 —
-  a stale star-rating plugin with a mismatched export kills the whole body).
+WHAT WAS WRONG:
+  The app had THREE separate detail-sheet implementations:
+    - plugins/detail-sheet.js  → the rich one (Similar to this, star rating,
+      Saves row) — used by Random, Popular-Now rows, Profile, deep-links.
+    - pages/search.js          → an old INLINE copy — used by every grid card
+      (Popular Now / New Uploads / Popular Week / search results).
+    - pages/bookmarks.js       → a third, minimal inline copy (Saved tab).
+  Every update to detail-sheet.js only ever reached Random — the grid sorts
+  opened the frozen inline copy.
 
-FILES:
-  miniapp/frontend/index.html
-      — app.js entry already bumped to ?v=12.54.
-  miniapp/frontend/js/plugins/detail-sheet.js
-      — build marker: console.info('[detail-sheet] build=v12.54')
-      — paintFull: console.info on enter; renderStarRating moved into a
-        try/catch at the TOP of the function so it can never abort the
-        detail body (Saves row + Similar row) again.
-      — mountSimilarRow: console.info on entry + loud warn when skipped.
-  miniapp/frontend/js/core/app.js       — dynamic import bumped to ?v=12.54
-  miniapp/frontend/js/pages/search.js   — dynamic import bumped to ?v=12.54
-  miniapp/frontend/js/pages/profile.js  — static import bumped to ?v=12.54
-  miniapp/frontend/js/plugins/home-rows.js — static import bumped to ?v=12.54
-  (Importmap trailing-slash mappings can't carry query strings, so the
-   bust is applied at every import site instead.)
+WHAT CHANGED:
+  search.js    — inline openDetail (110 lines) DELETED; card taps now open
+                 the shared rich sheet. v2_status prefetch kept (correct
+                 Download button label on first paint).
+  bookmarks.js — inline openDetail DELETED; Saved-tab cards open the shared
+                 rich sheet too.
+  detail-sheet.js — "Similar to this" strip scrolling fixed:
+                 snap changed mandatory → proximity (no more "stuck" feel),
+                 cards slightly smaller (next card peeks = obvious scroll
+                 affordance), iOS momentum + pan-x touch + hidden scrollbar.
+  app.js / profile.js / home-rows.js / search.js random chip / index.html —
+                 all detail-sheet.js references bumped to ?v=12.55 so phones
+                 pick up the new files.
+
+RESULT:
+  One sheet for the entire app. Any future sheet update ships to ALL sorts,
+  Saved, Random, Profile and deep-links automatically.
 
 DEPLOY:
-  1. Commit these 6 files (frontend only), push, Render auto-deploys.
-  2. On the phone: fully CLOSE the Mini App (swipe away) and reopen once.
-  3. Open WebView DevTools console (chrome://inspect) — expected lines:
-        [detail-sheet] build=v12.54
-        [similar-to-this] paintFull enter, gid= 675xxx
-        [similar-to-this] mountSimilarRow called, gid= 675xxx root? true
-        [similar] fetching suggestions for 675xxx
-        [similar] 675xxx -> N items
-  4. The "Similar to this" row renders under the metadata card.
-
-IF STILL MISSING — the console lines now pinpoint the exact stop:
-  no 'build=v12.54'      → Telegram cache (force-close app, clear cache)
-  no 'paintFull enter'   → enrich() bail (gallery fetch failed client-side)
-  'paintFull enter' + '[detail-sheet] renderStarRating failed' → confirmed
-                           stale-plugin throw, now non-fatal — row appears
-  'mountSimilarRow called' but no '[similar] fetching' → api.get threw sync
-  '[similar] -> 0 items' → backend returned empty (Turso tag data thin)
+  1. Copy these 7 files into the repo, commit, push — Render auto-deploys.
+  2. Fully close the Mini App once (swipe away) and reopen.
+  3. Open any gallery from ANY sort — you should see star rating, Saves,
+     and the horizontally scrollable "Similar to this" strip.

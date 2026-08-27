@@ -53,32 +53,11 @@ export async function render(root, { me }) {
 }
 
 function openDetail(g, me) {
-  // Fetch V2 dedup status once, in the background — sheet appears
-  // immediately, primary-button label updates once the RTT lands.
+  // v12.55: shared rich sheet — identical UI/updates as every other page.
   if (!g.v2_status) {
     api.get(`/api/gallery/${g.id}/status`)
-      .then(s => { g.v2_status = s || { known: false }; })
+      .then(st => { g.v2_status = st || { known: false }; })
       .catch(() => { g.v2_status = { known: false }; });
   }
-
-  // Unwrap function-valued label / icon / disabled from V2 dynamic actions.
-  const _val = (v, ctx) => (typeof v === "function" ? v(ctx) : v);
-  const actions = cardActions
-    .filter(a => !a.when || a.when({ gallery: g, me }))
-    .map(a => {
-      const ctx = { gallery: g, me };
-      return {
-        label:    `${_val(a.icon, ctx)} ${_val(a.label, ctx)}`,
-        kind:     a.kind || "secondary",
-        disabled: _val(a.disabled, ctx) || false,
-        onClick:  (sheetApi) => a.run({ gallery: g, me, close: sheetApi.close }),
-      };
-    });
-  const body = h("div", { style: { textAlign: "center" } },
-    g.cover ? h("img", { src: g.cover, alt: g.title,
-      style: { width: "60%", maxWidth: "220px", borderRadius: "12px",
-               margin: "0 auto", display: "block" } }) : null,
-    h("div", { style: { marginTop: "12px", fontWeight: "600" } }, g.title || `#${g.id}`),
-  );
-  make("sheet", { title: "Saved", body, actions }).open();  // v11.8 (#6a)
+  import("plugins/detail-sheet.js?v=12.55").then(m => m.openGalleryDetail(g, me));
 }

@@ -1,4 +1,4 @@
-console.info('[detail-sheet] build=v12.54');
+console.info('[detail-sheet] build=v12.55');
 /*
   detail-sheet.js — Rich gallery detail sheet
 
@@ -385,14 +385,20 @@ function mountSimilarRow(root, gid) {
   const strip = h("div", {
     class: "d-similar-strip",
     style: {
+      // v12.55: smooth, free-flowing horizontal scroll.
       display: "grid",
       gridAutoFlow: "column",
-      gridAutoColumns: "minmax(120px, 42vw)",
+      gridAutoColumns: "minmax(108px, 34vw)",   // smaller cards → next one peeks in
       gap: "10px",
       overflowX: "auto",
       overflowY: "hidden",
-      scrollSnapType: "x mandatory",
-      WebkitOverflowScrolling: "touch",
+      scrollSnapType: "x proximity",            // was "mandatory" (felt stuck)
+      scrollPaddingInline: "4px",
+      WebkitOverflowScrolling: "touch",         // momentum on iOS WebView
+      touchAction: "pan-x",                     // horizontal swipes go to the strip
+      overscrollBehaviorX: "contain",           // don't fight the sheet's own scroll
+      scrollbarWidth: "none",                   // hide scrollbar (Firefox)
+      msOverflowStyle: "none",                  // hide scrollbar (legacy Edge)
       paddingBottom: "6px",
     },
   });

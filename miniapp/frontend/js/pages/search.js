@@ -341,116 +341,18 @@ export async function render(root, { me }) {
     });
   }
 
-  function openDetail(g) {
-    // Fetch V2 dedup status once, in the background, so the sheet re-renders
-    // its primary button as "Open Post" / "Downloading…" / "Queue to Channel".
+  // v12.55: the inline detail sheet is GONE. Every page (all sorts, saved,
+  // random, deep-links) now opens the SAME rich sheet from
+  // plugins/detail-sheet.js — so any future sheet update applies everywhere.
+  async function openDetail(g) {
+    // Prefetch V2 dedup status so the Download button label is right on first paint.
     if (!g.v2_status) {
       api.get(`/api/gallery/${g.id}/status`)
-        .then(s => { g.v2_status = s || { known: false }; })
+        .then(st => { g.v2_status = st || { known: false }; })
         .catch(() => { g.v2_status = { known: false }; });
     }
-
-    // Turn cardActions entries into sheet-button descriptors, unwrapping
-    // function-valued label / icon / disabled fields (V2 dynamic actions).
-    const _val = (v, ctx) => (typeof v === "function" ? v(ctx) : v);
-    const actions = cardActions
-      .filter(a => !a.when || a.when({ gallery: g, me }))
-      .map(a => {
-        const ctx = { gallery: g, me };
-        return {
-          label:    `${_val(a.icon, ctx)} ${_val(a.label, ctx)}`,
-          kind:     a.kind || "secondary",
-          block:    false,
-          disabled: _val(a.disabled, ctx) || false,
-          onClick:  (sheetApi) => a.run({ gallery: g, me, close: sheetApi.close }),
-        };
-      });
-
-    // ---- detail-sheet body --------------------------------------------------
-    const GROUP_ORDER = ["parody", "character", "artist", "group", "language", "category", "tag"];
-    const GROUP_LABEL = {
-      parody: "Parody", character: "Characters", artist: "Artist",
-      group: "Circle", language: "Language", category: "Category", tag: "Tags",
-    };
-    const fmtNum = (n) => {
-      n = parseInt(n || 0, 10);
-      if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
-      if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
-      return String(n || 0);
-    };
-
-    const $body = h("div", { class: "d-root" });
-
-    function renderBase() {
-      $body.innerHTML = "";
-      $body.append(
-        g.cover ? h("img", {
-          class: "d-cover", src: g.cover, alt: g.title || "",
-          loading: "lazy",
-        }) : null,
-        h("div", { class: "d-title" }, g.title || `#${g.id}`),
-        h("div", { class: "d-sub" }, `#${g.id} · ${g.pages || "?"} pages`),
-        h("div", { class: "d-loading" }, "Loading details…"),
-      );
-    }
-
-    function renderFull(d) {
-      // d is the detail payload from GET /api/gallery/{id}
-      const groups = d.tag_groups || {};
-      $body.innerHTML = "";
-
-      const coverSrc = d.cover || g.cover;
-      if (coverSrc) {
-        $body.append(h("img", { class: "d-cover", src: coverSrc, alt: d.title || "" }));
-      }
-
-      // Bold clean title, then the FULL original titles as subtitles.
-      $body.append(h("div", { class: "d-title" }, d.title || g.title || `#${g.id}`));
-      if (d.title_english && d.title_english !== d.title) {
-        $body.append(h("div", { class: "d-full-title" }, d.title_english));
-      }
-      if (d.title_japanese) {
-        $body.append(h("div", { class: "d-jpn-title" }, d.title_japanese));
-      }
-
-      // Meta line: id · pages · ♥ favorites · upload date
-      const metaBits = [`#${d.id || g.id}`];
-      if (d.pages || g.pages) metaBits.push(`${d.pages || g.pages} pages`);
-      if (d.favorites) metaBits.push(`♥ ${fmtNum(d.favorites)}`);
-      if (d.upload_date) metaBits.push(d.upload_date);
-      if (d.scanlator) metaBits.push(`scans: ${d.scanlator}`);
-      $body.append(h("div", { class: "d-sub" }, metaBits.join("  ·  ")));
-
-      // Grouped tag rows with labels — this is the "caption" the user asked for.
-      for (const typ of GROUP_ORDER) {
-        const names = groups[typ];
-        if (!names || !names.length) continue;
-        $body.append(h("div", { class: "d-meta-row" },
-          h("span", { class: "d-meta-label" }, GROUP_LABEL[typ] + ":"),
-          h("div", { class: "d-meta-tags" },
-            ...names.slice(0, 12).map(n => h("span", { class: "d-tag" }, n))),
-        ));
-      }
-
-      // Fallback: if the API gave no groups but the card had tags, show them.
-      if (!Object.keys(groups).length && g.tags && g.tags.length) {
-        $body.append(h("div", { class: "d-meta-row" },
-          h("span", { class: "d-meta-label" }, "Tags:"),
-          h("div", { class: "d-meta-tags" },
-            ...g.tags.slice(0, 12).map(t => h("span", { class: "d-tag" }, t.name || t))),
-        ));
-      }
-    }
-
-    renderBase();
-
-    const sheet = make("sheet", { title: "Gallery", body: $body, actions });
-    sheet.open();
-
-    // Load the full caption in the background and rebuild the body in place.
-    api.get(`/api/gallery/${g.id}`)
-      .then(d => { if (d && d.id) renderFull(d); else $body.querySelector(".d-loading")?.remove(); })
-      .catch(() => { $body.querySelector(".d-loading")?.remove(); });
+    const m = await import("plugins/detail-sheet.js?v=12.55");
+    m.openGalleryDetail(g, me);
   }
 
   function emptyState() {
@@ -692,7 +594,7 @@ function buildChipRow(state, refetch) {
     try {
       const g = await api.get("/api/random?respect_tags=1");
       if (g && g.id) {
-        const m = await import("plugins/detail-sheet.js?v=12.54");
+        const m = await import("plugins/detail-sheet.js?v=12.55");
         m.openGalleryDetail(g, undefined);
         if (g._reason) {
           try { make("toast", { text: `🎲 Picked because ${g._reason}`, kind: "success" }); } catch (_) {}
