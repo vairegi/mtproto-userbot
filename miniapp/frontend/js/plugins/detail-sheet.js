@@ -1,4 +1,4 @@
-console.info('[detail-sheet] build=v12.55');
+console.info('[detail-sheet] build=v12.56');
 /*
   detail-sheet.js — Rich gallery detail sheet
 
@@ -365,27 +365,42 @@ function mountSimilarRow(root, gid) {
   const section = h("div", {
     class: "d-similar",
     style: {
-      marginTop: "14px",
-      paddingTop: "12px",
-      borderTop: "1px solid var(--du-divider, rgba(255,255,255,0.06))",
+      // v12.56: bolder separation — reads as a distinct block, not a footnote.
+      marginTop: "22px",
+      paddingTop: "18px",
+      borderTop: "2px solid var(--du-divider, rgba(255,255,255,0.10))",
       display: "none",   // shown only after we know we have items
     },
   });
+  // v12.56: brighter, bigger heading + right-aligned "scroll →" hint so the
+  // user sees the label AND knows the strip is scrollable.
+  const scrollHint = h("span", {
+    class: "d-similar-hint",
+    style: {
+      fontSize: "11px", fontWeight: "500",
+      color: "var(--du-ink-lo)", letterSpacing: "0.2px",
+      textTransform: "none", opacity: "0.85",
+    },
+  }, "scroll →");
   const heading = h("div", {
     class: "d-similar-heading",
     style: {
-      fontSize: "12px",
-      fontWeight: "700",
-      color: "var(--du-ink-lo)",
+      fontSize: "13px",
+      fontWeight: "800",
+      color: "var(--du-ink-mid)",
       textTransform: "uppercase",
-      letterSpacing: "0.4px",
-      marginBottom: "8px",
+      letterSpacing: "0.5px",
+      marginBottom: "10px",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: "8px",
     },
-  }, "Similar to this");
+  }, h("span", {}, "Similar to this"), scrollHint);
   const strip = h("div", {
     class: "d-similar-strip",
     style: {
-      // v12.55: smooth, free-flowing horizontal scroll.
+      // v12.56: smooth, free-flowing horizontal scroll.
       display: "grid",
       gridAutoFlow: "column",
       gridAutoColumns: "minmax(108px, 34vw)",   // smaller cards → next one peeks in
@@ -394,15 +409,35 @@ function mountSimilarRow(root, gid) {
       overflowY: "hidden",
       scrollSnapType: "x proximity",            // was "mandatory" (felt stuck)
       scrollPaddingInline: "4px",
-      WebkitOverflowScrolling: "touch",         // momentum on iOS WebView
-      touchAction: "pan-x",                     // horizontal swipes go to the strip
-      overscrollBehaviorX: "contain",           // don't fight the sheet's own scroll
+      WebkitOverflowScrolling: "touch",         // iOS momentum
+      touchAction: "pan-x",                     // horizontal swipes go here
+      overscrollBehaviorX: "contain",           // don't fight sheet scroll
       scrollbarWidth: "none",                   // hide scrollbar (Firefox)
       msOverflowStyle: "none",                  // hide scrollbar (legacy Edge)
       paddingBottom: "6px",
     },
   });
-  section.append(heading, strip);
+  // v12.56: wrap strip so we can layer a right-edge fade gradient on top
+  // (peek affordance) without breaking the scroll region. `contain: content`
+  // isolates layout/paint so the outer sheet never steals horizontal touches.
+  const stripWrap = h("div", {
+    class: "d-similar-stripwrap",
+    style: {
+      position: "relative",
+      contain: "content",
+      touchAction: "pan-x",
+    },
+  }, strip, h("div", {
+    class: "d-similar-fade",
+    style: {
+      position: "absolute",
+      top: "0", right: "0", bottom: "6px",
+      width: "28px",
+      pointerEvents: "none",
+      background: "linear-gradient(to left, var(--du-bg-0, rgba(0,0,0,0.55)), transparent)",
+    },
+  }));
+  section.append(heading, stripWrap);
   root.appendChild(section);
 
   (async () => {

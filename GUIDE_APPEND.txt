@@ -1,36 +1,48 @@
-v12.55 — One detail sheet for the whole app + smooth "Similar to this" scroll
+v12.56 — "Similar to this" polish + Turso similar-cache disabled
 Ship date: 2026-08-27
 
-WHAT WAS WRONG:
-  The app had THREE separate detail-sheet implementations:
-    - plugins/detail-sheet.js  → the rich one (Similar to this, star rating,
-      Saves row) — used by Random, Popular-Now rows, Profile, deep-links.
-    - pages/search.js          → an old INLINE copy — used by every grid card
-      (Popular Now / New Uploads / Popular Week / search results).
-    - pages/bookmarks.js       → a third, minimal inline copy (Saved tab).
-  Every update to detail-sheet.js only ever reached Random — the grid sorts
-  opened the frozen inline copy.
+FRONTEND (detail-sheet.js):
+  * Heading brighter + bigger: 12px dim → 13px bold var(--du-ink-mid),
+    uppercase, with an inline "scroll →" hint on the right so users see
+    the label AND know the strip is scrollable.
+  * Section separation: marginTop 14→22px, paddingTop 12→18px,
+    borderTop 1px → 2px, brighter divider color. Reads as a distinct
+    block below the metadata/actions instead of a footnote.
+  * Strip wrapped in a positioned container:
+      - `contain: content` isolates layout/paint (fixes Android WebView
+        stealing horizontal touches),
+      - `touchAction: pan-x` on both wrapper and strip,
+      - right-edge fade gradient (28px, pointer-events:none) as a peek
+        affordance so more items are obviously off-screen.
+  * scrollSnapType stays "proximity" — no more "stuck" feel.
 
-WHAT CHANGED:
-  search.js    — inline openDetail (110 lines) DELETED; card taps now open
-                 the shared rich sheet. v2_status prefetch kept (correct
-                 Download button label on first paint).
-  bookmarks.js — inline openDetail DELETED; Saved-tab cards open the shared
-                 rich sheet too.
-  detail-sheet.js — "Similar to this" strip scrolling fixed:
-                 snap changed mandatory → proximity (no more "stuck" feel),
-                 cards slightly smaller (next card peeks = obvious scroll
-                 affordance), iOS momentum + pan-x touch + hidden scrollbar.
-  app.js / profile.js / home-rows.js / search.js random chip / index.html —
-                 all detail-sheet.js references bumped to ?v=12.55 so phones
-                 pick up the new files.
+BACKEND (services/scraper_bridge.py):
+  * `similar:<gid>` Turso caching DISABLED.
+    - No cache read, no cache write on gallery_suggestions().
+    - Engine (Stage A/B/C) still runs and still logs
+      `similar(gid): stage=A returned=N`.
+    - Rationale:
+        + Turso SQL scoring already answers in ~1.2-1.5s.
+        + Caching burned ~500K writes/mo (one per opened gallery) for
+          data that stales as new galleries land.
+        + Users always get fresh recommendations reflecting the current
+          library.
+        + Frees ~1GB of Turso storage over time.
+    - `gallery:<gid>` and `search:*` caches are untouched (still 30-day
+      / 3-day TTL) — those are the ones that matter.
 
-RESULT:
-  One sheet for the entire app. Any future sheet update ships to ALL sorts,
-  Saved, Random, Profile and deep-links automatically.
+VERSION BUMPS:
+  All detail-sheet.js import specifiers → ?v=12.56
+  (index.html app.js, app.js dynamic import, search.js Random chip +
+   card taps, bookmarks.js, profile.js, home-rows.js)
 
 DEPLOY:
-  1. Copy these 7 files into the repo, commit, push — Render auto-deploys.
-  2. Fully close the Mini App once (swipe away) and reopen.
-  3. Open any gallery from ANY sort — you should see star rating, Saves,
-     and the horizontally scrollable "Similar to this" strip.
+  1. Copy the 8 files into the repo (frontend + one backend file), commit,
+     push — Render auto-deploys.
+  2. Fully close the Mini App once (swipe away), reopen.
+  3. Open any gallery — you should see:
+       * A clear "SIMILAR TO THIS   scroll →" heading in bright text.
+       * A distinct visual gap above the strip.
+       * Smooth horizontal swipe with a fade at the right edge.
+       * Log line `similar(<gid>): stage=A returned=N` — but NO
+         `[TURSO WRITE] key=similar:<gid>` line.

@@ -1057,18 +1057,15 @@ def gallery_suggestions(gallery_id: str, limit: int = 6) -> list[dict]:
         return []
     limit = max(1, min(int(limit or 6), 12))
 
-    _key = f"similar:{gid}"
+    # v12.56: `similar:<gid>` Turso cache DISABLED.
+    # Rationale:
+    #   * SQL scoring in Turso already answers in ~1.2-1.5s.
+    #   * Caching would burn ~500K writes/month (one per gallery) for
+    #     data that goes stale as the Turso library grows.
+    #   * Users get fresh, up-to-date recommendations every open.
+    #   * The engine still uses gallery:<gid> for its target signals below,
+    #     so Turso remains the single source of truth for cold data.
     _nhc = _sb_turso_cache()
-    if _nhc is not None:
-        try:
-            _hit = _nhc.get(_key, allow_stale=False)
-        except Exception as e:  # noqa: BLE001
-            log.warning("nhc.get(%s) raised: %s", _key, e)
-            _hit = None
-        if isinstance(_hit, list) and _hit:
-            log.info(_LOG_HIT, _key)
-            return _hit[:limit]
-
     if _nhc is None:
         return []
     try:
@@ -1143,15 +1140,7 @@ def gallery_suggestions(gallery_id: str, limit: int = 6) -> list[dict]:
     log.info("similar(%s): stage=%s returned=%d", gid, stage_used,
              len(out_rows))
 
-    if out_rows:
-        try:
-            _ok = _nhc.put(_key, out_rows)
-            if _ok == "unchanged":
-                log.info(_LOG_DEDUP, _key)
-            elif _ok:
-                log.info(_LOG_WRITE, _key, -1)
-        except Exception as e:  # noqa: BLE001
-            log.warning("nhc.put(%s) raised: %s", _key, e)
+    # v12.56: no cache write — see rationale above.
     return out_rows[:limit]
 
 

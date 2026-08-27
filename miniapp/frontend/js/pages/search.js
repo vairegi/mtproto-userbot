@@ -351,7 +351,7 @@ export async function render(root, { me }) {
         .then(st => { g.v2_status = st || { known: false }; })
         .catch(() => { g.v2_status = { known: false }; });
     }
-    const m = await import("plugins/detail-sheet.js?v=12.55");
+    const m = await import("plugins/detail-sheet.js?v=12.56");
     m.openGalleryDetail(g, me);
   }
 
@@ -594,7 +594,7 @@ function buildChipRow(state, refetch) {
     try {
       const g = await api.get("/api/random?respect_tags=1");
       if (g && g.id) {
-        const m = await import("plugins/detail-sheet.js?v=12.55");
+        const m = await import("plugins/detail-sheet.js?v=12.56");
         m.openGalleryDetail(g, undefined);
         if (g._reason) {
           try { make("toast", { text: `🎲 Picked because ${g._reason}`, kind: "success" }); } catch (_) {}
