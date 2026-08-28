@@ -204,6 +204,11 @@ def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
     conn = _bot_db.connect()
     try:
         doc = _gs.get(conn, gid) or {}
+        # v1.22.1: read the BackupDB toggle in the same connection.
+        try:
+            _bst = (conn.db["backup_state"].find_one({"_id": "state"}) or {})
+        except Exception:  # noqa: BLE001
+            _bst = {}
     finally:
         try:
             conn.close()
@@ -216,6 +221,30 @@ def deliver_to_dm(gallery_id: str, user_id: int) -> dict:
 
     cover_msg_id = doc.get("db_cover_msg_id")
     pdf_msg_id   = doc.get("db_pdf_msg_id")
+
+    # --- v1.22.1 BackupDB: honour the /usebackupDB toggle -------------------
+    # When ON and this gallery carries BOTH backup ids, copy from the Backup
+    # Database Channel instead of Main (disaster recovery: Main banned /
+    # deleted). Cover-only backups stay on Main — mixing source channels
+    # inside one delivery would send the PDF from the wrong chat.
+    try:
+        if _bst.get("use_backup"):
+            _bch = int(doc.get("backup_channel_id")
+                       or _bst.get("backup_channel_id") or 0)
+            _bcov = doc.get("backup_cover_msg_id")
+            _bpdf = doc.get("backup_pdf_msg_id")
+            if _bch and _bcov and _bpdf:
+                log.info("BackupDB toggle ON: gid=%s delivering from backup "
+                         "channel %s (cover=%s pdf=%s)",
+                         gid, _bch, _bcov, _bpdf)
+                from_chat = _bch
+                cover_msg_id = _bcov
+                pdf_msg_id = _bpdf
+            else:
+                log.info("BackupDB toggle ON but gid=%s has no full backup "
+                         "pair — using MAIN channel", gid)
+    except Exception as _be:  # noqa: BLE001
+        log.warning("BackupDB toggle check failed (using MAIN): %s", _be)
 
     if not cover_msg_id and not pdf_msg_id:
         return {

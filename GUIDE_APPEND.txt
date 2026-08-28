@@ -1,6 +1,6 @@
 ================================================================================
 GUIDE_APPEND — v1.22 "BackupDB" (high-availability Database Channel)
-Shipped: 2026-08-27
+Shipped: 2026-08-27 | v1.22.1 hotfix 2026-08-28: miniapp/backend/app/services/dm_delivery.py patched — Mini App dedup-deliver now honours /usebackupDB (was Main-only).
 ================================================================================
 
 WHAT CHANGED AND WHY

@@ -289,3 +289,10 @@ auto-creates a FRESH BackupDB against the new Main; galleries already
 stamped get a new backup copy (clear backup_* fields first if you want a
 full re-mirror). 6) Re-pin BACKUP_DB_CHANNEL_ID with the new id.
 ================================================================================
+
+v1.22.1 HOTFIX (2026-08-28): Mini App dedup-deliver path (POST
+/api/queue/deliver/<gid> → miniapp/backend/app/services/dm_delivery.py)
+bypassed the BackupDB toggle and always copied from Main. dm_delivery.py
+now reads backup_state.use_backup and, when ON with a full backup pair on
+the galleries doc, copies cover+PDF from BackupDB. Cover-only backups stay
+on Main deliberately (never mix source channels in one delivery).
