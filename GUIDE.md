@@ -296,3 +296,13 @@ bypassed the BackupDB toggle and always copied from Main. dm_delivery.py
 now reads backup_state.use_backup and, when ON with a full backup pair on
 the galleries doc, copies cover+PDF from BackupDB. Cover-only backups stay
 on Main deliberately (never mix source channels in one delivery).
+
+v1.22.2 (2026-08-28): 1) ScraperBot webhook keeper — set env
+BOT1_PUBLIC_BASE_URL (e.g. https://scraperbackup.onrender.com) and
+main.py auto-registers the /telegram?s=<BOT1_WEBHOOK_SECRET> webhook at
+boot and re-verifies every 6h. Ends manual setWebhook after token or
+Render-account changes (and prevents the 0-vs-O OCR incident — the URL
+is built from the env var itself). 2) Bot2Fetcher dashboard now wraps its
+message in a Markdown v1 code fence (quoted look, same as Bot 1) plus a
+plain-text fallback retry — gallery titles can no longer cause the
+400 "can't parse entities" spam.

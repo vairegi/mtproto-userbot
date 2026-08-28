@@ -1,142 +1,35 @@
 ================================================================================
-GUIDE_APPEND — v1.22 "BackupDB" (high-availability Database Channel)
-Shipped: 2026-08-27 | v1.22.1 hotfix 2026-08-28: miniapp/backend/app/services/dm_delivery.py patched — Mini App dedup-deliver now honours /usebackupDB (was Main-only).
+GUIDE_APPEND — v1.22.2 (webhook keeper + Bot2 dashboard quote fix)
+Shipped: 2026-08-28
 ================================================================================
 
-WHAT CHANGED AND WHY
---------------------------------------------------------------------------------
-If the Main Database Channel ever gets deleted / banned / inaccessible, Mini
-App downloads would break for every gallery. v1.22 adds a secondary private
-channel (BackupDB) that holds a server-side-forwarded copy of every cover
-post + PDF, and records the BackupDB message ids on the SAME Mongo galleries
-doc (one canonical record per gallery — no separate mapping collection):
+WHAT CHANGED
+1) ScraperBot (Bot 1): new env var BOT1_PUBLIC_BASE_URL. main.py now runs a
+   "webhook keeper" task at startup: it checks getWebhookInfo and, if the URL
+   does not point at <BOT1_PUBLIC_BASE_URL>/telegram, registers it with
+   ?s=<BOT1_WEBHOOK_SECRET> automatically, then re-verifies every 6 hours.
+   You never run setWebhook manually again — after a token change or a Render
+   account move, just update BOT1_PUBLIC_BASE_URL (+ BOT1_TOKEN) and deploy.
 
-    backup_channel_id, backup_cover_msg_id, backup_pdf_msg_id,
-    backup_status ("ok"|"cover_only"|"missing_in_main"|"needs_review"),
-    backed_up_at
+2) Bot2Fetcher (Bot 2): dashboard message is now wrapped in a Markdown v1
+   code fence (the quoted look Bot 1 uses) and retries as plain text if a
+   send/edit still fails. The repeating
+   400 "cant parse entities ... byte offset 204" spam is gone.
 
-Recovery is one admin command: /usebackupDB on  → Bot 0's delivery path
-(auto-DM / Mini App download) forwards from BackupDB instead of Main.
-Galleries without backup ids fall back to Main with a log line, so nothing
-breaks during the transition.
-
-FILES IN THIS ZIP (repo-relative paths — drag and drop onto the repo)
---------------------------------------------------------------------------------
-    backup_db.py                          NEW  — shared helpers (Bot 0 side):
-                                                 state doc, galleries stamping,
-                                                 delivery_source(), mirror
-    relay_v2.py                           PATCH — Bot 0: after the locked
-                                                 cover+PDF write succeeds,
-                                                 best-effort mirror to
-                                                 BackupDB + stamp galleries
-                                                 doc; auto-DM read path
-                                                 honours the use_backup toggle
-    admin_bot.py                          PATCH — new command
-                                                 /usebackupDB on|off|status
-    config.py                             PATCH — optional env
-                                                 BACKUP_DB_CHANNEL_ID (0 =
-                                                 read id from Mongo
-                                                 backup_state instead)
-    db.py                                 PATCH — MongoHandle.backup_state
-                                                 collection accessor
-    Bot2Fetcher/app/fetcher.py            PATCH — after mark_completed,
-                                                 best-effort mirror to
-                                                 BackupDB (self-contained
-                                                 twin — Bot2Fetcher cannot
-                                                 import repo-root modules)
-    scripts/backfill_backup_channel.py    NEW  — one-time backfill, run on
-                                                 YOUR Windows PC
-    GUIDE.md                              PATCH — v1.22 log entry + promotion
-                                                 runbook
-    GUIDE_APPEND.txt                      THIS FILE
-
-DESIGN FACTS (why it is built this way)
---------------------------------------------------------------------------------
-* Mongo-driven, NOT channel-history-driven: the backfill only touches
-  galleries docs that carry db_cover_msg_id/db_pdf_msg_id — i.e. Mini-App-era
-  posts ONLY. The 2,000+ legacy posts and old text messages in the channel
-  are never touched (they have no Mongo doc).
-* Integrity check before every forward: cover must be a photo (or caption
-  carries the gid); PDF must be application/pdf (or filename carries the
-  gid). A deleted/swapped message is NEVER forwarded as the wrong file —
-  it is marked "missing_in_main" or "needs_review" (see backfill_review.log).
-* Server-side forward (no download/re-upload) → fast, no bandwidth cost.
-* Mirror failure policy (operator-approved): log + counters ONLY, never
-  block or fail the user download.
-* Backfill is idempotent/resumable: any doc already stamped with
-  backup_cover_msg_id is skipped. Crash / laptop sleep / FloodWait → just
-  re-run the same command.
-* Runs in SMALL BATCHES (default 25 galleries, 1.2s between galleries,
-  30s pause between batches) so a Windows laptop CMD never gets stuck.
-  Tunable via BACKFILL_BATCH_SIZE / BACKFILL_MSG_SLEEP / BACKFILL_BATCH_SLEEP.
+FILES IN THIS ZIP
+   ScraperBot/main.py                 PATCH — webhook keeper task
+   ScraperBot/app/config.py           PATCH — BOT1_PUBLIC_BASE_URL setting
+   Bot2Fetcher/app/dashboard.py       PATCH — code-fence wrap + fallback
+   GUIDE.md                           PATCH — v1.22.2 entry
+   GUIDE_APPEND.txt                   THIS FILE
 
 DEPLOY STEPS
---------------------------------------------------------------------------------
-1. Drag-and-drop this zip's files onto the repo (paths already correct),
-   commit, push. Render auto-deploys Bot 0 and Bot2Fetcher.
-2. NO new Render env var is required. Optional: after the first backfill
-   run prints the new channel id, pin BACKUP_DB_CHANNEL_ID=<id> on BOTH
-   Render services (Bot 0 and Bot2Fetcher) — otherwise the id is read
-   from Mongo backup_state, which is fine too.
-3. Run the backfill on your PC (steps below).
-4. Test: /usebackupDB status  → shows channel id + counters.
-   /usebackupDB on → download a gallery in the Mini App → file arrives
-   from BackupDB. /usebackupDB off when done testing.
-5. Disaster drill complete: if Main ever dies, flip /usebackupDB on and
-   users keep downloading. Then promote BackupDB → Main (runbook in
-   GUIDE.md) and create a fresh backup.
-
-HOW TO RUN THE BACKFILL ON WINDOWS 11 (CMD, step by step)
---------------------------------------------------------------------------------
-1. Install Python 3.11+ from https://www.python.org/downloads/
-   IMPORTANT: tick "Add python.exe to PATH" during install.
-2. Open CMD (Win+R → cmd → Enter), then:
-       mkdir C:\backupdb
-       cd C:\backupdb
-3. Copy scripts\backfill_backup_channel.py from this zip into C:\backupdb.
-4. Install the two libraries:
-       pip install telethon pymongo
-5. Set the environment variables (one line each, in the SAME CMD window):
-       set API_ID=<your api_id from https://my.telegram.org>
-       set API_HASH=<your api_hash>
-       set STRING_SESSION=<your Telethon string session — same one as the
-                          STRING_SESSION var on the Bot 0 Render dashboard>
-       set MONGO_URI=<your MongoDB connection string>
-       set MONGO_DB_NAME=relaybot
-       set DATABASE_CHANNEL_ID=<your Main DB channel id, e.g. -100xxxxxxxxxx>
-   Optional tuning (defaults are already laptop-friendly):
-       set BACKFILL_BATCH_SIZE=25
-       set BACKFILL_MSG_SLEEP=1.2
-       set BACKFILL_BATCH_SLEEP=30
-6. DRY RUN FIRST (verifies + counts, forwards nothing, writes nothing):
-       python backfill_backup_channel.py --dry-run
-   Watch a few dozen lines: you should see "OK — would forward [...]".
-   Ctrl+C any time — nothing was written.
-7. REAL RUN:
-       python backfill_backup_channel.py
-   The script auto-creates "DU Database Backup" on first run and prints its
-   channel id — copy that id and (optionally) pin it as BACKUP_DB_CHANNEL_ID
-   on both Render services.
-8. If the laptop sleeps, CMD closes, or Telegram FloodWaits — just re-run
-   the same command. Already-backed-up galleries are skipped automatically.
-9. When it prints DONE: check the summary line
-   (ok / cover_only / missing_in_main / needs_review / failed) and review
-   backfill_review.log if needs_review > 0.
-
-VERIFICATION SIGNS
---------------------------------------------------------------------------------
-* Mongo galleries docs gain backup_cover_msg_id / backup_pdf_msg_id /
-  backup_status="ok".
-* Mongo backup_state doc _id="state" holds backup_channel_id.
-* /usebackupDB status shows the channel id and mirrored_ok growing after
-  each new download (live mirror working).
-* With /usebackupDB on, a Mini App download delivers the PDF even if you
-  cannot open the Main channel.
-
-SECURITY NOTE
---------------------------------------------------------------------------------
-The Turso token + Mongo URI shared in chat during planning are now exposed.
-Rotate the Turso token and change the Mongo user password, then update the
-Render env vars. Nothing in this zip hardcodes any credential — the script
-reads everything from env vars.
+1. Drop files onto repo (paths correct), commit, push.
+2. On BOTH Render services nothing changes except Bot 1: add env var
+      BOT1_PUBLIC_BASE_URL = https://scraperbackup.onrender.com
+3. Bot 1 redeploys; watch the log for "webhook keeper armed" and
+   "🔗 webhook auto-registered".
+4. Send /health to ScraperBot — should answer (allow 30-60s cold start).
+5. Bot 2 redeploys; the log channel dashboard reappears as a quoted block
+   and the 400 spam stops.
 ================================================================================

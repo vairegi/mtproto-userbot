@@ -73,6 +73,18 @@ async def _startup() -> None:
     global _stop_event
     _stop_event = asyncio.Event()
 
+    # v1.22.2: webhook keeper — auto-register the Telegram webhook from
+    # BOT1_PUBLIC_BASE_URL at boot, then re-verify every 6h. Runs even in
+    # degraded mode so /status /health /pause etc. always work.
+    if settings.public_base_url and settings.bot_token:
+        _tasks.append(asyncio.create_task(
+            _webhook_keeper(), name="webhook_keeper"))
+        log.info("webhook keeper armed for %s", settings.public_base_url)
+    elif settings.bot_token:
+        log.warning("BOT1_PUBLIC_BASE_URL unset — webhook NOT auto-managed; "
+                    "set it to this service's public URL to stop manual "
+                    "setWebhook steps.")
+
     # Spawn sweepers — fail-open: any startup exception here just gets
     # logged; the HTTP surface must stay up so UptimeRobot / admin routes
     # keep working even if a sweeper is misconfigured.
@@ -89,6 +101,32 @@ async def _startup() -> None:
                  [t.get_name() for t in _tasks])
     else:
         log.error("Sweepers NOT started — missing MONGO_URI or TURSO_DATABASE_URL")
+
+
+async def _webhook_keeper() -> None:
+    """v1.22.2: point Telegram's webhook at BOT1_PUBLIC_BASE_URL and keep
+    it there. set_webhook() builds `<url>/telegram?s=<BOT1_WEBHOOK_SECRET>`
+    from the env vars themselves, so the path/secret can never drift from
+    what the /telegram route checks (the v1.22.1 OCR 0-vs-O incident).
+    """
+    from app.services import telegram_bot
+    await asyncio.sleep(5)  # let uvicorn bind the port first
+    while True:
+        try:
+            info = await telegram_bot._api("getWebhookInfo", {})
+            cur = ((info.get("result") or {}).get("url") or "")
+            want = f"{settings.public_base_url.rstrip('/')}/telegram"
+            if not cur.startswith(want):
+                r = await telegram_bot.set_webhook(settings.public_base_url)
+                if r.get("ok"):
+                    log.info("\U0001f517 webhook auto-registered \u2192 %s?s=\u2022\u2022\u2022",
+                             want)
+                else:
+                    log.warning("webhook auto-register failed: %s",
+                                str(r)[:300])
+        except Exception as e:  # noqa: BLE001
+            log.warning("webhook keeper tick failed (retry in 6h): %s", e)
+        await asyncio.sleep(6 * 3600)
 
 
 @app.on_event("shutdown")

@@ -108,20 +108,38 @@ class LogBot:
         return True
 
     async def send_markdown(self, text: str) -> Optional[int]:
+        # v1.22.2: fence the whole dashboard in a Markdown v1 code block
+        # (quoted look, same as ScraperBot's channel dashboard). Inside a
+        # fence Telegram parses nothing, so gallery titles can never raise
+        # "can't parse entities" again.
+        body = "```\n" + text + "\n```"
         r = await self._call("sendMessage", {
-            "chat_id": self.chat_id, "text": text,
+            "chat_id": self.chat_id, "text": body,
             "parse_mode": "Markdown", "disable_web_page_preview": True,
         })
+        if r is None:
+            # Fallback: never let a parse error silence the dashboard —
+            # retry once as plain text (no parse_mode at all).
+            r = await self._call("sendMessage", {
+                "chat_id": self.chat_id, "text": text,
+                "disable_web_page_preview": True,
+            })
         if r and "message_id" in r:
             return int(r["message_id"])
         return None
 
     async def edit_markdown(self, msg_id: int, text: str) -> bool:
+        body = "```\n" + text + "\n```"
         r = await self._call("editMessageText", {
             "chat_id": self.chat_id, "message_id": int(msg_id),
-            "text": text, "parse_mode": "Markdown",
+            "text": body, "parse_mode": "Markdown",
             "disable_web_page_preview": True,
         })
+        if r is None:
+            r = await self._call("editMessageText", {
+                "chat_id": self.chat_id, "message_id": int(msg_id),
+                "text": text, "disable_web_page_preview": True,
+            })
         return r is not None
 
 
@@ -181,7 +199,14 @@ def _build_message(stats, scan_info: dict, mongo_counts: dict,
             for r in recent[-3:]:
                 lines.append(f"  `{_md(r)}`")
 
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    # v1.22.2: the message is wrapped in a code fence before sending, so
+    # legacy **bold** / `code` markers and _md backslash escapes would show
+    # literally inside the quote — strip them. Backticks must go entirely
+    # (a ``` inside the body would close the fence early).
+    body = (body.replace("**", "").replace("`", "'")
+                .replace("\\", ""))
+    return body
 
 
 class Dashboard:

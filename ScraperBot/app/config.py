@@ -75,6 +75,11 @@ class Settings:
     admin_key: str = os.getenv("BOT1_ADMIN_KEY", "").strip()
     admin_user_ids: List[int] = field(default_factory=_env_admin_ids)
     webhook_secret: str = os.getenv("BOT1_WEBHOOK_SECRET", "").strip()
+    # v1.22.2: set this to the service's public URL (e.g.
+    # https://scraperbackup.onrender.com) and the webhook keeper in
+    # main.py auto-registers /telegram?s=<secret> at boot and re-verifies
+    # it every 6h — no manual setWebhook after token/Render-account moves.
+    public_base_url: str = os.getenv("BOT1_PUBLIC_BASE_URL", "").strip()
 
     # Scraper toggles
     scraper_enabled: bool = _env_bool("SCRAPER_ENABLED", True)
