@@ -12,6 +12,11 @@ log = logging.getLogger("bot2fetcher.meta")
 _TAG_SANITISE_RE = re.compile(r"[^A-Za-z0-9_]+")
 _EVENT_PREFIX_RE = re.compile(r"^\([A-Za-z0-9+\- ]+\)\s*")
 _BRACKET_TAIL_RE = re.compile(r"(\[[^\]]*\])\s*$")
+# v1.22.3: strip EVERY [..] (..) {..} segment anywhere in the caption title
+# (artist circles, parody suffixes, language/scanner tails). Innermost-first
+# loop so nested forms like "[Aokihoshi (Zen Shiro)]" fully disappear.
+_ANY_BRACKET_RE = re.compile(r"\[[^\[\]]*\]|\([^()]*\)|\{[^{}]*\}")
+_MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
 _CAPTION_HARD_LIMIT = 1024
 _TAGS_ROW_MAX = 600
 
@@ -99,12 +104,18 @@ def _hashtagify(tag: str) -> str:
 
 def _clean_title(raw: str) -> str:
     s = (raw or "").strip()
-    s = _EVENT_PREFIX_RE.sub("", s)
+    # v1.22.3: remove all [..] / (..) / {..} segments, wherever they sit.
     prev = None
     while prev != s:
         prev = s
-        s = _BRACKET_TAIL_RE.sub("", s).strip()
-    return s or (raw or "").strip()
+        s = _ANY_BRACKET_RE.sub("", s)
+    # Tidy the gaps the removals leave behind: collapse runs of spaces,
+    # drop spaces before punctuation, trim dangling separators at the ends.
+    s = _MULTI_SPACE_RE.sub(" ", s)
+    s = re.sub(r"\s+([,.:;!?])", r"\1", s)
+    s = s.strip(" -–—|·")
+    s = _MULTI_SPACE_RE.sub(" ", s).strip()
+    return s or (raw or "").strip()  # never ship an empty title
 
 
 def _group_tags_by_type(tags) -> dict:
@@ -151,9 +162,9 @@ def caption_for(meta: Dict[str, Any]) -> str:
             joined = " ".join(hashtags)
             if len(joined) > _TAGS_ROW_MAX:
                 joined = joined[:_TAGS_ROW_MAX].rsplit(" ", 1)[0]
-            col = "Tags:".ljust(label_width)
+            # v1.22.3: Tags row uses ➲ (operator request); other rows keep ➤
             lines.append("")
-            lines.append(f"➤ {col} {joined}")
+            lines.append(f"➲ Tags: {joined}")
 
     out = "\n".join(lines)
     if len(out) > _CAPTION_HARD_LIMIT:

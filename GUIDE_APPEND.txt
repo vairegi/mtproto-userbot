@@ -1,35 +1,38 @@
 ================================================================================
-GUIDE_APPEND — v1.22.2 (webhook keeper + Bot2 dashboard quote fix)
+GUIDE_APPEND — v1.22.3 (Bot2Fetcher caption title cleanup + ➲ Tags row)
 Shipped: 2026-08-28
 ================================================================================
 
 WHAT CHANGED
-1) ScraperBot (Bot 1): new env var BOT1_PUBLIC_BASE_URL. main.py now runs a
-   "webhook keeper" task at startup: it checks getWebhookInfo and, if the URL
-   does not point at <BOT1_PUBLIC_BASE_URL>/telegram, registers it with
-   ?s=<BOT1_WEBHOOK_SECRET> automatically, then re-verifies every 6 hours.
-   You never run setWebhook manually again — after a token change or a Render
-   account move, just update BOT1_PUBLIC_BASE_URL (+ BOT1_TOKEN) and deploy.
+Bot2Fetcher/app/meta.py:
+  1. _clean_title() now removes EVERY [..], (..), {..} segment anywhere in
+     the caption title — artist circles like [Kuroiwa Menou], nested forms
+     like [Aokihoshi (Zen Shiro)], parody suffixes like (Goddess of Victory:
+     Nikke), language/scanner tails like [English] {Zombii}. Innermost-first
+     loop handles nesting; leftover double-spaces and dangling separators
+     (" -", " |" at the ends) are cleaned up. If stripping would leave an
+     empty title, the original is kept (safety net).
+  2. The Tags row now starts with ➲ instead of ➤. All other rows
+     (Groups/Parodies/Artists/Characters/Languages/Categories) keep ➤.
 
-2) Bot2Fetcher (Bot 2): dashboard message is now wrapped in a Markdown v1
-   code fence (the quoted look Bot 1 uses) and retries as plain text if a
-   send/edit still fails. The repeating
-   400 "cant parse entities ... byte offset 204" spam is gone.
+EXAMPLE (unit-tested):
+  Before: [Kuroiwa Menou] Hitozuma to Shounen Hirusagari no Yuuwaku |
+          Married Woman and Boy: Early Afternoon Temptation
+          (Hitozuma Club Glass no Kutsu) [English] {Zombii}
+  After:  Hitozuma to Shounen Hirusagari no Yuuwaku |
+          Married Woman and Boy: Early Afternoon Temptation
+
+SCOPE: NEW cover posts only. The 13,096 covers already in Main/BackupDB
+keep their current captions (Telegram captions can be edited later if you
+ever want a cleanup pass — separate task).
 
 FILES IN THIS ZIP
-   ScraperBot/main.py                 PATCH — webhook keeper task
-   ScraperBot/app/config.py           PATCH — BOT1_PUBLIC_BASE_URL setting
-   Bot2Fetcher/app/dashboard.py       PATCH — code-fence wrap + fallback
-   GUIDE.md                           PATCH — v1.22.2 entry
-   GUIDE_APPEND.txt                   THIS FILE
+   Bot2Fetcher/app/meta.py   PATCH — title cleaner + ➲ Tags row
+   GUIDE.md                  PATCH — v1.22.3 entry
+   GUIDE_APPEND.txt          THIS FILE
 
 DEPLOY STEPS
-1. Drop files onto repo (paths correct), commit, push.
-2. On BOTH Render services nothing changes except Bot 1: add env var
-      BOT1_PUBLIC_BASE_URL = https://scraperbackup.onrender.com
-3. Bot 1 redeploys; watch the log for "webhook keeper armed" and
-   "🔗 webhook auto-registered".
-4. Send /health to ScraperBot — should answer (allow 30-60s cold start).
-5. Bot 2 redeploys; the log channel dashboard reappears as a quoted block
-   and the 400 spam stops.
+1. Drop onto repo, commit, push → Bot2Fetcher redeploys on Render.
+2. Queue any gallery; the new cover post caption should show the clean
+   title and the ➲ Tags line.
 ================================================================================

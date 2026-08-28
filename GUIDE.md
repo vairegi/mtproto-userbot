@@ -306,3 +306,13 @@ is built from the env var itself). 2) Bot2Fetcher dashboard now wraps its
 message in a Markdown v1 code fence (quoted look, same as Bot 1) plus a
 plain-text fallback retry — gallery titles can no longer cause the
 400 "can't parse entities" spam.
+
+v1.22.3 (2026-08-28): Bot2Fetcher caption cleanup. _clean_title in
+Bot2Fetcher/app/meta.py now strips EVERY [..] / (..) / {..} segment
+anywhere in the title (innermost-first, so nested "[Circle (Artist)]"
+forms fully disappear), collapses the gaps left behind, and never ships
+an empty title. Tags row now uses ➲ instead of ➤. Verified: "[Kuroiwa
+Menou] Hitozuma to Shounen ... (Hitozuma Club Glass no Kutsu) [English]
+{Zombii}" → "Hitozuma to Shounen Hirusagari no Yuuwaku | Married Woman
+and Boy: Early Afternoon Temptation". Affects NEW cover posts only —
+already-posted captions in the channels are unchanged.
