@@ -1,21 +1,57 @@
 ================================================================================
-GUIDE_APPEND — v1.23.2 (Bot2Fetcher: drop progress bar from log-channel post)
+GUIDE_APPEND — v1.23.0 + v1.23.1 (dashboard countdowns + MEMORY LEAK fix)
 Shipped: 2026-08-29
 ================================================================================
 
-WHAT CHANGED (one file): Bot2Fetcher/app/dashboard.py
+READ THIS FIRST — the leak you caught before deploying was real and is
+fixed in this zip.
 
-Removed the "📊 Progress: `[███████░░░] N%`" line from the dashboard
-message that Bot2Fetcher edits in the log channel. All other counters
-(Turso cache, In DB channel, Failed-before, Remaining, per-slot state,
-etc.) are unchanged — only the visual bar and its percentage disappear.
-_progress_bar() itself is left in place so any future re-use is trivial.
+v1.23.1 — THE MEMORY LEAK (ScraperBot/app/mongo_client.py)
+------------------------------------------------------------
+What your log showed: 76MB at boot → 334→360MB in 3 minutes of sweeping →
+stuck at 463-466MB "CRITICAL" for 40+ minutes, never releasing.
+
+Root cause (introduced by v1.22.9): the non-blocking state cache spawned
+one background daemon thread per stale read/write with NO cap. The
+MongoClient had serverSelectionTimeoutMS=8000 and connectTimeoutMS=8000
+but NO socketTimeoutMS — so a thread performing a read on a half-dead
+Atlas M0 socket could block indefinitely. Threads accumulated during every
+Mongo slow phase (the 5s dashboard tick + sweeper state traffic spawn
+several per minute), each pinning its stack + pymongo buffers. RSS climbed
+~10MB/min and never came back.
+
+Fixes (all in mongo_client.py):
+  1. socketTimeoutMS=20000 — every blocked socket operation now dies in
+     20 seconds and its thread exits. This alone stops the pile-up.
+  2. _STATE_INFLIGHT guard — at most ONE background thread per state key,
+     ever; repeat triggers during a slow phase coalesce instead of
+     stacking threads.
+  3. State-cache eviction — entries untouched for 10 minutes are dropped
+     so the cache itself can never grow unbounded.
+
+v1.23.0 — DASHBOARD COUNTDOWN + 5s refresh
+------------------------------------------------------------
+* channel_dashboard.py: every sort/tag row in the edited log-channel
+  message gains a next-scrape countdown suffix ("· in 2h 5m" / "· due
+  now"), computed from the same list_sort_last:<sort> stamps and
+  _sort_interval map the scheduler uses, so it always matches reality.
+* config.py: BOT1_CHANNEL_REFRESH_SEC default back to 5s (operator
+  request; RAM headroom proven by the watchdog, loop-block risk removed
+  by v1.22.9 + hardened by v1.23.1). /time <n> still overrides live.
 
 FILES IN THIS ZIP
-   Bot2Fetcher/app/dashboard.py   PATCH
-   GUIDE.md / GUIDE_APPEND.txt    DOCS
+   ScraperBot/app/mongo_client.py               PATCH — v1.23.1 leak fix
+   ScraperBot/app/services/channel_dashboard.py PATCH — v1.23.0 countdowns
+   ScraperBot/app/config.py                     PATCH — 5s refresh default
+   GUIDE.md / GUIDE_APPEND.txt                  DOCS
 
 DEPLOY STEPS
-1. Drop onto the repo, commit, push → Bot2Fetcher redeploys on Render.
-2. Within ~30s the pinned dashboard message re-renders without the bar.
+1. Drop onto repo, commit, push → scraperbackup redeploys (this one deploy
+   covers both versions — v1.23.0 standalone zip is superseded).
+2. Watch the 🧠 RAM lines over a full sweep phase: expect climb to
+   ~90-150MB during activity and — critically — release/plateau instead
+   of marching to 465MB. CRITICAL warnings should not appear.
+3. The pinned log-channel message gains countdowns within ~15s of boot.
+4. If RAM ever approaches 450MB again, the watchdog log + /checkram will
+   show it early — send that log section and we hunt the next suspect.
 ================================================================================
