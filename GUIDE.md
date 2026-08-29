@@ -383,3 +383,17 @@ multiplied RSS during bursts). 4) RAM watchdog task logs VmRSS every 60s
 SIGKILL. 5) New admin command /checkram — live VmRSS + headroom in chat.
 NOTE: UptimeRobot prevents idle spindown only; it could never stop these
 OOM kills — the stagger + pool cap address the actual cause.
+
+v1.22.9 (2026-08-29): THE ScraperBot crash-loop root cause — sync Mongo on
+the event loop. Evidence: watchdog showed RAM steady at 76-84MB (RAM was
+never the problem) while Render logged graceful SIGTERM shutdowns every
+2-5 min, each after /healthz went unanswered >5s. The culprits:
+record_activity() (every fetch), is_paused() (every loop iteration),
+_stats_bump() (every write) and the dashboard tick all call synchronous
+pymongo (state_get/state_set) directly on the uvicorn loop; one cold Atlas
+M0 socket blocks up to serverSelectionTimeoutMS=8000 — longer than
+Render's 5s health window. Fix: scraper1_state helpers now use an
+in-process read-through cache (8s TTL, daemon-thread refresh; writes
+update the cache synchronously then persist in background threads). No
+event-loop path ever blocks on Mongo again. /checkram and the 60s RAM
+watchdog stay as the monitoring layer that proved the diagnosis.

@@ -10,8 +10,10 @@ We deliberately do NOT touch queue / users / admins / galleries / progress_*
 """
 from __future__ import annotations
 
-import logging
 import threading
+import time as _time
+
+import logging
 import time
 from typing import Any, Dict, Optional
 
@@ -64,7 +66,20 @@ def db():
 STATE_COLL = "scraper1_state"
 
 
-def state_get(key: str, default: Any = None) -> Any:
+# v1.22.9: in-process read-through cache for scraper1_state. The sweepers,
+# dashboard and activity recorder call state_get/is_paused/state_set on the
+# uvicorn EVENT LOOP every few seconds; a single synchronous pymongo call on
+# a cold Atlas M0 socket blocks up to serverSelectionTimeoutMS (8s) — longer
+# than Render's 5s /healthz window — and got the instance SIGTERMed on a
+# loop ("HTTP health check failed (timed out after 5 seconds)" while RAM sat
+# at 84MB). Reads now serve from an 8s TTL cache refreshed in a daemon
+# thread; writes update the cache instantly and persist in the background.
+_STATE_CACHE: dict = {}
+_STATE_CACHE_TTL = 8.0
+_STATE_LOCK = threading.Lock()
+
+
+def _state_fetch_sync(key: str, default: Any = None) -> Any:
     d = db()
     if d is None:
         return default
@@ -78,7 +93,28 @@ def state_get(key: str, default: Any = None) -> Any:
         return default
 
 
-def state_set(key: str, value: Any) -> bool:
+def state_get(key: str, default: Any = None) -> Any:
+    now = _time.monotonic()
+    with _STATE_LOCK:
+        hit = _STATE_CACHE.get(key)
+    if hit is not None and (now - hit[1]) < _STATE_CACHE_TTL:
+        return hit[0]
+    if hit is None:
+        # First-ever read of this key: one synchronous fetch, then cached.
+        v = _state_fetch_sync(key, default)
+        with _STATE_LOCK:
+            _STATE_CACHE[key] = (v, now)
+        return v
+    # Stale hit: serve it NOW, refresh in background — never block the loop.
+    def _refresh() -> None:
+        v = _state_fetch_sync(key, default)
+        with _STATE_LOCK:
+            _STATE_CACHE[key] = (v, _time.monotonic())
+    threading.Thread(target=_refresh, daemon=True).start()
+    return hit[0]
+
+
+def _state_set_sync(key: str, value: Any) -> bool:
     d = db()
     if d is None:
         return False
@@ -92,6 +128,25 @@ def state_set(key: str, value: Any) -> bool:
     except PyMongoError as e:
         log.warning("state_set(%s) failed: %s", key, e)
         return False
+
+
+
+def state_set(key: str, value: Any) -> bool:
+    """v1.22.9: update the in-process cache immediately (all readers see it
+    this instant), persist to Mongo in a daemon thread. Never blocks the
+    event loop on a cold Atlas socket. Returns True optimistically — stats
+    and cursors tolerate a rare dropped write; /pause correctness is kept
+    because the cache update is synchronous."""
+    with _STATE_LOCK:
+        _STATE_CACHE[key] = (value, _time.monotonic())
+    def _persist() -> None:
+        try:
+            _state_set_sync(key, value)
+        except Exception as e:  # noqa: BLE001
+            log.warning("state_set(%s) background persist failed: %s", key, e)
+    threading.Thread(target=_persist, daemon=True).start()
+    return True
+
 
 
 def is_paused() -> bool:

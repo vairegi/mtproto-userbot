@@ -1,67 +1,44 @@
 ================================================================================
-GUIDE_APPEND — v1.22.8 (ScraperBot crash-loop fix + RAM watchdog + /checkram)
+GUIDE_APPEND — v1.22.9 (crash loop: event-loop-blocking Mongo — the real fix)
 Shipped: 2026-08-29
 ================================================================================
 
-WHAT CHANGED (ScraperBot only — 4 files)
+WHAT THE LOG PROVED
+* RAM was innocent: watchdog read 76-84MB the whole time (/checkram is
+  real — the numbers vary slightly between ticks; it reads
+  /proc/self/status live).
+* Every "Shutting down" was a graceful SIGTERM preceded by /healthz going
+  unanswered — i.e. Render's 5s health check timing out, NOT an OOM.
+* Between health checks the loop was stuck inside synchronous pymongo:
+  state_get/state_set/is_paused run on the uvicorn event loop from
+  record_activity (every fetch), _stats_bump (every write), the pause
+  check (every iteration) and the dashboard tick (every 15s). One cold
+  Atlas M0 socket can block up to 8s > Render's 5s window → SIGTERM →
+  cold boot → cold Mongo again → loop forever (your 2-6 min cycle).
 
-1. main.py — STAGGERED STARTS. Previously db warmup (Mongo index build +
-   Turso schema migration), list_sweeper, details_sweeper, and the channel
-   dashboard all spawned at the same instant, so their memory peaks landed
-   in the same seconds on the 512MB free instance → status-137 SIGKILL →
-   Render marks instance failed → health checks time out during the next
-   cold boot → repeat (the "Instance failed / Service recovered" loop on
-   your events page).
-   Now: db warmup starts at +5s and is SPLIT (Mongo indexes, wait 20s,
-   then Turso schema), list_sweeper at +30s, dashboard at +45s,
-   details_sweeper at +60s. No two peaks overlap.
-
-2. main.py — RAM WATCHDOG. Logs VmRSS every 60s to the Render log:
-   "🧠 RAM: NNN MB / 512 MB" (warn at 380MB, CRITICAL at 450MB). You can
-   now see the ceiling being approached BEFORE Render kills the process.
-
-3. app/services/telegram_bot.py — NEW COMMAND /checkram (admin only):
-   replies in chat with live VmRSS, headroom vs the 512MB limit, and a
-   🟢/🟠/🔴 state. Same numbers the watchdog logs. Added to /help.
-
-4. app/config.py — dashboard default refresh 5s → 15s
-   (BOT1_CHANNEL_REFRESH_SEC; per operator request). /time <n> still
-   overrides at runtime.
-
-5. app/hf_scraper_lite.py — the httpx client pool is now capped at
-   4 connections (library default was 100 keep-alive connections; each
-   idle keep-alive holds socket buffers that inflate RSS during bursts).
-
-REMINDER — what UptimeRobot can and cannot do:
-   It prevents Render's 15-minute IDLE spindown. It cannot stop OOM kills.
-   Keep the monitor on https://scraperbackup.onrender.com/healthz (5 min,
-   GET) — combined with this fix the service should now stay up.
-
-CACHE TOPOLOGY NOTE (operator-confirmed): scraped payloads live ONLY in
-Turso (BOT1_CACHE_MONGO_MIRROR=1 makes the Mongo mirror optional; with it
-off, cache.py writes Turso-only). Mongo is used solely for tiny state docs
-(sweep cursors, pause flag, freshness stamps, trending tags, token bucket)
-in scraper1_state. There is exactly ONE copy of each cached page — no
-divergence possible. New nhentai items enter the Mini App automatically:
-each sweep REWRITES the whole page row (snapshot semantics), and the Mini
-App reads Turso on every request (no in-memory response layer), so a
-rewritten page is visible to users on the very next view.
+WHAT CHANGED (one file): ScraperBot/app/mongo_client.py
+* state_get(): 8s in-process read-through cache. First read of a key is
+  synchronous (once), thereafter stale values are served instantly while
+  a daemon thread refreshes in the background.
+* state_set(): updates the in-process cache IMMEDIATELY (so /pause and
+  cursors stay correct for all readers in this process), then persists
+  to Mongo on a daemon thread. Never blocks the loop.
+* _state_fetch_sync/_state_set_sync keep the original sync behavior for
+  the background threads.
+Semantics: stats/cursor writes tolerate a rare dropped background write;
+/pause stays exact because its cache update is synchronous.
 
 FILES IN THIS ZIP
-   ScraperBot/main.py                         PATCH — stagger + watchdog
-   ScraperBot/app/config.py                   PATCH — 15s dashboard default
-   ScraperBot/app/hf_scraper_lite.py          PATCH — pool cap 4
-   ScraperBot/app/services/telegram_bot.py    PATCH — /checkram command
-   GUIDE.md / GUIDE_APPEND.txt                DOCS
+   ScraperBot/app/mongo_client.py   PATCH — cached non-blocking state I/O
+   GUIDE.md / GUIDE_APPEND.txt      DOCS
 
 DEPLOY STEPS
-1. Drop onto repo, commit, push → scraperbackup redeploys on Render.
-2. Watch the boot log — you should see:
-      "db warmup stage 1/2 done (mongo indexes)"
-      "staggered start: list_sweeper.run_forever (after 30s)"
-      "🧠 RAM: NNN MB / 512 MB"   (every 60s)
-3. Send /checkram in the bot chat — expect a 🟢 reply with live numbers.
-4. Send /trigger and watch RAM during the sweep; it should stay under
-   450MB. If it ever approaches 500MB, send me the Render log section and
-   we cut deeper (page caps / per_tick).
+1. Drop onto repo, commit, push → scraperbackup redeploys.
+2. Expected: the every-few-minutes "Instance failed / Service recovered"
+   cycle stops. Boot log still shows staggered starts + RAM watchdog.
+3. Send /checkram (monitoring) and /trigger (work) — both should behave
+   as before, but /healthz will now answer through Mongo cold sockets.
+4. If any failure persists after this, send the new Render log — with
+   Mongo off the loop, remaining suspects would be Turso HTTP or Telegram
+   API stalls, both visible in the log.
 ================================================================================
