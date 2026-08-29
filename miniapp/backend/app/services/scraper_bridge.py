@@ -25,6 +25,8 @@ Fallback tree:
 """
 from __future__ import annotations
 
+import os  # v1.22.5: USE_OLD_CACHE env toggle
+
 import asyncio
 import dataclasses
 import logging
@@ -390,8 +392,18 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
         _turso_key = f"search:q={query}|sort={real_sort}|page={int(page or 1)}"
     _nhc = _sb_turso_cache()
     if _nhc is not None:
+        # v1.22.5: USE_OLD_CACHE=1 (default) lets chip/sort pages be served
+        # from stale-but-present cache rows when their TTL has lapsed.
+        # Rows are never deleted (cache-never-expires design), so gating
+        # reads on freshness produced the "gray next button after page 2"
+        # bug: aged rows read as MISSes, the upstream nhentai fallback was
+        # 429-backoff'd, and has_more flipped False. Stale cards are always
+        # better than a dead pagination bar — ScraperBot re-freshes rows on
+        # its schedule. Set USE_OLD_CACHE=0 to restore strict-fresh reads.
+        _allow_stale = os.environ.get("USE_OLD_CACHE", "1").strip() not in (
+            "0", "false", "no")
         try:
-            _hit = _nhc.get(_turso_key, allow_stale=False)
+            _hit = _nhc.get(_turso_key, allow_stale=_allow_stale)
         except Exception:  # noqa: BLE001
             _hit = None
         if isinstance(_hit, list):

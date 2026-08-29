@@ -1,57 +1,46 @@
 ================================================================================
-GUIDE_APPEND — v1.22.4 (ScraperBot stability + per-sort scheduling)
+GUIDE_APPEND — v1.22.5 (USE_OLD_CACHE + Try Searching These trending hints)
 Shipped: 2026-08-29
 ================================================================================
 
-WHAT CHANGED (ScraperBot only — 3 code files)
+WHAT CHANGED
 
-1. main.py — Mongo cache_ensure_indexes + Turso bootstrap now run in a
-   background task (_bg_db_warmup) AFTER uvicorn starts serving. They used
-   to block the event loop at boot, so Render's 5-second /healthz check
-   timed out mid-startup: that was your "Deploy failed — timed out waiting
-   for internal health check" and "Instance failed: HTTP health check
-   failed (timed out after 5 seconds)" events.
+1. miniapp/backend/app/services/scraper_bridge.py
+   Chip/sort Turso reads now use allow_stale=True by default. The cache
+   rows are never deleted (cache-never-expires design), but reads were
+   gated on TTL freshness — aged rows read as MISSes, the upstream
+   nhentai fallback was 429-backoffd, has_more flipped False, and the
+   Mini App next button grayed out after page 2. Serving stale rows
+   keeps pagination alive; ScraperBot refreshes rows on schedule anyway.
+   Env toggle: USE_OLD_CACHE=0 restores the old strict-fresh behavior.
 
-2. list_sweeper.py — OOM taming for the "Exited with status 137" kills:
-   the raw nhentai search-page JSON is deleted immediately after
-   normalize_search_page() and gc.collect() runs between pages, so memory
-   no longer spikes while a phase is mid-flight on the 512MB instance.
+2. miniapp/backend/app/routes/trending.py
+   New endpoint GET /api/trending/scraper-tags?limit=10 — returns the
+   trending tag list ScraperBot (BOT 1) scrapes every 24h from nhentai
+   popular-today (Mongo scraper1_state, _id="trending_tags"). Fail-open:
+   items=[] on any error.
 
-3. Per-sort freshness scheduling (the bandwidth fix). Each sort sweeps
-   only when its own interval has elapsed, matching how often nhentai
-   actually changes it:
-      date          → every 2h,  pages 1-5 (deep crawl 1-15 once per 24h)
-      popular-today → every 6h
-      popular-week  → every 12h
-      popular       → every 24h  (all-time classics barely move)
-      tag:<slug>    → every 24h  (trending tags drift weekly at most)
-   A phase that finds nothing due logs "all sorts fresh — idling" and the
-   loop wakes exactly when the next sort becomes due (floor 5 min). All
-   knobs are env vars: LIST_TICK_DATE_SEC, LIST_TICK_POPULAR_TODAY_SEC,
-   LIST_TICK_POPULAR_WEEK_SEC, LIST_TICK_POPULAR_SEC, LIST_TICK_TAG_SEC,
-   LIST_DATE_SHALLOW_PAGES, LIST_DATE_DEEP_PAGES, LIST_DATE_DEEP_SEC.
-   Expected fetch volume reduction vs the old sweep-everything-every-6h:
-   roughly 60-75% fewer nhentai API calls per day.
-
-4. Idle visibility: the channel dashboard "Now:" line shows
-   "💤 idle — all sorts fresh, waiting for next due slot" (or
-   "⏸ scraper disabled") instead of a frozen stale entry.
-
-UPTIMEROBOT (prevents idle spindown only — cannot fix crashes):
-   Add an HTTP(s) monitor: GET https://scraperbackup.onrender.com/healthz
-   every 5 minutes. The route answers GET+HEAD instantly from boot second
-   one, now that startup no longer blocks.
+3. miniapp/frontend/js/pages/search.js
+   The "Try:" hint row below the search bar now reads
+   "Try Searching These:" followed by tappable tag:<slug> chips fed by
+   the new endpoint. Tapping one fills the search box and searches.
+   If the endpoint returns nothing, the original static hints show.
+   Import of home-rows.js bumped to ?v=1.22.5 (importmap trailing-slash
+   mappings cannot carry versions — every changed file must bump at its
+   import sites; detail-sheet.js and registry.js needed no bumps since
+   they are unchanged / unversioned).
 
 FILES IN THIS ZIP
-   ScraperBot/main.py                       PATCH
-   ScraperBot/app/config.py                 PATCH
-   ScraperBot/app/services/list_sweeper.py  PATCH
-   GUIDE.md / GUIDE_APPEND.txt              DOCS
+   miniapp/backend/app/services/scraper_bridge.py   PATCH
+   miniapp/backend/app/routes/trending.py           PATCH
+   miniapp/frontend/js/pages/search.js              PATCH
+   GUIDE.md / GUIDE_APPEND.txt                      DOCS
 
 DEPLOY STEPS
-1. Drop onto repo, commit, push → ScraperBot redeploys.
-2. Watch boot log: "db warmup finished" should appear AFTER the server is
-   already answering /healthz; Render deploy should go green first try.
-3. Next phases log "freshness filter: N/M sorts still fresh — skipped".
-4. Add the UptimeRobot monitor above.
+1. Drop onto repo, commit, push → Bot 0 (miniapp) redeploys on Render.
+2. Open the Mini App: the hint row shows trending tags scraped by Bot 1.
+3. Discover page: navigate past page 2 on every sort — the › button
+   should stay active (rows are served from cache even when stale).
+4. Optional: set USE_OLD_CACHE=0 on the Bot 0 Render env if you ever
+   want strict-fresh reads back.
 ================================================================================

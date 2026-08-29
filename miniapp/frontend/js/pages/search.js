@@ -20,7 +20,7 @@ import { haptic } from "core/telegram.js";
 import { store } from "core/state.js";
 import { parseSearch } from "plugins/search-operators.js";
 import { cardActions } from "plugins/card-actions.js";
-import { renderTrendingTags, renderRecommendations } from "plugins/home-rows.js";  // v11.7
+import { renderTrendingTags, renderRecommendations } from "plugins/home-rows.js?v=1.22.5";  // v11.7
 // v12.3: prefetchGallery import REMOVED — no more background detail warming.
 // Card taps open a minimal sheet whose actions (Download/Save/Share) need no
 // extra upstream fetches; detail data only loads when the sheet is open.
@@ -75,12 +75,44 @@ export async function render(root, { me }) {
     if (inp) { inp.value = state.query; }
   }
   const $chips = buildChipRow(state, refetch);
+  // v1.22.5: hint row shows BOT 1's scraped trending tags (tappable) under
+  // the label "Try Searching These", falling back to the static operator
+  // hints if the scraper list is unavailable. Tapping a tag fills the
+  // search box with tag:<slug> and searches immediately.
   const $hint = h("div", { class: "search-hint" },
-    "Try: ", h("code", {}, "tag:vanilla"), " ",
+    "Try Searching These: ", h("code", {}, "tag:vanilla"), " ",
     h("code", {}, "-tag:yaoi"), " ",
     h("code", {}, "pages:>30"), " ",
     h("code", {}, "sort:popular-today"),
   );
+  const _fillSearch = (expr) => {
+    if (!$bar) return;
+    const input = $bar.querySelector("input");
+    if (input) {
+      input.value = expr;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    haptic("light");
+  };
+  (async () => {
+    let tags = [];
+    try {
+      const r = await api.get("/api/trending/scraper-tags?limit=10");
+      tags = r.items || [];
+    } catch (_) { tags = []; }
+    if (!tags.length) return;  // keep the static fallback hints
+    $hint.textContent = "";
+    $hint.append("Try Searching These: ");
+    tags.forEach((slug, i) => {
+      const c = h("code", {
+        style: { cursor: "pointer" },
+        title: `Search tag:${slug}`,
+      }, `tag:${slug}`);
+      c.addEventListener("click", () => _fillSearch(`tag:${slug}`));
+      $hint.append(c);
+      if (i < tags.length - 1) $hint.append(" ");
+    });
+  })();
   // v11.7: home widgets — visible only when there's no active query.
   const $trending = renderTrendingTags((tagExpr) => {
     if (!$bar) return;

@@ -29,6 +29,28 @@ def trending_tags_endpoint(
     return {"items": rows, "days": int(max(1, days))}
 
 
+@router.get("/scraper-tags")
+def scraper_trending_tags_endpoint(
+    limit: int = 10,
+    _user: dict = Depends(get_current_user),
+) -> dict:
+    """v1.22.5: trending tags AS SCRAPED BY BOT 1 (ScraperBot).
+
+    ScraperBot/services/trending_tags.py tallies tag frequencies across the
+    freshest nhentai popular-today pages every 24h and stores the ranked
+    slug list in Mongo `scraper1_state` under _id="trending_tags". This
+    endpoint surfaces exactly that list to the Mini App search-hint row
+    ("Try Searching These"). Fail-open: returns items=[] on any error so
+    the frontend keeps its static fallback hints.
+    """
+    try:
+        doc = db.db()["scraper1_state"].find_one({"_id": "trending_tags"}) or {}
+        tags = [t for t in (doc.get("value") or []) if isinstance(t, str) and t.strip()]
+    except Exception:
+        tags = []
+    return {"items": tags[:int(max(1, min(25, limit)))], "source": "scraperbot"}
+
+
 @router.get("/galleries")
 def trending_galleries_endpoint(
     page:     int = 1,
