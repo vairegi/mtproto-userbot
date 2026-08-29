@@ -397,3 +397,15 @@ in-process read-through cache (8s TTL, daemon-thread refresh; writes
 update the cache synchronously then persist in background threads). No
 event-loop path ever blocks on Mongo again. /checkram and the 60s RAM
 watchdog stay as the monitoring layer that proved the diagnosis.
+
+v1.23.1 (2026-08-29): ScraperBot MEMORY LEAK fix (76MB → 465MB climb, then
+stuck at CRITICAL 40+ min). Root cause: v1.22.9's background state threads
+were unbounded (one daemon thread per stale read/write) AND the MongoClient
+had no socketTimeoutMS — a thread reading on a half-dead Atlas socket
+blocked FOREVER (server selection has an 8s cap but socket reads did not),
+so threads piled up during every Mongo slow phase; each held its stack and
+pymongo buffers, RSS never released. Three fixes in
+ScraperBot/app/mongo_client.py: 1) socketTimeoutMS=20000 — any blocked
+socket op dies in 20s and its thread exits. 2) _STATE_INFLIGHT guard — at
+most ONE background refresh/persist thread per key, ever. 3) 10-minute
+eviction sweep on the state cache. Ship together with v1.23.0 countdowns.

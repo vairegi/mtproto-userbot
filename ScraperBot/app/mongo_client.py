@@ -41,6 +41,14 @@ def _connect() -> Optional[MongoClient]:
                 settings.mongo_uri,
                 serverSelectionTimeoutMS=8000,
                 connectTimeoutMS=8000,
+                # v1.23.1: without this, a read on a half-dead Atlas socket
+                # blocks FOREVER. v1.22.9's background refresh/persist
+                # threads piled up on such sockets (unbounded daemon
+                # threads, one per stale read/write) — RSS climbed ~10MB/min
+                # and never released (the 76MB -> 465MB leak the operator
+                # caught). With a 20s socket cap every blocked call dies on
+                # its own and the thread exits.
+                socketTimeoutMS=20000,
                 maxPoolSize=8,
                 retryWrites=True,
             )
@@ -77,6 +85,10 @@ STATE_COLL = "scraper1_state"
 _STATE_CACHE: dict = {}
 _STATE_CACHE_TTL = 8.0
 _STATE_LOCK = threading.Lock()
+# v1.23.1: one in-flight background op per key, ever. Without this guard a
+# 5s dashboard tick + sweeper state traffic could stack unlimited threads
+# on the same key whenever Mongo was slow.
+_STATE_INFLIGHT: set = set()
 
 
 def _state_fetch_sync(key: str, default: Any = None) -> Any:
@@ -93,9 +105,16 @@ def _state_fetch_sync(key: str, default: Any = None) -> Any:
         return default
 
 
+_STATE_EVICT_AFTER = 600.0  # v1.23.1: drop keys untouched for 10 min
+
+
 def state_get(key: str, default: Any = None) -> Any:
     now = _time.monotonic()
     with _STATE_LOCK:
+        # cheap sweep: dict is small (dozens of keys), eviction is rare
+        for _k in [k for k, (_, ts) in _STATE_CACHE.items()
+                   if now - ts > _STATE_EVICT_AFTER]:
+            _STATE_CACHE.pop(_k, None)
         hit = _STATE_CACHE.get(key)
     if hit is not None and (now - hit[1]) < _STATE_CACHE_TTL:
         return hit[0]
@@ -106,10 +125,21 @@ def state_get(key: str, default: Any = None) -> Any:
             _STATE_CACHE[key] = (v, now)
         return v
     # Stale hit: serve it NOW, refresh in background — never block the loop.
+    # v1.23.1: skip if a refresh for this key is already in flight.
+    with _STATE_LOCK:
+        if key in _STATE_INFLIGHT:
+            return hit[0]
+        _STATE_INFLIGHT.add(key)
+
     def _refresh() -> None:
-        v = _state_fetch_sync(key, default)
-        with _STATE_LOCK:
-            _STATE_CACHE[key] = (v, _time.monotonic())
+        try:
+            v = _state_fetch_sync(key, default)
+            with _STATE_LOCK:
+                _STATE_CACHE[key] = (v, _time.monotonic())
+        finally:
+            with _STATE_LOCK:
+                _STATE_INFLIGHT.discard(key)
+
     threading.Thread(target=_refresh, daemon=True).start()
     return hit[0]
 
@@ -139,11 +169,25 @@ def state_set(key: str, value: Any) -> bool:
     because the cache update is synchronous."""
     with _STATE_LOCK:
         _STATE_CACHE[key] = (value, _time.monotonic())
+    # v1.23.1: coalesce persists per key — if one is already flying, the
+    # cache already holds the newest value and that in-flight write is
+    # allowed to land older data; we re-check after it finishes by simply
+    # letting the next state_set trigger a fresh persist. Worst case a
+    # stats counter write is dropped during a Mongo stall — acceptable.
+    with _STATE_LOCK:
+        if key in _STATE_INFLIGHT:
+            return True
+        _STATE_INFLIGHT.add(key)
+
     def _persist() -> None:
         try:
             _state_set_sync(key, value)
         except Exception as e:  # noqa: BLE001
             log.warning("state_set(%s) background persist failed: %s", key, e)
+        finally:
+            with _STATE_LOCK:
+                _STATE_INFLIGHT.discard(key)
+
     threading.Thread(target=_persist, daemon=True).start()
     return True
 
