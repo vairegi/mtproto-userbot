@@ -263,6 +263,12 @@ export async function render(root, { me }) {
 
   // v12.16: query/sort changes reset to page 1 — a strict page replace.
   async function refetch() {
+    // v1.22.7: reset the learned page bounds too. They leaked across sorts
+    // (browsing "popular" to page 15 made the numbered bar show pages 3-15
+    // on popular-today/week/date as well). Each sort/query must learn its
+    // own bounds honestly.
+    state.highestKnownPage = 0;
+    state.knownLastPage = 0;
     await goToPage(1);
   }
 

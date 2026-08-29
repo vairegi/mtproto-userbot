@@ -357,3 +357,16 @@ timeouts as transient (Atlas M0 idle-closes connections; the next sweep
 reconnects) — no more identical "🧹 Dedup sweep ⚠ timed out" DMs every
 12h. Real errors still alert. v1.22.5 USE_OLD_CACHE confirmed live in
 Render log (CACHE HIT pages 1+2 on every sort).
+
+v1.22.7 (2026-08-29): gray › button on popular-today / popular-week / date —
+root-caused and fixed properly. TWO interacting bugs: (1) Backend
+scraper_bridge.py collected exactly the window worth of upstream pages,
+THEN v12.30 id-dedup shrank it (volatile nhentai lists share 5-8 galleries
+between adjacent pages) — short windows (page 2 showing only 3 cards) and
+has_more=False. Stable all-time "popular" had near-zero overlap so only it
+worked. Fix: collect one extra upstream page (collect_goal =
+want_total + per_page; cache-hit when warm) and fire the next-page
+lookahead probe whenever the window is non-empty, not only at exactly 25
+cards. (2) Frontend search.js leaked highestKnownPage/knownLastPage across
+sorts (never reset in refetch) — browsing popular to page 15 "unlocked"
+the numbered bar on other sorts. Fix: both bounds reset on refetch().

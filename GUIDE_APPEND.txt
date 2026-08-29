@@ -1,43 +1,45 @@
 ================================================================================
-GUIDE_APPEND — v1.22.6 (gray next-button REAL fix + dedup DM-spam fix)
+GUIDE_APPEND — v1.22.7 (gray next-button: dedup shrinkage + state leak)
 Shipped: 2026-08-29
 ================================================================================
 
-WHAT CHANGED
+ROOT CAUSE (confirmed against live Turso + Render logs + repo code)
+Two bugs interacted:
 
-1. miniapp/backend/app/services/scraper_bridge.py — THE GRAY BUTTON FIX.
-   Root cause found in your Render log: page-2 requests returned
-   "TURSO CACHE HIT page1 + page2" and STOPPED. The aggregation loop's
-   condition `while len(collected) < want_total` exits as soon as the
-   requested window is fillable — page 2 needs upstream pages 1+2, i.e.
-   exactly 50 cards, i.e. exactly start_offset+per_page — so the old
-   cushion check `len(collected) > start_offset+per_page` could never be
-   true and has_more was always False. v1.22.5's stale-read fix was
-   necessary but not sufficient.
-   Fix: after slicing the window, probe the NEXT chip cache key
-   (search:<sort>:page<upstream_page>) directly in Turso. One GET; stale
-   rows count when USE_OLD_CACHE=1. If the row exists and is non-empty,
-   has_more=True and the › button stays lit for every warmed page.
-   Only applies to chip/empty-query browses (the Discover sort tabs);
-   typed searches keep their old behavior.
+1. BACKEND (scraper_bridge.py): the aggregation loop collected EXACTLY the
+   requested window (page 2 → upstream pages 1+2 = 50 cards), then the
+   v12.30 id-dedup removed cross-page duplicates. nhentai's volatile lists
+   (popular-today, popular-week, date) reshuffle constantly, so adjacent
+   pages share 5-8 galleries — 50 cards dedup to ~43. Result: short page
+   (your screenshot showed only 3 cards on page 2), cushion check
+   (43 > 50) False, v1.22.6 probe gated on exactly-25 items never fired,
+   has_more=False → gray ›. All-time "popular" is a stable list with
+   near-zero overlap, which is why ONLY it paged deep.
 
-2. miniapp/backend/app/services/dedup_cron.py — DM SPAM FIX.
-   Your DMs showed "🧹 Dedup sweep ⚠ mongo sweep raised: ...27017: timed
-   out" every 12h. Atlas free-tier (M0) idle-closes connections; one
-   cursor timing out is transient — the next sweep reconnects. The alert
-   classifier now filters pymongo NetworkTimeout / ServerSelectionTimeout
-   / "timed out" messages out of the wake-the-admin path. Real errors
-   (auth failures, write errors, anything non-timeout) still alert.
+2. FRONTEND (search.js): highestKnownPage/knownLastPage were never reset
+   on sort/query change, so browsing "popular" to page 15 leaked those
+   bounds onto every other sort's numbered bar — your "browsing popular
+   unlocks the other sorts" observation.
+
+FIXES
+1. Backend: collect one extra upstream page per request (collect_goal =
+   want_total + per_page) so the cushion survives dedup; the lookahead
+   probe now fires whenever the window is non-empty. Extra page is a
+   Turso cache hit when warm — no meaningful bandwidth cost.
+2. Frontend: refetch() resets highestKnownPage/knownLastPage to 0 so each
+   sort learns its own bounds.
 
 FILES IN THIS ZIP
    miniapp/backend/app/services/scraper_bridge.py   PATCH
-   miniapp/backend/app/services/dedup_cron.py       PATCH
+   miniapp/frontend/js/pages/search.js              PATCH
    GUIDE.md / GUIDE_APPEND.txt                      DOCS
 
 DEPLOY STEPS
 1. Drop onto repo, commit, push → Bot 0 (miniapp) redeploys on Render.
-2. Open the Mini App Discover tab → go to page 2 of any sort → the ›
-   button should now be ACTIVE and page 3 should load from cache.
-3. Dedup sweeps continue every 12h but only DM you when something real
-   breaks (or when dupes are actually removed).
+2. Discover → popular-today page 2: should show a full 25-card grid and
+   an ACTIVE › button. Same for popular-week and date.
+3. Switching sorts should no longer inherit page numbers from another
+   sort — each starts fresh at page 1 with its own learned bounds.
+4. Simulated pre-ship: 75 collected → 67 post-dedup → full 25-card
+   window → cushion has_more=True (was False).
 ================================================================================

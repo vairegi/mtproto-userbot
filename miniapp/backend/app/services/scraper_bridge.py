@@ -844,14 +844,23 @@ def search(q: str, page: int, sort: str, lang: str,
         max_upstream = _MAX_UPSTREAM_PAGES_DEFAULT
 
     start_offset = (max(1, int(page or 1)) - 1) * per_page
+    # v1.22.7: collect ONE extra upstream page beyond the window. The
+    # v12.30 id-dedup runs AFTER collection, and nhentai's volatile lists
+    # (popular-today / popular-week / date) share 5-8 galleries between
+    # adjacent pages — so a bare-window collection (50 cards for page 2)
+    # shrank below the window after dedup: short pages AND has_more=False
+    # (the gray › button on those three sorts while stable all-time
+    # 'popular' worked). The extra page is a cache hit when warm, so this
+    # costs ~nothing. Loop still stops at max_upstream as before.
     want_total   = start_offset + per_page
+    collect_goal = want_total + per_page
 
     collected: list[dict] = []
     upstream_page = 1
     consecutive_empty = 0
     rate_limited_pages: list[int] = []
 
-    while len(collected) < want_total and upstream_page <= max_upstream:
+    while len(collected) < collect_goal and upstream_page <= max_upstream:
         rows: list[dict] = []
         # v12.29 (SORT BUG FIX): hf_scraper.search() takes NO sort argument
         # and internally hardcodes params["sort"]="date", then serves/writes
@@ -960,7 +969,10 @@ def search(q: str, page: int, sort: str, lang: str,
     # USE_OLD_CACHE), we know more pages exist. Cheap: one Turso GET.
     _lookahead_has_more = False
     try:
-        if len(items) == per_page and q_clean in ("", "english", "language:english"):
+        # v1.22.7: probe whenever the window is non-empty. v1.22.6 required
+        # exactly per_page items, but the post-dedup window can be short on
+        # volatile sorts — which was precisely when › went gray.
+        if items and q_clean in ("", "english", "language:english"):
             _nhc = _sb_turso_cache()
             if _nhc is not None:
                 _next_key = f"search:{(sort or 'popular').strip().lower()}:page{upstream_page}"
