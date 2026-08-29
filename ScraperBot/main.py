@@ -63,6 +63,11 @@ async def _startup() -> None:
     # the first second and Render never marks a boot as failed.
     _tasks.append(asyncio.create_task(_bg_db_warmup(), name="db_warmup"))
 
+    # v1.22.8: RAM watchdog — logs VmRSS every 60s so we can SEE the 512MB
+    # ceiling being approached before Render SIGKILLs (status 137) instead
+    # of finding out from the events page afterwards. ~0 cost.
+    _tasks.append(asyncio.create_task(_ram_watchdog(), name="ram_watchdog"))
+
     global _stop_event
     _stop_event = asyncio.Event()
 
@@ -82,28 +87,45 @@ async def _startup() -> None:
     # logged; the HTTP surface must stay up so UptimeRobot / admin routes
     # keep working even if a sweeper is misconfigured.
     if settings.mongo_uri and settings.turso_url:
+        # v1.22.8: staggered starts — the old code spawned all three at the
+        # same instant as db warmup, so the boot memory peak (Mongo index
+        # build + Turso bootstrap + first sweep page + dashboard) landed in
+        # the same seconds and tripped the 512MB ceiling (status 137 kills
+        # in the Render events). Now each component starts well after the
+        # previous one has settled.
         _tasks.append(asyncio.create_task(
-            list_sweeper.run_forever(_stop_event), name="list_sweeper"))
+            _delayed(list_sweeper.run_forever, 30, _stop_event),
+            name="list_sweeper"))
         _tasks.append(asyncio.create_task(
-            details_sweeper.run_forever(_stop_event), name="details_sweeper"))
-        # v1.5: live channel dashboard — edits the pinned pair of messages
-        # every channel_refresh_sec (default 5s, overridable with /time <n>).
+            _delayed(details_sweeper.run_forever, 60, _stop_event),
+            name="details_sweeper"))
         _tasks.append(asyncio.create_task(
-            channel_dashboard.refresh_loop(_stop_event), name="dashboard"))
+            _delayed(channel_dashboard.refresh_loop, 45, _stop_event),
+            name="dashboard"))
         log.info("sweepers + dashboard spawned: %s",
                  [t.get_name() for t in _tasks])
     else:
         log.error("Sweepers NOT started — missing MONGO_URI or TURSO_DATABASE_URL")
 
 
+async def _delayed(fn, delay_s: int, *args) -> None:
+    """v1.22.8: run fn(*args) after delay_s so boot memory peaks stagger."""
+    await asyncio.sleep(delay_s)
+    log.info("staggered start: %s (after %ds)", fn.__qualname__, delay_s)
+    await fn(*args)
+
+
 async def _bg_db_warmup() -> None:
-    """v1.22.4: non-blocking Mongo index ensure + Turso schema bootstrap."""
-    await asyncio.sleep(2)  # let uvicorn bind + first health checks pass
+    """v1.22.4/1.22.8: non-blocking Mongo index ensure + Turso bootstrap,
+    split into two stages so the two cold-connection peaks never overlap."""
+    await asyncio.sleep(5)  # let uvicorn bind + first health checks pass
     loop = asyncio.get_event_loop()
     try:
         await loop.run_in_executor(None, mongo_client.cache_ensure_indexes)
+        log.info("db warmup stage 1/2 done (mongo indexes)")
     except Exception as e:  # noqa: BLE001
         log.warning("cache_ensure_indexes failed: %s", e)
+    await asyncio.sleep(20)  # v1.22.8: let the Mongo peak subside first
     try:
         await turso_client.bootstrap_schema()
         try:
@@ -113,6 +135,29 @@ async def _bg_db_warmup() -> None:
     except Exception as e:  # noqa: BLE001
         log.warning("turso bootstrap failed: %s", e)
     log.info("db warmup finished (mongo indexes + turso schema)")
+
+
+async def _ram_watchdog() -> None:
+    """v1.22.8: log VmRSS every 60s. Thresholds: warn at 380MB, critical at
+    450MB (Render free ceiling is 512MB; status 137 arrives without warning
+    otherwise). Same numbers feed the /checkram bot command."""
+    while True:
+        try:
+            mb = 0.0
+            with open("/proc/self/status") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        mb = int(line.split()[1]) / 1024.0
+                        break
+            if mb >= 450:
+                log.warning("🧠 RAM CRITICAL: %.0f MB / 512 MB", mb)
+            elif mb >= 380:
+                log.info("🧠 RAM high: %.0f MB / 512 MB", mb)
+            else:
+                log.info("🧠 RAM: %.0f MB / 512 MB", mb)
+        except Exception as e:  # noqa: BLE001
+            log.info("ram watchdog read failed: %s", e)
+        await asyncio.sleep(60)
 
 
 async def _webhook_keeper() -> None:

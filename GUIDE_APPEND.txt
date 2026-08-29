@@ -1,45 +1,67 @@
 ================================================================================
-GUIDE_APPEND — v1.22.7 (gray next-button: dedup shrinkage + state leak)
+GUIDE_APPEND — v1.22.8 (ScraperBot crash-loop fix + RAM watchdog + /checkram)
 Shipped: 2026-08-29
 ================================================================================
 
-ROOT CAUSE (confirmed against live Turso + Render logs + repo code)
-Two bugs interacted:
+WHAT CHANGED (ScraperBot only — 4 files)
 
-1. BACKEND (scraper_bridge.py): the aggregation loop collected EXACTLY the
-   requested window (page 2 → upstream pages 1+2 = 50 cards), then the
-   v12.30 id-dedup removed cross-page duplicates. nhentai's volatile lists
-   (popular-today, popular-week, date) reshuffle constantly, so adjacent
-   pages share 5-8 galleries — 50 cards dedup to ~43. Result: short page
-   (your screenshot showed only 3 cards on page 2), cushion check
-   (43 > 50) False, v1.22.6 probe gated on exactly-25 items never fired,
-   has_more=False → gray ›. All-time "popular" is a stable list with
-   near-zero overlap, which is why ONLY it paged deep.
+1. main.py — STAGGERED STARTS. Previously db warmup (Mongo index build +
+   Turso schema migration), list_sweeper, details_sweeper, and the channel
+   dashboard all spawned at the same instant, so their memory peaks landed
+   in the same seconds on the 512MB free instance → status-137 SIGKILL →
+   Render marks instance failed → health checks time out during the next
+   cold boot → repeat (the "Instance failed / Service recovered" loop on
+   your events page).
+   Now: db warmup starts at +5s and is SPLIT (Mongo indexes, wait 20s,
+   then Turso schema), list_sweeper at +30s, dashboard at +45s,
+   details_sweeper at +60s. No two peaks overlap.
 
-2. FRONTEND (search.js): highestKnownPage/knownLastPage were never reset
-   on sort/query change, so browsing "popular" to page 15 leaked those
-   bounds onto every other sort's numbered bar — your "browsing popular
-   unlocks the other sorts" observation.
+2. main.py — RAM WATCHDOG. Logs VmRSS every 60s to the Render log:
+   "🧠 RAM: NNN MB / 512 MB" (warn at 380MB, CRITICAL at 450MB). You can
+   now see the ceiling being approached BEFORE Render kills the process.
 
-FIXES
-1. Backend: collect one extra upstream page per request (collect_goal =
-   want_total + per_page) so the cushion survives dedup; the lookahead
-   probe now fires whenever the window is non-empty. Extra page is a
-   Turso cache hit when warm — no meaningful bandwidth cost.
-2. Frontend: refetch() resets highestKnownPage/knownLastPage to 0 so each
-   sort learns its own bounds.
+3. app/services/telegram_bot.py — NEW COMMAND /checkram (admin only):
+   replies in chat with live VmRSS, headroom vs the 512MB limit, and a
+   🟢/🟠/🔴 state. Same numbers the watchdog logs. Added to /help.
+
+4. app/config.py — dashboard default refresh 5s → 15s
+   (BOT1_CHANNEL_REFRESH_SEC; per operator request). /time <n> still
+   overrides at runtime.
+
+5. app/hf_scraper_lite.py — the httpx client pool is now capped at
+   4 connections (library default was 100 keep-alive connections; each
+   idle keep-alive holds socket buffers that inflate RSS during bursts).
+
+REMINDER — what UptimeRobot can and cannot do:
+   It prevents Render's 15-minute IDLE spindown. It cannot stop OOM kills.
+   Keep the monitor on https://scraperbackup.onrender.com/healthz (5 min,
+   GET) — combined with this fix the service should now stay up.
+
+CACHE TOPOLOGY NOTE (operator-confirmed): scraped payloads live ONLY in
+Turso (BOT1_CACHE_MONGO_MIRROR=1 makes the Mongo mirror optional; with it
+off, cache.py writes Turso-only). Mongo is used solely for tiny state docs
+(sweep cursors, pause flag, freshness stamps, trending tags, token bucket)
+in scraper1_state. There is exactly ONE copy of each cached page — no
+divergence possible. New nhentai items enter the Mini App automatically:
+each sweep REWRITES the whole page row (snapshot semantics), and the Mini
+App reads Turso on every request (no in-memory response layer), so a
+rewritten page is visible to users on the very next view.
 
 FILES IN THIS ZIP
-   miniapp/backend/app/services/scraper_bridge.py   PATCH
-   miniapp/frontend/js/pages/search.js              PATCH
-   GUIDE.md / GUIDE_APPEND.txt                      DOCS
+   ScraperBot/main.py                         PATCH — stagger + watchdog
+   ScraperBot/app/config.py                   PATCH — 15s dashboard default
+   ScraperBot/app/hf_scraper_lite.py          PATCH — pool cap 4
+   ScraperBot/app/services/telegram_bot.py    PATCH — /checkram command
+   GUIDE.md / GUIDE_APPEND.txt                DOCS
 
 DEPLOY STEPS
-1. Drop onto repo, commit, push → Bot 0 (miniapp) redeploys on Render.
-2. Discover → popular-today page 2: should show a full 25-card grid and
-   an ACTIVE › button. Same for popular-week and date.
-3. Switching sorts should no longer inherit page numbers from another
-   sort — each starts fresh at page 1 with its own learned bounds.
-4. Simulated pre-ship: 75 collected → 67 post-dedup → full 25-card
-   window → cushion has_more=True (was False).
+1. Drop onto repo, commit, push → scraperbackup redeploys on Render.
+2. Watch the boot log — you should see:
+      "db warmup stage 1/2 done (mongo indexes)"
+      "staggered start: list_sweeper.run_forever (after 30s)"
+      "🧠 RAM: NNN MB / 512 MB"   (every 60s)
+3. Send /checkram in the bot chat — expect a 🟢 reply with live numbers.
+4. Send /trigger and watch RAM during the sweep; it should stay under
+   450MB. If it ever approaches 500MB, send me the Render log section and
+   we cut deeper (page caps / per_tick).
 ================================================================================

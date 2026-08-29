@@ -152,10 +152,17 @@ def extract_ids_from_search(payload: Dict[str, Any]) -> List[str]:
 
 
 async def make_client() -> httpx.AsyncClient:
-    """One AsyncClient per sweeper; reuse across many requests."""
+    """One AsyncClient per sweeper; reuse across many requests.
+
+    v1.22.8: cap the connection pool. The default pool (100 keep-alive
+    connections) let socket buffers multiply the resident set during sweep
+    bursts — one of the contributors to the status-137 OOM kills on the
+    512MB free instance. 4 connections is plenty for a single sweeper
+    walking pages sequentially with 3-6s gaps."""
     return httpx.AsyncClient(
         base_url=BASE_URL,
         timeout=_TIMEOUT,
         headers=_headers(),
         follow_redirects=True,
+        limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
     )

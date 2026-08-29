@@ -370,3 +370,16 @@ lookahead probe whenever the window is non-empty, not only at exactly 25
 cards. (2) Frontend search.js leaked highestKnownPage/knownLastPage across
 sorts (never reset in refetch) — browsing popular to page 15 "unlocked"
 the numbered bar on other sorts. Fix: both bounds reset on refetch().
+
+v1.22.8 (2026-08-29): ScraperBot status-137 OOM / health-check crash loop.
+1) Staggered starts: db warmup waits 5s (split into Mongo indexes, then
++20s, then Turso schema), list_sweeper 30s, details_sweeper 60s, dashboard
+45s — boot memory peaks no longer overlap on the 512MB free instance.
+2) Dashboard default refresh 5s → 15s (BOT1_CHANNEL_REFRESH_SEC; /time
+still overrides at runtime). 3) hf_scraper_lite.make_client caps the
+httpx pool at 4 connections (default was 100 keep-alives — socket buffers
+multiplied RSS during bursts). 4) RAM watchdog task logs VmRSS every 60s
+(warn 380MB / critical 450MB) so OOM approaches are visible BEFORE the
+SIGKILL. 5) New admin command /checkram — live VmRSS + headroom in chat.
+NOTE: UptimeRobot prevents idle spindown only; it could never stop these
+OOM kills — the stagger + pool cap address the actual cause.

@@ -192,6 +192,7 @@ def _help_text() -> str:
         "/resume    — resume both sweepers (admin)\n"
         "/trigger   — kick a list sweep now (admin)\n"
         "/time &lt;n&gt; — set channel dashboard refresh (2–300 s, admin)\n"
+        "/checkram  — live RAM usage of this instance (admin)\n"
         "/help      — this message"
     )
 
@@ -222,7 +223,7 @@ async def handle_update(update: Dict[str, Any]) -> None:
         await send_message(chat_id, _health_text())
         return
 
-    if cmd in ("/pause", "/resume", "/trigger", "/time"):
+    if cmd in ("/pause", "/resume", "/trigger", "/time", "/checkram"):
         if not is_tg_admin(from_user):
             await send_message(chat_id, "❌ admin only")
             return
@@ -240,6 +241,29 @@ async def handle_update(update: Dict[str, Any]) -> None:
             import asyncio
             asyncio.create_task(list_sweeper.sweep_once())
             await send_message(chat_id, "🚀 list sweep kicked. /status for progress.")
+            return
+        if cmd == "/checkram":
+            # v1.22.8: read this process's resident set from /proc — same
+            # numbers the RAM watchdog logs every 60s.
+            rss = avail = 0.0
+            try:
+                with open("/proc/self/status") as fh:
+                    for line in fh:
+                        if line.startswith("VmRSS:"):
+                            rss = int(line.split()[1]) / 1024.0
+                        elif line.startswith("VmAvail:"):
+                            avail = int(line.split()[1]) / 1024.0
+            except Exception as e:  # noqa: BLE001
+                await send_message(chat_id, f"❌ /checkram failed: {e}")
+                return
+            state = ("🔴 CRITICAL" if rss >= 450 else
+                     "🟠 high" if rss >= 380 else "🟢 ok")
+            await send_message(
+                chat_id,
+                f"🧠 <b>RAM</b> {state}\n"
+                f"• VmRSS: <b>{rss:.0f} MB</b> / 512 MB (Render free limit)\n"
+                + (f"• headroom: {512 - rss:.0f} MB\n" if rss else "")
+                + "• watchdog logs this every 60s in Render logs")
             return
         if cmd == "/time":
             from . import channel_dashboard

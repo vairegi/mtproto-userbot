@@ -202,7 +202,11 @@ class Settings:
 
     # Live channel dashboard
     log_channel_id: str = os.getenv("BOT1_LOG_CHANNEL_ID", "-1003796521529").strip()
-    channel_refresh_sec: int = _env_int("BOT1_CHANNEL_REFRESH_SEC", 5)
+    # v1.22.8: default 5s → 15s. The dashboard was doing a Mongo stats read
+    # + Telegram editMessageText every 5s for the process lifetime — 3x the
+    # churn for zero visible benefit. Still snappy for the log channel, and
+    # /time <n> can override at runtime as before.
+    channel_refresh_sec: int = _env_int("BOT1_CHANNEL_REFRESH_SEC", 15)
 
     # Timezone display for dashboard timestamps (IST = UTC+05:30).
     display_tz_offset_min: int = _env_int("BOT1_DISPLAY_TZ_OFFSET_MIN", 330)
