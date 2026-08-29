@@ -409,3 +409,9 @@ ScraperBot/app/mongo_client.py: 1) socketTimeoutMS=20000 — any blocked
 socket op dies in 20s and its thread exits. 2) _STATE_INFLIGHT guard — at
 most ONE background refresh/persist thread per key, ever. 3) 10-minute
 eviction sweep on the state cache. Ship together with v1.23.0 countdowns.
+
+v1.23.2 (2026-08-29): Bot2Fetcher — removed the progress-bar row
+("📊 Progress: [███░░░░░] N%") from the edited log-channel dashboard
+message. Everything else on the dashboard is unchanged. Operator request:
+the bar was visual noise vs. the numeric counters that already tell the
+story.
