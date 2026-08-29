@@ -22,6 +22,7 @@ State (in Mongo `scraper1_state`):
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import random
 import time
@@ -136,6 +137,42 @@ async def _priority_pop_all_list() -> List[Tuple[str, int]]:
     return await drain_details_hints()
 
 
+# ---------------------------------------------------------------------------
+# v1.22.4: per-sort freshness scheduling
+# ---------------------------------------------------------------------------
+
+def _sort_interval(sort: str) -> int:
+    """How often each sort is worth re-sweeping (nhentai freshness rhythm)."""
+    if isinstance(sort, str) and sort.startswith("tag:"):
+        return int(settings.list_tick_tag_sec)
+    return {
+        "date":          int(settings.list_tick_date_sec),
+        "popular-today": int(settings.list_tick_popular_today_sec),
+        "popular-week":  int(settings.list_tick_popular_week_sec),
+        "popular":       int(settings.list_tick_popular_sec),
+    }.get(sort, int(settings.list_tick_sec))
+
+
+def _sort_due(sort: str, now_ts: float) -> bool:
+    last = float(mongo_client.state_get(f"list_sort_last:{sort}", 0) or 0)
+    return (now_ts - last) >= _sort_interval(sort)
+
+
+def _next_due_gap_sec() -> int:
+    """Seconds until the nearest known sort becomes due (floor 5 min)."""
+    now_ts = time.time()
+    candidates = list(settings.list_sorts) + [
+        f"tag:{t}" for t in settings.extra_tag_sorts if (t or "").strip()]
+    best = None
+    for s in candidates:
+        last = float(mongo_client.state_get(f"list_sort_last:{s}", 0) or 0)
+        wait = max(0.0, last + _sort_interval(s) - now_ts)
+        best = wait if best is None else min(best, wait)
+    if best is None:
+        return int(settings.list_tick_sec)
+    return max(300, int(best))
+
+
 async def _fetch_and_cache(
     client: httpx.AsyncClient, sort: str, page: int
 ) -> str:
@@ -204,6 +241,7 @@ async def _fetch_and_cache(
         # (`if isinstance(_hit, list)`). Store the normalized list, not the
         # raw {"result": [...]} dict — otherwise every read is a MISS.
         payload = normalize.normalize_search_page(raw)
+        del raw  # v1.22.4: release the raw API body immediately (OOM guard)
         if not payload:
             _stats_bump(errors=1)
             channel_dashboard.record_error()
@@ -283,11 +321,28 @@ async def sweep_once() -> Dict[str, Any]:
              len(sorts_this_phase), len(settings.list_sorts),
              len(trending), len(settings.extra_tag_sorts))
 
+    # v1.22.4: freshness filter — sweep ONLY sorts whose own interval has
+    # elapsed. date runs ~every 2h; popular (all-time) ~24h; tags ~24h.
+    now_ts = time.time()
+    due = [s for s in sorts_this_phase if _sort_due(s, now_ts)]
+    fresh = len(sorts_this_phase) - len(due)
+    if fresh:
+        log.info("freshness filter: %d/%d sorts still fresh — skipped",
+                 fresh, len(sorts_this_phase))
+    sorts_this_phase = due
+    if not sorts_this_phase:
+        channel_dashboard.record_activity(
+            sweeping="💤 idle — all sorts fresh, waiting for next due slot")
+        log.info("list sweep: all sorts fresh — idling")
+        return {"ok": 0, "skip": 0, "rate_limited": 0, "errors": 0,
+                "duration_sec": 0, "idle": True}
+
     # v1.8: resume cursor — if Render restarted us mid-phase, continue from
     # the saved (sort_idx, page) instead of restarting from page 1.
     cur = channel_dashboard.cursor_get()
     resume_sort_idx = int(cur.get("sort_idx", 0) or 0)
     resume_page = int(cur.get("page", 1) or 1)
+    swept_sorts: set = set()  # v1.22.4: stamp freshness at phase end
 
     client = await hf_scraper_lite.make_client()
     try:
@@ -300,7 +355,9 @@ async def sweep_once() -> Dict[str, Any]:
             elif res == "skip": skip += 1
             elif res == "rate": rate += 1
             else:               err += 1
+            swept_sorts.add(sort)
             await _inter_attempt_sleep()
+            gc.collect()  # v1.22.4 OOM guard
 
         # Regular sweep — column-major so no sort starves.
         # v1.13: chip sorts sweep list_max_pages (default 30); tag sorts
@@ -325,6 +382,18 @@ async def sweep_once() -> Dict[str, Any]:
                 # ("popular", "date", ...). Skip a tag combo once page > 7.
                 is_tag = isinstance(sort, str) and sort.startswith("tag:")
                 per_sort_cap = tag_max_pages if is_tag else chip_max_pages
+                # v1.22.4: 'date' gets a shallow daily-driver crawl (pages
+                # 1-5); a deeper crawl (pages 1-15) only once per day.
+                if not is_tag and sort == "date":
+                    deep_due = (now_ts - float(mongo_client.state_get(
+                        "list_sort_last:date:deep", 0) or 0)) >= float(
+                        settings.list_date_deep_sec)
+                    if deep_due:
+                        per_sort_cap = int(settings.list_date_deep_pages)
+                        mongo_client.state_set("list_sort_last:date:deep",
+                                               now_ts)
+                    else:
+                        per_sort_cap = int(settings.list_date_shallow_pages)
                 if page > per_sort_cap:
                     continue
                 # Resume: skip combos strictly before the saved cursor.
@@ -345,7 +414,9 @@ async def sweep_once() -> Dict[str, Any]:
                 elif res == "skip": skip += 1
                 elif res == "rate": rate += 1
                 else:               err += 1
+                swept_sorts.add(sort)
                 await _inter_attempt_sleep()
+                gc.collect()  # v1.22.4: drop page payload before next page
 
                 # v1.14: mid-phase priority drain. Every _DRAIN_EVERY
                 # combos, pull up to _DRAIN_BATCH entries from the
@@ -370,6 +441,14 @@ async def sweep_once() -> Dict[str, Any]:
     finally:
         try:
             await client.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # v1.22.4: stamp last-swept time for every sort actually swept, so the
+    # freshness filter skips them until their own interval elapses.
+    for _s in swept_sorts:
+        try:
+            mongo_client.state_set(f"list_sort_last:{_s}", time.time())
         except Exception:  # noqa: BLE001
             pass
 
@@ -428,6 +507,12 @@ async def run_forever(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         if not settings.scraper_enabled:
             log.info("scraper disabled via SCRAPER_ENABLED=0 — idling")
+            try:  # v1.22.4: show idle state on the channel dashboard
+                from . import channel_dashboard as _cd
+                _cd.record_activity(
+                    sweeping="⏸ scraper disabled (SCRAPER_ENABLED=0)")
+            except Exception:  # noqa: BLE001
+                pass
         else:
             try:
                 res = await sweep_once()
@@ -437,7 +522,8 @@ async def run_forever(stop_event: asyncio.Event) -> None:
                 log.exception("list_sweeper: unhandled exception: %s", e)
                 _stats_bump(errors=1)
                 last_result = {"skip": 0, "rate_limited": 0, "errors": 1}
-        gap = _next_tick_sec(last_result)
+        # v1.22.4: never sleep past the moment the next-freshest sort is due
+        gap = min(_next_tick_sec(last_result), _next_due_gap_sec())
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=gap)
         except asyncio.TimeoutError:

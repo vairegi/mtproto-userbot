@@ -1,38 +1,57 @@
 ================================================================================
-GUIDE_APPEND — v1.22.3 (Bot2Fetcher caption title cleanup + ➲ Tags row)
-Shipped: 2026-08-28
+GUIDE_APPEND — v1.22.4 (ScraperBot stability + per-sort scheduling)
+Shipped: 2026-08-29
 ================================================================================
 
-WHAT CHANGED
-Bot2Fetcher/app/meta.py:
-  1. _clean_title() now removes EVERY [..], (..), {..} segment anywhere in
-     the caption title — artist circles like [Kuroiwa Menou], nested forms
-     like [Aokihoshi (Zen Shiro)], parody suffixes like (Goddess of Victory:
-     Nikke), language/scanner tails like [English] {Zombii}. Innermost-first
-     loop handles nesting; leftover double-spaces and dangling separators
-     (" -", " |" at the ends) are cleaned up. If stripping would leave an
-     empty title, the original is kept (safety net).
-  2. The Tags row now starts with ➲ instead of ➤. All other rows
-     (Groups/Parodies/Artists/Characters/Languages/Categories) keep ➤.
+WHAT CHANGED (ScraperBot only — 3 code files)
 
-EXAMPLE (unit-tested):
-  Before: [Kuroiwa Menou] Hitozuma to Shounen Hirusagari no Yuuwaku |
-          Married Woman and Boy: Early Afternoon Temptation
-          (Hitozuma Club Glass no Kutsu) [English] {Zombii}
-  After:  Hitozuma to Shounen Hirusagari no Yuuwaku |
-          Married Woman and Boy: Early Afternoon Temptation
+1. main.py — Mongo cache_ensure_indexes + Turso bootstrap now run in a
+   background task (_bg_db_warmup) AFTER uvicorn starts serving. They used
+   to block the event loop at boot, so Render's 5-second /healthz check
+   timed out mid-startup: that was your "Deploy failed — timed out waiting
+   for internal health check" and "Instance failed: HTTP health check
+   failed (timed out after 5 seconds)" events.
 
-SCOPE: NEW cover posts only. The 13,096 covers already in Main/BackupDB
-keep their current captions (Telegram captions can be edited later if you
-ever want a cleanup pass — separate task).
+2. list_sweeper.py — OOM taming for the "Exited with status 137" kills:
+   the raw nhentai search-page JSON is deleted immediately after
+   normalize_search_page() and gc.collect() runs between pages, so memory
+   no longer spikes while a phase is mid-flight on the 512MB instance.
+
+3. Per-sort freshness scheduling (the bandwidth fix). Each sort sweeps
+   only when its own interval has elapsed, matching how often nhentai
+   actually changes it:
+      date          → every 2h,  pages 1-5 (deep crawl 1-15 once per 24h)
+      popular-today → every 6h
+      popular-week  → every 12h
+      popular       → every 24h  (all-time classics barely move)
+      tag:<slug>    → every 24h  (trending tags drift weekly at most)
+   A phase that finds nothing due logs "all sorts fresh — idling" and the
+   loop wakes exactly when the next sort becomes due (floor 5 min). All
+   knobs are env vars: LIST_TICK_DATE_SEC, LIST_TICK_POPULAR_TODAY_SEC,
+   LIST_TICK_POPULAR_WEEK_SEC, LIST_TICK_POPULAR_SEC, LIST_TICK_TAG_SEC,
+   LIST_DATE_SHALLOW_PAGES, LIST_DATE_DEEP_PAGES, LIST_DATE_DEEP_SEC.
+   Expected fetch volume reduction vs the old sweep-everything-every-6h:
+   roughly 60-75% fewer nhentai API calls per day.
+
+4. Idle visibility: the channel dashboard "Now:" line shows
+   "💤 idle — all sorts fresh, waiting for next due slot" (or
+   "⏸ scraper disabled") instead of a frozen stale entry.
+
+UPTIMEROBOT (prevents idle spindown only — cannot fix crashes):
+   Add an HTTP(s) monitor: GET https://scraperbackup.onrender.com/healthz
+   every 5 minutes. The route answers GET+HEAD instantly from boot second
+   one, now that startup no longer blocks.
 
 FILES IN THIS ZIP
-   Bot2Fetcher/app/meta.py   PATCH — title cleaner + ➲ Tags row
-   GUIDE.md                  PATCH — v1.22.3 entry
-   GUIDE_APPEND.txt          THIS FILE
+   ScraperBot/main.py                       PATCH
+   ScraperBot/app/config.py                 PATCH
+   ScraperBot/app/services/list_sweeper.py  PATCH
+   GUIDE.md / GUIDE_APPEND.txt              DOCS
 
 DEPLOY STEPS
-1. Drop onto repo, commit, push → Bot2Fetcher redeploys on Render.
-2. Queue any gallery; the new cover post caption should show the clean
-   title and the ➲ Tags line.
+1. Drop onto repo, commit, push → ScraperBot redeploys.
+2. Watch boot log: "db warmup finished" should appear AFTER the server is
+   already answering /healthz; Render deploy should go green first try.
+3. Next phases log "freshness filter: N/M sorts still fresh — skipped".
+4. Add the UptimeRobot monitor above.
 ================================================================================

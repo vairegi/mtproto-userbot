@@ -316,3 +316,31 @@ Menou] Hitozuma to Shounen ... (Hitozuma Club Glass no Kutsu) [English]
 {Zombii}" → "Hitozuma to Shounen Hirusagari no Yuuwaku | Married Woman
 and Boy: Early Afternoon Temptation". Affects NEW cover posts only —
 already-posted captions in the channels are unchanged.
+
+v1.22.4 (2026-08-29): ScraperBot stability + bandwidth. 1) Mongo index
+ensure + Turso bootstrap moved off the startup path into a background task
+(main.py _bg_db_warmup) — Render's 5s /healthz probe can no longer time
+out during boot (the Deploy-failed / Instance-failed loop). 2) OOM taming:
+raw search-page JSON released right after normalize + gc.collect() between
+pages. 3) Per-sort freshness scheduling: date=2h (pages 1-5, deep 1-15
+daily), popular-today=6h, popular-week=12h, popular=24h, tag:*=24h — all
+env-overridable (LIST_TICK_*_SEC). Phases skip fresh sorts entirely and
+the gap sleeps only until the next sort is due. 4) Channel dashboard shows
+an explicit idle line ("💤 idle — all sorts fresh") between phases instead
+of a frozen "Now:" row. UptimeRobot: monitor https://<service>/healthz
+GET every 5 min to prevent idle spindown (cannot fix crash loops — that
+was the deploy blocker this version fixes).
+
+v1.22.4 (2026-08-29): ScraperBot stability + bandwidth. 1) Mongo index
+ensure + Turso bootstrap moved off the startup path into a background task
+(main.py _bg_db_warmup) — Render's 5s /healthz probe can no longer time
+out during boot (the Deploy-failed / Instance-failed loop). 2) OOM taming:
+raw search-page JSON released right after normalize + gc.collect() between
+pages. 3) Per-sort freshness scheduling: date=2h (pages 1-5, deep 1-15
+daily), popular-today=6h, popular-week=12h, popular=24h, tag:*=24h — all
+env-overridable (LIST_TICK_*_SEC). Phases skip fresh sorts entirely and
+the gap sleeps only until the next sort is due. 4) Channel dashboard shows
+an explicit idle line ("💤 idle — all sorts fresh") between phases instead
+of a frozen "Now:" row. UptimeRobot: monitor https://<service>/healthz
+GET every 5 min to prevent idle spindown (cannot fix crash loops — that
+was the deploy blocker this version fixes).

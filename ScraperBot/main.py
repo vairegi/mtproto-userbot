@@ -54,21 +54,14 @@ async def _startup() -> None:
              bool(settings.mongo_uri),
              "yes" if settings.turso_url else "no")
 
-    # Warm up Mongo (lazy connect + indexes).
-    try:
-        mongo_client.cache_ensure_indexes()
-    except Exception as e:  # noqa: BLE001
-        log.warning("cache_ensure_indexes failed: %s", e)
-
-    # Bootstrap Turso schema if reachable.
-    try:
-        await turso_client.bootstrap_schema()
-        try:
-            await turso_schema.ensure_schema()
-        except Exception as e:
-            log.warning("turso schema migration failed (non-fatal): %s", e)
-    except Exception as e:  # noqa: BLE001
-        log.warning("turso bootstrap failed: %s", e)
+    # v1.22.4: Mongo index creation + Turso bootstrap can block for tens of
+    # seconds on a cold Atlas connection. They used to run inline here,
+    # stalling the event loop so Render's 5s /healthz probe timed out mid-boot
+    # (the "Deploy failed — timed out waiting for internal health check" and
+    # "Instance failed: HTTP health check timed out" events). Now they run in
+    # the background AFTER uvicorn is already serving — /healthz answers from
+    # the first second and Render never marks a boot as failed.
+    _tasks.append(asyncio.create_task(_bg_db_warmup(), name="db_warmup"))
 
     global _stop_event
     _stop_event = asyncio.Event()
@@ -101,6 +94,25 @@ async def _startup() -> None:
                  [t.get_name() for t in _tasks])
     else:
         log.error("Sweepers NOT started — missing MONGO_URI or TURSO_DATABASE_URL")
+
+
+async def _bg_db_warmup() -> None:
+    """v1.22.4: non-blocking Mongo index ensure + Turso schema bootstrap."""
+    await asyncio.sleep(2)  # let uvicorn bind + first health checks pass
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, mongo_client.cache_ensure_indexes)
+    except Exception as e:  # noqa: BLE001
+        log.warning("cache_ensure_indexes failed: %s", e)
+    try:
+        await turso_client.bootstrap_schema()
+        try:
+            await turso_schema.ensure_schema()
+        except Exception as e:
+            log.warning("turso schema migration failed (non-fatal): %s", e)
+    except Exception as e:  # noqa: BLE001
+        log.warning("turso bootstrap failed: %s", e)
+    log.info("db warmup finished (mongo indexes + turso schema)")
 
 
 async def _webhook_keeper() -> None:

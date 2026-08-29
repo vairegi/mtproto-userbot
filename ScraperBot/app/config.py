@@ -112,6 +112,26 @@ class Settings:
     # visible win. Env-overridable via LIST_TAG_MAX_PAGES.
     list_tag_max_pages: int = _env_int("LIST_TAG_MAX_PAGES", 7)
     list_tick_sec: int = _env_int("LIST_TICK_SEC", 21600)   # 6 hours
+
+    # v1.22.4: per-sort freshness scheduling. Instead of sweeping ALL sorts
+    # every phase, each sort runs only when its own interval has elapsed.
+    # Cadence matches how often each nhentai sort actually changes:
+    #   date          — new uploads every few minutes  → 2 h, deep crawl 24 h
+    #   popular-today — reshuffles a few times a day   → 6 h
+    #   popular-week  — slow drift                     → 12 h
+    #   popular       — all-time classics, near-static → 24 h
+    #   tag:<slug>    — trending tags drift weekly     → 24 h
+    # All overridable via env: LIST_TICK_DATE_SEC, LIST_TICK_POPULAR_TODAY_SEC,
+    # LIST_TICK_POPULAR_WEEK_SEC, LIST_TICK_POPULAR_SEC, LIST_TICK_TAG_SEC,
+    # LIST_DATE_DEEP_PAGES / LIST_DATE_DEEP_SEC.
+    list_tick_date_sec: int = _env_int("LIST_TICK_DATE_SEC", 7200)          # 2 h
+    list_tick_popular_today_sec: int = _env_int("LIST_TICK_POPULAR_TODAY_SEC", 21600)   # 6 h
+    list_tick_popular_week_sec: int = _env_int("LIST_TICK_POPULAR_WEEK_SEC", 43200)     # 12 h
+    list_tick_popular_sec: int = _env_int("LIST_TICK_POPULAR_SEC", 86400)   # 24 h
+    list_tick_tag_sec: int = _env_int("LIST_TICK_TAG_SEC", 86400)           # 24 h
+    list_date_shallow_pages: int = _env_int("LIST_DATE_SHALLOW_PAGES", 5)
+    list_date_deep_pages: int = _env_int("LIST_DATE_DEEP_PAGES", 15)
+    list_date_deep_sec: int = _env_int("LIST_DATE_DEEP_SEC", 86400)         # deep crawl daily
     list_delay_sec: float = _env_float("LIST_DELAY_SEC", 1.0)
     # Sleep after a bucket-skip. Short (1s) matches BOT 0 — the bucket is
     # the throttle, not this sleep.
