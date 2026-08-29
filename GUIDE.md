@@ -344,3 +344,16 @@ an explicit idle line ("💤 idle — all sorts fresh") between phases instead
 of a frozen "Now:" row. UptimeRobot: monitor https://<service>/healthz
 GET every 5 min to prevent idle spindown (cannot fix crash loops — that
 was the deploy blocker this version fixes).
+
+v1.22.6 (2026-08-29): 1) Mini App gray "›" next button after page 2 — REAL
+fix. The aggregation loop in scraper_bridge.py stops the instant
+collected == window size (page 2 = upstream pages 1+2 = 50 = exactly
+start_offset+per_page), so the cushion-based has_more was always False.
+New: after slicing the window we probe the NEXT chip cache key
+(search:<sort>:page<upstream_page>) in Turso — one cheap GET, stale rows
+count under USE_OLD_CACHE — and OR that into has_more. 2) Dedup-sweep DM
+spam: dedup_cron._is_real_error now treats pymongo network/serverSelection
+timeouts as transient (Atlas M0 idle-closes connections; the next sweep
+reconnects) — no more identical "🧹 Dedup sweep ⚠ timed out" DMs every
+12h. Real errors still alert. v1.22.5 USE_OLD_CACHE confirmed live in
+Render log (CACHE HIT pages 1+2 on every sort).

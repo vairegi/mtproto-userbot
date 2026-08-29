@@ -1,46 +1,43 @@
 ================================================================================
-GUIDE_APPEND — v1.22.5 (USE_OLD_CACHE + Try Searching These trending hints)
+GUIDE_APPEND — v1.22.6 (gray next-button REAL fix + dedup DM-spam fix)
 Shipped: 2026-08-29
 ================================================================================
 
 WHAT CHANGED
 
-1. miniapp/backend/app/services/scraper_bridge.py
-   Chip/sort Turso reads now use allow_stale=True by default. The cache
-   rows are never deleted (cache-never-expires design), but reads were
-   gated on TTL freshness — aged rows read as MISSes, the upstream
-   nhentai fallback was 429-backoffd, has_more flipped False, and the
-   Mini App next button grayed out after page 2. Serving stale rows
-   keeps pagination alive; ScraperBot refreshes rows on schedule anyway.
-   Env toggle: USE_OLD_CACHE=0 restores the old strict-fresh behavior.
+1. miniapp/backend/app/services/scraper_bridge.py — THE GRAY BUTTON FIX.
+   Root cause found in your Render log: page-2 requests returned
+   "TURSO CACHE HIT page1 + page2" and STOPPED. The aggregation loop's
+   condition `while len(collected) < want_total` exits as soon as the
+   requested window is fillable — page 2 needs upstream pages 1+2, i.e.
+   exactly 50 cards, i.e. exactly start_offset+per_page — so the old
+   cushion check `len(collected) > start_offset+per_page` could never be
+   true and has_more was always False. v1.22.5's stale-read fix was
+   necessary but not sufficient.
+   Fix: after slicing the window, probe the NEXT chip cache key
+   (search:<sort>:page<upstream_page>) directly in Turso. One GET; stale
+   rows count when USE_OLD_CACHE=1. If the row exists and is non-empty,
+   has_more=True and the › button stays lit for every warmed page.
+   Only applies to chip/empty-query browses (the Discover sort tabs);
+   typed searches keep their old behavior.
 
-2. miniapp/backend/app/routes/trending.py
-   New endpoint GET /api/trending/scraper-tags?limit=10 — returns the
-   trending tag list ScraperBot (BOT 1) scrapes every 24h from nhentai
-   popular-today (Mongo scraper1_state, _id="trending_tags"). Fail-open:
-   items=[] on any error.
-
-3. miniapp/frontend/js/pages/search.js
-   The "Try:" hint row below the search bar now reads
-   "Try Searching These:" followed by tappable tag:<slug> chips fed by
-   the new endpoint. Tapping one fills the search box and searches.
-   If the endpoint returns nothing, the original static hints show.
-   Import of home-rows.js bumped to ?v=1.22.5 (importmap trailing-slash
-   mappings cannot carry versions — every changed file must bump at its
-   import sites; detail-sheet.js and registry.js needed no bumps since
-   they are unchanged / unversioned).
+2. miniapp/backend/app/services/dedup_cron.py — DM SPAM FIX.
+   Your DMs showed "🧹 Dedup sweep ⚠ mongo sweep raised: ...27017: timed
+   out" every 12h. Atlas free-tier (M0) idle-closes connections; one
+   cursor timing out is transient — the next sweep reconnects. The alert
+   classifier now filters pymongo NetworkTimeout / ServerSelectionTimeout
+   / "timed out" messages out of the wake-the-admin path. Real errors
+   (auth failures, write errors, anything non-timeout) still alert.
 
 FILES IN THIS ZIP
    miniapp/backend/app/services/scraper_bridge.py   PATCH
-   miniapp/backend/app/routes/trending.py           PATCH
-   miniapp/frontend/js/pages/search.js              PATCH
+   miniapp/backend/app/services/dedup_cron.py       PATCH
    GUIDE.md / GUIDE_APPEND.txt                      DOCS
 
 DEPLOY STEPS
 1. Drop onto repo, commit, push → Bot 0 (miniapp) redeploys on Render.
-2. Open the Mini App: the hint row shows trending tags scraped by Bot 1.
-3. Discover page: navigate past page 2 on every sort — the › button
-   should stay active (rows are served from cache even when stale).
-4. Optional: set USE_OLD_CACHE=0 on the Bot 0 Render env if you ever
-   want strict-fresh reads back.
+2. Open the Mini App Discover tab → go to page 2 of any sort → the ›
+   button should now be ACTIVE and page 3 should load from cache.
+3. Dedup sweeps continue every 12h but only DM you when something real
+   breaks (or when dupes are actually removed).
 ================================================================================

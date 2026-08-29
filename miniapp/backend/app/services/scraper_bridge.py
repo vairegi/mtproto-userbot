@@ -950,15 +950,39 @@ def search(q: str, page: int, sort: str, lang: str,
     window = collected[start_offset:start_offset + per_page]
     items = [_normalize(r) for r in window]
 
+    # v1.22.6: honest has_more via a cache lookahead probe.
+    # Previously the loop stopped the moment `collected` reached the
+    # window size (e.g. page 2 = 50 cards from upstream pages 1+2), so
+    # the cushion check `len(collected) > start_offset+per_page` was
+    # ALWAYS false and the Mini App grayed the › button after page 2
+    # even when Turso already held pages 3–30 warm. Now we probe the
+    # NEXT upstream cache key directly: if it exists (fresh OR stale under
+    # USE_OLD_CACHE), we know more pages exist. Cheap: one Turso GET.
+    _lookahead_has_more = False
+    try:
+        if len(items) == per_page and q_clean in ("", "english", "language:english"):
+            _nhc = _sb_turso_cache()
+            if _nhc is not None:
+                _next_key = f"search:{(sort or 'popular').strip().lower()}:page{upstream_page}"
+                _allow_stale = os.environ.get("USE_OLD_CACHE", "1").strip() not in (
+                    "0", "false", "no")
+                _peek = _nhc.get(_next_key, allow_stale=_allow_stale)
+                if isinstance(_peek, list) and _peek:
+                    _lookahead_has_more = True
+    except Exception:  # noqa: BLE001
+        pass
+
     if not _return_meta:
         return items
     return {
         "items": items,
         # has_more: we EITHER filled the window AND some upstream cushion
         # remains, OR we didn't fill it but had to give up early due to
-        # 429s (client can retry). Both signals produce a truthful button.
+        # 429s (client can retry), OR the next-page cache probe found
+        # more (the v1.22.6 lookahead fix). Any signal produces a truthful button.
         "has_more": (
             len(collected) > start_offset + per_page
+            or _lookahead_has_more
             or bool(rate_limited_pages)
             or (upstream_page > max_upstream and len(items) == per_page)
         ),

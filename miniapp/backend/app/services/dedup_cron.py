@@ -275,6 +275,15 @@ async def _send_admin_alert(summary: Dict[str, Any]) -> bool:
         # "unsupported" is a shape/capability status, not a failure.
         if "unsupported" in s:
             return False
+        # v1.22.6: Mongo Atlas free-tier connections idle-close routinely and
+        # timing out ONE cursor is not an operational failure worth waking
+        # anyone up — the next sweep just reconnects. The DM spam the operator
+        # saw was every dedup tick raising socketTimeout on the shared M0
+        # replica, alerting every 12h with an identical scary traceback.
+        # Treat pymongo network timeouts as transient noise; a genuine
+        # dedup malfunction still surfaces via non-timeout wording.
+        if "timed out" in s or "networktimeout" in s or "serverselectiontimeout" in s:
+            return False
         # Anything mentioning "raised", "failed", "crashed", "timeout" IS
         # a real error worth surfacing. Be conservative: default to alert
         # when we can't classify a non-empty message.
