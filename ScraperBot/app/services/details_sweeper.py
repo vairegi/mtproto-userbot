@@ -14,6 +14,16 @@ State (Mongo `scraper1_state`):
   * details_cursor        — {sort_idx, page}  round-robin position
   * details_last_run      — unix ts
   * details_stats         — {sweeps, writes, skips, errors, hits}
+
+v12.48 (sync-audit) — F3:
+  _gallery_is_fresh() honours the shared canonical never-expire sentinel
+  (expires_at == 0). Bot 0's mini-app reader already treats 0 as fresh,
+  the contract in common/turso_cache/normalize.py §7 documents 0 as the
+  never-expire sentinel, and Bot 2's meta.py doesn't inspect expires_at
+  at all — BOT 1 was the ONE outlier that read 0 as expired. Live pre-fix:
+  4,413 of 11,325 gallery:* rows carry expires_at=0; the sweeper used to
+  re-fetch and rewrite ALL of them once per round-robin sweep, burning
+  the shared 10/min nhentai bucket for zero user benefit.
 """
 from __future__ import annotations
 
@@ -145,15 +155,41 @@ def _coerce_epoch(v: Any) -> float:
         return 0.0
 
 
+def _cache_row_is_fresh(row: Optional[Dict[str, Any]], now: float) -> bool:
+    """v12.48 (F3): canonical-contract-aware freshness check.
+
+    A cache row is fresh if the payload is present AND either:
+      * expires_at is exactly 0 (never-expire sentinel, per contract §7), OR
+      * expires_at is a future epoch.
+
+    A row with expires_at absent / non-numeric / negative behaves like the
+    pre-fix expired path (no false-fresh reads of malformed legacy rows).
+    """
+    if not row:
+        return False
+    if not row.get("payload"):
+        return False
+    exp = row.get("expires_at")
+    # Exactly-zero sentinel: accept ONLY when the column was explicitly
+    # stamped 0 (int or float). Missing / None / strings do not count as
+    # the sentinel — they behave like the old "expired" path.
+    if isinstance(exp, (int, float)) and float(exp) == 0.0:
+        return True
+    return _coerce_epoch(exp) > now
+
+
 async def _gallery_is_fresh(gid: str) -> bool:
-    """True if gallery:<id> is present AND not expired in either backend."""
+    """True if gallery:<id> is present AND not expired in either backend.
+
+    v12.48 (F3): sentinel-aware via _cache_row_is_fresh().
+    """
     key = cache.gallery_key(gid)
     now = time.time()
     hit = await turso_client.get(key)
-    if hit and _coerce_epoch(hit.get("expires_at")) > now:
+    if _cache_row_is_fresh(hit, now):
         return True
     m = mongo_client.cache_get_mongo(key)
-    if m and _coerce_epoch(m.get("expires_at")) > now:
+    if _cache_row_is_fresh(m, now):
         return True
     return False
 
