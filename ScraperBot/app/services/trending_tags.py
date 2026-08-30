@@ -22,6 +22,15 @@ slugs. Cached in Mongo under `scraper1_state` for
 
 Fail-open: any fetch/parse error returns the stale cache (or [] if cold).
 The sweeper always keeps manual EXTRA_TAG_SORTS on top of these.
+
+v1.24 (English-only enforcement — 2026-08-30):
+  The /galleries listing endpoint does not accept a `query` param, so
+  server-side language filtering is impossible on this harvest path.
+  Instead we filter CLIENT-SIDE: every sampled detail response's tag list
+  is checked for a language tag, and only galleries tagged
+  language=english contribute to the frequency tally. Non-English
+  galleries no longer steer the trending-tag ranking, which in turn
+  stops non-English tag pages from being swept by list_sweeper.
 """
 from __future__ import annotations
 
@@ -46,10 +55,35 @@ _DETAIL_SAMPLE = 6     # galleries per page to open for tag names
 _LIST_DELAY = 1.2      # be gentle with upstream
 
 
+def _english_only() -> bool:
+    """Env-gated (ENGLISH_ONLY, default true). getattr-guarded so a stale
+    config.py without the new field can never crash this module."""
+    return bool(getattr(settings, "english_only", True))
+
+
+def _gallery_is_english(tags: object) -> bool:
+    """True if the tag list carries language=english (or no language tag
+    at all — very old rows may lack one; treat those as acceptable rather
+    than dropping the sample entirely)."""
+    if not isinstance(tags, list):
+        return True
+    langs = [
+        str(t.get("name") or "").strip().lower()
+        for t in tags
+        if isinstance(t, dict) and str(t.get("type", "")).lower() == "language"
+    ]
+    if not langs:
+        return True
+    return "english" in langs
+
+
 async def _fetch_gallery_names(c: httpx.AsyncClient, gid: int,
                                headers: dict, counts: Counter) -> None:
     """One /galleries/<id> call — the DETAIL response carries full tag
-    dicts [{id, type, name, ...}]. We tally names of type=='tag'."""
+    dicts [{id, type, name, ...}]. We tally names of type=='tag'.
+
+    v1.24: non-English galleries are skipped entirely when ENGLISH_ONLY
+    is on (default) so they cannot steer the trending-tag ranking."""
     try:
         r = await c.get(f"{_API}/galleries/{gid}", headers=headers)
     except httpx.HTTPError:
@@ -60,7 +94,10 @@ async def _fetch_gallery_names(c: httpx.AsyncClient, gid: int,
         d = r.json()
     except Exception:
         return
-    for tag in (d.get("tags") or []):
+    tags = d.get("tags") or []
+    if _english_only() and not _gallery_is_english(tags):
+        return
+    for tag in tags:
         if (isinstance(tag, dict)
                 and str(tag.get("type", "")).lower() == "tag"):
             name = str(tag.get("name") or "").strip().lower()

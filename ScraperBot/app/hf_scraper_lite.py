@@ -14,6 +14,17 @@ Anon quotas (per openapi.json):
 
 We share the token bucket with BOT 0 via Mongo (`nhentai_bucket`), so the
 two processes never race the quota.
+
+v1.24 (English-only enforcement — 2026-08-30):
+  Chip pages (empty query) already sent query=language:english, but TAG
+  pages (trending tags + EXTRA_TAG_SORTS) sent their query verbatim —
+  `tag:<slug>` with no language filter — so every tag sweep cached
+  non-English galleries into Turso, which Bot 2 then downloaded as PDFs.
+  Fix: when settings.english_only is on (default true), every non-empty
+  query gets ` language:english` appended unless it already carries an
+  explicit language filter. The TURSO CACHE KEY is computed from the
+  user's raw query in list_sweeper (not from this upstream query), so
+  key parity with BOT 0 is unaffected.
 """
 from __future__ import annotations
 
@@ -29,6 +40,17 @@ log = logging.getLogger("scraperbot.scraper")
 
 BASE_URL = "https://nhentai.net"
 API_URL = f"{BASE_URL}/api/v2"
+
+# v1.24: the English-language query token. Appending it to any /search
+# query restricts results to English galleries (nhentai supports compound
+# queries, e.g. "tag:incest language:english").
+_ENGLISH_GUARD = "language:english"
+
+
+def _english_only() -> bool:
+    """Env-gated (ENGLISH_ONLY, default true). getattr-guarded so a stale
+    config.py without the new field can never crash the scraper."""
+    return bool(getattr(settings, "english_only", True))
 
 
 def _headers() -> Dict[str, str]:
@@ -92,9 +114,9 @@ async def fetch_search_page(
     page: int = 1,
 ) -> Dict[str, Any]:
     """One listing call. Routes by query (matches BOT 0's hf_scraper.py):
-        * empty query  → GET /api/v2/galleries?sort=<s>&page=<p>
+        * empty query  → GET /api/v2/search?query=language:english&sort=<s>&page=<p>
           (v1.0 used /search?query=&… and got 400s; nhentai rejects an
-          empty `query` string. /galleries is the correct empty-query path.)
+          empty `query` string.)
         * non-empty    → GET /api/v2/search?query=<q>&sort=<s>&page=<p>
     Returns the raw JSON blob so we cache upstream verbatim."""
     q = (query or "").strip()
@@ -103,6 +125,11 @@ async def fetch_search_page(
         "page": int(page or 1),
     }
     if q:
+        # v1.24: enforce English-only on tag/typed queries. A query that
+        # already carries an explicit language filter is respected as-is
+        # (never double-append).
+        if _english_only() and "language:" not in q.lower():
+            q = f"{q} {_ENGLISH_GUARD}"
         params["query"] = q
         return await _get_json(client, "/search", params)
     # v12.33c (pagination bug fix): the empty-query path previously used
@@ -113,7 +140,7 @@ async def fetch_search_page(
     # query=language:english (the app's English-only spirit; mirrors BOT 0's
     # scraper_bridge empty-query fallback which uses query=english) and the
     # /search endpoint which DOES honor sort + page.
-    params["query"] = "language:english"
+    params["query"] = _ENGLISH_GUARD
     return await _get_json(client, "/search", params)
 
 

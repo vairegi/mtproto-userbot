@@ -196,6 +196,12 @@ class Settings:
 
     # Trending-tag auto-discovery — scrapes nhentai.net/tags/popular HTML
     # once every trending_tags_refresh_sec to pick up the current top N.
+    # v1.24 (2026-08-30): English-only enforcement for BOT 1 scraping.
+    # When true (default), hf_scraper_lite appends "language:english" to
+    # every non-empty /search query (tag pages + typed queries), and
+    # trending_tags harvests only English-tagged galleries. Set
+    # ENGLISH_ONLY=0 to revert to the pre-v1.24 all-languages behavior.
+    english_only: bool = _env_bool("ENGLISH_ONLY", True)
     trending_tags_enabled: bool = _env_bool("TRENDING_TAGS_ENABLED", True)
     trending_tags_top_n: int   = _env_int("TRENDING_TAGS_TOP_N", 10)
     trending_tags_refresh_sec: int = _env_int("TRENDING_TAGS_REFRESH_SEC", 24 * 3600)
