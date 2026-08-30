@@ -22,6 +22,22 @@ Design principles
    store them as strings because (a) other providers may use non-numeric
    IDs later, (b) MongoDB _id equality survives int/str drift, and (c)
    Python's dict + Mongo's document model both prefer strings for IDs.
+
+v12.48 (sync-audit) — F2 + F6:
+  * F2  _is_stale_processing now honours Bot 2's `claim_expires` field in
+        addition to Bot 0's `started_at` clock. A doc whose `claim_expires`
+        is still in the future is treated as fresh even if `started_at`
+        crossed the stale threshold, which prevents Bot 0's dedup gate
+        from ripping a still-active Bot 2 claim out from under it (the
+        double-download race). Conversely, if a claim expires by either
+        clock, the doc is stale — Bot 0 can adopt it.
+  * F6  Fresh PROCESSING inserts (dedup_check + stale reset) now stamp
+        `source`, `updated_at`, and `claim_expires` so Bot 2's schema-
+        sensitive claimer sees a doc it can reclaim if this pipeline
+        wedges. requested_by/tags/cover_url continue to work the same way.
+  * Adds source= parameter to dedup_check (defaults to "bot0") so admin/
+        worker callers can distinguish who authored the claim without
+        breaking the existing keyword-only signature.
 """
 
 from __future__ import annotations
@@ -142,13 +158,50 @@ def get(conn: db.MongoHandle, gallery_id: str) -> Optional[Dict[str, Any]]:
     return conn.galleries.find_one({"_id": str(gallery_id)})
 
 
+def _coerce_float(v: Any) -> float:
+    """Never raises; unknown/None/non-numeric -> 0.0."""
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _is_stale_processing(doc: Dict[str, Any]) -> bool:
+    """v12.48 (F2): unify the two writers' staleness signals.
+
+    A PROCESSING doc is fresh if EITHER writer's clock says it is:
+      * Bot 2 shape — `claim_expires` >= now (an active lease)
+      * Bot 0 shape — time since `started_at` (fallback `claimed_at`/
+        `created_at`) is still within MINIAPP_STALE_PROCESSING_S
+
+    A doc is stale if BOTH signals say so, OR if none of the timestamps
+    are present at all (an obviously stuck doc from a crashed writer).
+    """
     if not doc or doc.get("status") != STATUS_PROCESSING:
         return False
-    started = float(doc.get("started_at") or doc.get("created_at") or 0.0)
-    if started <= 0:
-        return True   # doc has no timestamp → treat as stuck
-    return (time.time() - started) > _stale_processing_seconds()
+    now = time.time()
+
+    # Bot 2 signal — an unexpired claim lease keeps the doc fresh regardless
+    # of started_at, so Bot 0 never rips an in-flight Bot 2 job.
+    exp = doc.get("claim_expires")
+    if exp is not None:
+        exp_f = _coerce_float(exp)
+        if exp_f >= now:
+            return False       # fresh by Bot 2's clock
+        # exp_f < now → expired; still fall through to the started_at check;
+        # only reject the doc as stale if the Bot 0 clock ALSO agrees, or if
+        # there's no started_at at all.
+
+    started = _coerce_float(doc.get("started_at")) \
+        or _coerce_float(doc.get("claimed_at")) \
+        or _coerce_float(doc.get("created_at"))
+    if started <= 0.0:
+        return True    # doc has no usable timestamp → treat as stuck
+    return (now - started) > _stale_processing_seconds()
 
 
 def dedup_check(
@@ -158,6 +211,7 @@ def dedup_check(
     url: str = "",
     url_hash: str = "",
     requested_by: Optional[int] = None,
+    source: str = "bot0",
 ) -> DedupDecision:
     """The single entry point for "should this request do any work?".
 
@@ -177,6 +231,7 @@ def dedup_check(
     """
     gid = str(gallery_id)
     now = time.time()
+    stale_s = float(_stale_processing_seconds())
 
     existing = get(conn, gid)
 
@@ -213,11 +268,17 @@ def dedup_check(
     if existing and existing.get("status") == STATUS_PROCESSING:
         if _is_stale_processing(existing):
             # Reset stale processing atomically, then proceed as if new.
+            # v12.48 (F6): also stamp claim_expires/source/updated_at so
+            # Bot 2's schema-sensitive claimer can see this new claim if
+            # it needs to reclaim it later.
             reset = conn.galleries.find_one_and_update(
                 {"_id": gid, "status": STATUS_PROCESSING},
                 {"$set": {
                     "status": STATUS_PROCESSING,
                     "started_at": now,
+                    "claim_expires": now + stale_s,
+                    "source": str(source or "bot0"),
+                    "updated_at": now,
                     "url": url or existing.get("url", ""),
                     "url_hash": url_hash or existing.get("url_hash", ""),
                 }},
@@ -254,14 +315,21 @@ def dedup_check(
         ]
     }
 
+    # v12.48 (F6): fresh docs carry the union of both writers' fields so
+    # a later Bot 2 claim() (via cross-writer stale reclaim) doesn't need
+    # to heal missing keys before it can proceed.
     fresh_doc = {
         "_id": gid,
         "gallery_id": gid,
         "url": url,
         "url_hash": url_hash,
         "status": STATUS_PROCESSING,
+        "source": str(source or "bot0"),
         "created_at": now,
         "started_at": now,
+        "claimed_at": now,
+        "claim_expires": now + stale_s,
+        "updated_at": now,
         "completed_at": None,
         "failed_reason": "",
         "requested_by": [int(requested_by)] if requested_by else [],
@@ -274,7 +342,8 @@ def dedup_check(
         except Exception as e:  # noqa: BLE001 — likely DuplicateKey (another worker beat us)
             log.info("insert race for gallery_id=%s (%s); re-checking", gid, e)
             return dedup_check(
-                conn, gid, url=url, url_hash=url_hash, requested_by=requested_by,
+                conn, gid, url=url, url_hash=url_hash,
+                requested_by=requested_by, source=source,
             )
         return DedupDecision(action="proceed", gallery_id=gid, status=STATUS_PROCESSING)
 
@@ -286,6 +355,10 @@ def dedup_check(
             "url": url or existing.get("url", ""),
             "url_hash": url_hash or existing.get("url_hash", ""),
             "started_at": now,
+            "claimed_at": now,
+            "claim_expires": now + stale_s,
+            "source": str(source or "bot0"),
+            "updated_at": now,
             "failed_reason": "",
             "completed_at": None,
         }},
@@ -296,7 +369,8 @@ def dedup_check(
         return DedupDecision(action="proceed", gallery_id=gid, status=STATUS_PROCESSING,
                              reason=f"retry after {existing.get('status')}")
     # Someone else changed the state between our read and update — recurse.
-    return dedup_check(conn, gid, url=url, url_hash=url_hash, requested_by=requested_by)
+    return dedup_check(conn, gid, url=url, url_hash=url_hash,
+                       requested_by=requested_by, source=source)
 
 
 def _append_requester(
@@ -331,9 +405,12 @@ def mark_completed(
     job_id: Optional[int] = None,
 ) -> None:
     """Move a PROCESSING doc to COMPLETED and stamp delivery details."""
-    updates = {
+    now = time.time()
+    updates: Dict[str, Any] = {
         "status": STATUS_COMPLETED,
-        "completed_at": time.time(),
+        "gallery_id": str(gallery_id),       # v12.48 (F6): always stamp
+        "completed_at": now,
+        "updated_at": now,                    # v12.48 (F6): always stamp
         "failed_reason": "",
     }
     if title is not None:           updates["title"] = title
@@ -356,9 +433,12 @@ def mark_partial(
     reason: str = "cover-less delivery",
     job_id: Optional[int] = None,
 ) -> None:
-    updates = {
+    now = time.time()
+    updates: Dict[str, Any] = {
         "status": STATUS_PARTIAL,
-        "completed_at": time.time(),
+        "gallery_id": str(gallery_id),      # v12.48 (F6)
+        "completed_at": now,
+        "updated_at": now,                   # v12.48 (F6)
         "failed_reason": reason,
     }
     if db_pdf_msg_id is not None: updates["db_pdf_msg_id"] = int(db_pdf_msg_id)
@@ -385,12 +465,15 @@ def mark_failed(
     if purge:
         conn.galleries.delete_one({"_id": str(gallery_id)})
         return
+    now = time.time()
     conn.galleries.update_one(
         {"_id": str(gallery_id)},
         {"$set": {
             "status": status,
+            "gallery_id": str(gallery_id),   # v12.48 (F6)
             "failed_reason": (reason or "")[:500],
-            "completed_at": time.time(),
+            "completed_at": now,
+            "updated_at": now,                # v12.48 (F6)
         }},
         upsert=False,
     )

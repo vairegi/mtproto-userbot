@@ -1,30 +1,182 @@
 ================================================================================
-GUIDE_APPEND — v1.23.0 re-ship (dashboard countdowns — the missing half)
-Shipped: 2026-08-30
+GUIDE_APPEND — v12.48  Sync-Audit Fixes (F1–F8)
+Ships in one drag-and-drop zip; supersedes GUIDE_APPEND.txt from the repo.
+Base commit audited: 722280f (2026-08-30, "Add files via upload").
 ================================================================================
 
-WHY THIS EXISTS
-The v1.23.1 combined zip contained TWO changes: the mongo_client.py leak
-fix and the channel_dashboard.py countdowns. Your repo has the leak fix
-(verified: socketTimeoutMS=20000 + _STATE_INFLIGHT present) but the
-dashboard file never made it in — so the log-channel message rendered
-without the "· in Xh Ym" / "· due now" suffixes.
+WHY (short version)
+-------------------
+Full 3-bot sync audit against production Turso + Mongo revealed:
+  * 14,161 galleries docs, 11,325 gallery:* Turso rows, 5,192 chip rows +
+    3,950 typed-search rows — canonical Turso contract is HEALTHY (all
+    live gallery: and search: payloads match v12.47 shape).
+  * REAL cross-bot bugs live in the shared Mongo galleries collection and
+    two Bot 1 / Bot 2 read paths:
+      P0-1  Bot 2's "recent-first" queue was silently dead — canonical
+            list-shaped search payloads returned 0 ids from the extractor.
+      P0-2  Two incompatible "stale PROCESSING" definitions produced a
+            livelock (Bot 2 could NEVER adopt Bot 0's 14 stuck docs, some
+            ~23 days old) AND a double-download race (Bot 0 rip-and-reset
+            of a still-active Bot 2 claim).
+      P0-3  Bot 1's details_sweeper treated the never-expire sentinel
+            (expires_at=0) as expired — 4,413 gallery rows re-fetched
+            every sweep, burning shared 10/min nhentai bucket.
+      P1-4  Bot 2 full-table scan of nhentai_cache every ~5min ≈ 98M
+            row-reads/month on a 500M/mo free tier.
+      P1-5  note_bot2_no_images's blind upsert could create a status-less
+            orphan doc that wedged the claimer permanently.
+      P1-6  Two writers stamped mutually incompatible doc shapes (Bot 0
+            wrote gallery_id/url_hash/requested_by; Bot 2 wrote source/
+            claim_expires — no field overlap).
+      P1-7  Vendored __init__.py docstring drift (harmless but visible).
+      P2-8  6 dead Turso tables re-created on every ScraperBot bootstrap.
 
-WHAT THIS ZIP CONTAINS (one file)
-   ScraperBot/app/services/channel_dashboard.py — the countdown block:
-   every sort/tag row gains "· in 2h 5m" (or "· due now") computed from
-   the same list_sort_last:<sort> stamps + _sort_interval map that the
-   v1.22.4 per-sort scheduler uses, so display always matches behavior:
-       date → 2h · popular-today → 6h · popular-week → 12h
-       popular → 24h · tag:<slug> → 24h
-   Nothing else in the dashboard layout was touched (per operator
-   request — countdowns only, no risky restyle).
 
-   Plus GUIDE.md / GUIDE_APPEND.txt docs.
+WHAT'S IN THIS ZIP
+------------------
+Complete patched files at their repo-relative paths (drag onto repo):
 
-DEPLOY STEPS
-1. Drop onto repo, commit, push → scraperbackup redeploys.
-2. Within ~15s of boot the pinned message gains countdowns on every row.
-3. Sorts never swept since v1.22.4 shipped show "due now" until their
-   first run — correct behavior, not a bug.
+  Bot2Fetcher/app/turso_store.py                (F1, F4)
+  Bot2Fetcher/app/mongo_state.py                (F2, F5, F6)
+  gallery_state.py                              (F2, F6)
+  ScraperBot/app/services/details_sweeper.py    (F3)
+  ScraperBot/app/services/turso_schema.py       (F8)
+  common/turso_cache/__init__.py                (F7 docstring)
+  ScraperBot/app/turso_cache/__init__.py        (F7 docstring)
+  Bot2Fetcher/app/turso_cache/__init__.py       (F7 docstring)
+  tests/test_sync_audit_v12_48.py               (NEW — 10 unit tests)
+  GUIDE_APPEND.txt                              (this file)
+
+
+PER-FIX DETAIL
+--------------
+F1 — Bot 2 turso_store: canonical-list search payload
+     list_recent_search_ids used `payload.get("result") if isinstance(dict)`,
+     but v1.16+ writes search:* as a LIST of card dicts. Result: 0 recent
+     ids extracted every scan cycle. New helper _extract_ids_from_search_
+     payload accepts list, dict-with-result, and legacy raw-v2 shapes. Also
+     logs the recent/popular counts so a silent 0 is now visible.
+
+F2 — Cross-writer stale reclaim (both sides)
+     Root cause: Bot 0 measured stale by started_at+900s; Bot 2 measured
+     stale by claim_expires<now. Docs from the OTHER writer had a missing
+     field and were never reclaimable.
+     * Bot 2 mongo_state._doc_is_stale is now lease-first: an unexpired
+       claim_expires keeps the doc fresh regardless of started_at (blocks
+       the double-download race), then falls back to newest of started_at
+       / claimed_at / created_at (adopts Bot 0's stuck docs).
+     * The reclaim in claim() switched from a fragile $or+$exists Mongo
+       predicate to the standard read-then-CAS pattern: decide staleness
+       in code, then take the claim atomically via a filter on OBSERVED
+       timestamp values. Concurrent updates naturally lose the CAS.
+     * Bot 0 gallery_state._is_stale_processing now respects Bot 2's
+       claim_expires lease as fresh (blocks the rip-out race from the
+       other direction).
+     * refresh_claim() now bumps started_at along with claim_expires so
+       Bot 0's clock also sees active jobs as fresh.
+
+F3 — Bot 1 sentinel-aware freshness
+     details_sweeper._gallery_is_fresh now delegates to a new
+     _cache_row_is_fresh helper. A row with expires_at exactly 0 (int/
+     float) is treated as fresh — matches the canonical contract §7,
+     Bot 0's miniapp reader, and Bot 2's silence on the field. Missing/
+     None/string expires_at values remain "expired" so legacy malformed
+     rows still get re-fetched.
+
+F4 — Bot 2 incremental scan
+     list_gallery_ids uses a per-instance watermark (max cached_at seen).
+     Every _FULL_RESCAN_EVERY cycles (default 12, ~1/hour) it does a full
+     walk; other cycles read only cached_at >= (wm - slack). Cuts steady-
+     state row-reads by two orders of magnitude while guaranteeing
+     recovery of missed rows on the next full pass.
+     Env knobs: BOT2_LIST_FULL_RESCAN_EVERY (default 12),
+                BOT2_LIST_WATERMARK_SLACK_S (default 60).
+
+F5 — note_bot2_no_images orphan-doc guard
+     Old code: find_one_and_update(upsert=True). If the doc had been
+     deleted, the $inc created a stub with `bot2_no_images_count:1`
+     and NO status — the claimer's fall-through then treated it as
+     "busy" forever. Fix: upsert=False; when there is no PROCESSING doc
+     to count against, write a proper FAILED_BOT2_ERROR tombstone
+     directly. Also backdates started_at to 0 alongside claim_expires=0
+     so Bot 0's clock agrees the claim is released.
+
+F6 — Doc-shape convergence
+     * Bot 2 claim() stamps gallery_id, url_hash, started_at, requested_by
+       (empty list) — the fields Bot 0 keys admin/dedup queries on.
+     * Bot 2 mark_completed accepts cover_url + tags + requested_by,
+       $addToSets requested_by (never clobbers Bot 0's list), stamps
+       gallery_id.
+     * Bot 2 mark_failed stamps gallery_id, failed_reason (Bot 0 shape),
+       and completed_at alongside failed_at.
+     * Bot 0 dedup_check now stamps source, claim_expires, claimed_at,
+       updated_at, gallery_id on every fresh/retryable PROCESSING insert
+       and on stale-reset. dedup_check() gained an optional source= kwarg
+       (defaults "bot0"; existing callers unaffected).
+     * Bot 0 mark_completed / mark_partial / mark_failed now stamp
+       gallery_id + updated_at on every terminal transition.
+
+F7 — Vendored __init__.py docstring alignment
+     All three copies now carry an identical explanatory docstring
+     describing the deliberate leading package-name divergence and
+     pointing at the parity test. Runtime imports unchanged. The parity
+     test (tests/test_turso_cache.py) already scopes byte-identity to
+     normalize.py + writer.py, both of which STILL md5-match across all
+     three copies (verified in the sandbox).
+
+F8 — Stop bootstrapping dead Turso tables
+     ScraperBot/app/services/turso_schema.py: _SCHEMA is now the empty
+     tuple. The six dead tables (cache, bm_cover, bot0_queue_tag,
+     bucket_replica, bot2_queue, bot2_done) are all 0-row on production
+     and unreferenced in code. The active schema tables (nhentai_cache,
+     nhentai_ratelimit, bot2_fetch_state) are still bootstrapped by
+     their own owners (turso_client.py, turso_store.ensure_schema, the
+     bucket module). Callers passing `extra=` DDL keep working.
+
+
+ONE-TIME RECOVERY (post-deploy)
+-------------------------------
+Run against production Mongo AFTER Bot 2 is redeployed with F2 to
+un-stick the pre-existing 14 stuck PROCESSING docs. Idempotent — Bot 2's
+scanner will now reclaim them automatically within one cycle, but this
+manual bump makes them all reclaimable within seconds:
+
+    db.galleries.updateMany(
+        { status: "PROCESSING",
+          $or: [
+            { claim_expires: { $exists: false } },
+            { claim_expires: { $lt: 0 } }
+          ] },
+        { $set: { claim_expires: 0 } }
+    )
+
+Alternately, just wait one Bot 2 scan cycle: they'll be adopted
+automatically once the deploy is live.
+
+
+VERIFICATION SIGNS (post-deploy, Render logs / probe)
+-----------------------------------------------------
+Bot 2:
+  * "list_gallery_ids: N galleries (mode=FULL, wm=..., cycle=1)" on cold
+    start, then "mode=DELTA" for 11 cycles, back to FULL every 12th.
+  * "list_recent_search_ids: N ids (recent=N1, popular=N2)" with N > 0
+    once search:date:* is warm — this was 0 pre-fix.
+  * `PROCESSING` count in count_by_status trends toward 0 within one scan.
+
+Bot 1:
+  * details sweep hit rate rises (rows with expires_at=0 no longer
+    trigger writes). Live pre-fix: ~4,413 wasted writes/sweep possible.
+
+Bot 0:
+  * No more "another worker is downloading this gallery" surfacing while
+    Bot 2 is actively delivering — the lease-aware _is_stale_processing
+    respects an active Bot 2 claim.
+
+
+TESTS
+-----
+    python3 tests/test_turso_cache.py          # canonical contract parity
+    python3 tests/test_sync_audit_v12_48.py    # F1/F2/F3/F5/F6 unit tests
+
+Both pass in the sandbox. Full-repo `python3 -m py_compile` is clean.
 ================================================================================
