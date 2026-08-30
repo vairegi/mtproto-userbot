@@ -373,15 +373,43 @@ def _render() -> str:
     trending_keys = [f"tag:{t}" for t in trending if isinstance(t, str) and t]
     tag_order = list(dict.fromkeys(configured + trending_keys + tags_seen))
 
+    # v1.23.0: next-scrape countdown per sort/tag. Reads the SAME
+    # `list_sort_last:<sort>` freshness stamps that list_sweeper's
+    # v1.22.4 scheduler consults, plus its interval map, so the countdown
+    # can never disagree with what the sweeper actually does.
+    try:
+        from .list_sweeper import _sort_interval as _ls_interval
+    except Exception:  # noqa: BLE001
+        _ls_interval = None
+
+    def _next_str(sort_key: str) -> str:
+        if _ls_interval is None:
+            return ""
+        try:
+            last = float(mongo_client.state_get(
+                f"list_sort_last:{sort_key}", 0) or 0)
+        except Exception:  # noqa: BLE001
+            last = 0.0
+        if not last:
+            return "due now"  # never swept — runs at next phase
+        remaining = int(last + _ls_interval(sort_key) - now)
+        if remaining <= 0:
+            return "due now"
+        h, rem = divmod(remaining, 3600)
+        mnt = rem // 60
+        return f"in {h}h {mnt}m" if h else f"in {mnt}m"
+
     per_cached = c.get("per_cached") or {}
     for s in core + tag_order:
         n = int(per_sort.get(s, 0))
         m = int(per_cached.get(s, 0))
         label = _label_for(s)
+        nxt = _next_str(s)
+        suffix = f" · {nxt}" if nxt else ""
         if m:
-            lines.append(f"➥ {label:<20} ▸ {n} new · {m} cached")
+            lines.append(f"➥ {label:<20} ▸ {n} new · {m} cached{suffix}")
         else:
-            lines.append(f"➥ {label:<20} ▸ {n}")
+            lines.append(f"➥ {label:<20} ▸ {n}{suffix}")
 
     lines.append(f"➥ Pages written: {int(c.get('search_pages', 0))}")
     lines.append(f"➥ Errors: {int(c.get('errors', 0))} · Skips: {int(c.get('skips', 0))}")
