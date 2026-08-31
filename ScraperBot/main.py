@@ -23,6 +23,7 @@ from app.routes import mount_all
 from app import mongo_client, turso_client
 from app.services import turso_schema
 from app.services import list_sweeper, details_sweeper, channel_dashboard
+from app.services import discovery_digest  # v1.25: daily 10:00 IST admin digest
 
 log = setup_logging("scraperbot")
 
@@ -102,6 +103,11 @@ async def _startup() -> None:
         _tasks.append(asyncio.create_task(
             _delayed(channel_dashboard.refresh_loop, 45, _stop_event),
             name="dashboard"))
+        # v1.25: daily admin digest (10:00 IST) — per sort/tag per page
+        # new-item counts. Zero scraping cost; observability only.
+        _tasks.append(asyncio.create_task(
+            _delayed(discovery_digest.run_forever, 50, _stop_event),
+            name="discovery_digest"))
         log.info("sweepers + dashboard spawned: %s",
                  [t.get_name() for t in _tasks])
     else:

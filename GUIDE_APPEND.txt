@@ -1,79 +1,74 @@
 ================================================================================
-GUIDE_APPEND — ScraperBot v1.24  English-Only Enforcement
-Ships in one drag-and-drop zip (BOT 1 files only — BOT 0 / BOT 2 untouched).
-Base commit: 8d60a95 (2026-08-30, v12.47-era repo).
+GUIDE_APPEND — ScraperBot v1.25 (2026-08-31)
+Page-cap reduction + per-page discovery tracking + daily 10:00 IST admin digest.
 ================================================================================
-
-WHY
----
-BOT 1 was caching non-English galleries into the shared Turso cache, and
-BOT 2 was then downloading PDFs for them. Root cause: only ONE of BOT 1's
-three fetch paths was language-filtered.
-
-  * Chip pages (empty query)  → already sent query=language:english.
-  * Tag pages (trending tags + EXTRA_TAG_SORTS) → sent `tag:<slug>`
-    VERBATIM with no language filter.  ← main leak
-  * Trending-tags discovery → hit /api/v2/galleries?sort=popular-today
-    with no filtering, so non-English galleries steered the tag ranking,
-    which then seeded non-English tag sweeps.
-
-Cache-key parity is SAFE: the Turso key is computed from the user's raw
-query inside list_sweeper (search:q=<tag>|sort=<s>|page=<N>), NOT from the
-upstream request, so BOT 0's typed-search lookups still hit the same keys.
-
 
 WHAT'S IN THIS ZIP
 ------------------
-  ScraperBot/app/hf_scraper_lite.py            (query guard)
-  ScraperBot/app/services/trending_tags.py     (client-side language filter)
-  ScraperBot/app/config.py                     (new ENGLISH_ONLY knob)
-  ScraperBot/tests/test_english_only.py        (NEW — unit tests)
-  GUIDE_APPEND.txt                             (this file)
+  ScraperBot/app/config.py                      — defaults: LIST_MAX_PAGES 30→20,
+                                                  LIST_TAG_MAX_PAGES 7→5; new
+                                                  BOT1_DIGEST_ENABLED /
+                                                  BOT1_DIGEST_TIME_IST knobs
+  ScraperBot/app/services/details_sweeper.py    — per-page discovery records
+                                                  + live 🆕 log lines
+  ScraperBot/app/services/discovery_digest.py   — NEW: daily admin broadcast
+  ScraperBot/main.py                            — spawn digest task (staggered)
+  ScraperBot/tests/test_v1_25_digest.py         — NEW: 6 test groups
+  GUIDE_APPEND.txt                              — this file
+
+All knobs stay env-overridable on Render — tune later without redeploying.
 
 
-DETAIL
-------
-1. hf_scraper_lite.fetch_search_page()
-   Non-empty queries now get ` language:english` appended when
-   settings.english_only is on, unless the query already carries an
-   explicit `language:` filter. nhentai supports compound queries
-   (e.g. "tag:incest language:english") so this is server-side filtering.
+BONUS ANSWERS (verified against deployed code)
+----------------------------------------------
+1) List sweeper re-fetching page 1 of popular: it REPLACES the whole page
+   payload (cache.put is a full upsert) on every scheduled pass — not a diff,
+   not a "only if new items" check. That's deliberate: nhentai has no
+   changes-feed, and popular-today ordering genuinely churns. Cost is tiny
+   (~7.6 KB/page); the expensive detail fetches are gated by the F3
+   freshness check, so unchanged galleries on that page are never re-fetched.
 
-2. trending_tags.refresh_if_needed()
-   /galleries cannot take a `query` param, so filtering is client-side:
-   each sampled detail's tags are checked for a `language` tag; galleries
-   whose language is not english (or missing — treated as acceptable) are
-   excluded from the frequency tally.
+2) Old items: they live on. Search pages are replaced wholesale, but every
+   gallery:* detail row persists independently in Turso until its 30-day TTL
+   expires (or never, for sentinel rows). Removing a gallery from a search
+   page does NOT delete its gallery:<id> row — the Mini App can still open
+   it via detail lookup, and Bot 2's scanner can still see it.
 
-3. config.py
-   New knob `english_only` (env ENGLISH_ONLY, default true). Set
-   ENGLISH_ONLY=0 on Render to revert to all-languages behavior without
-   a redeploy. Both modules getattr-guard the setting so a stale config
-   can never crash them.
+3) "Which page of which sort/tag found new items" — THIS ZIP. Every new
+   gallery fetched now logs `🆕 NEW gid=<id> found on <sort> page <n>` in
+   Render logs, plus a per-page summary `🆕 <sort> page <n> → N new
+   galleries fetched`. Both feed a 24h ring in dash_counters.per_page_new,
+   and every day at 10:00 IST the bot DMs each BOT1_ADMIN_USER_IDS a digest:
 
-No contract changes. No vendored turso_cache changes. No BOT 0 / BOT 2
-changes. Mongo/Turso schemas untouched.
+       📊 Daily discovery digest (last 24h)
+       popular-today — 12 new
+         · page 1: 9
+         · page 3: 3
+       tag:incest — 4 new
+         · page 2: 4
+       Total new galleries: 16
+
+   Use it to see the real "discovery frontier" per sort — if date only ever
+   finds new items on pages 1-2, you can cut LIST_MAX_PAGES further with
+   confidence.
 
 
 DEPLOY
 ------
 Drag the zip onto the repo, redeploy ONLY the ScraperBot (BOT 1) service.
-No env changes required — ENGLISH_ONLY defaults to true.
+No env changes required. Optional overrides:
+  LIST_MAX_PAGES / LIST_TAG_MAX_PAGES / DETAILS_PAGE_CAP — depth tuning
+  BOT1_DIGEST_ENABLED=0     — mute the daily digest
+  BOT1_DIGEST_TIME_IST=HH:MM — change send time (default 10:00 IST)
 
-POST-DEPLOY VERIFICATION SIGNS (BOT 1 logs)
--------------------------------------------
-  * Tag sweeps now show compound queries upstream; cached rows contain
-    only English-tagged galleries.
-  * Next trending_tags refresh (every 24h) logs the same tag set shape
-    but harvested from English-only samples.
-  * details_sweeper keeps warming whatever ids list pages hand it; those
-    ids now come from English-filtered list pages only.
 
-EXISTING NON-ENGLISH CACHE ROWS
--------------------------------
-Rows already in Turso/Mongo are untouched by this patch — they simply
-stop being refreshed. Cleanup options (purge non-English gallery:* rows
-from Turso, purge from relaybot.galleries + BackupDB channel posts) are
-a separate follow-up we'll plan next — needs your decision on whether to
-also delete already-posted Telegram channel messages.
+TESTS (both suites pass in the sandbox)
+---------------------------------------
+  python3 ScraperBot/tests/test_v1_25_digest.py     — 6 groups, all PASS
+  python3 ScraperBot/tests/test_english_only.py     — v1.24 regression, PASS
+  Full-repo py_compile: ALL OK.
+
+v1.25 coverage: page-cap defaults 20/5, next-fire math (09:30→today 10:00,
+10:05→tomorrow, edge at exactly 10:00), report aggregation (24h cutoff,
+malformed entries skipped), empty case, per-page recorder, 2-admin fan-out.
 ================================================================================

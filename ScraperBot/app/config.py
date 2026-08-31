@@ -95,7 +95,7 @@ class Settings:
     # /search) + the 6-hour inter-phase gap, NOT the per-fetch delay.
     list_sorts: List[str] = field(default_factory=lambda: _env_csv(
         "LIST_SORTS", ["popular", "date", "popular-today", "popular-week"]))
-    list_max_pages: int = _env_int("LIST_MAX_PAGES", 30)
+    list_max_pages: int = _env_int("LIST_MAX_PAGES", 20)  # v1.25: was 30
     # v1.15 (#4): adaptive tick. Instead of a fixed 6 h phase gap, the
     # sweeper self-tunes: a clean phase (0 skips, 0 errors) shortens the
     # next gap toward list_tick_min_sec (fresher cache); a phase with any
@@ -110,7 +110,7 @@ class Settings:
     # EXTRA_TAG_SORTS) are typed-search fodder — users almost never scroll
     # past page 7, and going deeper burns the shared /search bucket for no
     # visible win. Env-overridable via LIST_TAG_MAX_PAGES.
-    list_tag_max_pages: int = _env_int("LIST_TAG_MAX_PAGES", 7)
+    list_tag_max_pages: int = _env_int("LIST_TAG_MAX_PAGES", 5)  # v1.25: was 7
     list_tick_sec: int = _env_int("LIST_TICK_SEC", 21600)   # 6 hours
 
     # v1.22.4: per-sort freshness scheduling. Instead of sweeping ALL sorts
@@ -213,6 +213,14 @@ class Settings:
     # churn for zero visible benefit. Still snappy for the log channel, and
     # /time <n> can override at runtime as before.
     channel_refresh_sec: int = _env_int("BOT1_CHANNEL_REFRESH_SEC", 15)
+
+    # v1.25: daily admin digest — at DIGEST_TIME_IST (default 10:00 IST)
+    # every day, broadcast to BOT1_ADMIN_USER_IDS: per sort/tag, per page,
+    # how many NEW galleries were fetched in the last 24h. Pure
+    # observability — zero scraping cost. Set DIGEST_ENABLED=0 to mute.
+    digest_enabled: bool = _env_bool("BOT1_DIGEST_ENABLED", True)
+    digest_time_ist: str = (os.getenv("BOT1_DIGEST_TIME_IST", "10:00").strip()
+                            or "10:00")
 
     # Timezone display for dashboard timestamps (IST = UTC+05:30).
     display_tz_offset_min: int = _env_int("BOT1_DISPLAY_TZ_OFFSET_MIN", 330)

@@ -45,6 +45,24 @@ _STATS_KEY  = "details_stats"
 _LAST_KEY   = "details_last_run"
 
 
+def _record_new_on_page(sort: str, page: "Optional[int]") -> None:
+    """v1.25: append (sort, page, ts) to the 24h discovery ring in
+    dash_counters["per_page_new"] — the raw data the daily admin digest
+    (services/discovery_digest.py) aggregates. Capped at 4000 entries so
+    the Mongo doc stays small. Failures are swallowed: observability must
+    never break a sweep."""
+    try:
+        from . import channel_dashboard
+        c = channel_dashboard._counters()
+        ring = [e for e in (c.get("per_page_new") or [])
+                if isinstance(e, list)]
+        ring.append([str(sort), int(page or 0), time.time()])
+        c["per_page_new"] = ring[-4000:]
+        channel_dashboard._save_counters(c)
+    except Exception as e:  # noqa: BLE001
+        log.warning("per-page record failed (non-fatal): %s", e)
+
+
 def _stats_read() -> Dict[str, Any]:
     return mongo_client.state_get(_STATS_KEY, {}) or {}
 
@@ -196,6 +214,7 @@ async def _gallery_is_fresh(gid: str) -> bool:
 
 async def _fetch_one_gallery(
     client: httpx.AsyncClient, gid: str, *, source_sort: str = "",
+    page: "Optional[int]" = None,
 ) -> str:
     """One /galleries/<id> call → cache. Returns ok / hit / skip / rate / error.
     `source_sort` is the list-sort or tag pseudo-sort the gid came from
@@ -253,6 +272,12 @@ async def _fetch_one_gallery(
     # v1.22: also add to the deduped per-key set backing /health cached: N.
     channel_dashboard.record_gid_seen(source_sort or "popular", gid)
     channel_dashboard.record_activity(last_gid=str(gid))
+    # v1.25: per-page discovery record (feeds the daily admin digest) +
+    # live log line so Render logs show exactly which page found new items.
+    if page is not None:
+        log.info("\U0001f195 NEW gid=%s found on %s page %d", gid,
+                 source_sort or "popular", page)
+    _record_new_on_page(source_sort or "popular", page)
     return "ok"
 
 
@@ -279,12 +304,17 @@ async def _work_page(
             break
         if mongo_client.is_paused():
             break
-        res = await _fetch_one_gallery(client, gid, source_sort=sort)
+        res = await _fetch_one_gallery(client, gid, source_sort=sort,
+                                        page=page)
         tally[res if res in tally else "error"] += 1
         # Only sleep if we actually made an upstream call.
         if res in ("ok", "rate", "error"):
             worked += 1
             await asyncio.sleep(settings.details_rest_sec)
+    # v1.25: one summary line per page whenever new items were found.
+    if tally["ok"]:
+        log.info("\U0001f195 %s page %d \u2192 %d new galleries fetched",
+                 sort, page, tally["ok"])
     return tally
 
 
