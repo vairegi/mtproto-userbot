@@ -204,6 +204,95 @@ class Galleries:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------ v12.49
+    def get(self, gid: str) -> Optional[Dict[str, Any]]:
+        try:
+            return self.coll.find_one({"_id": str(gid)})
+        except Exception:
+            return None
+
+    def claim_ex(self, gid: str):
+        """v12.49: claim() + routing hint for the fallback chain.
+
+        Returns (decision, prior_doc) where decision is one of:
+          "claimed_new"      — fresh claim, start with @Gallery_DLBot
+          "claimed_fallback" — reclaimed after a both-bots-failed park;
+                               caller goes STRAIGHT to the fallback bot
+          "done" / "failed" / "busy" — same meaning as claim()
+
+        Legacy FAILED_BOT2_ERROR docs (the pre-v12.49 permanent skips)
+        become reclaimable once their park has expired; docs written before
+        both_failed_at existed fall back to failed_at/completed_at/updated_at
+        and, if none exist, are immediately eligible (ref=0).
+        """
+        gid = str(gid)
+        now = time.time()
+        doc = self.get(gid)
+
+        if doc and doc.get("status") == STATUS_FAILED_BOT2:
+            ref = 0.0
+            for k in ("both_failed_at", "failed_at", "completed_at", "updated_at"):
+                try:
+                    v = float(doc.get(k) or 0)
+                except (TypeError, ValueError):
+                    v = 0.0
+                if v > ref:
+                    ref = v
+            park = float(doc.get("both_fail_park_s") or 0) or 43200.0
+            if now - ref >= park:
+                res = self.coll.find_one_and_update(
+                    {"_id": gid, "status": STATUS_FAILED_BOT2,
+                     "both_failed_at": doc.get("both_failed_at")},
+                    {"$set": {
+                        "status": STATUS_PROCESSING,
+                        "claimed_at": now, "started_at": now,
+                        "claim_expires": now + self.stale_s,
+                        "source": "bot2fetcher", "updated_at": now,
+                        "gallery_id": gid,
+                        "fallback_pending": True,
+                    }},
+                )
+                if res:
+                    return "claimed_fallback", doc
+                return "busy", doc
+            return "failed", doc
+
+        d = self.claim(gid)
+        if d == "claimed":
+            # A parked PROCESSING doc (fallback_pending=True) reclaimed after
+            # its lease expired also routes straight to the fallback bot.
+            if doc and doc.get("fallback_pending"):
+                return "claimed_fallback", doc
+            return "claimed_new", doc
+        return d, doc
+
+    def set_both_failed(self, gid: str, *, primary_err: str,
+                        fallback_err: str, park_s: int) -> None:
+        """v12.49: BOTH downloader bots failed — park the claim for park_s
+        (default 12h). fallback_pending=True makes the NEXT claim (after
+        park expiry) route straight to the fallback bot, skipping
+        @Gallery_DLBot. started_at is pushed into the future by the same
+        amount so Bot 0's staleness clock respects the park (F2-compat,
+        same pattern as defer_claim)."""
+        now = time.time()
+        try:
+            self.coll.update_one(
+                {"_id": str(gid), "status": STATUS_PROCESSING},
+                {"$set": {
+                    "claim_expires": now + int(park_s),
+                    "started_at": now + int(park_s),
+                    "updated_at": now,
+                    "fallback_pending": True,
+                    "both_failed_at": now,
+                    "both_fail_park_s": int(park_s),
+                    "primary_last_error": (primary_err or "")[:300],
+                    "fallback_last_error": (fallback_err or "")[:300],
+                }},
+            )
+            log.info("🅿️ %s parked %ds (both bots failed)", gid, int(park_s))
+        except Exception as e:
+            log.warning("set_both_failed(%s) failed: %s", gid, e)
+
     # ------------------------------------------------------ terminal writes
     def mark_completed(self, gid: str, *, title: str, cover_msg_id: int,
                        pdf_msg_id: int, open_link: str, pages: int = 0,
@@ -245,7 +334,10 @@ class Galleries:
         update_doc: Dict[str, Any] = {
             "$set": updates,
             # v12.44: successful delivery wipes the v12.42 retry counter
-            "$unset": {"bot2_no_images_count": "", "bot2_last_error": ""},
+            "$unset": {"bot2_no_images_count": "", "bot2_last_error": "",
+                      # v12.49: success wipes the fallback-chain state
+                      "fallback_pending": "", "both_failed_at": "",
+                      "primary_last_error": "", "fallback_last_error": ""},
         }
         if requested_by:
             # F6: never clobber Bot 0's requested_by list.
@@ -487,3 +579,55 @@ class PeerCache:
             )
         except Exception as e:
             log.warning("peercache put(%s,%s) failed: %s", slot, kind, e)
+
+
+# ---------------------------------------------------------------------------
+# v12.49 (Layer B): cross-process single-owner lease for the fallback
+# downloader bot. The in-process asyncio.Lock in fetcher.py serializes slots
+# inside one Render instance; THIS lease covers the multi-instance / restart
+# window. Doc: {_id: "pdf_fallback", owner_slot, session_fp, expires}.
+# Self-expiring — a crashed owner never blocks the chain for more than ttl.
+# ---------------------------------------------------------------------------
+class FallbackLease:
+    COLL = "fallback_lease"
+
+    def __init__(self, db, ttl_s: int = 420):
+        self.coll = db[self.COLL]
+        self.ttl_s = int(ttl_s)
+
+    @staticmethod
+    def _fp(client) -> str:
+        try:
+            return PeerCache.fp(client)
+        except Exception:
+            return "nofp"
+
+    def acquire(self, slot: int, client) -> bool:
+        now = time.time()
+        fp = self._fp(client)
+        try:
+            doc = self.coll.find_one_and_update(
+                {"_id": "pdf_fallback",
+                 "$or": [{"expires": {"$lt": now}},
+                         {"owner_slot": int(slot), "session_fp": fp}]},
+                {"$set": {"owner_slot": int(slot), "session_fp": fp,
+                          "expires": now + self.ttl_s}},
+                upsert=True, return_document=ReturnDocument.AFTER)
+            return bool(doc and doc.get("owner_slot") == int(slot)
+                        and doc.get("session_fp") == fp)
+        except DuplicateKeyError:
+            return False
+        except Exception as e:  # noqa: BLE001
+            # Fail-open on Mongo blips: the in-process lock still serializes
+            # this Render instance's slots; only the cross-instance window
+            # degrades. Never hard-block the download chain on a lease error.
+            log.warning("fallback lease acquire error (fail-open): %s", e)
+            return True
+
+    def release(self, slot: int, client) -> None:
+        try:
+            self.coll.delete_one({"_id": "pdf_fallback",
+                                  "owner_slot": int(slot),
+                                  "session_fp": self._fp(client)})
+        except Exception:  # noqa: BLE001
+            pass

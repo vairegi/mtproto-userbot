@@ -1,11 +1,28 @@
 """
-fetcher.py — the Bot2Fetcher pipeline (v12.40k, unchanged from v12.40j
-except no direct dashboard-posting via userbot).
+fetcher.py — the Bot2Fetcher pipeline (v12.49 — dual-downloader chain).
 
 Per-slot peer resolution: each Telethon session warms its own peer
 cache via iter_dialogs() + get_input_entity() before the slot loop
 starts. All Bot 0 / DB channel / @Gallery_DLBot calls use per-slot
 input entities so slot 2 can NEVER PeerIdInvalidError.
+
+v12.49 (fallback chain, operator spec 2026-09-01):
+  * When @Gallery_DLBot answers with ANY error text (the
+    _HARD_ERROR_PATTERNS match), the SAME link is immediately DM'd to the
+    fallback bot (BACKUP_PDF_USERNAME, default pdfdownloadcinbot) with a
+    fixed 5-minute wait — no more 3-strike counter on the primary bot.
+  * If the fallback also fails (error text or timeout), the gallery is
+    parked 12h (mongo_state.set_both_failed), a loud alert goes to the
+    Bot 2 LOG_CHANNEL, and the next retry after the park goes STRAIGHT
+    to the fallback bot (fallback_pending flag), skipping @Gallery_DLBot.
+  * Legacy FAILED_BOT2_ERROR docs (pre-v12.49 permanent skips) become
+    reclaimable 12h after their last failure and also route straight to
+    the fallback bot.
+  * Single-flight guarantee: an in-process asyncio.Lock plus a Mongo
+    fallback_lease doc (FallbackLease) make concurrent DMs to the
+    fallback bot impossible — across slots AND across instances.
+  * BACKUP_PDF_USERNAME unset/empty → the whole chain is inert and
+    behavior is byte-identical to v12.48.
 """
 from __future__ import annotations
 
@@ -116,6 +133,11 @@ class Fetcher:
         self._stop = asyncio.Event()
         self._channel_per_slot: dict[int, Any] = {}
         self._bot2_per_slot: dict[int, Any] = {}
+        # v12.49: fallback downloader state
+        self._fallback_per_slot: dict[int, Any] = {}
+        self._fallback_lock = asyncio.Lock()          # Layer A: in-process
+        self.fallback_lease = None                    # Layer B: Mongo lease
+        self._alert_lock = asyncio.Lock()             # alert rate-limiting
 
     def _d_state(self, idx, state, gid="", title="", pages=0, step=""):
         if self.dash:
@@ -214,6 +236,23 @@ class Fetcher:
                 f"slot {idx}: cannot resolve BOT2_USERNAME=@{self.s.bot2_username} — {e}. "
                 f"Have this userbot DM @{self.s.bot2_username} once, then restart."
             ) from e
+
+        # v12.49: resolve the fallback downloader bot per slot. Optional —
+        # when BACKUP_PDF_USERNAME is unset the chain is inert and we skip
+        # resolution entirely (never blocks boot, never errors).
+        fb = (getattr(self.s, "fallback_username", "") or "").strip().lstrip("@")
+        if fb:
+            try:
+                self._fallback_per_slot[idx] = await _get_entity(
+                    "fallback_bot", fb)
+                log.info("🛟 slot %d resolved fallback bot: @%s", idx, fb)
+            except Exception as e:
+                # Non-fatal: the chain degrades to v12.48 behavior for this
+                # slot, and the operator sees exactly why in the boot log.
+                log.error("🛟 slot %d CANNOT resolve fallback bot @%s — "
+                          "fallback chain DISABLED for this slot: %s. "
+                          "Have this userbot DM @%s once, then restart.",
+                          idx, fb, e, fb)
 
     async def start(self) -> None:
         for i, sess in enumerate(self.s.sessions, 1):
@@ -328,7 +367,10 @@ class Fetcher:
                 self._d_state(idx, "idle")
 
     async def _do_job(self, idx: int, client: TelegramClient, gid: str) -> bool:
-        decision = self.galleries.claim(gid)
+        # v12.49: claim_ex adds the routing hint — "claimed_fallback" means
+        # this gid double-failed 12h+ ago (or is a legacy FAILED_BOT2_ERROR
+        # permanent skip) and goes STRAIGHT to the fallback bot.
+        decision, _prior = self.galleries.claim_ex(gid)
         if decision == "done":
             self.stats.skipped_done += 1
             self._known_done.add(gid)          # v12.44: never re-queue
@@ -343,6 +385,12 @@ class Fetcher:
             self.stats.skipped_busy += 1
             log.info("🔒 %s claimed by another worker — skipped", gid)
             return False
+        route_fallback_direct = (decision == "claimed_fallback")
+        if route_fallback_direct:
+            log.info("🛟 %s — both-bots park expired; routing STRAIGHT to "
+                     "@%s (skipping @%s)", gid,
+                     getattr(self.s, "fallback_username", "") or "?",
+                     self.s.bot2_username)
         self.stats.claimed += 1
         self.stats.in_flight[gid] = f"slot{idx}"
         log.info("🎯 slot %d claimed %s — starting job", idx, gid)
@@ -389,48 +437,92 @@ class Fetcher:
             log.info("📄 %s — %d pages, PDF wait budget %ds",
                      gid, m.get("pages") or 0, int(timeout))
 
-            self._d_state(idx, "waiting_pdf", gid, title=m["title"],
-                          pages=m.get("pages") or 0, step="waiting @Gallery_DLBot")
-            pdf_msg = await self._request_pdf(client, bot2, gid, timeout)
-            if pdf_msg is None:
-                log.error("⏰ %s — @Gallery_DLBot timed out (%ds) — dropping",
-                          gid, int(timeout))
-                self.galleries.drop_claim(gid)
+            # ---------------- v12.49: dual-downloader chain ----------------
+            primary_err = ""
+            pdf_msg = None
+            if route_fallback_direct and self._fallback_per_slot.get(idx) is not None:
+                # Skip the primary entirely: it already failed this gid.
+                pdf_msg, fb_err = await self._try_fallback_pdf(
+                    idx, client, gid, "park-expired retry (primary skipped)")
+                if pdf_msg is None:
+                    # Fallback failed AGAIN on the park-expired retry — re-park.
+                    log.error("\U0001f6ab %s — park-expired retry: fallback failed "
+                              "again (%r) — re-parking 12h", gid, (fb_err or "")[:80])
+                    self.galleries.set_both_failed(
+                        gid, primary_err="park-expired retry (primary skipped)",
+                        fallback_err=fb_err or "", park_s=self.s.both_fail_park_s)
+                    await self._alert_log_channel(
+                        "\U0001f6ab <b>Double failure (park-expired retry)</b> — "
+                        "gallery <code>%s</code>\n"
+                        "@%s: <code>%s</code>\n"
+                        "Parked another 12h.\nhttps://nhentai.net/g/%s/" % (
+                            gid, getattr(self.s, "fallback_username", "") or "?",
+                            (fb_err or "timeout")[:150], gid))
+                    self.stats.dropped += 1
+                    self._d_event(idx, "fallback_error", gid)
+                    return True
+            elif route_fallback_direct:
+                # Fallback bot unresolvable for this slot — keep the park.
+                log.error("🛟 %s — fallback bot unavailable on slot %d; "
+                          "re-parking 12h", gid, idx)
+                self.galleries.set_both_failed(
+                    gid, primary_err="park-expired retry but fallback bot "
+                    "unresolved", fallback_err="unresolved",
+                    park_s=self.s.both_fail_park_s)
                 self.stats.dropped += 1
-                # v12.44: same re-claim loop fix as no-meta — do not feed
-                # this gid to slots again this process lifetime.
-                self._known_failed.add(gid)
                 self._d_event(idx, "dropped", gid)
                 return True
-            if isinstance(pdf_msg, str):
-                # v12.42: permanent "no images" failure — count it in Mongo.
-                # 1st/2nd time: release claim as immediately-stale so the next
-                # scan cycle re-claims and retries. 3rd time (>2): mark
-                # FAILED_BOT2_ERROR so claim() returns "failed" and the gid is
-                # NEVER sent to @Gallery_DLBot again.
-                if _NO_IMAGES_PATTERN.search(pdf_msg or ""):
-                    verdict = self.galleries.note_bot2_no_images(gid, pdf_msg)
-                    if verdict == "skip":
-                        log.error(
-                            "🚷 %s — Gallery_DLBot 'no images' x3 — "
-                            "marked FAILED_BOT2_ERROR, never re-sending", gid)
-                        self.stats.failed += 1
-                        self._known_failed.add(gid)   # v12.44
-                        self._d_event(idx, "failed", gid)
-                        return True
-                    log.warning(
-                        "🔁 %s — Gallery_DLBot 'no images' (attempt <3, "
-                        "will retry next cycle): %s", gid, pdf_msg[:120])
+            else:
+                self._d_state(idx, "waiting_pdf", gid, title=m["title"],
+                              pages=m.get("pages") or 0,
+                              step="waiting @Gallery_DLBot")
+                pdf_msg = await self._request_pdf(client, bot2, gid, timeout)
+                if pdf_msg is None:
+                    # v12.49 (operator spec): timeout is NOT an explicit
+                    # "An error occurred" reply — keep the legacy drop path.
+                    log.error("⏰ %s — @Gallery_DLBot timed out (%ds) — dropping",
+                              gid, int(timeout))
+                    self.galleries.drop_claim(gid)
                     self.stats.dropped += 1
+                    self._known_failed.add(gid)
                     self._d_event(idx, "dropped", gid)
                     return True
-                log.error("🤖❌ %s — Bot 2 hard error, dropping: %s",
-                          gid, pdf_msg[:150])
-                self.galleries.drop_claim(gid)
-                self.stats.dropped += 1
-                self._d_event(idx, "dropped", gid)
-                return True
-            log.info("📥 %s — PDF received from @Gallery_DLBot", gid)
+                if isinstance(pdf_msg, str):
+                    # ANY error text from the primary → immediate fallback.
+                    primary_err = pdf_msg
+                    pdf_msg = None
+                    log.warning("🛟 %s — @Gallery_DLBot error %r — trying "
+                                "fallback @%s", gid, primary_err[:100],
+                                getattr(self.s, "fallback_username", "") or "?")
+                    self._d_state(idx, "waiting_pdf", gid, title=m["title"],
+                                  pages=m.get("pages") or 0,
+                                  step=f"fallback @{getattr(self.s, 'fallback_username', '')}")
+                    pdf_msg, fb_err = await self._try_fallback_pdf(
+                        idx, client, gid, primary_err)
+                    if pdf_msg is None:
+                        # BOTH bots failed → park 12h + log-channel alert.
+                        log.error("🚫 %s — BOTH bots failed "
+                                  "(primary=%r | fallback=%r) — parking 12h",
+                                  gid, primary_err[:80], (fb_err or "")[:80])
+                        self.galleries.set_both_failed(
+                            gid, primary_err=primary_err,
+                            fallback_err=fb_err or "",
+                            park_s=self.s.both_fail_park_s)
+                        await self._alert_log_channel(
+                            "🚫 <b>Double failure</b> — gallery <code>%s</code>\n"
+                            "@%s: <code>%s</code>\n"
+                            "@%s: <code>%s</code>\n"
+                            "Parked 12h; next retry goes straight to the "
+                            "fallback bot.\nhttps://nhentai.net/g/%s/" % (
+                                gid, self.s.bot2_username,
+                                (primary_err or "timeout")[:150],
+                                getattr(self.s, "fallback_username", "") or "?",
+                                (fb_err or "timeout")[:150], gid))
+                        self.stats.dropped += 1
+                        self._d_event(idx, "fallback_error", gid)
+                        return True
+            # ---------------- /v12.49 chain — pdf_msg is a Message here ----
+            log.info("📥 %s — PDF received", gid)
 
             self._d_state(idx, "working", gid, title=m["title"],
                           pages=m.get("pages") or 0, step="downloading cover")
@@ -656,6 +748,76 @@ class Fetcher:
                                  gid, remain, head)
                         last_progress_log = now
         return None
+
+    async def _try_fallback_pdf(self, idx: int, client: TelegramClient,
+                                gid: str, primary_err: str):
+        """v12.49: single-flight fallback attempt to the backup downloader.
+
+        Returns (Message, "") on a document reply, or (None, reason) on
+        error text / timeout / unavailability. Layer A = in-process
+        asyncio.Lock (serializes this Render instance's slots); Layer B =
+        Mongo fallback_lease (covers multi-instance + restart windows).
+        """
+        fb_ent = self._fallback_per_slot.get(idx)
+        if fb_ent is None:
+            return None, "fallback bot unavailable (unresolved or unset)"
+        timeout = float(getattr(self.s, "fallback_timeout_s", 300) or 300)
+        async with self._fallback_lock:
+            if self.fallback_lease is not None:
+                ok = self.fallback_lease.acquire(idx, client)
+                if not ok:
+                    return None, "fallback lease held by another process"
+            try:
+                self._d_state(idx, "waiting_pdf", gid,
+                              step=f"fallback @{getattr(self.s, 'fallback_username', '')}")
+                res = await self._request_pdf(client, fb_ent, gid, timeout)
+            finally:
+                if self.fallback_lease is not None:
+                    try:
+                        self.fallback_lease.release(idx, client)
+                    except Exception:
+                        pass
+        if res is None:
+            return None, f"no reply within {int(timeout)}s"
+        if isinstance(res, str):
+            return None, res
+        return res, ""
+
+    async def _alert_log_channel(self, text: str) -> None:
+        """v12.49: post a double-failure alert to the Bot 2 LOG_CHANNEL via
+        the Bot API bot (same transport the dashboard uses). Rate-limited
+        to one alert per 60s process-wide; failures are logged, never raise."""
+        token = (getattr(self.s, "log_bot_token", "") or "").strip()
+        chat = (getattr(self.s, "log_channel_id", "") or "").strip()
+        if not token or not chat:
+            log.warning("alert not sent (LOG_CHANNEL_ID / log bot token unset): %s",
+                        text[:120])
+            return
+        async with self._alert_lock:
+            last = getattr(self, "_last_alert_at", 0.0)
+            now = time.time()
+            if now - last < 60:
+                log.info("alert rate-limited (suppressed): %s", text[:120])
+                return
+            try:
+                chat_id = int(chat)
+            except (TypeError, ValueError):
+                chat_id = chat
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as h:
+                    r = await h.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat_id, "text": text,
+                              "parse_mode": "HTML",
+                              "disable_web_page_preview": True})
+                if r.status_code == 200:
+                    self._last_alert_at = now
+                    log.info("📢 double-failure alert sent to log channel")
+                else:
+                    log.warning("alert sendMessage HTTP %s: %s",
+                                r.status_code, r.text[:200])
+            except Exception as e:  # noqa: BLE001
+                log.warning("alert send failed (non-fatal): %s", e)
 
     async def _post_pdf(self, client: TelegramClient, channel, bot2,
                         pdf_msg, m: Dict[str, Any]) -> int:

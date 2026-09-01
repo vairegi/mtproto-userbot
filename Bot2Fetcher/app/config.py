@@ -48,6 +48,12 @@ class Settings:
     turso_token: str
     db_channel_id: str
     bot2_username: str
+    # v12.49: fallback downloader bot chain (@pdfdownloadcinbot).
+    # Empty fallback_username = feature fully inert (pre-v12.49 behavior).
+    fallback_username: str
+    fallback_timeout_s: int
+    both_fail_park_s: int
+    fallback_lease_s: int
     log_channel_id: str
     log_bot_token: str
     fetch_gap_min: int
@@ -79,6 +85,11 @@ def load() -> Settings:
         turso_token=_req("TURSO_AUTH_TOKEN"),
         db_channel_id=_req("DB_CHANNEL_ID", "DATABASE_CHANNEL_ID"),
         bot2_username=_first("BOT2_USERNAME") or "Gallery_DLBot",
+        # v12.49: fallback bot. Set BACKUP_PDF_USERNAME=pdfdownloadcinbot.
+        fallback_username=(_first("BACKUP_PDF_USERNAME") or "").lstrip("@"),
+        fallback_timeout_s=_int("BACKUP_PDF_TIMEOUT_S", 300),   # 5 min
+        both_fail_park_s=_int("BOTH_FAIL_PARK_S", 43200),       # 12 h
+        fallback_lease_s=_int("FALLBACK_LEASE_S", 420),         # > timeout
         log_channel_id=_first("LOG_CHANNEL_ID"),
         # v12.40k: preferred log-channel transport is a Bot API bot.
         # Env var name per operator: BOT_2_PDF_FECTHER (kept verbatim).

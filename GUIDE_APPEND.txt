@@ -1,74 +1,82 @@
 ================================================================================
-GUIDE_APPEND — ScraperBot v1.25 (2026-08-31)
-Page-cap reduction + per-page discovery tracking + daily 10:00 IST admin digest.
+GUIDE_APPEND — Bot2Fetcher v12.49 (2026-09-01)
+Dual-downloader fallback chain: @Gallery_DLBot → @pdfdownloadcinbot
 ================================================================================
 
 WHAT'S IN THIS ZIP
 ------------------
-  ScraperBot/app/config.py                      — defaults: LIST_MAX_PAGES 30→20,
-                                                  LIST_TAG_MAX_PAGES 7→5; new
-                                                  BOT1_DIGEST_ENABLED /
-                                                  BOT1_DIGEST_TIME_IST knobs
-  ScraperBot/app/services/details_sweeper.py    — per-page discovery records
-                                                  + live 🆕 log lines
-  ScraperBot/app/services/discovery_digest.py   — NEW: daily admin broadcast
-  ScraperBot/main.py                            — spawn digest task (staggered)
-  ScraperBot/tests/test_v1_25_digest.py         — NEW: 6 test groups
-  GUIDE_APPEND.txt                              — this file
+  Bot2Fetcher/app/config.py          — BACKUP_PDF_USERNAME / BACKUP_PDF_TIMEOUT_S
+                                       / BOTH_FAIL_PARK_S / FALLBACK_LEASE_S
+  Bot2Fetcher/app/mongo_state.py     — claim_ex() routing, set_both_failed()
+                                       12h park, FallbackLease (Layer B)
+  Bot2Fetcher/app/fetcher.py         — the chain itself + LOG_CHANNEL alerts
+  Bot2Fetcher/main.py                — FallbackLease wiring
+  Bot2Fetcher/tests/test_fallback_chain.py — NEW: 6 test groups
+  GUIDE_APPEND.txt                   — this file
 
-All knobs stay env-overridable on Render — tune later without redeploying.
+Bot 0 / Bot 1 / common/turso_cache: untouched. Captions unchanged (no
+credit line). Turso contract untouched (byte-parity still asserted by
+tests/test_turso_cache.py).
 
+NEW BEHAVIOR
+------------
+1) @Gallery_DLBot replies with ANY error text → the same link is DM'd
+   immediately to the fallback bot (default @pdfdownloadcinbot), wait
+   ≤5 min (BACKUP_PDF_TIMEOUT_S). The old 3-strike "no images" counter
+   is retired as a decision-maker (field remains for history).
+2) Fallback replies with a document → identical success path (cover +
+   spoiler post, PDF forward, mark_completed, BackupDB mirror).
+3) BOTH bots fail → Mongo doc parked 12h (claim_expires AND started_at
+   pushed +12h so Bot 0's staleness clock respects it), loud alert to
+   the Bot 2 LOG_CHANNEL with both bots' error text and the link.
+4) After the 12h park, the next claim routes STRAIGHT to the fallback
+   bot — @Gallery_DLBot is skipped for that gid.
+5) Legacy FAILED_BOT2_ERROR docs (the old permanent skips, ~124 rows)
+   become reclaimable 12h after their last failure and also go straight
+   to the fallback bot.
+6) Single-flight: in-process asyncio.Lock (Layer A) + Mongo
+   fallback_lease doc (Layer B). Two slots can never DM the fallback
+   bot at once; a crashed owner self-expires after FALLBACK_LEASE_S
+   (default 420s > the 5-min wait). Mongo blips fail OPEN to the lock.
+7) Timeout on @Gallery_DLBot (silence, no explicit error) is unchanged:
+   claim dropped, retried next process run — per spec, the fallback
+   triggers on error TEXT only.
 
-BONUS ANSWERS (verified against deployed code)
-----------------------------------------------
-1) List sweeper re-fetching page 1 of popular: it REPLACES the whole page
-   payload (cache.put is a full upsert) on every scheduled pass — not a diff,
-   not a "only if new items" check. That's deliberate: nhentai has no
-   changes-feed, and popular-today ordering genuinely churns. Cost is tiny
-   (~7.6 KB/page); the expensive detail fetches are gated by the F3
-   freshness check, so unchanged galleries on that page are never re-fetched.
+DEPLOY (Render, Bot2Fetcher service)
+------------------------------------
+1) Drop the zip onto the repo, push.
+2) New env var (required to activate the chain):
+       BACKUP_PDF_USERNAME=pdfdownloadcinbot
+   Optional overrides:
+       BACKUP_PDF_TIMEOUT_S=300      # fallback wait
+       BOTH_FAIL_PARK_S=43200        # 12h park
+       FALLBACK_LEASE_S=420          # cross-process lease TTL
+3) IMPORTANT: each userbot session (STRING_SESSION, STRING_SESSION_2)
+   must have DM'd @pdfdownloadcinbot at least once, or the boot log will
+   show "CANNOT resolve fallback bot … chain DISABLED for this slot"
+   (non-fatal; the primary chain keeps working).
+4) Redeploy. Boot log should show "🛟 slot N resolved fallback bot".
 
-2) Old items: they live on. Search pages are replaced wholesale, but every
-   gallery:* detail row persists independently in Turso until its 30-day TTL
-   expires (or never, for sentinel rows). Removing a gallery from a search
-   page does NOT delete its gallery:<id> row — the Mini App can still open
-   it via detail lookup, and Bot 2's scanner can still see it.
+VERIFICATION SIGNS
+------------------
+  * "🛟 <gid> — @Gallery_DLBot error … trying fallback" on first error.
+  * "📥 <gid> — PDF received" right after a fallback success (caption
+    byte-identical to the primary path).
+  * "🅿️ <gid> parked 43200s (both bots failed)" + a LOG_CHANNEL message
+    "🚫 Double failure — gallery <gid> …".
+  * "🛟 <gid> — both-bots park expired; routing STRAIGHT to @pdfdownloadcinbot"
+    for legacy skips on their first re-scan.
+  * /status gains nothing new (stats counters unchanged); dashboard slot
+    steps show "fallback @pdfdownloadcinbot".
 
-3) "Which page of which sort/tag found new items" — THIS ZIP. Every new
-   gallery fetched now logs `🆕 NEW gid=<id> found on <sort> page <n>` in
-   Render logs, plus a per-page summary `🆕 <sort> page <n> → N new
-   galleries fetched`. Both feed a 24h ring in dash_counters.per_page_new,
-   and every day at 10:00 IST the bot DMs each BOT1_ADMIN_USER_IDS a digest:
-
-       📊 Daily discovery digest (last 24h)
-       popular-today — 12 new
-         · page 1: 9
-         · page 3: 3
-       tag:incest — 4 new
-         · page 2: 4
-       Total new galleries: 16
-
-   Use it to see the real "discovery frontier" per sort — if date only ever
-   finds new items on pages 1-2, you can cut LIST_MAX_PAGES further with
-   confidence.
-
-
-DEPLOY
-------
-Drag the zip onto the repo, redeploy ONLY the ScraperBot (BOT 1) service.
-No env changes required. Optional overrides:
-  LIST_MAX_PAGES / LIST_TAG_MAX_PAGES / DETAILS_PAGE_CAP — depth tuning
-  BOT1_DIGEST_ENABLED=0     — mute the daily digest
-  BOT1_DIGEST_TIME_IST=HH:MM — change send time (default 10:00 IST)
-
-
-TESTS (both suites pass in the sandbox)
----------------------------------------
-  python3 ScraperBot/tests/test_v1_25_digest.py     — 6 groups, all PASS
-  python3 ScraperBot/tests/test_english_only.py     — v1.24 regression, PASS
+TESTS (sandbox, all pass)
+-------------------------
+  python3 Bot2Fetcher/tests/test_fallback_chain.py   — 6 groups:
+    claim_ex routing (legacy permanent-skip retry, parked <12h, expired
+    parked PROCESSING, fresh), set_both_failed park + busy-during-park,
+    FallbackLease single-owner/release/expiry, _request_pdf doc/progress/
+    error/timeout/stale-msg-floor, fallback single-flight serialization
+    across two slots, fallback error/timeout results.
+  python3 tests/test_sync_audit_v12_48.py            — v12.48 regression PASS
   Full-repo py_compile: ALL OK.
-
-v1.25 coverage: page-cap defaults 20/5, next-fire math (09:30→today 10:00,
-10:05→tomorrow, edge at exactly 10:00), report aggregation (24h cutoff,
-malformed entries skipped), empty case, per-page recorder, 2-admin fan-out.
 ================================================================================

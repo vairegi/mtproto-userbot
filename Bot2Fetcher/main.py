@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
 from app.config import load
-from app.mongo_state import connect as mongo_connect, Galleries, PeerCache
+from app.mongo_state import connect as mongo_connect, Galleries, PeerCache, FallbackLease
 from app.turso_store import Turso
 from app.fetcher import Fetcher, Stats
 from app.dashboard import Dashboard
@@ -37,6 +37,9 @@ fetcher = Fetcher(settings, galleries, turso, stats, dashboard=dashboard)
 # 200-dialog iter_dialogs scan; session rotation auto-invalidates via
 # fingerprint mismatch. Falls back to live resolution on any miss.
 fetcher.peer_cache = PeerCache(_db)
+# v12.49: Layer B single-flight lease for the fallback downloader bot
+# (covers the multi-instance / restart window; Layer A lock lives in fetcher).
+fetcher.fallback_lease = FallbackLease(_db, settings.fallback_lease_s)
 
 app = FastAPI(title="Bot2Fetcher")
 
@@ -73,7 +76,7 @@ def _run_api() -> None:
 
 
 async def _main() -> None:
-    log.info("🚀 Bot2Fetcher v12.40k booting (%d slot(s))", len(settings.sessions))
+    log.info("🚀 Bot2Fetcher v12.49 booting (%d slot(s))", len(settings.sessions))
     await turso.ensure_schema()
     dash_task = asyncio.create_task(dashboard.run(fetcher))
     try:
