@@ -256,23 +256,23 @@ _client: Optional[httpx.AsyncClient] = None
 # v11.6 hardening:
 #   * Base TTL raised 30s -> 60s (empirically nhentai's window is closer
 #     to a full minute; 30s often just re-hit the ban).
-#   * Exponential ramp on repeat 429s for the same key (cap 300s).
+#   * Exponential ramp on repeat 429s for the same key (cap 120s).  # v12.54
 #   * Honour the server's `Retry-After` header when present.
 #   * All three tunables env-overridable so ops can adjust without redeploy:
-#         NH_RATE_LIMIT_TTL_SEC        (default 60)
-#         NH_RATE_LIMIT_TTL_CAP_SEC    (default 300)
+#         NH_RATE_LIMIT_TTL_SEC        (default 20  -- v12.54)
+#         NH_RATE_LIMIT_TTL_CAP_SEC    (default 120 -- v12.54)
 #         NH_RATE_LIMIT_RAMP           (default 2.0)
 import os as _os_rl  # local alias, avoid collision with top-level `os`
 _RATE_LIMIT_CACHE: "dict[tuple, float]" = {}
 _RATE_LIMIT_STRIKES: "dict[tuple, int]" = {}
 try:
-    _RATE_LIMIT_TTL_SEC = int(_os_rl.environ.get("NH_RATE_LIMIT_TTL_SEC", "60"))
+    _RATE_LIMIT_TTL_SEC = int(_os_rl.environ.get("NH_RATE_LIMIT_TTL_SEC", "20"))
 except (TypeError, ValueError):
-    _RATE_LIMIT_TTL_SEC = 60
+    _RATE_LIMIT_TTL_SEC = 20
 try:
-    _RATE_LIMIT_TTL_CAP_SEC = int(_os_rl.environ.get("NH_RATE_LIMIT_TTL_CAP_SEC", "300"))
+    _RATE_LIMIT_TTL_CAP_SEC = int(_os_rl.environ.get("NH_RATE_LIMIT_TTL_CAP_SEC", "120"))
 except (TypeError, ValueError):
-    _RATE_LIMIT_TTL_CAP_SEC = 300
+    _RATE_LIMIT_TTL_CAP_SEC = 120
 try:
     _RATE_LIMIT_RAMP = float(_os_rl.environ.get("NH_RATE_LIMIT_RAMP", "2.0"))
 except (TypeError, ValueError):
@@ -402,6 +402,15 @@ def _turso_key_for(cache_key: str) -> str:
     """
     if cache_key.startswith("gallery|"):
         return "gallery:" + cache_key.split("|", 1)[1]
+    if cache_key.startswith("search:"):
+        # v12.55: typed-search keys (search:<q>:p<N>) map straight onto the
+        # canonical Bot 0 key instead of the legacy search:search:* row —
+        # one shared row, half the Turso reads, no new legacy rows.
+        rest = cache_key[len("search:"):]
+        head, sep, tail = rest.rpartition(":p")
+        if sep and tail.isdigit():
+            qn = " ".join(head.lower().split())
+            return f"search:q={qn}|sort=date|page={int(tail)}"
     return "search:" + cache_key
 
 
@@ -475,7 +484,11 @@ async def _fetch_json_cached(cache_key: str, path: str,
                 payload_bytes = -1
             log.info(_LOG_MISS, turso_key, ttl_sec)
             _cache_put(cache_key, data, ttl_sec)                    # L1
-            if nhc is not None:
+            if nhc is not None and (
+                    turso_key.startswith("gallery:")
+                    or turso_key.startswith("search:q=")):
+                # v12.55: write canonical keys ONLY — legacy shapes
+                # (search:search:* etc.) must never be created again.
                 try:
                     ok = bool(nhc.put(turso_key, data))             # L2 write
                     if ok:
@@ -609,7 +622,10 @@ def _pick_search_title(item: dict) -> str:
     then clean_title() so the picker button shows just the human-readable
     title without [Artist] or [English]/[Digital] noise.
     """
-    en = (item.get("english_title") or "").strip()
+    # v12.55: canonical card dicts carry title_en_clean/title, not
+    # english_title — check all three so warm list rows keep their titles.
+    en = (item.get("english_title") or item.get("title_en_clean")
+          or item.get("title") or "").strip()
     if en:
         return clean_title(en)
     jp = (item.get("japanese_title") or "").strip()
@@ -755,13 +771,13 @@ async def search(query: str, page: int = 1) -> Optional[SearchPage]:
     _qn = " ".join(q.lower().split())
     _nhc0 = _turso_cache_module()
     if _nhc0 is not None:
-        for _srt in ("date", "popular"):
+        for _srt in ("date",):  # v12.55: canonical sweeps write sort=date only
             _warm_key = f"search:q={_qn}|sort={_srt}|page={int(page or 1)}"
             try:
                 _warm = _nhc0.get(_warm_key, allow_stale=False)
             except Exception:  # noqa: BLE001
                 _warm = None
-            if isinstance(_warm, dict):
+            if isinstance(_warm, (dict, list)):  # v12.55: canonical rows are lists
                 _ttl_r = getattr(_nhc0, "ttl_for_key", lambda _k: 0)(_warm_key)
                 log.info(_LOG_HIT, _warm_key, _ttl_r)
                 _cache_put(cache_key, _warm, _SEARCH_CACHE_TTL_SEC)  # re-warm L1
@@ -786,10 +802,21 @@ async def search(query: str, page: int = 1) -> Optional[SearchPage]:
         return None
 
     try:
-        results = data.get("result") or []
-        num_pages = int(data.get("num_pages") or 1)
-        per_page = int(data.get("per_page") or len(results) or 25)
-        total = int(data.get("total") or (num_pages * per_page))
+        # v12.55: canonical Turso rows are a LIST of card dicts (Bot 1
+        # writes them normalised); raw upstream JSON is a dict envelope.
+        # Accepting the list kills the "'list' object has no attribute
+        # 'get'" WARNING.
+        is_card_list = isinstance(data, list)
+        if is_card_list:
+            results = data
+            num_pages = 1
+            per_page = len(results) or 25
+            total = per_page
+        else:
+            results = data.get("result") or []
+            num_pages = int(data.get("num_pages") or 1)
+            per_page = int(data.get("per_page") or len(results) or 25)
+            total = int(data.get("total") or (num_pages * per_page))
 
         # English-only filter: nhentai's language tag IDs are stable —
         #   12227 = english  (tag name verified from /api/v2/galleries/<id>)
@@ -804,10 +831,13 @@ async def search(query: str, page: int = 1) -> Optional[SearchPage]:
             if gid is None:
                 continue
 
-            # English-only filter
-            tag_ids = item.get("tag_ids") or []
-            if _ENGLISH_TAG_ID not in tag_ids:
-                continue
+            # English-only filter. Raw upstream rows carry tag_ids;
+            # canonical card lists were already language-filtered by
+            # Bot 1's sweeps, so the tag-ids check would drop them all.
+            if not is_card_list:
+                tag_ids = item.get("tag_ids") or []
+                if _ENGLISH_TAG_ID not in tag_ids:
+                    continue
 
             gid_str = str(gid)
             hits.append(

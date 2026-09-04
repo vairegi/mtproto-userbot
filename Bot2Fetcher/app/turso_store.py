@@ -53,6 +53,10 @@ _MAX_SEARCH_ROWS = 200
 _FULL_RESCAN_EVERY = max(1, int(_os.getenv("BOT2_LIST_FULL_RESCAN_EVERY", "12") or 12))
 _WATERMARK_SLACK_SEC = max(0, int(_os.getenv("BOT2_LIST_WATERMARK_SLACK_S", "60") or 60))
 
+# v12.55: short in-process memo for list_gallery_ids — collapses
+# rapid producer ticks into ONE Turso scan per window.
+_LIST_MEMO_TTL_SEC = max(1, int(_os.getenv("BOT2_LIST_MEMO_TTL_SEC", "10") or 10))
+
 
 def _normalise_url(raw: str) -> str:
     u = (raw or "").strip()
@@ -157,6 +161,8 @@ class Turso:
         # simply performs one full scan before switching back to deltas.
         self._list_gallery_watermark: int = 0
         self._list_gallery_cycles: int = 0
+        # v12.55: (expires_at_epoch, rows) memo for list_gallery_ids
+        self._list_gallery_memo: tuple = (0.0, [])
 
     async def _pipeline(self, sql: str, args: Optional[list] = None) -> Optional[Dict[str, Any]]:
         # v12.41: delegate to the shared common.turso_http client so all
@@ -229,6 +235,12 @@ class Turso:
             '"key" TEXT PRIMARY KEY, payload TEXT NOT NULL, '
             'updated_at INTEGER NOT NULL DEFAULT 0)'
         )
+        # v12.55: index the watermark column so delta scans stop touching
+        # every gallery:* row (Turso bills rows touched, not returned).
+        await self.execute(
+            'CREATE INDEX IF NOT EXISTS idx_nhentai_cache_cached_at '
+            'ON nhentai_cache (cached_at)'
+        )
         self._ready = True
 
     async def list_gallery_ids(self) -> List[Dict[str, Any]]:
@@ -244,6 +256,11 @@ class Turso:
         in a row (i.e. nothing new is being written — the producer should
         still see the full inventory once per rescan window).
         """
+        # v12.55: serve the memo when fresh — collapses rapid producer
+        # ticks into ONE Turso scan per _LIST_MEMO_TTL_SEC window.
+        _memo_exp, _memo_rows = self._list_gallery_memo
+        if _memo_rows and _memo_exp > time.time():
+            return list(_memo_rows)
         self._list_gallery_cycles += 1
         full_sweep = (
             self._list_gallery_watermark == 0
@@ -289,6 +306,7 @@ class Turso:
             len(out), "FULL" if full_sweep else "DELTA",
             self._list_gallery_watermark, self._list_gallery_cycles,
         )
+        self._list_gallery_memo = (time.time() + _LIST_MEMO_TTL_SEC, list(out))
         return out
 
     async def list_recent_search_ids(self) -> List[str]:
