@@ -844,3 +844,27 @@ mode included. NOTE: token-bucket consume was audited and left alone — it's
 one atomic single-row UPDATE, already minimal; a memo there would break
 cross-process quota. Cache contract: read shapes extended (list accepted),
 written shapes unchanged. New tests/test_v12_55_read_budget.py (14 checks).
+
+v12.56 (2026-09-04): Bot2Fetcher dashboard honesty fix. "Turso cache:
+16,527" vs "In DB channel: 19,496" looked like data loss — it was a label
+bug. cache_total is the POST-FILTER work queue (known-done/failed removed
+in _build_queue_order), while "In DB channel" is the cumulative lifetime
+COMPLETED+PARTIAL count from Mongo. Different sets; neither contains the
+other. Now: "Lifetime cached (Turso)" (pre-filter gallery:* row count) +
+"Cache queue (not yet done/failed)" + "Remaining" = queue size (the old
+remaining formula subtracted completed_db from an already-filtered queue —
+double-counting, fixed).
+
+v1.27 (2026-09-04): ScraperBot discovery counting + digest window. TWO
+root causes for "digest says No new galleries": (1) the per_page_new ring
+was only written by details_sweeper/user-hints — list_sweeper (4 sorts x
+20 pages + 66 tags x 5 pages) never recorded its discoveries, so the ring
+held 10 user-hint entries and zero sort/tag entries (confirmed live in
+Mongo). list_sweeper now batch-records true discoveries (gid has no
+gallery:<id> row yet — one PK-indexed IN query per page) via the new
+channel_dashboard.record_new_galleries_on_page (one Mongo read+write per
+page, feeds per_page_new + per_sort + ring24h_by_key + gid dedupe set).
+(2) build_report hardcoded a trailing-24h window; it now anchors to the
+previous send (discovery_digest_last_sent) so a 10:00 digest covers
+everything since the prior send, header reads "(since 03 Sep 10:00 IST)".
+New tests: ScraperBot/tests/test_v1_27_discovery.py.

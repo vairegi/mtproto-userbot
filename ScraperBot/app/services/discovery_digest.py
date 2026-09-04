@@ -20,7 +20,7 @@ import logging
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .. import mongo_client
 from ..config import settings
@@ -48,9 +48,22 @@ def _next_fire_epoch(now_ts: float) -> float:
     return target.timestamp()
 
 
-def build_report(now_ts: float) -> Tuple[str, int]:
-    """Aggregate the per_page_new ring into (message_text, total_new)."""
-    cutoff = now_ts - 86400
+def build_report(now_ts: float, since_ts: Optional[float] = None) -> Tuple[str, int]:
+    """Aggregate the per_page_new ring into (message_text, total_new).
+
+    v1.27: window anchors to the PREVIOUS digest send instead of a
+    hardcoded 24h — a digest at 10:00 covers everything since the prior
+    send (no gaps, no double-counting). Falls back to 24h when no prior
+    send is recorded."""
+    if since_ts is None:
+        try:
+            since_ts = float(mongo_client.state_get(_K_SENT, 0) or 0)
+        except Exception:  # noqa: BLE001
+            since_ts = 0.0
+    cutoff = (float(since_ts)
+              if (isinstance(since_ts, (int, float)) and 0 < since_ts < now_ts)
+              else now_ts - 86400)
+    when = datetime.fromtimestamp(cutoff, tz=IST).strftime("%d %b %H:%M IST")
     from . import channel_dashboard
     c = channel_dashboard._counters()
     ring = [e for e in (c.get("per_page_new") or []) if isinstance(e, list)]
@@ -67,8 +80,8 @@ def build_report(now_ts: float) -> Tuple[str, int]:
             pass
 
     if not recent:
-        return ("📊 <b>Daily discovery digest</b> (last 24h)\n"
-                "No new galleries were scraped today."), 0
+        return (f"📊 <b>Daily discovery digest</b> (since {when})\n"
+                "No new galleries were scraped in this window."), 0
 
     # by_sort: sort -> total; pages: (sort, page) -> count
     by_sort: Counter = Counter()
@@ -78,7 +91,7 @@ def build_report(now_ts: float) -> Tuple[str, int]:
         by_sort[s] += 1
         pages[(s, int(page or 0))] += 1
 
-    lines: List[str] = ["📊 <b>Daily discovery digest</b> (last 24h)"]
+    lines: List[str] = [f"📊 <b>Daily discovery digest</b> (since {when})"]
     total = sum(by_sort.values())
     for sort, cnt in by_sort.most_common():
         esc = html.escape(sort)
@@ -125,7 +138,8 @@ async def run_forever(stop_event: asyncio.Event) -> None:
                 if time.time() - last < 20 * 3600:
                     continue
                 from . import telegram_bot
-                text, total = build_report(time.time())
+                # v1.27: anchor the report window to this last-send ts.
+                text, total = build_report(time.time(), since_ts=last)
                 ok_all = True
                 for uid in settings.admin_user_ids:
                     r = await telegram_bot.send_message(int(uid), text)

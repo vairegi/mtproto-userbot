@@ -147,16 +147,21 @@ def _build_message(stats, scan_info: dict, mongo_counts: dict,
                    slots: Dict[int, dict], accounts: Dict[int, str]) -> str:
     s = stats.snapshot()
     total_cache = scan_info.get("cache_total", 0)
+    cache_lifetime = scan_info.get("cache_lifetime", 0)  # v12.56
     completed_db = mongo_counts.get("COMPLETED", 0) + mongo_counts.get("PARTIAL", 0)
     failed_db = sum(v for k, v in mongo_counts.items()
                     if isinstance(k, str) and k.startswith("FAILED"))
-    remaining = max(0, total_cache - completed_db - s["claimed"])
+    # v12.56: total_cache is ALREADY the post-filter work queue (known-
+    # done/failed removed in _build_queue_order) — subtracting completed_db
+    # again double-counted. Remaining == queue size.
+    remaining = total_cache
 
     lines = [
         "🤖 **Bot2Fetcher — Live**",
         "",
         f"📡 Phase: `{_md(scan_info.get('phase', 'scanning'))}`",
-        f"🗂 Turso cache: **{total_cache}** galleries",
+        f"🗄 Lifetime cached (Turso): **{cache_lifetime}**",
+        f"🗂 Cache queue (not yet done/failed): **{total_cache}**",
         f"✅ In DB channel: **{completed_db}**",
         f"❌ Failed-before (Mongo): **{failed_db}**",
         f"📋 Remaining: **{remaining}**",

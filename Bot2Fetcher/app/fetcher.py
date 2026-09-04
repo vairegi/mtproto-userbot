@@ -291,6 +291,12 @@ class Fetcher:
             gid = r["gid"]
             if gid not in seen:
                 seen.add(gid); ordered.append(gid)
+        # v12.56: lifetime cached = ALL gallery:* rows in Turso BEFORE the
+        # known-done/failed filter — shown on the dashboard alongside the
+        # post-filter queue so "cache < In DB channel" stops looking like
+        # data loss (the two measure different sets).
+        self._last_cache_lifetime = len(gallery_rows)
+
         # v12.44: drop gids we already know are delivered / permanently
         # failed. On a warm process this eliminates nearly every
         # "⏭ already in DB channel — skipped" cycle (the 146-PDFs-in-15h

@@ -1,97 +1,76 @@
 ================================================================================
-GUIDE_APPEND — v12.55 (2026-09-04) — Turso read-budget triage (all 3 bots)
+GUIDE_APPEND — v1.27 (ScraperBot) + v12.56 (Bot2Fetcher)
+2026-09-04 — Telegram log-channel truthfulness: discovery counting, digest
+window, dashboard labels
 ================================================================================
 
 WHAT CHANGED & WHY
 ------------------
-Turso free tier = 500M ROWS READ / month (rows touched, NOT rows returned).
-Usage was 292.45M on Sep 4 — pace ~2.2B/month, i.e. a lock-out around Sep 10.
-Live census (read-only, via /v2/pipeline):
-  nhentai_cache 18,930 rows: 15,048 gallery:* + 3,857 search:* + 25 similar:*
-  2,136 of the search rows are LEGACY `search:search:*` (55%) — probed on
-  every typed search but never matched (they hold raw dict envelopes while
-  the read path now expects canonical lists).
+Three log-channel bugs, all root-caused against LIVE Mongo/Turso data:
 
-Fixes (all backend; no frontend / no cache-contract change):
-  1. hf_scraper.py — _turso_key_for: typed-search keys map DIRECTLY to the
-     canonical row `search:q=<q>|sort=date|page=<N>`. The legacy
-     `search:search:*` row is never read or written again. (-50% typed-
-     search reads)
-  2. hf_scraper.py — search() warm probe reads ONLY the sort=date variant
-     (was date+popular: 2 reads/page -> 1), and accepts canonical LIST
-     payloads. This silences the recurring "'list' object has no attribute
-     'get'" WARNING from the Render log AND lets Bot 1's warm rows finally
-     serve Bot 0 typed searches (title via title_en_clean, thumb via cover
-     string, English filter skipped for card lists — Bot 1 pre-filters).
-  3. hf_scraper.py — L2 cache writes restricted to canonical keys
-     (gallery:* / search:q=*) so legacy shapes can never re-appear.
-  4. Bot2Fetcher/app/turso_store.py — list_gallery_ids got a 10s memo
-     (env BOT2_LIST_MEMO_TTL_SEC): back-to-back producer ticks share ONE
-     scan. Plus ensure_schema now CREATEs INDEX idx_nhentai_cache_cached_at
-     — before this, the "incremental watermark" scan still touched all
-     ~15k gallery rows every cycle because cached_at was unindexed.
-     (NOTE: the token-bucket consume path was audited and deliberately NOT
-     memoized — it is one atomic single-row UPDATE, already minimal.)
-  5. scripts/purge_legacy_search_keys.py — NEW. Resumable batched purge of
-     the 2,136 legacy rows (cursor = remaining keys, so re-running after a
-     crash just continues). Dry-run mode included. Run ONCE by hand (below).
-  Also cumulative: hf_scraper.py carries the v12.54 backoff softening
-  (NH_RATE_LIMIT_TTL_SEC 20 / CAP 120) in case the v12.54 zip was not yet
-  applied to the repo. Apply the v12.54 zip FIRST, then this one — the two
-  are compatible either way for hf_scraper.py (same content).
+1) Bot 2 dashboard "Turso cache: 16,527 vs In DB channel: 19,496" looked
+   like deleted rows. It was a LABEL bug: cache_total is the POST-FILTER
+   work queue (known-done/failed already removed by _build_queue_order),
+   while "In DB channel" is the cumulative lifetime COMPLETED+PARTIAL
+   count from Mongo. Nothing was wrongly deleted. Now shows:
+     "Lifetime cached (Turso)"   — ALL gallery:* rows (pre-filter)
+     "Cache queue (not yet done/failed)" — the work queue
+     "Remaining"                 — = queue size (old formula subtracted
+                                   completed_db AGAIN — double-count fix)
 
-EXPECTED EFFECT
----------------
-  * Typed searches: 2 Turso reads/page -> 1 (and that 1 now actually HITs
-    Bot 1's warm rows instead of falling through to upstream).
-  * Bot 2 producer: full/delta scans collapse from "every tick touches
-    ~15k rows" to "one scan per 10s window, and delta scans touch only new
-    rows once the index exists". This was likely the single biggest read
-    consumer (15k rows x every few seconds, 24/7).
-  * Net projection: well under 500M reads/month. Watch the Turso dashboard
-    over the next 24-48h.
+2) ScraperBot "finds no new items": scraping WAS working (live Mongo:
+   715 new/24h) — but only details_sweeper/user-hints incremented the
+   counters. list_sweeper (4 sorts x 20 pages + 66 tags x 5 pages) never
+   recorded discoveries, so all that scanning was invisible. Now, after
+   each page write, list_sweeper batch-checks which gids have NO
+   gallery:<id> row yet (one PK-indexed IN query per page, ~25 row-reads)
+   and records true discoveries via the new batched
+   channel_dashboard.record_new_galleries_on_page (ONE Mongo read+write
+   per page — feeds per_page_new, per_sort, new_galleries, ring_24h,
+   ring_hb, ring24h_by_key, and the gid dedupe set).
+
+3) Digest "No new galleries were scraped today": per_page_new held only
+   10 user-hint entries (confirmed live) AND build_report hardcoded a
+   trailing-24h window. Now the window anchors to the PREVIOUS send
+   (discovery_digest_last_sent): a 10:00 digest covers everything since
+   the prior send; header reads "(since 03 Sep 10:00 IST)". Cadence stays
+   once-daily at BOT1_DIGEST_TIME_IST (your choice).
 
 FILES IN THIS ZIP (repo-relative)
 ---------------------------------
-  hf_scraper.py
-  Bot2Fetcher/app/turso_store.py
-  scripts/purge_legacy_search_keys.py   (new — run by hand once)
-  tests/test_v12_55_read_budget.py      (new — 14 checks)
+  ScraperBot/app/services/list_sweeper.py
+  ScraperBot/app/services/channel_dashboard.py
+  ScraperBot/app/services/discovery_digest.py
+  ScraperBot/tests/test_v1_27_discovery.py   (new — 19 checks)
+  Bot2Fetcher/app/dashboard.py
+  Bot2Fetcher/app/fetcher.py
   GUIDE.md
   GUIDE_APPEND.txt
 
 DEPLOY STEPS
 ------------
 1) Drag-and-drop the zip onto the repo root. Commit + push.
-2) Purge legacy rows ONCE from your machine (resumable; dry-run first):
-     set TURSO_DATABASE_URL=https://doujinshi-cache-vairegi.aws-us-west-2.turso.io
-     set TURSO_AUTH_TOKEN=<your token>
-     python scripts/purge_legacy_search_keys.py --dry-run   (expect ~2,136)
-     python scripts/purge_legacy_search_keys.py
-   If it stops mid-run, re-run the same command — it resumes.
-3) Redeploy ALL THREE services on Render (Bot 0, ScraperBot, Bot2Fetcher).
-   Bot2Fetcher's boot runs CREATE INDEX IF NOT EXISTS — one-off, idempotent.
-4) No env changes needed. (NHENTAI_API_KEY from v12.54 stays as-is.)
+2) Redeploy ScraperBot AND Bot2Fetcher on Render. No env changes.
+3) Watch the next sweep tick: "🆕 <sort> page N: K new galleries [...]"
+   lines appear in the ScraperBot Render log when discoveries happen.
 
 VERIFICATION SIGNS
 ------------------
-  * The "'list' object has no attribute 'get'" WARNING disappears from the
-    Bot 0 Render log.
-  * Typed searches log a single ⚡ TURSO CACHE HIT with key
-    `search:q=<q>|sort=date|page=N` — no `search:search:*` keys anywhere.
-  * Bot2Fetcher logs "📚 list_gallery_ids: N galleries (mode=DELTA …)" and,
-    within 10s of the previous tick, no new scan (memo) — then mode=DELTA
-    returns only new rows once the index is live.
-  * Turso dashboard: daily read rate visibly drops within 24-48h.
-  * python3 tests/test_v12_55_read_budget.py — ALL CHECKS PASSED.
+  * ScraperBot channel message: "New last 2h" rises as list sweeps run.
+  * Next 10:00 IST digest lists per-sort/tag new counts with the header
+    "(since <prior send time> IST)" — no more empty "No new galleries"
+    while sweeps are finding items.
+  * Bot 2 dashboard shows the three honest lines; Lifetime cached >=
+    Cache queue always.
+  * python3 ScraperBot/tests/test_v1_27_discovery.py — ALL CHECKS PASSED.
 
 TESTS (sandbox, all pass)
 -------------------------
-  python3 tests/test_v12_55_read_budget.py      — 14/14 PASS (new)
-  python3 tests/test_turso_cache.py             — PASS (regression)
-  python3 tests/test_sync_audit_v12_48.py       — PASS (regression)
-  python3 ScraperBot/tests/test_english_only.py — PASS (regression)
-  python3 ScraperBot/tests/test_v1_25_digest.py — PASS (regression)
+  python3 ScraperBot/tests/test_v1_27_discovery.py — 19/19 PASS (new)
+  python3 ScraperBot/tests/test_v1_25_digest.py    — PASS (regression)
+  python3 ScraperBot/tests/test_english_only.py    — PASS (regression)
   python3 Bot2Fetcher/tests/test_fallback_chain.py — PASS (regression)
+  python3 tests/test_turso_cache.py                — PASS (regression)
+  python3 tests/test_sync_audit_v12_48.py          — PASS (regression)
   py_compile on every touched file: ALL OK.
 ================================================================================

@@ -175,6 +175,61 @@ def record_new_gallery(sort_or_tag: str) -> None:
     _save_totals(t)
 
 
+def record_new_galleries_on_page(sort_or_tag: str, page: Any,
+                                 gids: List[str]) -> None:
+    """v1.27: batch discovery recorder for list_sweeper — ONE Mongo
+    read+write per swept page instead of one per gallery. Feeds:
+      * dash_counters["per_page_new"]  — the daily digest ring
+      * dash_counters per_sort / new_galleries — Message B counters
+      * dash_totals ring_24h / ring_hb / ring24h_by_key — /health +24h
+    Failures are swallowed: observability must never break a sweep."""
+    if not sort_or_tag or not gids:
+        return
+    try:
+        now = time.time()
+        n = len(gids)
+        c = _counters()
+        ring = [e for e in (c.get("per_page_new") or [])
+                if isinstance(e, list)]
+        for _g in gids:
+            ring.append([str(sort_or_tag), int(page or 0), now])
+        c["per_page_new"] = ring[-4000:]
+        per_sort = c.get("per_sort") or {}
+        per_sort[sort_or_tag] = int(per_sort.get(sort_or_tag, 0)) + n
+        c["per_sort"] = per_sort
+        c["new_galleries"] = int(c.get("new_galleries", 0)) + n
+        c["last_write_at"] = now
+        _save_counters(c)
+
+        t = _totals()
+        t["total_galleries"] = int(t.get("total_galleries", 0)) + n
+        ring24 = _prune_ring(t.get("ring_24h") or [], now - 86400)
+        ring24.extend([now] * n)
+        t["ring_24h"] = ring24[-20000:]
+        hring = _prune_ring(t.get("ring_hb") or [], now - _HEARTBEAT_SEC)
+        hring.extend([now] * n)
+        t["ring_hb"] = hring[-20000:]
+        by_key = t.get("ring24h_by_key") or {}
+        if not isinstance(by_key, dict):
+            by_key = {}
+        lst = [float(ts) for ts in (by_key.get(sort_or_tag) or [])
+               if isinstance(ts, (int, float)) and ts >= now - 86400]
+        lst.extend([now] * n)
+        by_key[sort_or_tag] = lst[-_PER_KEY_RING_CAP:]
+        t["ring24h_by_key"] = by_key
+        _save_totals(t)
+
+        for g in gids:
+            record_gid_seen(sort_or_tag, g)
+    except Exception as e:  # noqa: BLE001
+        try:
+            import logging
+            logging.getLogger("scraperbot.dashboard").warning(
+                "record_new_galleries_on_page failed (non-fatal): %s", e)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def record_cached_gallery(sort_or_tag: str) -> None:
     c = _counters()
     pc = c.get("per_cached") or {}

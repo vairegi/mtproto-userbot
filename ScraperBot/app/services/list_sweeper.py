@@ -280,6 +280,38 @@ async def _fetch_and_cache(
     _stats_bump(writes=1)
     channel_dashboard.record_search_page_written()
 
+    # v1.27: record TRUE discoveries — gids with no gallery:<id> cache row
+    # yet. Until now only details_sweeper + user-hints incremented the
+    # "new" counters, so list sweeps (4 sorts x 20 pages + 66 tags) were
+    # invisible to the dashboard and the digest always read "No new
+    # galleries". One batched PK-indexed IN-query per page (~25 row-reads)
+    # — negligible against the Turso read budget.
+    try:
+        ids = [str(it["id"]) for it in payload
+               if isinstance(it, dict) and it.get("id") is not None]
+        if ids:
+            from .. import turso_client as _tc
+            ph = ",".join("?" for _ in ids)
+            res = await _tc.execute(
+                f'SELECT "key" FROM nhentai_cache WHERE "key" IN ({ph})',
+                [f"gallery:{g}" for g in ids])
+            known: set = set()
+            if res:
+                for row in res.get("rows") or []:
+                    cell = row[0] if isinstance(row, list) and row else None
+                    val = (cell.get("value") if isinstance(cell, dict)
+                           else cell)
+                    if val:
+                        known.add(str(val).split(":", 1)[-1])
+            new_ids = [g for g in ids if g not in known]
+            if new_ids:
+                channel_dashboard.record_new_galleries_on_page(
+                    sort, page, new_ids)
+                log.info("🆕 %s page %d: %d new galleries %s",
+                         sort, page, len(new_ids), new_ids[:5])
+    except Exception as e:  # noqa: BLE001
+        log.debug("list_sweeper discovery record failed (non-fatal): %s", e)
+
     # Hint details_sweeper: freshly-written page's IDs deserve hydration,
     # and pass the sort/tag along so 'new' galleries can be attributed.
     await _register_details_hint(sort, page)
