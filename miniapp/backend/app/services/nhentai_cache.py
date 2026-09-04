@@ -706,7 +706,10 @@ def list_gallery_keys() -> list[dict]:
     try:
         rs = _turso.execute(
             "SELECT key, expires_at, cached_at FROM nhentai_cache "
-            "WHERE key LIKE 'gallery:%'"
+            "WHERE key LIKE 'gallery:%' LIMIT ?",
+            # v12.57: cap the full-table walk (top read burner).
+            [int(os.environ.get("DEDUP_SCAN_MAX_ROWS", "5000") or 5000)
+             or 2_000_000_000],
         )
     except Exception as e:  # noqa: BLE001
         log.debug("list_gallery_keys: turso execute failed: %s", e)

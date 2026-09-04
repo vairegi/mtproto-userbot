@@ -50,12 +50,12 @@ _MAX_SEARCH_ROWS = 200
 # deliberately generous — the producer already de-dupes against the known-
 # done / known-failed sets, so a missed row simply gets picked up on the
 # next full pass. Env-tunable so ops can retune without a redeploy.
-_FULL_RESCAN_EVERY = max(1, int(_os.getenv("BOT2_LIST_FULL_RESCAN_EVERY", "12") or 12))
-_WATERMARK_SLACK_SEC = max(0, int(_os.getenv("BOT2_LIST_WATERMARK_SLACK_S", "60") or 60))
+_FULL_RESCAN_EVERY = max(1, int(_os.getenv("BOT2_LIST_FULL_RESCAN_EVERY", "144") or 144))  # v12.57: was 12
+_WATERMARK_SLACK_SEC = max(0, int(_os.getenv("BOT2_LIST_WATERMARK_SLACK_S", "300") or 300))  # v12.57
 
 # v12.55: short in-process memo for list_gallery_ids — collapses
 # rapid producer ticks into ONE Turso scan per window.
-_LIST_MEMO_TTL_SEC = max(1, int(_os.getenv("BOT2_LIST_MEMO_TTL_SEC", "10") or 10))
+_LIST_MEMO_TTL_SEC = max(1, int(_os.getenv("BOT2_LIST_MEMO_TTL_SEC", "120") or 120))  # v12.57: was 10s
 
 
 def _normalise_url(raw: str) -> str:
@@ -163,6 +163,7 @@ class Turso:
         self._list_gallery_cycles: int = 0
         # v12.55: (expires_at_epoch, rows) memo for list_gallery_ids
         self._list_gallery_memo: tuple = (0.0, [])
+        self._search_ids_memo: tuple = (0.0, [])  # v12.57
 
     async def _pipeline(self, sql: str, args: Optional[list] = None) -> Optional[Dict[str, Any]]:
         # v12.41: delegate to the shared common.turso_http client so all
@@ -326,6 +327,10 @@ class Turso:
         queries are queried second so tag-scoped 'recent' pages also feed
         the producer. Popular-today is the final fallback.
         """
+        # v12.57: memo — payload scan, cap at 1 per window
+        _exp, _rows = self._search_ids_memo
+        if _rows and _exp > time.time():
+            return list(_rows)
         out: List[str] = []
         seen: set = set()
 
@@ -373,6 +378,7 @@ class Turso:
             "🔥 list_recent_search_ids: %d ids (recent=%d, popular=%d)",
             len(out), n_recent, n_pop,
         )
+        self._search_ids_memo = (time.time() + _LIST_MEMO_TTL_SEC, list(out))  # v12.57
         return out
 
     async def get_gallery_row(self, gid: str) -> Optional[Dict[str, Any]]:

@@ -52,6 +52,12 @@ def gallery_suggestions(
           "count": N
         }
     """
+    # v12.57: kill switch — this endpoint ran a full-table json_each
+    # scan (all ~15k gallery rows PER REQUEST), a top Turso read burner.
+    # Disabled by default; set SIMILAR_ENABLED=1 to re-enable.
+    import os as _os_sim
+    if _os_sim.environ.get("SIMILAR_ENABLED", "0").strip().lower() not in ("1", "true", "on"):
+        return {"ok": False, "error": "similar-disabled", "items": [], "results": []}
     try:
         items = scraper_bridge.gallery_suggestions(str(gallery_id), int(limit))
     except Exception as e:  # noqa: BLE001

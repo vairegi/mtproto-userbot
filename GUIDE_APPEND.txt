@@ -1,76 +1,68 @@
 ================================================================================
-GUIDE_APPEND — v1.27 (ScraperBot) + v12.56 (Bot2Fetcher)
-2026-09-04 — Telegram log-channel truthfulness: discovery counting, digest
-window, dashboard labels
+GUIDE_APPEND — v12.57 (2026-09-04) — Turso read-budget emergency brake
 ================================================================================
 
-WHAT CHANGED & WHY
-------------------
-Three log-channel bugs, all root-caused against LIVE Mongo/Turso data:
+CONTEXT
+-------
+Reads jumped 293M -> 300.05M in 70 minutes (~100k rows/min, ~144M/day pace
+-> budget exhausted in ~2 days). Live code + census showed the burners were
+NOT the empty tables (bot2_done, bot2_queue, bm_cover, cache, bucket_replica
+all hold 0 rows — moving them to Mongo would save nothing). The real
+burners: Bot 2's gallery:* scans (15k rows touched per scan even in "delta"
+mode before the cached_at index), /similar's full-table json_each scan
+(15k rows PER USER REQUEST), and Bot 0's unbounded dedup gallery walk.
+Bot 2 was manually suspended by Ryan as an immediate brake; this zip makes
+its scans safe to re-enable.
 
-1) Bot 2 dashboard "Turso cache: 16,527 vs In DB channel: 19,496" looked
-   like deleted rows. It was a LABEL bug: cache_total is the POST-FILTER
-   work queue (known-done/failed already removed by _build_queue_order),
-   while "In DB channel" is the cumulative lifetime COMPLETED+PARTIAL
-   count from Mongo. Nothing was wrongly deleted. Now shows:
-     "Lifetime cached (Turso)"   — ALL gallery:* rows (pre-filter)
-     "Cache queue (not yet done/failed)" — the work queue
-     "Remaining"                 — = queue size (old formula subtracted
-                                   completed_db AGAIN — double-count fix)
+CHANGES
+-------
+1) miniapp/backend/app/routes/suggestions.py — /similar KILL SWITCH.
+   gallery_suggestions() now returns {"ok": false, "error":
+   "similar-disabled", "items": [], "results": []} immediately unless
+   SIMILAR_ENABLED=1 is set on the Bot 0 Render service. Default OFF.
+   (User-requested temporary disable until budget recovers; the toggle is
+   env-only, redeploy-free.)
 
-2) ScraperBot "finds no new items": scraping WAS working (live Mongo:
-   715 new/24h) — but only details_sweeper/user-hints incremented the
-   counters. list_sweeper (4 sorts x 20 pages + 66 tags x 5 pages) never
-   recorded discoveries, so all that scanning was invisible. Now, after
-   each page write, list_sweeper batch-checks which gids have NO
-   gallery:<id> row yet (one PK-indexed IN query per page, ~25 row-reads)
-   and records true discoveries via the new batched
-   channel_dashboard.record_new_galleries_on_page (ONE Mongo read+write
-   per page — feeds per_page_new, per_sort, new_galleries, ring_24h,
-   ring_hb, ring24h_by_key, and the gid dedupe set).
+2) Bot2Fetcher/app/turso_store.py — scan hardening:
+     BOT2_LIST_MEMO_TTL_SEC        default 10  -> 120  (one scan / 2 min max)
+     BOT2_LIST_FULL_RESCAN_EVERY   default 12  -> 144  (full 15k-row sweep
+                                                        roughly daily, not hourly)
+     BOT2_LIST_WATERMARK_SLACK_S   default 60  -> 300  (fewer false deltas)
+     list_recent_search_ids() memoized with the same 120s window.
+   All env-overridable.
 
-3) Digest "No new galleries were scraped today": per_page_new held only
-   10 user-hint entries (confirmed live) AND build_report hardcoded a
-   trailing-24h window. Now the window anchors to the PREVIOUS send
-   (discovery_digest_last_sent): a 10:00 digest covers everything since
-   the prior send; header reads "(since 03 Sep 10:00 IST)". Cadence stays
-   once-daily at BOT1_DIGEST_TIME_IST (your choice).
+3) miniapp/backend/app/services/nhentai_cache.py — dedup gallery walk
+   capped: DEDUP_SCAN_MAX_ROWS (default 5000; <=0 restores old unbounded
+   behaviour).
 
-FILES IN THIS ZIP (repo-relative)
----------------------------------
-  ScraperBot/app/services/list_sweeper.py
-  ScraperBot/app/services/channel_dashboard.py
-  ScraperBot/app/services/discovery_digest.py
-  ScraperBot/tests/test_v1_27_discovery.py   (new — 19 checks)
-  Bot2Fetcher/app/dashboard.py
-  Bot2Fetcher/app/fetcher.py
-  GUIDE.md
+FILES IN THIS ZIP
+-----------------
+  miniapp/backend/app/routes/suggestions.py
+  miniapp/backend/app/services/nhentai_cache.py
+  Bot2Fetcher/app/turso_store.py
   GUIDE_APPEND.txt
 
-DEPLOY STEPS
-------------
-1) Drag-and-drop the zip onto the repo root. Commit + push.
-2) Redeploy ScraperBot AND Bot2Fetcher on Render. No env changes.
-3) Watch the next sweep tick: "🆕 <sort> page N: K new galleries [...]"
-   lines appear in the ScraperBot Render log when discoveries happen.
+DEPLOY
+------
+1) Drag-and-drop zip onto repo root; commit + push.
+2) Redeploy Bot 0 (miniapp backend) — /similar now returns disabled by
+   default. No env needed unless you later set SIMILAR_ENABLED=1.
+3) Bot2Fetcher stays SUSPENDED until the Turso dashboard shows the read
+   rate back under control; when you resume it, these tunables apply
+   automatically.
 
-VERIFICATION SIGNS
-------------------
-  * ScraperBot channel message: "New last 2h" rises as list sweeps run.
-  * Next 10:00 IST digest lists per-sort/tag new counts with the header
-    "(since <prior send time> IST)" — no more empty "No new galleries"
-    while sweeps are finding items.
-  * Bot 2 dashboard shows the three honest lines; Lifetime cached >=
-    Cache queue always.
-  * python3 ScraperBot/tests/test_v1_27_discovery.py — ALL CHECKS PASSED.
+VERIFY
+------
+  * Bot 0 log: /similar requests return {"error":"similar-disabled"} and
+    NO "similar_sql" scan follows.
+  * Turso dashboard: reads/min drops sharply within an hour of Bot 0
+    redeploy (Bot 2 already suspended).
+  * python3 -m py_compile on all 3 files: OK (done in sandbox).
 
-TESTS (sandbox, all pass)
--------------------------
-  python3 ScraperBot/tests/test_v1_27_discovery.py — 19/19 PASS (new)
-  python3 ScraperBot/tests/test_v1_25_digest.py    — PASS (regression)
-  python3 ScraperBot/tests/test_english_only.py    — PASS (regression)
-  python3 Bot2Fetcher/tests/test_fallback_chain.py — PASS (regression)
-  python3 tests/test_turso_cache.py                — PASS (regression)
-  python3 tests/test_sync_audit_v12_48.py          — PASS (regression)
-  py_compile on every touched file: ALL OK.
+HONEST NOTE
+-----------
+Sandbox instability this session meant validation was compile + source-
+placement checks (gate placed before the scan call in the handler), not a
+live HTTP test of the endpoint. If the mini-app's Similar section errors
+instead of showing empty, set SIMILAR_ENABLED=1 to roll back instantly.
 ================================================================================
