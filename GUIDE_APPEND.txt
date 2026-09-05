@@ -1,63 +1,82 @@
 ================================================================================
-GUIDE_APPEND — v12.64 (2026-09-05)
-Rating removal + trending-chip fix + live online badge
+GUIDE_APPEND — v12.65 (2026-09-05) — Bot 0 crash-loop fixes
 ================================================================================
 
-1) RATING REMOVED (detail sheet)
-   The star-rating widget is gone from the gallery detail sheet (import,
-   render call, and the vestigial try/catch dropped). star-rating.js stays
-   in the repo unused — ratings data in Mongo is untouched if you ever
-   want it back.
+ROOT CAUSE (verified line-by-line from the 11:23-11:25 crash log)
+-----------------------------------------------------------------
+NOT a leak. NOT the similar cache in RAM (the result cache lives in
+Mongo-2 — 81 rows, working; the lean scan releases every doc transiently).
+The crash was a PEAK-RAM collision on the 512MB instance:
+  * start.sh runs THREE processes in one instance: admin_bot.py +
+    worker.py (background) + uvicorn mini-app backend (foreground) —
+    high baseline before any request.
+  * 11:24:45-11:24:52: one /similar lean-scan completing (~15.8k docs
+    streamed) PLUS a ~25-request burst (all static JS/CSS + gallery APIs)
+    as a second device opened the Mini App at that exact moment.
+  * baseline + burst + scan spike -> peak >512MB -> Render kill ->
+    restart -> users retry -> repeat. That is why restarting "fixed" it
+    for a few minutes only.
 
-2) TRENDING CHIPS FIXED ("Try Searching These")
-   Before: tapping a chip pasted "tag:blowjob" into the search box. Bot 1
-   warms searches under the bare-slug canonical key
-   (search:q=blowjob|sort=popular-today|page=N), so the tag: form was a
-   guaranteed cache MISS — wrong sort + slow live fetch.
-   Now: chip pastes the bare slug ("blowjob") and the existing input-event
-   -> debounced-commit flow fires the search automatically.
-   Result: chip taps now hit the warmed cache instantly.
-
-3) LIVE ONLINE BADGE (header, in front of PUBLIC)
-   New "🟢 N" badge = users with last_seen in the last 5 minutes.
-   Backend: NEW miniapp/backend/app/routes/online.py — GET /api/online
-   (authenticated, one count_documents on miniapp_users.last_seen;
-   last_seen is already maintained on every request, so this adds zero
-   write load). Frontend: app.js polls every 30s.
-   Tunable: ONLINE_WINDOW_MIN on the miniapp service (default 5).
-
-FILES IN THIS ZIP
+FIXES IN THIS ZIP
 -----------------
-  miniapp/frontend/js/plugins/detail-sheet.js   (rating removed)
-  miniapp/frontend/js/pages/search.js           (chip fix)
-  miniapp/frontend/js/core/app.js               (online badge + polling)
-  miniapp/frontend/js/core/registry.js          (search.js pin)
-  miniapp/backend/app/routes/online.py          (NEW endpoint)
-  miniapp/frontend/js/pages/bookmarks.js        (version bump only)
-  miniapp/frontend/js/pages/profile.js          (version bump only)
-  miniapp/frontend/js/plugins/home-rows.js      (version bump only)
-  miniapp/frontend/index.html                   (app.js pin bump)
-  index.html                                    (app.js pin bump)
+1) miniapp/backend/app/db.py — NEW is_admin_user() shim. profile.py called
+   db.is_admin_user(uid) but the miniapp db module never defined it (only
+   the repo-root db.py had it) -> EVERY /api/profile/me returned 500 with
+   "module 'app.db' has no attribute 'is_admin_user'" (visible twice in
+   the crash log). Shim: super-admin id OR row in `admins` collection;
+   silent-fail False on any error (profile must never 500).
+
+2) miniapp/backend/app/services/similar_mongo.py — scan admission control.
+   BoundedSemaphore (SIMILAR_MAX_CONCURRENT, default 1, env-tunable on the
+   miniapp service): only one corpus scan at a time; additional cold-scan
+   requests wait up to 20s then fail open (Similar row simply hides).
+   An app-open burst can no longer stack scan allocations into an OOM peak.
+
+ANSWERS TO USER QUESTIONS (for the record)
+------------------------------------------
+* "Page 2 loads itself on open": that is hash-restore replaying the last
+  position (#search?page=2) from the previous session — by design (v12.16).
+  Only ONE page is ever fetched and held (old results are replaced, never
+  accumulated — that part was already correct). To force page-1 opens,
+  strip the hash on boot — ask and it ships in the next zip.
+* "index.html shifted in v12_64": the repo holds TWO identical copies
+  (repo-root index.html + miniapp/frontend/index.html, the served one).
+  Both got the app.js ?v=12.64 pin bump so they can never drift apart.
+  No file was moved or renamed.
+* Similar cache is NOT stored in RAM — it is a Mongo-2 document per
+  gallery (similar:<gid>, 30-min TTL). Removing it was unnecessary; the
+  RAM peak came from concurrent scans + boot burst, not the cache.
+
+FILES
+-----
+  miniapp/backend/app/db.py
+  miniapp/backend/app/services/similar_mongo.py
   GUIDE.md
   GUIDE_APPEND.txt
 
 DEPLOY
 ------
 1) Drop zip on repo root; commit + push.
-2) Redeploy the Bot 0 (miniapp) service only.
-3) Fully close and reopen the Mini App once (pulls the new JS pins).
+2) Redeploy the Bot 0 (miniapp) service. No env changes.
 
 VERIFY
 ------
-  * Detail sheet: no star row between title/meta and the metadata card.
-  * Tap "tag:blowjob" chip -> search box shows "blowjob", results load
-    automatically (and fast — cache hit).
-  * Header shows "🟢 N" in front of PUBLIC; N updates every 30s.
-  * Render log: GET /api/online 200 every 30s per active client.
+  * Mini App opens without the profile 500 (check log: no
+    "is_admin_user" AttributeError; /api/profile/me returns 200).
+  * Open many cold galleries fast: service survives; extra scans log
+    "scan slots busy — failing open" instead of stacking RAM.
+  * Events page: no new "Ran out of memory" kills.
 
-TESTS (sandbox)
----------------
-  node --check on all 5 touched JS files: OK.
-  py_compile online.py: OK.
-  tests/test_v12_60_mongo2.py: 20/20 PASS (no regressions).
+IF CRASHES PERSIST
+------------------
+The remaining lever: split admin_bot.py + worker.py onto their own free
+Render service (the miniapp keeps the full 512MB to itself). One render
+.yaml change + moving two env groups — ask and it ships.
+
+TESTS (sandbox, all pass)
+-------------------------
+  DB shim checks: super-admin True / random False / zero-safe — PASS.
+  tests/test_v12_60_mongo2.py — 20/20 PASS (regression; semaphore change
+  exercised through the normal call path).
+  py_compile: db.py + similar_mongo.py OK.
 ================================================================================

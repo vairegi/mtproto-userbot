@@ -387,3 +387,23 @@ def record_share(user_id: int, gallery_id: Any) -> None:
         "gallery_id": gallery_id,
         "ts":         _dt.datetime.utcnow(),
     })
+
+
+# ---- v12.65: is_admin_user shim -------------------------------------------------
+# profile.py calls db.is_admin_user(uid); the miniapp db module never defined it
+# (it lives in the repo-root db.py), so EVERY /api/profile/me -> 500
+# AttributeError. Same semantics as the root version: super-admin OR a row in
+# the `admins` collection. Silent-fail on errors (never 500 the profile).
+def is_admin_user(user_id: int) -> bool:
+    if not user_id:
+        return False
+    try:
+        from .config import settings
+        if int(user_id) == int(getattr(settings, "admin_user_id", 0) or 0):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return bool(db()["admins"].find_one({"_id": int(user_id)}, {"_id": 1}))
+    except Exception:  # noqa: BLE001
+        return False

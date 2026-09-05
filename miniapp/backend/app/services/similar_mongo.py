@@ -42,6 +42,13 @@ _SIM_CACHE_TTL_SEC = int(os.getenv("SIMILAR_CACHE_TTL_SEC", "1800") or 1800)
 # scans from stacking in RAM on the 512MB instance.
 _SCAN_LOCK = threading.Lock()
 
+# v12.65: admission control. The lean scan is ~4s but still transiently
+# allocates per doc; three of them landing during an app-open burst on a
+# 512MB instance (shared with admin_bot + worker) was the OOM peak in the
+# 2026-09-05 11:24 crash. Cap concurrent scans at 1 HARD and make waiters
+# beyond the first few fail open instantly instead of queueing memory work.
+_SCAN_SLOTS = threading.BoundedSemaphore(int(os.getenv("SIMILAR_MAX_CONCURRENT", "1") or 1))
+
 
 def _enabled() -> bool:
     return os.getenv("SIMILAR_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
@@ -151,8 +158,8 @@ def similar_galleries(gid: str, limit: int = 6) -> List[Dict[str, Any]]:
     # 2) v12.63: single-flight — only one corpus scan may run at a time.
     # Concurrent cold-gallery requests wait their turn (scan is a few
     # seconds) instead of stacking 100MB+ each until the instance OOMs.
-    if not _SCAN_LOCK.acquire(timeout=_SCAN_WAIT_SEC):
-        log.warning("similar_mongo(%s): scan busy >%ss — failing open "
+    if not _SCAN_SLOTS.acquire(timeout=_SCAN_WAIT_SEC):
+        log.warning("similar_mongo(%s): scan slots busy >%ss — failing open "
                     "(client keeps skeletons hidden)", gid, _SCAN_WAIT_SEC)
         return []
     try:
@@ -181,7 +188,7 @@ def similar_galleries(gid: str, limit: int = 6) -> List[Dict[str, Any]]:
             if card["id"] is not None:
                 out.append(card)
     finally:
-        _SCAN_LOCK.release()
+        _SCAN_SLOTS.release()
 
     log.info("📖 /similar gid=%s source=MONGO2 scored=%d rows -> %d cards (lean-scan)",
              gid, n_scanned, len(out))

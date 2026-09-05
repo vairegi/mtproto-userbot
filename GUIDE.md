@@ -962,3 +962,19 @@ last_seen was already maintained by upsert_user on every authenticated
 request, so zero new write load. Version bumps per rule 6: detail-sheet
 ?sites, registry search.js pin added, home-rows pin, app.js pin in both
 index.html copies.
+
+v12.65 (2026-09-05): Bot 0 crash-loop root cause + fixes. Log forensics
+(11:23-11:25 window): the 512MB miniapp instance runs THREE processes
+(start.sh: admin_bot + worker + uvicorn) — baseline RAM is already high.
+Death window shows: final lean-scan completing + a ~25-request static/API
+burst from a second device opening the app at the same moment -> peak
+crossed 512MB -> kill. Not a leak; not the Mongo result cache (server-side
+and working: 81 cached rows). Fixes: 1) miniapp app/db.py gained the
+missing is_admin_user() shim (super-admin OR admins-collection row,
+silent-fail) — every /api/profile/me was 500ing with AttributeError since
+the profile route called a function that only existed in repo-root db.py.
+2) similar_mongo scan admission control: BoundedSemaphore
+(SIMILAR_MAX_CONCURRENT, default 1) — extra scans beyond the first wait
+max 20s then fail open, so an app-open burst can never stack scan
+allocations into an OOM peak again. If crashes persist, the next lever is
+splitting admin_bot/worker to a separate Render service.
