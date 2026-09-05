@@ -24,6 +24,7 @@ from app import mongo_client, turso_client
 from app.services import turso_schema
 from app.services import list_sweeper, details_sweeper, channel_dashboard
 from app.services import discovery_digest  # v1.25: daily 10:00 IST admin digest
+from app.services import turso_backup  # v1.28: Turso -> 2nd Mongo backup
 
 log = setup_logging("scraperbot")
 
@@ -108,6 +109,10 @@ async def _startup() -> None:
         _tasks.append(asyncio.create_task(
             _delayed(discovery_digest.run_forever, 50, _stop_event),
             name="discovery_digest"))
+        # v1.28: Turso -> second-Mongo backup (every 12h; idles w/o URI)
+        _tasks.append(asyncio.create_task(
+            _delayed(turso_backup.run_forever, 120, _stop_event),
+            name="turso_backup"))
         log.info("sweepers + dashboard spawned: %s",
                  [t.get_name() for t in _tasks])
     else:

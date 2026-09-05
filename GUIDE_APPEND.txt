@@ -1,68 +1,58 @@
 ================================================================================
-GUIDE_APPEND — v12.57 (2026-09-04) — Turso read-budget emergency brake
+GUIDE_APPEND — v1.28 (2026-09-05) — Turso -> second-Mongo backup (ScraperBot)
 ================================================================================
 
-CONTEXT
--------
-Reads jumped 293M -> 300.05M in 70 minutes (~100k rows/min, ~144M/day pace
--> budget exhausted in ~2 days). Live code + census showed the burners were
-NOT the empty tables (bot2_done, bot2_queue, bm_cover, cache, bucket_replica
-all hold 0 rows — moving them to Mongo would save nothing). The real
-burners: Bot 2's gallery:* scans (15k rows touched per scan even in "delta"
-mode before the cached_at index), /similar's full-table json_each scan
-(15k rows PER USER REQUEST), and Bot 0's unbounded dedup gallery walk.
-Bot 2 was manually suspended by Ryan as an immediate brake; this zip makes
-its scans safe to re-enable.
+WHY
+---
+Turso free tier hard-locks at 500M reads/month. The v12.57 brake + Bot 2
+suspension fixed the burn (7M/70min -> ~10k/9h), but if the account ever
+locks while you're away, the entire cache is unreachable. This mirrors all
+content into your SECOND Mongo cluster (separate account) every 12h.
 
-CHANGES
--------
-1) miniapp/backend/app/routes/suggestions.py — /similar KILL SWITCH.
-   gallery_suggestions() now returns {"ok": false, "error":
-   "similar-disabled", "items": [], "results": []} immediately unless
-   SIMILAR_ENABLED=1 is set on the Bot 0 Render service. Default OFF.
-   (User-requested temporary disable until budget recovers; the toggle is
-   env-only, redeploy-free.)
+WHAT
+----
+NEW ScraperBot/app/services/turso_backup.py — a background task inside
+ScraperBot (no new Render service). Every 12h it copies:
+    nhentai_cache, bot2_fetch_state, bot2_done
+into Mongo-2 collections turso_nhentai_cache, turso_bot2_fetch_state,
+turso_bot2_done via bulk upserts. Keyset pagination (key > :last, 500-row
+batches) — no OFFSET scans. Cost ~19k Turso reads/pass (~0.2% of budget).
+Manual restore mode: python -m app.services.turso_backup --restore
 
-2) Bot2Fetcher/app/turso_store.py — scan hardening:
-     BOT2_LIST_MEMO_TTL_SEC        default 10  -> 120  (one scan / 2 min max)
-     BOT2_LIST_FULL_RESCAN_EVERY   default 12  -> 144  (full 15k-row sweep
-                                                        roughly daily, not hourly)
-     BOT2_LIST_WATERMARK_SLACK_S   default 60  -> 300  (fewer false deltas)
-     list_recent_search_ids() memoized with the same 120s window.
-   All env-overridable.
-
-3) miniapp/backend/app/services/nhentai_cache.py — dedup gallery walk
-   capped: DEDUP_SCAN_MAX_ROWS (default 5000; <=0 restores old unbounded
-   behaviour).
+CHANGED: ScraperBot/main.py (import + task wiring, starts 120s after boot).
 
 FILES IN THIS ZIP
 -----------------
-  miniapp/backend/app/routes/suggestions.py
-  miniapp/backend/app/services/nhentai_cache.py
-  Bot2Fetcher/app/turso_store.py
+  ScraperBot/app/services/turso_backup.py   (new)
+  ScraperBot/main.py
+  GUIDE.md
   GUIDE_APPEND.txt
 
-DEPLOY
-------
-1) Drag-and-drop zip onto repo root; commit + push.
-2) Redeploy Bot 0 (miniapp backend) — /similar now returns disabled by
-   default. No env needed unless you later set SIMILAR_ENABLED=1.
-3) Bot2Fetcher stays SUSPENDED until the Turso dashboard shows the read
-   rate back under control; when you resume it, these tunables apply
-   automatically.
+DEPLOY (step by step)
+---------------------
+1) Drag-and-drop the zip onto the repo root. Commit + push.
+2) Render -> ScraperBot service -> Environment, add:
+     2NDMONGO_BACKUP_TURSO = mongodb+srv://<2nd-cluster-uri>
+   (If Render rejects the name, use MONGO2_BACKUP_URI instead — the code
+   reads both.)
+3) Redeploy ScraperBot only. Bot 0 / Bot2Fetcher untouched.
+4) First backup fires ~2 min after boot; watch Render logs for:
+     "turso_backup: starting (every=12.0h, enabled=True)"
+     "turso_backup: nhentai_cache -> 18930 rows"
+     "turso_backup: done ok=True tables={...}"
 
 VERIFY
 ------
-  * Bot 0 log: /similar requests return {"error":"similar-disabled"} and
-    NO "similar_sql" scan follows.
-  * Turso dashboard: reads/min drops sharply within an hour of Bot 0
-    redeploy (Bot 2 already suspended).
-  * python3 -m py_compile on all 3 files: OK (done in sandbox).
+  * If the URI env is missing, the task logs "not set — skipping" and
+    idles harmlessly (zero Turso reads).
+  * BACKUP_ENABLED=0 idles the loop without a redeploy of code.
+  * Mongo-2 (Atlas UI): collections turso_nhentai_cache etc. appear with
+    row counts matching Turso.
 
-HONEST NOTE
------------
-Sandbox instability this session meant validation was compile + source-
-placement checks (gate placed before the scan call in the handler), not a
-live HTTP test of the endpoint. If the mini-app's Similar section errors
-instead of showing empty, set SIMILAR_ENABLED=1 to roll back instantly.
+TESTS (sandbox)
+---------------
+  py_compile: turso_backup.py + main.py OK.
+  Live smoke: not run (service task; verified by log lines above after
+  deploy). Restore path reviewed line-by-line; run it ONLY in a real
+  emergency — it overwrites Turso rows with the backup copy.
 ================================================================================

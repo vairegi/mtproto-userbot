@@ -868,3 +868,17 @@ page, feeds per_page_new + per_sort + ring24h_by_key + gid dedupe set).
 previous send (discovery_digest_last_sent) so a 10:00 digest covers
 everything since the prior send, header reads "(since 03 Sep 10:00 IST)".
 New tests: ScraperBot/tests/test_v1_27_discovery.py.
+
+v1.28 (2026-09-05): Turso -> second-Mongo backup service (disaster recovery).
+Context: v12.57 brake worked — reads went from ~7M/70min to ~10k/9h after
+deploy + Bot 2 suspension, budget safe. But Turso hard-locks at 500M reads;
+if that ever fired unattended, all 18,930 cache rows + Bot 2 state would be
+unreachable. New app/services/turso_backup.py runs inside ScraperBot
+(no new service): every BACKUP_EVERY_HOURS (default 12h) it keyset-paginates
+(key > :last, 500-row batches) through nhentai_cache, bot2_fetch_state and
+bot2_done and bulk-upserts into a SECOND Mongo cluster (separate account).
+Cost: ~19k Turso reads per pass = ~38k/day = 0.2% of budget. Env:
+2NDMONGO_BACKUP_TURSO (URI, required; also accepts 2ndmongo_backup_turso /
+MONGO2_BACKUP_URI), MONGO2_BACKUP_DB (default turso_backup), BACKUP_ENABLED=0
+to idle. Restore: python -m app.services.turso_backup --restore. State +
+status in scraper1_state["turso_backup_state"].
