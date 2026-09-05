@@ -978,3 +978,12 @@ the profile route called a function that only existed in repo-root db.py.
 max 20s then fail open, so an app-open burst can never stack scan
 allocations into an OOM peak again. If crashes persist, the next lever is
 splitting admin_bot/worker to a separate Render service.
+
+v12.66 (2026-09-05): In-app Read reader + worker.py removal. Read (📖)
+button added to the detail sheet action bar: opens plugins/reader.js —
+webtoon vertical scroll, pages 1-3 on open, +2 per sentinel hit, max ±10
+mounted window, 2-ahead preload, CDN-direct image URLs (zero server RAM/
+bandwidth). Detail payloads now carry pages_meta ([{n,path,w,h}]) — all 3
+vendored normalize.py copies extended additively; old rows backfill lazily
+via one keyed /api/gallery fetch. worker.py deleted; start.sh no longer
+supervises it (~90-130MB freed on the miniapp instance — v12.65 OOM fix).

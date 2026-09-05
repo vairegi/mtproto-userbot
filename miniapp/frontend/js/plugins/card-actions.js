@@ -347,4 +347,25 @@ export const cardActions = [
       close && close();
     },
   },
+  // v12.66: in-app Read (📖) — webtoon reader via plugins/reader.js.
+  {
+    id: "read",
+    label: "Read",
+    icon: "📖",
+    kind: "secondary",
+    async run({ gallery }) {
+      try {
+        const m = await import("plugins/reader.js?v=12.66");
+        let g = gallery;
+        if (!(g && Array.isArray(g.pages_meta) && g.pages_meta.length)) {
+          g = await api.get(`/api/gallery/${encodeURIComponent((g && g.id) || "")}`);
+        }
+        if (g && Array.isArray(g.pages_meta) && g.pages_meta.length) {
+          m.openReader(g);
+        } else {
+          toast("Reader unavailable for this gallery yet", "error");
+        }
+      } catch (e) { console.warn("[read] open failed:", e); }
+    },
+  },
 ];

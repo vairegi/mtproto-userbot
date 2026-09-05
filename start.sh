@@ -155,7 +155,9 @@ log "------------------------------------------------------------"
 supervise "admin_bot.py" "admin_bot"
 sleep 3                      # let the Admin Bot claim the Telegram polling slot
 
-supervise "worker.py" "worker"
+# v12.66: worker.py REMOVED — Bot2Fetcher owns all fetching.
+# Frees ~90-130MB baseline RAM on this 512MB instance.
+log "worker.py removed (v12.66) — Bot2Fetcher handles fetching"
 sleep 2
 
 # --- 4. Foreground: Mini App backend (uvicorn) on ${PORT:-8000} ------------

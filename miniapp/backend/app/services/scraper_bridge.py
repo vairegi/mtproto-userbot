@@ -724,6 +724,8 @@ def _hit_to_dict(hit) -> dict:
         "title_en_clean": clean_title(_title) if _title else "",
         "cover": d.get("thumb_url") or d.get("cover") or d.get("cover_url") or "",
         "pages": d.get("pages") or d.get("num_pages"),
+        # v12.66: reader page metadata ([{n,path,w,h}]; [] on old rows)
+        "pages_meta": _pages_meta_of(d),
         "tags":  d.get("tags") or [],
     }
 
@@ -767,6 +769,8 @@ def _meta_to_dict(meta) -> dict:
         # future "reader" preview) can request it without another scrape.
         "page1_url": page1,
         "pages": d.get("pages") or d.get("num_pages"),
+        # v12.66: reader page metadata ([{n,path,w,h}]; [] on old rows)
+        "pages_meta": _pages_meta_of(d),
         "tags":  tag_dicts,
     }
 
@@ -1023,6 +1027,26 @@ def _detail_rate_limit_wait_sec(gallery_id: str) -> int:
     return max(1, int(ban - now))
 
 
+
+def _pages_meta_of(d: dict) -> list:
+    """v12.66: extract [{n, path, w, h}] — accepts v12.66+ rows
+    (pages_meta), raw v2 payloads (images.pages / pages)."""
+    src = None
+    if isinstance(d, dict):
+        if isinstance(d.get("pages_meta"), list): src = d["pages_meta"]
+        elif isinstance(d.get("images"), dict) and isinstance(d["images"].get("pages"), list):
+            src = d["images"]["pages"]
+        elif isinstance(d.get("pages"), list): src = d["pages"]
+    out = []
+    for i, pp in enumerate(src or []):
+        if not isinstance(pp, dict): continue
+        out.append({"n": int(pp.get("number") or pp.get("n") or i + 1),
+                    "path": str(pp.get("path") or ""),
+                    "w": int(pp.get("width") or pp.get("w") or 0),
+                    "h": int(pp.get("height") or pp.get("h") or 0)})
+    return out
+
+
 def gallery_detail(gallery_id: str) -> dict:
     """Return the full detail dict for one gallery.
 
@@ -1221,6 +1245,8 @@ def _normalize(row: dict) -> dict:
         "title": row.get("title") or row.get("english_title") or "",
         "cover": row.get("cover") or row.get("cover_url") or row.get("thumb_url") or "",
         "pages": row.get("pages") or row.get("num_pages"),
+        # v12.66: reader page metadata
+        "pages_meta": _pages_meta_of(row),
         "tags":  row.get("tags") or [],
     }
 

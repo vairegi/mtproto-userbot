@@ -270,6 +270,25 @@ def normalize_gallery_payload(raw: Any, gid_hint: str = ""
         "cover":          cover,
         "page1_url":      page1,
         "pages":          coerce_int(raw.get("pages"), raw.get("num_pages")),
+        # v12.66: reader page metadata passthrough [{n, path, w, h}]
+        # (from raw["pages_meta"] or raw["images"]["pages"]). Optional.
+        "pages_meta":      ([{"n": int(pp.get("number") or pp.get("n") or i + 1),
+                              "path": str(pp.get("path") or ""),
+                              "w": int(pp.get("width") or pp.get("w") or 0),
+                              "h": int(pp.get("height") or pp.get("h") or 0)}
+                             for i, pp in enumerate(raw["pages_meta"])
+                             if isinstance(pp, dict)]
+                            if isinstance(raw.get("pages_meta"), list)
+                            else ([{"n": int(pp.get("number") or pp.get("n") or i + 1),
+                                    "path": str(pp.get("path") or ""),
+                                    "w": int(pp.get("width") or pp.get("w") or 0),
+                                    "h": int(pp.get("height") or pp.get("h") or 0)}
+                                   for i, pp in enumerate(
+                                       (raw.get("images") or {}).get("pages") or [])
+                                   if isinstance(pp, dict)]
+                                  if isinstance(raw.get("images"), dict)
+                                  and isinstance((raw.get("images") or {}).get("pages"), list)
+                                  else [])),
         "favorites":      coerce_int(raw.get("favorites"), raw.get("num_favorites")),
         "upload_date":    _iso_date(raw.get("upload_date")),
         "scanlator":      coerce_str(raw.get("scanlator")),
