@@ -402,12 +402,23 @@ class Turso:
 
     async def put_state(self, key: str, payload: Dict[str, Any]) -> None:
         await self.ensure_schema()
-        await self.execute(
+        import time as _t_mod
+        _t0 = _t_mod.monotonic()
+        _turso_res = await self.execute(
             f'INSERT INTO {STATE_TABLE} ("key", payload, updated_at) '
             "VALUES (?, ?, ?) ON CONFLICT(\"key\") DO UPDATE SET "
             "payload=excluded.payload, updated_at=excluded.updated_at",
             [key, json.dumps(payload, separators=(",", ":")), int(time.time())],
         )
+        # v12.60: mirror state to Mongo-2 (visible dual-write log).
+        try:
+            from . import mongo2_client as _m2
+            _m2_ok = _m2.put(key, json.dumps(payload, separators=(",", ":")),
+                             0, 0, cached_at=int(time.time()))
+            _m2.log_dual_write(key, _turso_res is not None, _m2_ok,
+                               int((_t_mod.monotonic() - _t0) * 1000))
+        except Exception as _e:  # noqa: BLE001
+            log.warning("mongo2 put_state(%s) failed (non-fatal): %s", key, _e)
 
     async def get_state(self, key: str) -> Optional[Dict[str, Any]]:
         await self.ensure_schema()

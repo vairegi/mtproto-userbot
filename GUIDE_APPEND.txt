@@ -1,58 +1,107 @@
 ================================================================================
-GUIDE_APPEND — v1.28 (2026-09-05) — Turso -> second-Mongo backup (ScraperBot)
+GUIDE_APPEND — v12.60 / v1.30 (2026-09-05)
+Mongo-2 dual-write + Mongo-first read (Deploy A + B in one zip)
 ================================================================================
 
-WHY
----
-Turso free tier hard-locks at 500M reads/month. The v12.57 brake + Bot 2
-suspension fixed the burn (7M/70min -> ~10k/9h), but if the account ever
-locks while you're away, the entire cache is unreachable. This mirrors all
-content into your SECOND Mongo cluster (separate account) every 12h.
+WHAT & WHY
+----------
+Turso's 500M-reads/month cap nearly locked the account twice. Mongo Atlas
+has no per-read billing, so this makes Mongo-2 the read primary while
+Turso keeps every write (warm fallback + your existing 12h backup stays
+valid). BOTH phases are in this one zip — you control go-live purely by
+env vars, no redeploy needed between phases.
 
-WHAT
-----
-NEW ScraperBot/app/services/turso_backup.py — a background task inside
-ScraperBot (no new Render service). Every 12h it copies:
-    nhentai_cache, bot2_fetch_state, bot2_done
-into Mongo-2 collections turso_nhentai_cache, turso_bot2_fetch_state,
-turso_bot2_done via bulk upserts. Keyset pagination (key > :last, 500-row
-batches) — no OFFSET scans. Cost ~19k Turso reads/pass (~0.2% of budget).
-Manual restore mode: python -m app.services.turso_backup --restore
+ARCHITECTURE
+------------
+WRITE (all 3 bots, every write):
+  payload -> normalize (unchanged) -> Turso write (unchanged, first)
+          -> Mongo-2 upsert (second) -> ONE visible log line:
+             "DUAL-WRITE key=gallery:123 turso=OK mongo2=OK (58ms)"
+  A Mongo-2 failure NEVER blocks — logs mongo2=FAIL, Turso copy intact.
 
-CHANGED: ScraperBot/main.py (import + task wiring, starts 120s after boot).
+READ (all 3 bots):
+  Mongo-2 find_one -> HIT  = zero Turso reads (log: "MONGO2 HIT key=...")
+                   -> MISS = Turso fallback (log: "MONGO2 MISS ...")
+  The v1.28 backup + dual-writes keep Mongo-2 current; misses self-heal.
+
+TTL parity: Mongo TTL index on expires_at (partial: >0 only), so expiring
+rows auto-delete in Mongo exactly like Turso; expires_at=0 never-expire
+rows persist in both.
+
+/SIMILAR: re-enabled by default, scored on Mongo-2 (miniapp/backend/app/
+services/similar_mongo.py) — the full-corpus scan that cost ~15k Turso
+rows/request is now free. Route falls back to the old Turso engine if
+Mongo-2 returns nothing for a gallery.
+
+ENV VARS — SAME NAMES ON ALL 3 SERVICES (Bot 0, ScraperBot, Bot2Fetcher)
+-------------------------------------------------------------------------
+  MONGO2_URI      = mongodb+srv://foodytrend_db_user:...@cache.hc0jiaj.mongodb.net/?appName=cache
+                    (MONGO2_BACKUP_URI or 2NDMONGO_BACKUP_TURSO also work —
+                    you already set MONGO2_BACKUP_URI; either is fine)
+  MONGO2_READS    = 1   (Mongo-first reads; 0 = Turso-only rollback)
+  MONGO2_WRITES   = 1   (dual-write on; 0 = Turso-only writes)
+  MONGO2_DB       = turso_backup   (optional; this is the default)
+
+PHASE CONTROL (no redeploy needed)
+----------------------------------
+  Deploy A "shadow writes": MONGO2_WRITES=1, MONGO2_READS=0
+      -> writes mirror to Mongo-2, reads stay Turso. Run 24-48h and
+         compare row counts (Atlas turso_backup.turso_nhentai_cache vs
+         Turso nhentai_cache should match ~17.5k+).
+  Deploy B "flip reads":   MONGO2_READS=1
+      -> reads go Mongo-first; Turso dashboard reads/day should collapse
+         toward backup-only (~70k/day).
+
+/SIMILAR CONTROL (Bot 0 / miniapp service env only)
+---------------------------------------------------
+  Where: the Bot 0 Render service (the one serving the mini-app backend).
+  SIMILAR_ENABLED = 0   -> disabled (returns similar-disabled)
+  SIMILAR_ENABLED = 1   -> enabled  (DEFAULT if unset — you asked for this)
+  SIMILAR_SOURCE  = mongo (default) | turso (force old engine)
 
 FILES IN THIS ZIP
 -----------------
-  ScraperBot/app/services/turso_backup.py   (new)
-  ScraperBot/main.py
+  common/mongo2_client.py                     (new — shared client)
+  ScraperBot/app/mongo2_client.py             (vendored copy)
+  Bot2Fetcher/app/mongo2_client.py            (vendored copy)
+  miniapp/backend/app/services/nhentai_cache.py   (dual-write + Mongo-first read)
+  miniapp/backend/app/services/similar_mongo.py   (new — Mongo engine)
+  miniapp/backend/app/routes/suggestions.py       (default ON, Mongo source)
+  ScraperBot/app/cache.py                         (dual-write)
+  Bot2Fetcher/app/turso_store.py                  (dual-write state)
+  tests/test_v12_60_mongo2.py                     (new — 20 checks)
   GUIDE.md
   GUIDE_APPEND.txt
 
-DEPLOY (step by step)
----------------------
-1) Drag-and-drop the zip onto the repo root. Commit + push.
-2) Render -> ScraperBot service -> Environment, add:
-     2NDMONGO_BACKUP_TURSO = mongodb+srv://<2nd-cluster-uri>
-   (If Render rejects the name, use MONGO2_BACKUP_URI instead — the code
-   reads both.)
-3) Redeploy ScraperBot only. Bot 0 / Bot2Fetcher untouched.
-4) First backup fires ~2 min after boot; watch Render logs for:
-     "turso_backup: starting (every=12.0h, enabled=True)"
-     "turso_backup: nhentai_cache -> 18930 rows"
-     "turso_backup: done ok=True tables={...}"
+DEPLOY
+------
+1) Drag-and-drop zip onto repo root; commit + push.
+2) Confirm env vars on ALL 3 services (you already set MONGO2_READS=1,
+   MONGO2_WRITES=1, MONGO2_BACKUP_URI — that URI var works as-is).
+3) Redeploy ALL THREE services.
+4) Watch Render logs for "DUAL-WRITE ... turso=OK mongo2=OK" and
+   "MONGO2 HIT" lines. Turso dashboard reads should drop within hours.
 
 VERIFY
 ------
-  * If the URI env is missing, the task logs "not set — skipping" and
-    idles harmlessly (zero Turso reads).
-  * BACKUP_ENABLED=0 idles the loop without a redeploy of code.
-  * Mongo-2 (Atlas UI): collections turso_nhentai_cache etc. appear with
-    row counts matching Turso.
+  * tests/test_v12_60_mongo2.py — ALL 20 CHECKS PASSED (sandbox).
+  * Regressions: test_turso_cache, test_sync_audit_v12_48,
+    test_english_only, test_v1_25_digest, test_v1_27_discovery,
+    test_fallback_chain — all PASS.
+  * Atlas: turso_backup.turso_nhentai_cache row count grows with every
+    bot write; TTL index ttl_expires_at present.
+  * Mini App: Similar row on a gallery page returns cards (Mongo source),
+    Render log shows "/similar gid=... source=MONGO2 scored=N rows".
 
-TESTS (sandbox)
----------------
-  py_compile: turso_backup.py + main.py OK.
-  Live smoke: not run (service task; verified by log lines above after
-  deploy). Restore path reviewed line-by-line; run it ONLY in a real
-  emergency — it overwrites Turso rows with the backup copy.
+KNOWN LIMITS (honest)
+---------------------
+  * similar_mongo scans up to 25k Mongo docs per /similar call (~200-500ms
+    expected on M0) — acceptable per your latency sign-off; unconfirmed
+    until first live call.
+  * Bot 1/Bot 2 still READ gallery state from Turso in some paths
+    (turso_client.get, get_gallery_row) — those are cheap PK reads, left
+    as-is deliberately; the expensive paths (user-facing reads, scans,
+    /similar) are all Mongo-first now.
+  * Vendored copies of mongo2_client.py must stay byte-identical across
+    the three folders (same rule as common/turso_cache).
 ================================================================================

@@ -69,6 +69,15 @@ try:
 except Exception:  # noqa: BLE001
     _turso = None
 
+# v12.60: Mongo-2 mirror client (dual-write + Mongo-first read).
+try:
+    from common import mongo2_client as _mongo2
+except Exception:  # noqa: BLE001
+    try:
+        import mongo2_client as _mongo2  # flat deploy fallback
+    except Exception:  # noqa: BLE001
+        _mongo2 = None
+
 # ---------------------------------------------------------------------------
 # TTL config (seconds). Env-overridable so ops can tune without a redeploy.
 # ---------------------------------------------------------------------------
@@ -402,6 +411,18 @@ def hitmiss_reset() -> None:
 
 
 def get(key: str, allow_stale: bool = False) -> Optional[dict]:
+    # v12.60: Mongo-2 first read — a HIT here costs ZERO Turso reads.
+    if _mongo2 is not None:
+        try:
+            _m2 = _mongo2.get(key)
+        except Exception:  # noqa: BLE001
+            _m2 = None
+        if _m2 and _m2.get("payload") is not None:
+            try:
+                import json as _json
+                return _json.loads(_m2["payload"]) if isinstance(_m2["payload"], str) else _m2["payload"]
+            except Exception:  # noqa: BLE001
+                pass  # fall through to Turso
     """Return the cached payload for `key`, or None.
 
     `allow_stale=True` lets the caller pull a doc that's past its expires_at
@@ -553,8 +574,22 @@ def put(key: str, payload: Any, ttl_sec: Optional[int] = None):
         except Exception:  # noqa: BLE001
             pass  # dedup is best-effort; never block the write path
 
+    _t0 = _time.monotonic() if False else None
+    import time as _t_mod
+    _t0 = _t_mod.monotonic()
     ok_turso = _turso_put(key, payload_json, ttl)
     ok_mongo = _mongo_put(key, payload, ttl)
+    # v12.60: dual-write to the Mongo-2 mirror with a visible log line.
+    if _mongo2 is not None:
+        try:
+            _now_e = _now_epoch()
+            _exp = 0 if (os.environ.get("NHCACHE_NEVER_EXPIRE_ALL", "0").strip() in ("1","true","yes")
+                         or (NHCACHE_CHIP_TAG_NEVER_EXPIRE and _is_chip_or_tag_key(key))) else _now_e + ttl
+            _m2_ok = _mongo2.put(key, payload_json, _exp, ttl, cached_at=_now_e)
+            _mongo2.log_dual_write(key, bool(ok_turso), bool(_m2_ok),
+                                   int((_t_mod.monotonic() - _t0) * 1000))
+        except Exception as _e:  # noqa: BLE001
+            log.warning("mongo2 dual-write(%s) failed (non-fatal): %s", key, _e)
     return ok_turso or ok_mongo
 
 

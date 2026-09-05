@@ -882,3 +882,21 @@ Cost: ~19k Turso reads per pass = ~38k/day = 0.2% of budget. Env:
 MONGO2_BACKUP_URI), MONGO2_BACKUP_DB (default turso_backup), BACKUP_ENABLED=0
 to idle. Restore: python -m app.services.turso_backup --restore. State +
 status in scraper1_state["turso_backup_state"].
+
+v12.60 / v1.30 (2026-09-05): Mongo-2 dual-write + Mongo-first read (both
+deploys in one). All 3 bots now dual-write every nhentai_cache row to the
+second Mongo cluster (turso_backup.turso_nhentai_cache) AFTER the Turso
+write, with a visible Render log line per write: "DUAL-WRITE key=...
+turso=OK mongo2=OK (Nms)". Reads are Mongo-first (MONGO2_READS=1 default);
+a miss falls back to Turso (self-healing: the backup + dual-writes keep
+Mongo-2 current). TTL parity via a partial TTL index on expires_at (>0);
+expires_at=0 never-expire sentinel preserved. /similar re-enabled by
+default on the new Mongo-native engine (miniapp/.../similar_mongo.py —
+same +10 heavy / +2 tag scoring as similar_sql, but zero per-read cost);
+SIMILAR_ENABLED=0 disables, SIMILAR_SOURCE=turso forces the old engine.
+Rollback: MONGO2_READS=0 + MONGO2_WRITES=0 = byte-identical pre-migration
+system. Env needed on ALL 3 services: MONGO2_URI (or MONGO2_BACKUP_URI /
+2NDMONGO_BACKUP_TURSO), MONGO2_READS, MONGO2_WRITES; MONGO2_DB defaults
+to turso_backup. New shared client common/mongo2_client.py, vendored to
+ScraperBot/app/ and Bot2Fetcher/app/. New tests/test_v12_60_mongo2.py
+(20 checks).

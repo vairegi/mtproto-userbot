@@ -174,8 +174,22 @@ async def put(key: str, payload: Any) -> dict:
         except Exception as _e:  # noqa: BLE001
             log.warning("cache.put(%s): canonical gate raised %s — "
                         "writing unnormalised", key, _e)
+    import time as _t_mod, json as _json
+    _t0 = _t_mod.monotonic()
     turso_ok = await turso_client.put(key, payload, ttl)
     mongo_ok = False if _TURSO_ONLY else mongo_client.cache_put_mongo(key, payload, ttl)
+    # v1.30: dual-write to the Mongo-2 mirror with a visible log line.
+    try:
+        from . import mongo2_client as _m2
+        if _m2 is not None:
+            _pj = _json.dumps(payload, separators=(",", ":"), default=str)
+            _now_e = int(_t_mod.time())
+            _exp = 0 if (NEVER_EXPIRE_CHIP_TAG and is_chip_or_tag_key(key)) else _now_e + ttl
+            _m2_ok = _m2.put(key, _pj, _exp, ttl, cached_at=_now_e)
+            _m2.log_dual_write(key, bool(turso_ok), bool(_m2_ok),
+                               int((_t_mod.monotonic() - _t0) * 1000))
+    except Exception as _e:  # noqa: BLE001
+        log.warning("mongo2 dual-write(%s) failed (non-fatal): %s", key, _e)
     return {"turso": bool(turso_ok), "mongo": bool(mongo_ok), "ttl": ttl}
 
 
