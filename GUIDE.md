@@ -1135,3 +1135,48 @@ VERIFY (Render logs, first Read of any gallery):
 Reader opens with progress "1 / N". The "no images (media_id/pages
 missing)" line should no longer appear for any gallery that exists
 upstream.
+
+## v12.71 — Reader skip-fix: re-mount trimmed pages on scroll-up (2026-09-05)
+
+Bug: Read worked (v12.70) but images loaded with HOLES — user report:
+"did not load page 1 2 3 4, loaded 5 6 7, then did load 8 9 10". Cause
+in miniapp/frontend/js/plugins/reader.js: the old trimWindow() dropped a
+trimmed page's <img> and left an EMPTY placeholder. Scrolling back up
+never re-mounted those pages — the IntersectionObserver only watches
+the bottom sentinel and nextIdx had already advanced past them — so any
+page that got trimmed stayed blank forever. On Telegram WebViews (RAM-
+weak, fast trim) the symptom was exactly "every other page missing".
+
+Fix (reader.js only, no backend change):
+- mountPage() is now idempotent and keyed by page number
+  (mountedByN Map). A page can be mounted, trimmed, and re-mounted any
+  number of times. If a placeholder with the same data-page stamp is
+  still in the DOM, it is REUSED in place (page order preserved).
+- New ensureVisibleWindow() runs on every scroll tick: finds the page
+  at the top of the viewport and mounts any unmounted page within
+  -BEHIND/+AHEAD (5/5) of it. Scrolling back up re-hydrates previously
+  trimmed pages; scrolling down still uses the bottom sentinel.
+- trimWindow() now ranks mounted pages by DISTANCE from the viewport
+  and drops the furthest (previously it dropped whichever end was
+  further by a one-sided heuristic that could evict the visible page).
+- updateProgress() now reports the page at the TOP of the viewport
+  instead of the midpoint of the mounted window — no more jumpy counter
+  when scrolling back up.
+- img.onerror leaves a sized placeholder with "page N — tap to retry"
+  instead of clearing it, so a failed CDN fetch is a visible, retryable
+  hole instead of an invisible gap.
+
+RAM safety unchanged: MAX_MOUNTED=21 cap, ±5 re-mount window, lazy
+<img> creation only inside the window.
+
+Server cost: ZERO image bandwidth on Render — pages hotlink
+i1-i4.nhentai.net directly from the browser. Verified live 2026-09-05:
+i1-i4.nhentai.net/galleries/4160409/1.webp all return 200 image/webp.
+Mongo stores only the tiny pages_meta JSON (~1.5 KB/gallery), NOT
+images — 19k galleries backfilled would be ~30 MB of the 512 MB.
+
+Deploy: drop zip on repo root, commit, push, redeploy Bot 0 (miniapp)
+only. Users must fully close + reopen the Mini App once to pick up the
+new reader.js. VERIFY: open any gallery with 10+ pages, scroll to the
+bottom, scroll back up — every page re-loads in place; progress counter
+tracks the visible page; no blank holes.
