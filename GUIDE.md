@@ -1042,3 +1042,43 @@ legacy gallery, zero new reads.
 
 Deploy: drop zip on repo root, commit, push, redeploy Bot 0 (miniapp)
 only. No new env vars, no frontend change.
+
+## v12.69 — Send NHENTAI_API_KEY on direct nhentai calls (2026-09-05)
+
+Bug: v12.68 shipped a working backfill, but every attempt on the live Bot
+0 hit the "no images for <gid> (media_id/pages missing)" branch — 32
+attempts across 6 different galleries, ZERO successes, ZERO
+"upstream HTTP" errors, ZERO "fetch failed" errors. Not upstream, not
+Cloudflare (private API key rules out challenge pages) — a code bug.
+
+Root cause: scraper_bridge.py has three direct httpx.get() call sites to
+nhentai's v2 endpoints (/search, /galleries/<id>, and v12.68's new
+backfill /galleries/<id>). ALL THREE sent only User-Agent + Accept +
+Referer — NONE of them sent the Authorization header. hf_scraper.py
+(line 104-106) and ScraperBot/hf_scraper_lite.py (line 64-65) both
+attach `Authorization: Key <NHENTAI_API_KEY>` when the env var is set;
+scraper_bridge silently didn't. Anonymous v2 responses omit `media_id`
+and `images.pages` entirely — which is EXACTLY the payload shape that
+makes `_pages_meta_from_raw()` return []. Same bug also silently
+corrupted every write into the gallery cache (page1_url only worked
+because ScraperBot's authenticated scrape had populated it earlier).
+
+Fix (scraper_bridge.py only):
+- New module-level `_NHENTAI_API_KEY = os.environ.get("NHENTAI_API_KEY",
+  "").strip()` (parity with hf_scraper.py and hf_scraper_lite.py).
+- New `_nh_headers()` helper: returns UA + Accept + Referer, plus
+  `Authorization: Key <token>` when the env var is set; falls back to
+  anonymous headers cleanly when unset.
+- All three httpx.get() call sites (/search in the search fallback,
+  /galleries/<id> in _direct_nhentai_detail, /galleries/<id> in
+  _pages_meta_backfill) switched to `headers=_nh_headers()`.
+
+Deploy: drop zip on repo root, commit, push, redeploy Bot 0 only.
+NHENTAI_API_KEY must already be set in Bot 0's Render env (it is — Bot 1
+uses the same var). No new env vars introduced; no frontend change.
+
+VERIFY (Render logs, first Read of an old gallery after deploy):
+  📖 [PAGES BACKFILL] gid=... pages=N cached for Read (put=True)
+  📝 [TURSO WRITE] Uploaded payload to Turso  key=gallery:<id>
+The "no images (media_id/pages missing)" line should now only appear for
+galleries genuinely removed upstream, not for every attempt.

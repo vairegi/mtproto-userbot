@@ -252,6 +252,32 @@ def _rate_limit_backoff_sec(cache_key, retry_after):
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
+# v12.69: private-key parity with hf_scraper / hf_scraper_lite. When
+# NHENTAI_API_KEY is set, EVERY upstream call from this module must send
+# `Authorization: Key <token>` — without it nhentai returns a stub
+# response (title/tags only, no `media_id`, no `images.pages`), which
+# silently killed pages_meta on both `_direct_nhentai_detail` (write path)
+# and `_pages_meta_backfill` (read path). Read at import time; empty when
+# unset so anonymous callers still work.
+_NHENTAI_API_KEY = os.environ.get("NHENTAI_API_KEY", "").strip()
+
+
+def _nh_headers() -> dict:
+    """Shared header dict for every direct nhentai HTTP call in this module.
+
+    Includes Authorization when NHENTAI_API_KEY is configured — without it
+    the v2 payload loses `media_id` + `images.pages`, so the working
+    page1_url path AND the reader's pages_meta go silently empty.
+    """
+    h = {
+        "User-Agent": _UA,
+        "Accept":     "application/json",
+        "Referer":    "https://nhentai.net/",
+    }
+    if _NHENTAI_API_KEY:
+        h["Authorization"] = f"Key {_NHENTAI_API_KEY}"
+    return h
+
 
 import re
 
@@ -417,14 +443,14 @@ def _direct_nhentai_search(q: str, page: int, sort: str) -> list[dict]:
 
     try:
         # v2 endpoint: /api/v2/search (params: query, sort, page)
+        # v12.69: parity with the two /galleries/<id> call sites — send
+        # NHENTAI_API_KEY when configured so search responses come back
+        # authenticated (avoids stubbed anonymous payloads on this route
+        # too, if nhentai ever tightens it).
         r = httpx.get(
             f"{_NH_API}/search",
             params=params,
-            headers={
-                "User-Agent": _UA,
-                "Accept": "application/json",
-                "Referer": "https://nhentai.net/",
-            },
+            headers=_nh_headers(),
             timeout=15,
         )
         # v11.2: 429 is expected under load. Log at WARNING level ONCE
@@ -634,13 +660,12 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
 
     try:
         # v2 endpoint for a single gallery: /api/v2/galleries/<id>
+        # v12.69: use _nh_headers() so NHENTAI_API_KEY (when set) is sent
+        # — anonymous responses omit media_id/images.pages, which is what
+        # was silently corrupting every write into the cache.
         r = httpx.get(
             f"{_NH_API}/galleries/{gallery_id}",
-            headers={
-                "User-Agent": _UA,
-                "Accept": "application/json",
-                "Referer": "https://nhentai.net/",
-            },
+            headers=_nh_headers(),
             timeout=15,
         )
         # v11.2: 429 -> log ONCE at WARNING + back-off, no stack trace.
@@ -1105,11 +1130,13 @@ def _pages_meta_backfill(gid: str, row: dict) -> dict:
     except Exception:
         return row
     # --- one upstream fetch (respects the shared 429 backoff budget) -------
+    # v12.69: use _nh_headers() so NHENTAI_API_KEY (when set) is sent.
+    # Anonymous v2 responses omit media_id/images.pages entirely, which is
+    # exactly what v12.68 mis-diagnosed as "gallery removed upstream".
     try:
         r = httpx.get(
             f"{_NH_API}/galleries/{gid}",
-            headers={"User-Agent": _UA, "Accept": "application/json",
-                     "Referer": "https://nhentai.net/"},
+            headers=_nh_headers(),
             timeout=15,
         )
         if r.status_code != 200:
