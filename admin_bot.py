@@ -3327,6 +3327,20 @@ def main() -> int:
     #                              on a hiccup.
     # allowed_updates            → only the update types we actually handle
     #                              (unchanged behaviour, less bandwidth).
+    # v12.61: singleton guard — only ONE admin_bot poller may hold the bot
+    # token per host. Render's rolling deploy can overlap the old process
+    # with the new one (both call getUpdates -> telegram.error.Conflict
+    # loop in the log). An exclusive flock on a tmp file makes the loser
+    # exit immediately so start.sh's supervisor can retry cleanly.
+    try:
+        import fcntl as _fcntl
+        _lock_fd = open("/tmp/admin_bot.lock", "w")
+        _fcntl.flock(_lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        log.info("admin_bot: acquired singleton lock")
+    except (BlockingIOError, OSError):
+        log.error("🚨 admin_bot: another instance already holds the token — "
+                  "exiting to avoid getUpdates Conflict")
+        raise SystemExit(3)  # non-zero so supervise() backs off & retries
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         close_loop=False,

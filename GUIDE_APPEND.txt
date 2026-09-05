@@ -1,107 +1,81 @@
 ================================================================================
-GUIDE_APPEND — v12.60 / v1.30 (2026-09-05)
-Mongo-2 dual-write + Mongo-first read (Deploy A + B in one zip)
+GUIDE_APPEND — v12.61 (2026-09-05) — post-v12.60 log-review fixes
 ================================================================================
 
-WHAT & WHY
-----------
-Turso's 500M-reads/month cap nearly locked the account twice. Mongo Atlas
-has no per-read billing, so this makes Mongo-2 the read primary while
-Turso keeps every write (warm fallback + your existing 12h backup stays
-valid). BOTH phases are in this one zip — you control go-live purely by
-env vars, no redeploy needed between phases.
+TRIGGER: full review of all 3 Render logs + GitHub Actions syntax check
+after the v12.60 Mongo-2 migration deploy.
 
-ARCHITECTURE
-------------
-WRITE (all 3 bots, every write):
-  payload -> normalize (unchanged) -> Turso write (unchanged, first)
-          -> Mongo-2 upsert (second) -> ONE visible log line:
-             "DUAL-WRITE key=gallery:123 turso=OK mongo2=OK (58ms)"
-  A Mongo-2 failure NEVER blocks — logs mongo2=FAIL, Turso copy intact.
+CONFIRMED WORKING (from your logs — no action needed):
+  * Bot 2: dual-write live — "✍️ DUAL-WRITE key=... turso=OK mongo2=OK"
+    on all 43 completed galleries.
+  * Bot 0: Mongo-first reads live — 34 "📖 MONGO2 HIT", ZERO misses;
+    "/similar gid=678407 source=MONGO2 scored=15792 rows -> 8 cards"
+    (the migration goal achieved: /similar back, free of Turso reads).
+  * Bot 1: discovery counting live — "🆕 popular-today page N: 1 new
+    galleries" lines present (v1.27 fix working).
 
-READ (all 3 bots):
-  Mongo-2 find_one -> HIT  = zero Turso reads (log: "MONGO2 HIT key=...")
-                   -> MISS = Turso fallback (log: "MONGO2 MISS ...")
-  The v1.28 backup + dual-writes keep Mongo-2 current; misses self-heal.
+4 FIXES IN THIS ZIP
+-------------------
+1) miniapp/backend/app/services/nhentai_cache.py — removed the dead
+   `_t0 = _time.monotonic() if False else None` line that failed GitHub's
+   F821 syntax check (CI red on every push). Runtime was unaffected.
 
-TTL parity: Mongo TTL index on expires_at (partial: >0 only), so expiring
-rows auto-delete in Mongo exactly like Turso; expires_at=0 never-expire
-rows persist in both.
+2) miniapp/backend/main.py — /static mount is now UNCONDITIONAL with path
+   fallbacks + loud boot log ("✅ /static mounted from ..." or a 🚨
+   error). Root cause of the broken admin tab: the old
+   `if FRONTEND_DIR.is_dir()` guard silently skipped the mount in your
+   deploy layout, so /static/js/pages/admin.js fell through to the SPA
+   catch-all and returned index.html (HTML) instead of JS → browser threw
+   "Failed to fetch dynamically imported module". The file was never
+   missing from the repo — the server was answering it wrong.
 
-/SIMILAR: re-enabled by default, scored on Mongo-2 (miniapp/backend/app/
-services/similar_mongo.py) — the full-corpus scan that cost ~15k Turso
-rows/request is now free. Route falls back to the old Turso engine if
-Mongo-2 returns nothing for a gallery.
+3) ScraperBot/app/cache.py — the mongo2_client import is now OUTSIDE the
+   try/except, and a dual-write failure logs at ERROR ("🚨 mongo2
+   dual-write FAILED — mirror drifting"). Your Bot 1 log showed writes
+   with turso=True and ZERO dual-write lines AND zero warnings — meaning
+   the vendored mongo2_client.py was silently absent in that deploy.
+   Now a missing file is a loud ImportError at first write, impossible
+   to miss. ACTION REQUIRED: redeploy ScraperBot AFTER merging this zip;
+   if the boot log shows an ImportError, the file isn't reaching Render
+   and you must re-upload the zip's ScraperBot/app/mongo2_client.py.
 
-ENV VARS — SAME NAMES ON ALL 3 SERVICES (Bot 0, ScraperBot, Bot2Fetcher)
--------------------------------------------------------------------------
-  MONGO2_URI      = mongodb+srv://foodytrend_db_user:...@cache.hc0jiaj.mongodb.net/?appName=cache
-                    (MONGO2_BACKUP_URI or 2NDMONGO_BACKUP_TURSO also work —
-                    you already set MONGO2_BACKUP_URI; either is fine)
-  MONGO2_READS    = 1   (Mongo-first reads; 0 = Turso-only rollback)
-  MONGO2_WRITES   = 1   (dual-write on; 0 = Turso-only writes)
-  MONGO2_DB       = turso_backup   (optional; this is the default)
+4) admin_bot.py — exclusive flock (/tmp/admin_bot.lock) before
+   run_polling. Render's rolling deploy overlapped two admin_bot pollers
+   on the same bot token -> "telegram.error.Conflict: terminated by other
+   getUpdates request" loop in your Bot 0 log. Now the second poller
+   exits(3) instantly and start.sh's supervisor retries cleanly.
 
-PHASE CONTROL (no redeploy needed)
-----------------------------------
-  Deploy A "shadow writes": MONGO2_WRITES=1, MONGO2_READS=0
-      -> writes mirror to Mongo-2, reads stay Turso. Run 24-48h and
-         compare row counts (Atlas turso_backup.turso_nhentai_cache vs
-         Turso nhentai_cache should match ~17.5k+).
-  Deploy B "flip reads":   MONGO2_READS=1
-      -> reads go Mongo-first; Turso dashboard reads/day should collapse
-         toward backup-only (~70k/day).
-
-/SIMILAR CONTROL (Bot 0 / miniapp service env only)
----------------------------------------------------
-  Where: the Bot 0 Render service (the one serving the mini-app backend).
-  SIMILAR_ENABLED = 0   -> disabled (returns similar-disabled)
-  SIMILAR_ENABLED = 1   -> enabled  (DEFAULT if unset — you asked for this)
-  SIMILAR_SOURCE  = mongo (default) | turso (force old engine)
-
-FILES IN THIS ZIP
------------------
-  common/mongo2_client.py                     (new — shared client)
-  ScraperBot/app/mongo2_client.py             (vendored copy)
-  Bot2Fetcher/app/mongo2_client.py            (vendored copy)
-  miniapp/backend/app/services/nhentai_cache.py   (dual-write + Mongo-first read)
-  miniapp/backend/app/services/similar_mongo.py   (new — Mongo engine)
-  miniapp/backend/app/routes/suggestions.py       (default ON, Mongo source)
-  ScraperBot/app/cache.py                         (dual-write)
-  Bot2Fetcher/app/turso_store.py                  (dual-write state)
-  tests/test_v12_60_mongo2.py                     (new — 20 checks)
+FILES
+-----
+  miniapp/backend/app/services/nhentai_cache.py
+  miniapp/backend/main.py
+  ScraperBot/app/cache.py
+  admin_bot.py
   GUIDE.md
   GUIDE_APPEND.txt
 
 DEPLOY
 ------
-1) Drag-and-drop zip onto repo root; commit + push.
-2) Confirm env vars on ALL 3 services (you already set MONGO2_READS=1,
-   MONGO2_WRITES=1, MONGO2_BACKUP_URI — that URI var works as-is).
-3) Redeploy ALL THREE services.
-4) Watch Render logs for "DUAL-WRITE ... turso=OK mongo2=OK" and
-   "MONGO2 HIT" lines. Turso dashboard reads should drop within hours.
+1) Drop zip on repo root; commit + push. GitHub CI syntax check should go
+   green.
+2) Redeploy ALL THREE services (Bot 0 needs the /static fix; ScraperBot
+   needs the dual-write visibility; the admin_bot flock lives on Bot 0's
+   service too since admin_bot runs there).
+3) Verify:
+   - Bot 0 boot log: "✅ /static mounted from ..." then open the Mini App
+     admin tab — it loads.
+   - ScraperBot Render log after first sweep: "✍️ DUAL-WRITE key=...
+     turso=OK mongo2=OK" lines appear. If you instead see an ImportError,
+     the vendored ScraperBot/app/mongo2_client.py didn't reach Render —
+     re-upload it.
+   - Bot 0 log: no more "telegram.error.Conflict" spam.
 
-VERIFY
-------
-  * tests/test_v12_60_mongo2.py — ALL 20 CHECKS PASSED (sandbox).
-  * Regressions: test_turso_cache, test_sync_audit_v12_48,
-    test_english_only, test_v1_25_digest, test_v1_27_discovery,
-    test_fallback_chain — all PASS.
-  * Atlas: turso_backup.turso_nhentai_cache row count grows with every
-    bot write; TTL index ttl_expires_at present.
-  * Mini App: Similar row on a gallery page returns cards (Mongo source),
-    Render log shows "/similar gid=... source=MONGO2 scored=N rows".
-
-KNOWN LIMITS (honest)
----------------------
-  * similar_mongo scans up to 25k Mongo docs per /similar call (~200-500ms
-    expected on M0) — acceptable per your latency sign-off; unconfirmed
-    until first live call.
-  * Bot 1/Bot 2 still READ gallery state from Turso in some paths
-    (turso_client.get, get_gallery_row) — those are cheap PK reads, left
-    as-is deliberately; the expensive paths (user-facing reads, scans,
-    /similar) are all Mongo-first now.
-  * Vendored copies of mongo2_client.py must stay byte-identical across
-    the three folders (same rule as common/turso_cache).
+TESTS (sandbox)
+---------------
+  py_compile: all 4 touched files OK.
+  tests/test_v12_60_mongo2.py — 20/20 PASS (no regressions).
+  ScraperBot/tests/test_english_only.py — PASS.
+  The /static fix is verified by construction (candidates checked with
+  is_dir() + (js) presence at boot) — the first Bot 0 boot log line
+  "✅ /static mounted from ..." is the live acceptance test.
 ================================================================================

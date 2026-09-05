@@ -900,3 +900,20 @@ system. Env needed on ALL 3 services: MONGO2_URI (or MONGO2_BACKUP_URI /
 to turso_backup. New shared client common/mongo2_client.py, vendored to
 ScraperBot/app/ and Bot2Fetcher/app/. New tests/test_v12_60_mongo2.py
 (20 checks).
+
+v12.61 (2026-09-05): post-v12.60 log-review fixes. 4 issues from the Render
+logs + GitHub CI: 1) Removed dead line `_t0 = _time.monotonic() if False
+else None` in nhentai_cache.py — failed the repo's F821 syntax gate
+(runtime-dead, hence Bot 0 was unaffected). 2) miniapp/backend/main.py:
+/static now mounts unconditionally with path fallbacks (miniapp/frontend,
+repo-root/miniapp/frontend, repo-root/frontend) + a loud boot log — the old
+`if FRONTEND_DIR.is_dir()` guard silently skipped the mount when the deploy
+layout differed by a level, so /static/js/pages/admin.js fell through to the
+SPA catch-all and returned HTML -> "Failed to fetch dynamically imported
+module" broke the admin tab. 3) ScraperBot cache.py: the mongo2_client import
+moved OUT of the try/except so a missing vendored file is a loud ImportError
+in the Render log instead of a silently-skipped dual-write (Bot 1's log had
+zero DUAL-WRITE lines and zero warnings). 4) admin_bot.py: exclusive flock on
+/tmp/admin_bot.lock before run_polling — Render's rolling deploy briefly ran
+two pollers on one bot token -> telegram.error.Conflict loop; the loser now
+exits(3) so start.sh's supervisor backs off and retries cleanly.

@@ -178,9 +178,11 @@ async def put(key: str, payload: Any) -> dict:
     _t0 = _t_mod.monotonic()
     turso_ok = await turso_client.put(key, payload, ttl)
     mongo_ok = False if _TURSO_ONLY else mongo_client.cache_put_mongo(key, payload, ttl)
-    # v1.30: dual-write to the Mongo-2 mirror with a visible log line.
+    # v1.30/v1.31: dual-write to the Mongo-2 mirror with a visible log line.
+    # The import is OUTSIDE the try so a missing vendored file is LOUD
+    # (Render log) instead of silently skipping the mirror.
+    from . import mongo2_client as _m2
     try:
-        from . import mongo2_client as _m2
         if _m2 is not None:
             _pj = _json.dumps(payload, separators=(",", ":"), default=str)
             _now_e = int(_t_mod.time())
@@ -189,7 +191,7 @@ async def put(key: str, payload: Any) -> dict:
             _m2.log_dual_write(key, bool(turso_ok), bool(_m2_ok),
                                int((_t_mod.monotonic() - _t0) * 1000))
     except Exception as _e:  # noqa: BLE001
-        log.warning("mongo2 dual-write(%s) failed (non-fatal): %s", key, _e)
+        log.error("🚨 mongo2 dual-write(%s) FAILED — mirror drifting: %s", key, _e)
     return {"turso": bool(turso_ok), "mongo": bool(mongo_ok), "ttl": ttl}
 
 

@@ -77,12 +77,28 @@ async def _no_cache_static(request: Request, call_next):
         resp.headers["Expires"] = "0"
     return resp
 
-if FRONTEND_DIR.is_dir():
+# v12.61: mount /static unconditionally with path fallbacks. The old
+# `if FRONTEND_DIR.is_dir()` guard silently skipped the mount when the
+# deployed layout differed by one level — /static/js/* then fell through
+# to the SPA catch-all, which returned index.html for admin.js and the
+# browser threw "Failed to fetch dynamically imported module".
+_STATIC_CANDIDATES = [
+    FRONTEND_DIR,                                   # miniapp/frontend
+    Path(__file__).resolve().parent.parent.parent / "miniapp" / "frontend",  # repo-root boot
+    Path(__file__).resolve().parent.parent.parent / "frontend",              # flat boot
+]
+_static_dir = next((d for d in _STATIC_CANDIDATES
+                    if d.is_dir() and (d / "js").is_dir()), None)
+if _static_dir is not None:
     app.mount(
         "/static",
-        StaticFiles(directory=str(FRONTEND_DIR), html=False),
+        StaticFiles(directory=str(_static_dir), html=False),
         name="static",
     )
+    log.info("✅ /static mounted from %s", _static_dir)
+else:
+    log.error("🚨 /static NOT mounted — no frontend dir found among %s. "
+              "Mini App admin/js will 404.", [str(d) for d in _STATIC_CANDIDATES])
 
 # Mount every /api/* route file automatically.
 mount_all(app)

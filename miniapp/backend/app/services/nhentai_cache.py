@@ -574,7 +574,6 @@ def put(key: str, payload: Any, ttl_sec: Optional[int] = None):
         except Exception:  # noqa: BLE001
             pass  # dedup is best-effort; never block the write path
 
-    _t0 = _time.monotonic() if False else None
     import time as _t_mod
     _t0 = _t_mod.monotonic()
     ok_turso = _turso_put(key, payload_json, ttl)
