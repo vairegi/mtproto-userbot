@@ -33,7 +33,21 @@ export function pageUrl(meta) {
 export function openReader(gallery) {
   const meta = (gallery && gallery.pages_meta) || [];
   const gid = (gallery && gallery.id) || "?";
-  if (!meta.length) return false;
+  if (!meta.length) {
+    // v12.67: first-ever open of a legacy cached row — the backend is
+    // backfilling pages_meta right now; tell the user to retry.
+    try {
+      var tg = (typeof window !== "undefined") ? window.Telegram : null;
+      if (tg && tg.WebApp && tg.WebApp.showPopup) {
+        tg.WebApp.showPopup({ title: "Loading pages",
+          message: "Fetching this gallery's pages for the first time — tap Read again in a few seconds.",
+          buttons: [{ type: "ok" }] });
+      } else if (typeof window !== "undefined" && window.alert) {
+        window.alert("Loading pages — tap Read again in a few seconds.");
+      }
+    } catch (_) {}
+    return false;
+  }
   closeReader();
 
   const scroller = h("div", {
