@@ -579,32 +579,54 @@ _NH_EXT_MAP = {"j": "jpg", "p": "png", "g": "gif", "w": "webp"}
 
 
 def _pages_meta_from_raw(item: dict) -> list:
-    """v12.68: build the reader's pages_meta ([{n, path, w, h}]) from a RAW
+    """v12.70: build the reader's pages_meta ([{n, path, w, h}]) from a RAW
     nhentai /api/v2/galleries/<id> payload.
+
+    The REAL v2 payload (verified live 2026-09-05) has NO 'images' key at
+    all — the page list is the TOP-LEVEL 'pages' array, and each entry
+    already carries a full CDN-relative 'path' (plus width/height):
+        pages[0] = {"number": 1, "path": "galleries/4160409/1.webp",
+                    "width": 1280, "height": 1808, ...}
+    v12.68 read item["images"]["pages"] — a key that never exists — so it
+    returned [] on EVERY real payload (32/32 live failures). We now read
+    the top-level 'pages' first, fall back to the legacy 'images.pages'
+    shape just in case an old cached row was written that way, and prefer
+    the API's own 'path' string over rebuilding it from media_id.
 
     `path` is CDN-relative ('galleries/<media_id>/<n>.<ext>') — the reader
     prepends the i1-i4.nhentai.net host itself (plugins/reader.js pageUrl).
     The images stay on nhentai's CDN (zero Render bandwidth/RAM); we only
     store this tiny per-page metadata inside the gallery cache row.
-    Returns [] when media_id or images.pages is missing.
+    Returns [] when the payload genuinely carries no page list.
     """
     if not isinstance(item, dict):
         return []
-    media_id = str(item.get("media_id") or "").strip()
-    images = item.get("images") or {}
-    pages = images.get("pages") if isinstance(images, dict) else None
-    if not (media_id and isinstance(pages, list) and pages):
+    # Real v2 shape: top-level 'pages'. Legacy/defensive: 'images.pages'.
+    src = item.get("pages")
+    if not (isinstance(src, list) and src):
+        images = item.get("images") or {}
+        src = images.get("pages") if isinstance(images, dict) else None
+    if not (isinstance(src, list) and src):
         return []
+    media_id = str(item.get("media_id") or "").strip()
     out = []
-    for i, p in enumerate(pages):
+    for i, p in enumerate(src):
         if not isinstance(p, dict):
             continue
-        ext = _NH_EXT_MAP.get(str(p.get("t") or "j").strip().lower(), "jpg")
+        n = int(p.get("number") or p.get("n") or i + 1)
+        # Prefer the API's own full path; only rebuild from media_id +
+        # <n>.<ext> for legacy entries that carry a 't' ext-code instead.
+        path = str(p.get("path") or "").strip()
+        if not path and media_id:
+            ext = _NH_EXT_MAP.get(str(p.get("t") or "j").strip().lower(), "jpg")
+            path = f"galleries/{media_id}/{n}.{ext}"
+        if not path:
+            continue
         out.append({
-            "n":    int(p.get("number") or i + 1),
-            "path": f"galleries/{media_id}/{int(p.get('number') or i + 1)}.{ext}",
-            "w":    int(p.get("w") or 0),
-            "h":    int(p.get("h") or 0),
+            "n":    n,
+            "path": path,
+            "w":    int(p.get("width")  or p.get("w") or 0),
+            "h":    int(p.get("height") or p.get("h") or 0),
         })
     return out
 
@@ -612,18 +634,31 @@ def _pages_meta_from_raw(item: dict) -> list:
 def _direct_nhentai_page1(item: dict) -> str:
     """Build the high-quality page-1 URL from a raw nhentai detail dict.
 
-    Returns '' when the detail is missing `media_id` or `images.pages[0]`.
-    Example: media_id=614941, pages[0].t='j' -> 
-    'https://i.nhentai.net/galleries/614941/1.jpg'.
+    v12.70: the REAL v2 payload has no 'images' key — the page list is the
+    TOP-LEVEL 'pages' array whose entries already carry a full CDN-relative
+    'path'. The old version read item["images"]["pages"], which is None on
+    every real response, so this helper silently returned '' on every fresh
+    write (page1_url has been empty in the cache the whole time; the
+    frontend just fell back to cover_thumb, so nobody noticed).
+    Returns '' when the payload genuinely carries no page list.
     """
-    media_id = str(item.get("media_id") or "").strip()
-    images = item.get("images") or {}
-    pages = images.get("pages") if isinstance(images, dict) else None
-    if not (media_id and isinstance(pages, list) and pages):
+    src = item.get("pages")
+    if not (isinstance(src, list) and src):
+        images = item.get("images") or {}
+        src = images.get("pages") if isinstance(images, dict) else None
+    if not (isinstance(src, list) and src):
         return ""
-    first = pages[0] if isinstance(pages[0], dict) else {}
-    ext = _NH_EXT_MAP.get((first.get("t") or "j").strip().lower(), "jpg")
-    return f"https://i.nhentai.net/galleries/{media_id}/1.{ext}"
+    first = src[0] if isinstance(src[0], dict) else {}
+    path = str(first.get("path") or "").strip()
+    if path:
+        return f"https://i.nhentai.net/{path.lstrip('/')}"
+    # Legacy/defensive: entry has a 't' ext-code but no full 'path'.
+    media_id = str(item.get("media_id") or "").strip()
+    if not media_id:
+        return ""
+    ext = _NH_EXT_MAP.get(str(first.get("t") or "j").strip().lower(), "jpg")
+    n = int(first.get("number") or first.get("n") or 1)
+    return f"https://i.nhentai.net/galleries/{media_id}/{n}.{ext}"
 
 
 def _direct_nhentai_detail(gallery_id: str) -> dict:

@@ -1,23 +1,22 @@
-GUIDE_APPEND — v12.69 (2026-09-05) — Send NHENTAI_API_KEY on direct calls
-WHAT: v12.68 backfill logic was correct but every attempt still failed
-because scraper_bridge.py's three direct httpx.get() sites (/search and
-two /galleries/<id>) sent no Authorization header. Anonymous v2
-responses omit media_id + images.pages, which is exactly what triggered
-"no images for <gid> (media_id/pages missing)" 32/32 times in the live
-log. hf_scraper.py and ScraperBot/hf_scraper_lite.py already send the
-key; scraper_bridge silently didn't. This was ALSO corrupting every new
-gallery cache row (write path is anonymous → media_id lost → pages_meta
-empty at birth). Now: module-level _NHENTAI_API_KEY read once at
-import, shared _nh_headers() helper adds Authorization: Key <token> when
-the env var is set, all three call sites switched. Anonymous fallback
-still works (no key → no Authorization header, same as before).
+GUIDE_APPEND — v12.70 (2026-09-05) — Read fix: correct v2 payload shape
+WHAT: v12.68 backfill + v12.69 auth header were both correct code but
+read the WRONG payload shape. Live probe of /api/v2/galleries/<id> (with
+and without NHENTAI_API_KEY — byte-identical) shows the real v2 payload
+has NO `images` key: the page list is the TOP-LEVEL `pages` array and
+each entry already carries a full CDN-relative `path` + width/height.
+Every helper in the repo read item["images"]["pages"], which is None on
+every real response — so pages_meta was always [] and page1_url was
+silently empty on every write since v11. Now _pages_meta_from_raw and
+_direct_nhentai_page1 read top-level `pages` first, fall back to legacy
+`images.pages` defensively, and prefer the API's own `path` string over
+rebuilding from media_id + <n>.<ext>. v12.69's _nh_headers() kept for
+parity with hf_scraper.py / hf_scraper_lite.py.
 FILES: miniapp/backend/app/services/scraper_bridge.py, GUIDE.md,
 GUIDE_APPEND.txt. (No frontend change, no new env vars.)
 DEPLOY: drop on repo root, commit, push, redeploy Bot 0 only. Confirm
-NHENTAI_API_KEY is already in Bot 0's Render env (Bot 1 uses same var).
-VERIFY: on first Read of an old gallery, Render log shows
+NHENTAI_API_KEY is already in Bot 0's Render env (v12.69 requirement).
+VERIFY: first Read of any gallery, Render log shows
   📖 [PAGES BACKFILL] gid=… pages=N cached for Read (put=True)
   📝 [TURSO WRITE] Uploaded payload to Turso  key=gallery:<id>
-The reader opens with progress "1 / N". "no images (media_id/pages
-missing)" should only appear now for galleries genuinely removed
-upstream, not on every attempt.
+Reader opens with progress "1 / N". "no images (media_id/pages missing)"
+should no longer appear for any gallery that exists upstream. CI green.

@@ -1082,3 +1082,56 @@ VERIFY (Render logs, first Read of an old gallery after deploy):
   📝 [TURSO WRITE] Uploaded payload to Turso  key=gallery:<id>
 The "no images (media_id/pages missing)" line should now only appear for
 galleries genuinely removed upstream, not for every attempt.
+
+## v12.70 — Read fix: correct v2 payload shape (top-level `pages`) (2026-09-05)
+
+Bug: after v12.68 + v12.69 the Read button STILL failed on every gallery
+— live log showed "pages_meta backfill: no images for <gid>
+(media_id/pages missing)" 32/32 times. Root cause proven by live probe
+of https://nhentai.net/api/v2/galleries/<id> with and without
+NHENTAI_API_KEY (byte-identical responses):
+
+  The REAL v2 payload has NO `images` key at all. The page list is the
+  TOP-LEVEL `pages` array, and each entry ALREADY carries a full
+  CDN-relative `path` plus width/height:
+      pages[0] = {"number": 1, "path": "galleries/4160409/1.webp",
+                  "width": 1280, "height": 1808, ...}
+
+  Every code path in the repo read item["images"]["pages"] — a key that
+  never exists — so:
+  - _pages_meta_from_raw (v12.68) returned [] on every real payload,
+  - _direct_nhentai_page1 (v11) silently returned '' on every fresh
+    write (page1_url has been empty in the cache the whole time; the
+    frontend fell back to cover_thumb so nobody noticed),
+  - common/turso_cache/normalize.py's images.pages passthrough also
+    never matched (harmless dead branch, left in place).
+
+Fix (miniapp/backend/app/services/scraper_bridge.py only):
+- _pages_meta_from_raw rewritten: reads top-level `pages` first, falls
+  back to legacy `images.pages` for defensive compatibility, prefers the
+  API's own `path` string, only rebuilds from media_id + <n>.<ext> for
+  legacy entries that carry a 't' ext-code instead.
+- _direct_nhentai_page1 rewritten: same shape fix; now actually returns
+  https://i.nhentai.net/<path> on real payloads.
+- v12.69's _nh_headers() (Authorization: Key <NHENTAI_API_KEY>) kept —
+  parity with hf_scraper.py / hf_scraper_lite.py is correct hygiene even
+  though it wasn't the cause of this bug.
+
+Smoke tests (run pre-ship): real-shape payload → correct
+[{n,path,w,h}]; legacy-shape payload → correct fallback; empty guards →
+[] / ''. CDN check: i1-i4.nhentai.net/galleries/4160409/1.webp all
+return 200 image/webp.
+
+Regression suites ALL PASS: test_v12_60_mongo2, test_turso_cache,
+ScraperBot/tests/test_english_only, test_v1_27_discovery.
+(test_v1_25_digest needs fastapi in the runner env — module-only dep,
+not a code failure.)
+
+Deploy: drop zip on repo root, commit, push, redeploy Bot 0 only.
+NHENTAI_API_KEY must be set in Bot 0's Render env (v12.69 requirement).
+VERIFY (Render logs, first Read of any gallery):
+  📖 [PAGES BACKFILL] gid=... pages=N cached for Read (put=True)
+  📝 [TURSO WRITE] Uploaded payload to Turso  key=gallery:<id>
+Reader opens with progress "1 / N". The "no images (media_id/pages
+missing)" line should no longer appear for any gallery that exists
+upstream.
