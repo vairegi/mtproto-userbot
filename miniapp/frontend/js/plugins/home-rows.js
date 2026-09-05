@@ -18,7 +18,7 @@
 import { api } from "core/api.js";
 import { h, make } from "core/components.js";
 import { haptic } from "core/telegram.js";
-import { openGalleryDetail } from "plugins/detail-sheet.js?v=12.57";
+import { openGalleryDetail } from "plugins/detail-sheet.js?v=12.62";
 // v12.3: prefetchGallery import removed — no more background warming storm.
 
 /* ---- Trending Tags ------------------------------------------------- */

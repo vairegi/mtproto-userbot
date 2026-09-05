@@ -428,12 +428,19 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     sent = failed = 0
     src_chat = src.chat_id
     src_msg_id = src.message_id
+    # v12.62: copyMessage does NOT carry inline keyboards by default — the
+    # source message's tag/link BUTTONS (reply_markup) must be passed
+    # explicitly, otherwise recipients get plain media+caption with no
+    # buttons. Caption + caption_entities (hashtags, spoilers, links) are
+    # preserved verbatim by the Bot API server-side.
+    src_markup = getattr(src, "reply_markup", None)
     for uid in recipients:
         try:
             await ctx.bot.copy_message(
                 chat_id=uid,
                 from_chat_id=src_chat,
                 message_id=src_msg_id,
+                reply_markup=src_markup,
             )
             sent += 1
         except Exception:

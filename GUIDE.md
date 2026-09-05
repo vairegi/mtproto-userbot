@@ -917,3 +917,18 @@ zero DUAL-WRITE lines and zero warnings). 4) admin_bot.py: exclusive flock on
 /tmp/admin_bot.lock before run_polling — Render's rolling deploy briefly ran
 two pollers on one bot token -> telegram.error.Conflict loop; the loser now
 exits(3) so start.sh's supervisor backs off and retries cleanly.
+
+v12.62 (2026-09-05): broadcast buttons + /similar latency + loading UX.
+1) admin_bot.py /broadcast: Telegram's copyMessage never carries the
+source message's inline keyboard — recipients got media+caption but no
+buttons (tag/link buttons silently dropped). Now reply_markup is passed
+through explicitly; caption entities (hashtags/spoilers/links) were and
+are preserved server-side. 2) similar_mongo.py: per-gallery result cache
+in Mongo-2 (key similar:<gid>, SIMILAR_CACHE_TTL_SEC default 1800s) —
+first open of a gallery pays the full-corpus scan (~10-15s on M0), every
+repeat open within 30min is one find_one (~50ms). Writes are free on
+Mongo so the v12.56 "no similar cache" rationale no longer applies.
+3) detail-sheet.js: Similar section now renders IMMEDIATELY with 6
+shimmer skeleton cards (dSimShimmer keyframes), replaced by real cards on
+fetch; section hides if zero results. All 5 detail-sheet import sites
+bumped ?v=12.57 -> ?v=12.62 (handoff rule 6).

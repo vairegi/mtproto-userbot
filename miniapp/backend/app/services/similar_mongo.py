@@ -12,6 +12,7 @@ collection in the Mongo-2 mirror DB via the shared mongo2_client.
 from __future__ import annotations
 
 import json
+import time
 import logging
 import os
 import re
@@ -22,6 +23,11 @@ log = logging.getLogger("miniapp.similar_mongo")
 _WEIGHT_HEAVY = 10   # artist / parody / group / character
 _WEIGHT_TAG = 2      # content tags
 _MAX_SCAN = 25000    # hard cap on docs scored per request
+# v12.62: per-gallery result cache in Mongo-2 (writes are free here —
+# the v12.56 "no Turso similar cache" rationale does not apply to Mongo).
+# First open of a gallery pays the scan (~10-15s on M0); every repeat
+# open within the TTL is one find_one (~50ms).
+_SIM_CACHE_TTL_SEC = int(os.getenv("SIMILAR_CACHE_TTL_SEC", "1800") or 1800)
 
 
 def _enabled() -> bool:
@@ -61,6 +67,19 @@ def similar_galleries(gid: str, limit: int = 6) -> List[Dict[str, Any]]:
     if coll is None:
         log.warning("similar_mongo: Mongo-2 unavailable")
         return []
+
+    # v12.62: result cache hit = instant response, zero scan
+    _ck = f"similar:{gid}"
+    try:
+        _hit = coll.find_one({"_id": _ck}, {"items": 1, "cached_at": 1})
+        if _hit and isinstance(_hit.get("items"), list):
+            _age = time.time() - float(_hit.get("cached_at") or 0)
+            if _age < _SIM_CACHE_TTL_SEC:
+                log.info("📖 /similar gid=%s source=MONGO2-CACHE age=%ds -> %d cards",
+                         gid, int(_age), len(_hit["items"]))
+                return _hit["items"][:limit]
+    except Exception:  # noqa: BLE001
+        pass
 
     # 1) target signals
     target = coll.find_one({"_id": f"gallery:{gid}"}, {"payload": 1})
@@ -112,4 +131,11 @@ def similar_galleries(gid: str, limit: int = 6) -> List[Dict[str, Any]]:
             out.append(card)
     log.info("📖 /similar gid=%s source=MONGO2 scored=%d rows -> %d cards",
              gid, n_scanned, len(out))
+    # v12.62: cache the result for repeat opens (best-effort)
+    try:
+        coll.replace_one({"_id": _ck},
+                         {"_id": _ck, "items": out, "cached_at": time.time()},
+                         upsert=True)
+    except Exception:  # noqa: BLE001
+        pass
     return out

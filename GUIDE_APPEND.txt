@@ -1,81 +1,71 @@
 ================================================================================
-GUIDE_APPEND — v12.61 (2026-09-05) — post-v12.60 log-review fixes
+GUIDE_APPEND — v12.62 (2026-09-05) — broadcast buttons + /similar speed + loader
 ================================================================================
 
-TRIGGER: full review of all 3 Render logs + GitHub Actions syntax check
-after the v12.60 Mongo-2 migration deploy.
+1) BROADCAST BUTTONS FIX (admin_bot.py)
+   Root cause: Telegram Bot API copyMessage copies media + caption +
+   caption_entities (hashtags, spoiler styling, links) verbatim — but NOT
+   reply_markup. Your broadcasts with tag/link buttons were arriving as
+   plain image+caption because the keyboard was never passed. Fix: the
+   source message's reply_markup is now forwarded on every copyMessage
+   call. Caption tags (#hashtags in the caption text) were already
+   preserved — only buttons were being dropped.
+   Test: reply to a post that has buttons with /broadcast — recipients
+   receive the buttons too.
 
-CONFIRMED WORKING (from your logs — no action needed):
-  * Bot 2: dual-write live — "✍️ DUAL-WRITE key=... turso=OK mongo2=OK"
-    on all 43 completed galleries.
-  * Bot 0: Mongo-first reads live — 34 "📖 MONGO2 HIT", ZERO misses;
-    "/similar gid=678407 source=MONGO2 scored=15792 rows -> 8 cards"
-    (the migration goal achieved: /similar back, free of Turso reads).
-  * Bot 1: discovery counting live — "🆕 popular-today page N: 1 new
-    galleries" lines present (v1.27 fix working).
+2) /SIMILAR SPEED FIX (miniapp/backend/app/services/similar_mongo.py)
+   Root cause of the 10-15s: every detail-sheet open ran a full-corpus
+   Mongo scan (15,792 docs, JSON-parsed and scored in Python). Fix:
+   per-gallery result cache in Mongo-2 (key similar:<gid>, TTL 30 min via
+   SIMILAR_CACHE_TTL_SEC). First open of a cold gallery still scans;
+   every repeat open within 30 min answers in ~50ms.
+   Render log: "source=MONGO2-CACHE age=Ns -> 8 cards" on cache hits.
+   Rollback: SIMILAR_CACHE_TTL_SEC=0 disables the cache (miniapp service
+   env). Freshness note: new uploads only appear in a gallery's Similar
+   row after that gallery's cache entry ages out (<=30 min).
 
-4 FIXES IN THIS ZIP
--------------------
-1) miniapp/backend/app/services/nhentai_cache.py — removed the dead
-   `_t0 = _time.monotonic() if False else None` line that failed GitHub's
-   F821 syntax check (CI red on every push). Runtime was unaffected.
+3) LOADING EFFECT (miniapp/frontend/js/plugins/detail-sheet.js)
+   The Similar section now mounts VISIBLE with 6 shimmering skeleton
+   cards (same shimmer idiom as the mini-app's other loaders) the moment
+   the sheet opens; real cards replace skeletons when the fetch lands.
+   If a gallery has zero similar results the section hides itself.
+   Importmap rule honoured: all 5 detail-sheet import sites bumped
+   ?v=12.57 -> ?v=12.62 (bookmarks.js, profile.js, search.js,
+   home-rows.js, core/app.js) so Telegram WebView cannot serve the old
+   cached module.
 
-2) miniapp/backend/main.py — /static mount is now UNCONDITIONAL with path
-   fallbacks + loud boot log ("✅ /static mounted from ..." or a 🚨
-   error). Root cause of the broken admin tab: the old
-   `if FRONTEND_DIR.is_dir()` guard silently skipped the mount in your
-   deploy layout, so /static/js/pages/admin.js fell through to the SPA
-   catch-all and returned index.html (HTML) instead of JS → browser threw
-   "Failed to fetch dynamically imported module". The file was never
-   missing from the repo — the server was answering it wrong.
-
-3) ScraperBot/app/cache.py — the mongo2_client import is now OUTSIDE the
-   try/except, and a dual-write failure logs at ERROR ("🚨 mongo2
-   dual-write FAILED — mirror drifting"). Your Bot 1 log showed writes
-   with turso=True and ZERO dual-write lines AND zero warnings — meaning
-   the vendored mongo2_client.py was silently absent in that deploy.
-   Now a missing file is a loud ImportError at first write, impossible
-   to miss. ACTION REQUIRED: redeploy ScraperBot AFTER merging this zip;
-   if the boot log shows an ImportError, the file isn't reaching Render
-   and you must re-upload the zip's ScraperBot/app/mongo2_client.py.
-
-4) admin_bot.py — exclusive flock (/tmp/admin_bot.lock) before
-   run_polling. Render's rolling deploy overlapped two admin_bot pollers
-   on the same bot token -> "telegram.error.Conflict: terminated by other
-   getUpdates request" loop in your Bot 0 log. Now the second poller
-   exits(3) instantly and start.sh's supervisor retries cleanly.
-
-FILES
------
-  miniapp/backend/app/services/nhentai_cache.py
-  miniapp/backend/main.py
-  ScraperBot/app/cache.py
+FILES IN THIS ZIP
+-----------------
   admin_bot.py
+  miniapp/backend/app/services/similar_mongo.py
+  miniapp/frontend/js/plugins/detail-sheet.js
+  miniapp/frontend/js/pages/bookmarks.js      (version bump only)
+  miniapp/frontend/js/pages/profile.js        (version bump only)
+  miniapp/frontend/js/pages/search.js         (version bump only)
+  miniapp/frontend/js/plugins/home-rows.js    (version bump only)
+  miniapp/frontend/js/core/app.js             (version bump only)
   GUIDE.md
   GUIDE_APPEND.txt
 
 DEPLOY
 ------
-1) Drop zip on repo root; commit + push. GitHub CI syntax check should go
-   green.
-2) Redeploy ALL THREE services (Bot 0 needs the /static fix; ScraperBot
-   needs the dual-write visibility; the admin_bot flock lives on Bot 0's
-   service too since admin_bot runs there).
-3) Verify:
-   - Bot 0 boot log: "✅ /static mounted from ..." then open the Mini App
-     admin tab — it loads.
-   - ScraperBot Render log after first sweep: "✍️ DUAL-WRITE key=...
-     turso=OK mongo2=OK" lines appear. If you instead see an ImportError,
-     the vendored ScraperBot/app/mongo2_client.py didn't reach Render —
-     re-upload it.
-   - Bot 0 log: no more "telegram.error.Conflict" spam.
+1) Drop zip on repo root; commit + push.
+2) Redeploy the Bot 0 (miniapp) service — admin_bot.py runs there too.
+3) No env changes needed.
+
+VERIFY
+------
+  * Broadcast a post with buttons -> recipients get the buttons.
+  * Open a gallery detail sheet -> "SIMILAR TO THIS" appears instantly
+    with shimmer placeholders, cards fill in after the fetch.
+  * Open the SAME gallery again -> Render log shows
+    "source=MONGO2-CACHE" and the row appears ~instantly.
+  * First-open latency drops as popular galleries' caches warm.
 
 TESTS (sandbox)
 ---------------
-  py_compile: all 4 touched files OK.
-  tests/test_v12_60_mongo2.py — 20/20 PASS (no regressions).
-  ScraperBot/tests/test_english_only.py — PASS.
-  The /static fix is verified by construction (candidates checked with
-  is_dir() + (js) presence at boot) — the first Bot 0 boot log line
-  "✅ /static mounted from ..." is the live acceptance test.
+  py_compile: admin_bot.py, similar_mongo.py OK.
+  node --check detail-sheet.js: OK.
+  tests/test_v12_60_mongo2.py — 20/20 PASS (cache path exercised via
+  FakeColl; scoring parity checks unchanged).
 ================================================================================

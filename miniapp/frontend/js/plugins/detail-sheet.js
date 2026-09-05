@@ -378,7 +378,9 @@ function mountSimilarRow(host, gid) {
       paddingTop: "14px",
       paddingBottom: "4px",
       borderTop: "2px solid var(--du-divider, rgba(255,255,255,0.14))",
-      display: "none",
+      // v12.62: visible immediately with skeleton cards — the Mongo scan can
+      // take ~10s on a cold gallery and a hidden section read as "broken".
+      display: "block",
     },
   });
 
@@ -457,6 +459,29 @@ function mountSimilarRow(host, gid) {
   section.append(heading, stripWrap);
   host.appendChild(section);   // v12.57: appended to sheet.el, AFTER actions
 
+  // v12.62: shimmer style (once per document) + skeleton placeholders so
+  // the row reads as "loading" instead of invisible while the scan runs.
+  if (!document.getElementById("d-similar-skel-style")) {
+    const _st = document.createElement("style");
+    _st.id = "d-similar-skel-style";
+    _st.textContent =
+      ".d-similar-skel .sk{background:var(--du-bg-1,#222);position:relative;overflow:hidden}" +
+      ".d-similar-skel .sk::after{content:'';position:absolute;inset:0;" +
+      "background:linear-gradient(90deg,transparent,rgba(255,255,255,.09),transparent);" +
+      "animation:dSimShimmer 1.2s infinite}" +
+      "@keyframes dSimShimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}";
+    document.head.appendChild(_st);
+  }
+  for (let _i = 0; _i < 6; _i++) {
+    strip.appendChild(h("div", {
+      class: "d-similar-card d-similar-skel",
+      style: { borderRadius: "10px", overflow: "hidden" },
+    },
+      h("div", { class: "sk", style: { width: "100%", aspectRatio: "3 / 4" } }),
+      h("div", { class: "sk", style: { height: "12px", margin: "6px 8px", borderRadius: "4px", width: "70%" } }),
+    ));
+  }
+
   (async () => {
     let items = [];
     try {
@@ -468,7 +493,8 @@ function mountSimilarRow(host, gid) {
       items = [];
     }
     console.log("[similar]", gid, "->", items.length, "items");
-    if (!items.length) return;
+    strip.innerHTML = "";   // v12.62: drop skeletons before real cards
+    if (!items.length) { section.style.display = "none"; return; }
 
     for (const s of items) {
       if (!s || !s.id) continue;

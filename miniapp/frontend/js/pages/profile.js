@@ -14,7 +14,7 @@
 import { api } from "core/api.js";
 import { h, make } from "core/components.js";
 import { store } from "core/state.js";
-import { openGalleryDetail } from "plugins/detail-sheet.js?v=12.57";  // v11.9
+import { openGalleryDetail } from "plugins/detail-sheet.js?v=12.62";  // v11.9
 // v12.3: prefetchGallery import removed — no more background warming storm.
 
 export async function render(root, { me }) {

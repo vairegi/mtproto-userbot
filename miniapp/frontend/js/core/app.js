@@ -193,7 +193,7 @@ function _galleryHashId() {
 async function _openGalleryFromDeepLink(gid, me) {
   if (!gid) return;
   try {
-    const m = await import("plugins/detail-sheet.js?v=12.57");
+    const m = await import("plugins/detail-sheet.js?v=12.62");
     let g = { id: gid, title: `#${gid}` };
     try {
       const d = await api.get(`/api/gallery/${encodeURIComponent(gid)}`);
