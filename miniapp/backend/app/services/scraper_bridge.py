@@ -552,6 +552,37 @@ def _iso_date(ts) -> str:
 _NH_EXT_MAP = {"j": "jpg", "p": "png", "g": "gif", "w": "webp"}
 
 
+def _pages_meta_from_raw(item: dict) -> list:
+    """v12.68: build the reader's pages_meta ([{n, path, w, h}]) from a RAW
+    nhentai /api/v2/galleries/<id> payload.
+
+    `path` is CDN-relative ('galleries/<media_id>/<n>.<ext>') — the reader
+    prepends the i1-i4.nhentai.net host itself (plugins/reader.js pageUrl).
+    The images stay on nhentai's CDN (zero Render bandwidth/RAM); we only
+    store this tiny per-page metadata inside the gallery cache row.
+    Returns [] when media_id or images.pages is missing.
+    """
+    if not isinstance(item, dict):
+        return []
+    media_id = str(item.get("media_id") or "").strip()
+    images = item.get("images") or {}
+    pages = images.get("pages") if isinstance(images, dict) else None
+    if not (media_id and isinstance(pages, list) and pages):
+        return []
+    out = []
+    for i, p in enumerate(pages):
+        if not isinstance(p, dict):
+            continue
+        ext = _NH_EXT_MAP.get(str(p.get("t") or "j").strip().lower(), "jpg")
+        out.append({
+            "n":    int(p.get("number") or i + 1),
+            "path": f"galleries/{media_id}/{int(p.get('number') or i + 1)}.{ext}",
+            "w":    int(p.get("w") or 0),
+            "h":    int(p.get("h") or 0),
+        })
+    return out
+
+
 def _direct_nhentai_page1(item: dict) -> str:
     """Build the high-quality page-1 URL from a raw nhentai detail dict.
 
@@ -663,6 +694,11 @@ def _direct_nhentai_detail(gallery_id: str) -> dict:
         # v11: expose page1_url separately alongside `cover`.
         "page1_url": page1,
         "pages":    item.get("num_pages"),
+        # v12.68: reader page metadata — built from the SAME raw upstream
+        # payload (images.pages + media_id), zero extra requests. Every new
+        # gallery:<id> cache row is born with pages_meta so Read works on
+        # first tap. Canonical normalize.py already passes it through.
+        "pages_meta": _pages_meta_from_raw(item),
         "favorites": item.get("num_favorites"),
         "upload_date": _iso_date(item.get("upload_date")),
         "scanlator": item.get("scanlator") or "",
@@ -1049,43 +1085,58 @@ def _pages_meta_of(d: dict) -> list:
 
 
 def _pages_meta_backfill(gid: str, row: dict) -> dict:
-    """v12.67: cached gallery rows written before the Read viewer have no
-    pages_meta. On first open of such a row, fetch the nhentai detail once,
-    build pages_meta, and persist the enriched row (Mongo-2 + Turso dual-write
-    via nhentai_cache.put). Best-effort: any failure returns the row unchanged.
+    """v12.68: cached gallery rows written before the Read viewer have no
+    pages_meta. On first open of such a row, fetch the nhentai v2 detail
+    ONCE (~400ms), build pages_meta from raw images.pages + media_id, and
+    persist the enriched row. Best-effort: any failure returns row unchanged.
+
+    v12.67 BUG FIX: the previous version called `_hf.fetch_detail(gid)` —
+    a function that DOES NOT EXIST in hf_scraper.py (it only exposes the
+    ASYNC fetch_gallery_meta, whose GalleryMeta carries no images). Every
+    backfill raised AttributeError, was swallowed, and returned the row
+    unchanged — so NO legacy row ever got pages_meta and Read showed
+    'Reader unavailable' forever. We now do the upstream fetch ourselves
+    (direct httpx to /api/v2/galleries/<id>) and write through
+    nhentai_cache.put, which DUAL-WRITES Turso + Mongo-2 (dedup-guarded).
     """
     try:
         if row.get("pages_meta"):
             return row
     except Exception:
         return row
+    # --- one upstream fetch (respects the shared 429 backoff budget) -------
     try:
-        detail = _hf.fetch_detail(str(gid))  # noqa: F821
+        r = httpx.get(
+            f"{_NH_API}/galleries/{gid}",
+            headers={"User-Agent": _UA, "Accept": "application/json",
+                     "Referer": "https://nhentai.net/"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log.info("pages_meta backfill: upstream HTTP %s for %s",
+                     r.status_code, gid)
+            return row
+        item = r.json() or {}
     except Exception as e:  # noqa: BLE001
         log.info("pages_meta backfill: fetch failed for %s (%s)", gid, e)
         return row
-    if not detail:
-        return row
+    # --- build pages_meta + persist -----------------------------------------
     try:
-        meta = []
-        for p in (detail.get("pages") or []):
-            if not isinstance(p, dict) or not p.get("path"):
-                continue
-            meta.append({
-                "n": int(p.get("number") or len(meta) + 1),
-                "path": str(p["path"]),
-                "w": int(p.get("width") or 0),
-                "h": int(p.get("height") or 0),
-            })
+        meta = _pages_meta_from_raw(item)
         if not meta:
+            log.info("pages_meta backfill: no images for %s (media_id/pages missing)", gid)
             return row
         row["pages_meta"] = meta
-        row["num_pages"] = int(detail.get("num_pages") or len(meta))
+        if not row.get("pages") and not row.get("num_pages"):
+            row["pages"] = int(item.get("num_pages") or len(meta))
         try:
             from . import nhentai_cache as _nhc2  # noqa: WPS433
-            import json as _json
-            _nhc2.put(f"gallery:{gid}", _json.dumps(row), ttl_sec=None)
-            log.info("📖 [PAGES BACKFILL] gid=%s pages=%d cached for Read", gid, len(meta))
+            # Pass the DICT (not a json.dumps string) so put's canonical
+            # gate + JSON-serialisation guard work correctly; put DUAL-WRITES
+            # Turso AND Mongo-2 best-effort.
+            _ok = _nhc2.put(f"gallery:{gid}", row, ttl_sec=None)
+            log.info("📖 [PAGES BACKFILL] gid=%s pages=%d cached for Read (put=%s)",
+                     gid, len(meta), _ok)
         except Exception as e:  # noqa: BLE001
             log.info("pages_meta backfill: persist failed for %s (%s)", gid, e)
     except Exception as e:  # noqa: BLE001

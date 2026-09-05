@@ -1000,3 +1000,45 @@ Frontend (miniapp/frontend/js/plugins/reader.js):
 - Empty pages_meta now shows a Telegram popup "Loading pages — tap Read again in a few seconds" instead of a silent refusal.
 
 Deploy: drop zip on repo root, commit, push, redeploy Bot 0 (miniapp). No new env vars.
+
+## v12.68 — Read button fix: pages_meta born on write + working backfill (2026-09-05)
+
+Bug: Read (📖) showed "Reader unavailable for this gallery yet" on EVERY
+gallery. Two compounding causes, both in miniapp/backend/app/services/
+scraper_bridge.py:
+
+1. v12.67's _pages_meta_backfill called `_hf.fetch_detail(gid)` — a
+   function that DOES NOT EXIST in hf_scraper.py (it only exposes the
+   async fetch_gallery_meta, whose GalleryMeta carries no images).
+   Every backfill raised AttributeError, was swallowed, and returned the
+   row unchanged — so no legacy row EVER got pages_meta.
+2. _direct_nhentai_detail normalised the raw upstream payload and DROPPED
+   images.pages — so even brand-new cache rows had no pages_meta. Live
+   check vs Mongo-2 (2026-09-05): 400/400 sampled gallery: rows missing
+   pages_meta.
+
+Fix (scraper_bridge.py only):
+- New _pages_meta_from_raw(item): builds [{n, path, w, h}] from raw
+  images.pages + media_id. path is CDN-relative
+  ('galleries/<media_id>/<n>.<ext>') — the reader prepends the
+  i1-i4.nhentai.net host itself. Images stay on nhentai's CDN: zero
+  Render bandwidth/RAM; we only cache the tiny page metadata.
+- _direct_nhentai_detail now embeds pages_meta from the SAME upstream
+  payload it already fetches (zero extra requests) → every new
+  gallery:<id> row is born Read-ready. Canonical normalize.py already
+  passes pages_meta through (v12.66 contract).
+- _pages_meta_backfill rewritten: direct httpx GET to
+  /api/v2/galleries/<id> (replaces the nonexistent _hf.fetch_detail),
+  builds pages_meta, persists via nhentai_cache.put (dict, not
+  json.dumps string, so the canonical gate works) → DUAL-WRITES
+  Turso + Mongo-2, dedup-guarded. One ~400ms upstream call per legacy
+  gallery, once; afterwards Read is instant. v12.67's frontend
+  "tap Read again in a few seconds" popup covers the first slow tap.
+
+Storage math: ~60B/page × ~25 pages ≈ 1.5 KB/gallery; even all ~19k
+cached rows backfilled ≈ ~30 MB of the 512 MB Mongo (lazy backfill
+touches only rows actually opened). Turso: +1 dedup-guarded write per
+legacy gallery, zero new reads.
+
+Deploy: drop zip on repo root, commit, push, redeploy Bot 0 (miniapp)
+only. No new env vars, no frontend change.
