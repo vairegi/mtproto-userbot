@@ -932,3 +932,16 @@ Mongo so the v12.56 "no similar cache" rationale no longer applies.
 shimmer skeleton cards (dSimShimmer keyframes), replaced by real cards on
 fetch; section hides if zero results. All 5 detail-sheet import sites
 bumped ?v=12.57 -> ?v=12.62 (handoff rule 6).
+
+v12.63 (2026-09-05): CRITICAL — Bot 0 OOM crash loop fixed. Symptom:
+miniapp instance "Ran out of memory (used over 512MB)" every few minutes
+(5 kills in 25 min on the events page). Cause: similar_mongo.py v12.60
+accumulated (score, FULL_PAYLOAD) for every matching gallery (~150MB/scan)
+AND the sync FastAPI handler let concurrent cold-gallery opens run scans
+in PARALLEL via the threadpool — 6 scans in 2.5 min on the 10:01-10:04
+log window, dead 3min10s after boot. Fixes: top-N heap scan (only
+(score, gid) tuples kept; payloads parsed-scored-released immediately;
+winners re-fetched with ONE $in query) + process-wide single-flight lock
+(one scan at a time; concurrent requests wait up to 20s or fail open).
+Result cache from v12.62 unchanged. New checks in test run: lean scan,
+scoring order, cache hit, lock fail-open.
