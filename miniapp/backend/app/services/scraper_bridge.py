@@ -1047,7 +1047,53 @@ def _pages_meta_of(d: dict) -> list:
     return out
 
 
-def gallery_detail(gallery_id: str) -> dict:
+
+def _pages_meta_backfill(gid: str, row: dict) -> dict:
+    """v12.67: cached gallery rows written before the Read viewer have no
+    pages_meta. On first open of such a row, fetch the nhentai detail once,
+    build pages_meta, and persist the enriched row (Mongo-2 + Turso dual-write
+    via nhentai_cache.put). Best-effort: any failure returns the row unchanged.
+    """
+    try:
+        if row.get("pages_meta"):
+            return row
+    except Exception:
+        return row
+    try:
+        detail = _hf.fetch_detail(str(gid))  # noqa: F821
+    except Exception as e:  # noqa: BLE001
+        log.info("pages_meta backfill: fetch failed for %s (%s)", gid, e)
+        return row
+    if not detail:
+        return row
+    try:
+        meta = []
+        for p in (detail.get("pages") or []):
+            if not isinstance(p, dict) or not p.get("path"):
+                continue
+            meta.append({
+                "n": int(p.get("number") or len(meta) + 1),
+                "path": str(p["path"]),
+                "w": int(p.get("width") or 0),
+                "h": int(p.get("height") or 0),
+            })
+        if not meta:
+            return row
+        row["pages_meta"] = meta
+        row["num_pages"] = int(detail.get("num_pages") or len(meta))
+        try:
+            from . import nhentai_cache as _nhc2  # noqa: WPS433
+            import json as _json
+            _nhc2.put(f"gallery:{gid}", _json.dumps(row), ttl_sec=None)
+            log.info("📖 [PAGES BACKFILL] gid=%s pages=%d cached for Read", gid, len(meta))
+        except Exception as e:  # noqa: BLE001
+            log.info("pages_meta backfill: persist failed for %s (%s)", gid, e)
+    except Exception as e:  # noqa: BLE001
+        log.info("pages_meta backfill: build failed for %s (%s)", gid, e)
+    return row
+
+
+def _gallery_detail_impl(gallery_id: str) -> dict:
     """Return the full detail dict for one gallery.
 
     Strategy: ALWAYS call the direct nhentai v2 endpoint for the rich
@@ -1270,3 +1316,14 @@ def _apply_filters(rows, include_tags, exclude_tags, pages_min, pages_max):
         if pages_max is not None and p > pages_max: return False
         return True
     return [r for r in rows if _pass(r)]
+
+
+def gallery_detail(gid: str):
+    """v12.67: backfill pages_meta for legacy cached rows before returning."""
+    detail = _gallery_detail_impl(gid)
+    try:
+        if detail and detail.get("id") and not detail.get("pages_meta"):
+            detail = _pages_meta_backfill(str(detail["id"]), detail)
+    except Exception:
+        pass
+    return detail
