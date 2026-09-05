@@ -12,7 +12,7 @@ console.info('[detail-sheet] build=v12.57');
 import { api } from "core/api.js";
 import { h, make } from "core/components.js";
 import { cardActions, warmSaveCount } from "plugins/card-actions.js";
-import { renderStarRating } from "plugins/star-rating.js";  // v11.7
+// v12.64: star-rating widget removed per user request — import dropped.
 
 const GROUP_LABELS = {
   parody:    "Parodies",
@@ -251,11 +251,6 @@ async function enrich(root, g, sheetEl) {
 function paintFull(root, d, sheetEl) {
   console.info('[similar-to-this] paintFull enter, gid=', d && d.id);
   root.innerHTML = "";
-  try {
-    } catch (e) {
-    // v12.54: a stale star-rating plugin must never abort the detail body.
-    console.warn('[detail-sheet] renderStarRating failed (non-fatal):', e);
-  }
   root.append(
     d.cover
       ? h("img", { class: "d-cover", src: d.cover, alt: d.title })
@@ -277,8 +272,7 @@ function paintFull(root, d, sheetEl) {
       + (d.upload_date ? ` · 📅 ${fmtDate(d.upload_date)}` : "")),
   );
 
-  // v11.7: interactive star-rating widget between header and metadata card.
-  root.appendChild(renderStarRating(d.id));
+  // v12.64: star-rating widget removed (user request).
 
   /* v11.8 (#3): ONE unified metadata card. Parodies/Characters/Artists/
      Groups/Languages/Categories/Tags/Uploaded all stack inside a single

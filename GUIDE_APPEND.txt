@@ -1,67 +1,63 @@
 ================================================================================
-GUIDE_APPEND — v12.63 (2026-09-05) — CRITICAL: Bot 0 OOM crash loop fix
+GUIDE_APPEND — v12.64 (2026-09-05)
+Rating removal + trending-chip fix + live online badge
 ================================================================================
 
-SYMPTOM (your events page + log)
---------------------------------
-miniapp instance killed "Ran out of memory (used over 512MB)" five times
-in 25 minutes. Log window: live 10:01:47 -> dead 10:04:57 (3m10s). In that
-window: SIX full-corpus /similar scans, several overlapping.
+1) RATING REMOVED (detail sheet)
+   The star-rating widget is gone from the gallery detail sheet (import,
+   render call, and the vestigial try/catch dropped). star-rating.js stays
+   in the repo unused — ratings data in Mongo is untouched if you ever
+   want it back.
 
-ROOT CAUSE (my v12.60 similar_mongo.py — two compounding mistakes)
-------------------------------------------------------------------
-1. The scan accumulated (score, FULL_PAYLOAD) for EVERY matching gallery —
-   thousands of full gallery dicts held in RAM per scan (~100-150MB).
-2. The route is a sync FastAPI handler -> runs in a threadpool -> 2-3
-   concurrent cold-gallery opens ran scans IN PARALLEL, stacking RAM until
-   the 512MB instance was killed. Restart -> users retry -> scans fire
-   again -> killed again. That is the crash loop you kept hitting.
+2) TRENDING CHIPS FIXED ("Try Searching These")
+   Before: tapping a chip pasted "tag:blowjob" into the search box. Bot 1
+   warms searches under the bare-slug canonical key
+   (search:q=blowjob|sort=popular-today|page=N), so the tag: form was a
+   guaranteed cache MISS — wrong sort + slow live fetch.
+   Now: chip pastes the bare slug ("blowjob") and the existing input-event
+   -> debounced-commit flow fires the search automatically.
+   Result: chip taps now hit the warmed cache instantly.
 
-FIXES (v12.63)
---------------
-1. TOP-N HEAP SCAN: each doc is parsed, scored, RELEASED immediately; the
-   heap keeps only (score, gid) for the best `limit` candidates. Winners'
-   payloads are re-fetched afterwards with ONE $in query (<=8 docs).
-   Peak RAM per scan: a few MB instead of ~150MB.
-2. SINGLE-FLIGHT LOCK (process-wide): only one corpus scan may run at a
-   time. Concurrent requests wait up to 20s for it (lean scan is ~2-4s) —
-   never stack. On timeout they fail open (frontend hides the section).
-3. The v12.62 per-gallery result cache is unchanged — most opens never
-   scan at all.
-
-NOT a memory leak: RAM was correctly freed between requests; the kill came
-from PEAK usage during parallel scans. The fixes cap the peak.
+3) LIVE ONLINE BADGE (header, in front of PUBLIC)
+   New "🟢 N" badge = users with last_seen in the last 5 minutes.
+   Backend: NEW miniapp/backend/app/routes/online.py — GET /api/online
+   (authenticated, one count_documents on miniapp_users.last_seen;
+   last_seen is already maintained on every request, so this adds zero
+   write load). Frontend: app.js polls every 30s.
+   Tunable: ONLINE_WINDOW_MIN on the miniapp service (default 5).
 
 FILES IN THIS ZIP
 -----------------
-  miniapp/backend/app/services/similar_mongo.py   (rewritten engine)
+  miniapp/frontend/js/plugins/detail-sheet.js   (rating removed)
+  miniapp/frontend/js/pages/search.js           (chip fix)
+  miniapp/frontend/js/core/app.js               (online badge + polling)
+  miniapp/frontend/js/core/registry.js          (search.js pin)
+  miniapp/backend/app/routes/online.py          (NEW endpoint)
+  miniapp/frontend/js/pages/bookmarks.js        (version bump only)
+  miniapp/frontend/js/pages/profile.js          (version bump only)
+  miniapp/frontend/js/plugins/home-rows.js      (version bump only)
+  miniapp/frontend/index.html                   (app.js pin bump)
+  index.html                                    (app.js pin bump)
   GUIDE.md
   GUIDE_APPEND.txt
 
 DEPLOY
 ------
 1) Drop zip on repo root; commit + push.
-2) Redeploy the Bot 0 (miniapp) service.
-3) No env changes.
+2) Redeploy the Bot 0 (miniapp) service only.
+3) Fully close and reopen the Mini App once (pulls the new JS pins).
 
 VERIFY
 ------
-  * Events page: no more "Ran out of memory" kills after deploy.
-  * Open several COLD galleries quickly in a row: each Similar row still
-    loads (sequentially, a few seconds apart), service stays alive.
-  * Render log shows "scored=... rows -> N cards (lean-scan)".
-  * Repeat opens show "source=MONGO2-CACHE" instantly.
+  * Detail sheet: no star row between title/meta and the metadata card.
+  * Tap "tag:blowjob" chip -> search box shows "blowjob", results load
+    automatically (and fast — cache hit).
+  * Header shows "🟢 N" in front of PUBLIC; N updates every 30s.
+  * Render log: GET /api/online 200 every 30s per active client.
 
-TESTS (sandbox, all pass)
--------------------------
-  v12.63 checks: lean scan scoring order, winner-only payload fetch,
-  cache-hit path, single-flight fail-open — PASS.
-  tests/test_v12_60_mongo2.py — 20/20 PASS (regression).
-  py_compile: OK.
-
-HONEST NOTE
------------
-If opens STILL feel slow during heavy concurrent cold-gallery traffic,
-the next step is pre-warming the similar cache for trending galleries in
-the prefetch cron (writes are free on Mongo). Say the word.
+TESTS (sandbox)
+---------------
+  node --check on all 5 touched JS files: OK.
+  py_compile online.py: OK.
+  tests/test_v12_60_mongo2.py: 20/20 PASS (no regressions).
 ================================================================================

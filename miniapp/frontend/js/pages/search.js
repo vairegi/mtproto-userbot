@@ -20,7 +20,7 @@ import { haptic } from "core/telegram.js";
 import { store } from "core/state.js";
 import { parseSearch } from "plugins/search-operators.js";
 import { cardActions } from "plugins/card-actions.js";
-import { renderTrendingTags, renderRecommendations } from "plugins/home-rows.js?v=1.22.5";  // v11.7
+import { renderTrendingTags, renderRecommendations } from "plugins/home-rows.js?v=12.64";  // v11.7
 // v12.3: prefetchGallery import REMOVED — no more background detail warming.
 // Card taps open a minimal sheet whose actions (Download/Save/Share) need no
 // extra upstream fetches; detail data only loads when the sheet is open.
@@ -75,10 +75,12 @@ export async function render(root, { me }) {
     if (inp) { inp.value = state.query; }
   }
   const $chips = buildChipRow(state, refetch);
-  // v1.22.5: hint row shows BOT 1's scraped trending tags (tappable) under
-  // the label "Try Searching These", falling back to the static operator
-  // hints if the scraper list is unavailable. Tapping a tag fills the
-  // search box with tag:<slug> and searches immediately.
+  // v12.64: hint row shows BOT 1's scraped trending tags (tappable) under
+  // the label "Try Searching These". Tapping a chip pastes the BARE slug
+  // ("blowjob", NOT "tag:blowjob") so the search hits Bot 1's warmed
+  // canonical key (search:q=blowjob|sort=popular-today|...) — the tag:
+  // prefix was a guaranteed Turso/Mongo cache MISS. The dispatched input
+  // event fires the bar's 350ms-debounced commit -> auto-search.
   const $hint = h("div", { class: "search-hint" },
     "Try Searching These: ", h("code", {}, "tag:vanilla"), " ",
     h("code", {}, "-tag:yaoi"), " ",
@@ -108,7 +110,7 @@ export async function render(root, { me }) {
         style: { cursor: "pointer" },
         title: `Search tag:${slug}`,
       }, `tag:${slug}`);
-      c.addEventListener("click", () => _fillSearch(`tag:${slug}`));
+      c.addEventListener("click", () => _fillSearch(slug));  // v12.64: bare slug, auto-search
       $hint.append(c);
       if (i < tags.length - 1) $hint.append(" ");
     });
@@ -389,7 +391,7 @@ export async function render(root, { me }) {
         .then(st => { g.v2_status = st || { known: false }; })
         .catch(() => { g.v2_status = { known: false }; });
     }
-    const m = await import("plugins/detail-sheet.js?v=12.62");
+    const m = await import("plugins/detail-sheet.js?v=12.64");
     m.openGalleryDetail(g, me);
   }
 
@@ -632,7 +634,7 @@ function buildChipRow(state, refetch) {
     try {
       const g = await api.get("/api/random?respect_tags=1");
       if (g && g.id) {
-        const m = await import("plugins/detail-sheet.js?v=12.62");
+        const m = await import("plugins/detail-sheet.js?v=12.64");
         m.openGalleryDetail(g, undefined);
         if (g._reason) {
           try { make("toast", { text: `🎲 Picked because ${g._reason}`, kind: "success" }); } catch (_) {}

@@ -945,3 +945,20 @@ winners re-fetched with ONE $in query) + process-wide single-flight lock
 (one scan at a time; concurrent requests wait up to 20s or fail open).
 Result cache from v12.62 unchanged. New checks in test run: lean scan,
 scoring order, cache hit, lock fail-open.
+
+v12.64 (2026-09-05): detail-sheet rating removed + trending-chip search fix
++ live online-users badge. 1) Star-rating widget removed from the detail
+sheet (renderStarRating call + import + vestigial try/catch dropped;
+star-rating.js left in repo unused). 2) "Try Searching These" chips now
+paste the BARE slug ("blowjob") instead of "tag:blowjob" — the tag: prefix
+was a guaranteed cache MISS against Bot 1's warmed canonical keys
+(search:q=<slug>|sort=popular-today|...), forcing a live upstream fetch
+with wrong-sort results. Tap -> input event -> 350ms debounced commit ->
+auto-search (unchanged flow, deterministic). 3) New "users online" header
+badge (🟢 N) in FRONT of the PUBLIC/PRIVATE badge: frontend polls
+GET /api/online every 30s; new miniapp/backend/app/routes/online.py counts
+miniapp_users with last_seen within ONLINE_WINDOW_MIN (default 5) —
+last_seen was already maintained by upsert_user on every authenticated
+request, so zero new write load. Version bumps per rule 6: detail-sheet
+?sites, registry search.js pin added, home-rows pin, app.js pin in both
+index.html copies.

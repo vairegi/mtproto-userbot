@@ -23,7 +23,7 @@ export const pages = [
     title: "Discover",
     icon: "🔎",
     label: "Search",
-    module: () => import("pages/search.js"),
+    module: () => import("pages/search.js?v=12.64"),
   },
   {
     id: "bookmarks",

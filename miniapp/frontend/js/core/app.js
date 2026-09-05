@@ -193,7 +193,7 @@ function _galleryHashId() {
 async function _openGalleryFromDeepLink(gid, me) {
   if (!gid) return;
   try {
-    const m = await import("plugins/detail-sheet.js?v=12.62");
+    const m = await import("plugins/detail-sheet.js?v=12.64");
     let g = { id: gid, title: `#${gid}` };
     try {
       const d = await api.get(`/api/gallery/${encodeURIComponent(gid)}`);
@@ -213,12 +213,19 @@ function renderHeader(me) {
     class: "hdr-badge " + (me.public_mode ? "" : "warn"),
     title: me.public_mode ? "Public mode" : "Private (admin only)",
   }, me.public_mode ? "PUBLIC" : "PRIVATE");
+  // v12.64: live online-users badge, placed in FRONT of the PUBLIC badge.
+  const badgeOnline = h("span", {
+    class: "hdr-badge", id: "online-badge",
+    title: "Users online (last 5 min)",
+  }, "🟢 –");
   $header.appendChild(title);
+  $header.appendChild(badgeOnline);
   $header.appendChild(badgeMode);
   $header.appendChild(badgeQueue);
 
   // Live queue polling — 5s cadence.  This is the "live badge" feature.
   startQueuePolling();
+  startOnlinePolling();   // v12.64
 }
 
 function renderTabbar(me) {
@@ -295,6 +302,21 @@ async function startQueuePolling() {
   tick();
   clearInterval(queuePollTimer);
   queuePollTimer = setInterval(tick, 5000);
+}
+
+let onlinePollTimer = null;
+// v12.64: 30s cadence is plenty for an online count (5-min window).
+async function startOnlinePolling() {
+  const badge = document.getElementById("online-badge");
+  const tick = async () => {
+    try {
+      const r = await api.get("/api/online");
+      badge.textContent = "🟢 " + (r.online || 0);
+    } catch (_) { /* ignore transient errors */ }
+  };
+  tick();
+  clearInterval(onlinePollTimer);
+  onlinePollTimer = setInterval(tick, 30000);
 }
 
 boot();
