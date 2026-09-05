@@ -987,3 +987,16 @@ bandwidth). Detail payloads now carry pages_meta ([{n,path,w,h}]) — all 3
 vendored normalize.py copies extended additively; old rows backfill lazily
 via one keyed /api/gallery fetch. worker.py deleted; start.sh no longer
 supervises it (~90-130MB freed on the miniapp instance — v12.65 OOM fix).
+
+## v12.67 — Reader backfill fix (2026-09-05)
+
+Bug: tapping Read on any gallery cached BEFORE v12.66 showed "Reader is unavailable for this gallery yet" — those rows have no pages_meta.
+
+Fix (miniapp/backend/app/services/scraper_bridge.py):
+- New _pages_meta_backfill(gid, row): on first open of a legacy row, calls hf_scraper.fetch_detail once, builds pages_meta [{n,path,w,h}], and persists the enriched row via nhentai_cache.put (dual-writes Mongo-2 + Turso). Logged as "📖 [PAGES BACKFILL] gid=… pages=N cached for Read".
+- gallery_detail is now a thin wrapper that backfills before returning. One-time ~400ms upstream call per legacy gallery; afterwards Read is instant.
+
+Frontend (miniapp/frontend/js/plugins/reader.js):
+- Empty pages_meta now shows a Telegram popup "Loading pages — tap Read again in a few seconds" instead of a silent refusal.
+
+Deploy: drop zip on repo root, commit, push, redeploy Bot 0 (miniapp). No new env vars.
