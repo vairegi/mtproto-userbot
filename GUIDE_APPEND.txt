@@ -1,14 +1,16 @@
-GUIDE_APPEND — v12.76b (2026-09-06) — workers panel stale-claim hotfix
-WHAT: "Working now" cards were frozen on two old gids at 10% "Working…".
-Cause: _workers sorted started_at ASC; Bot 2 refresh_claim bumps started_at
-on every heartbeat, so live workers sort LAST and stale/abandoned PROCESSING
-claims (no progress.* writes → empty stage → 10%) pinned the limit-4 window.
-Fix: sort started_at DESC + skip docs whose progress.updated_at (or
-started_at) is older than 300s. Backend-only change.
+GUIDE_APPEND — v12.76c (2026-09-06) — workers panel lease-based freshness
+WHAT: "Working now" disappeared entirely after v12.76b. Cause: the 300s
+heartbeat filter was wrong — progress.updated_at only ticks when
+@Gallery_DLBot echoes a page counter, and refresh_claim only bumps
+started_at AFTER the PDF arrives, so live workers mid-wait looked stale.
+Fix: a worker is "live" iff its claim lease (claim_expires) is in the
+future — the same lease both bots already maintain; legacy rows without a
+lease fall back to last-touch ≤1800s. Scan widened to limit 8 (2 cards max
+returned); titles now strip the " » nhentai" suffix.
 FILES: miniapp/backend/app/services/queue_bridge.py, GUIDE.md,
 GUIDE_APPEND.txt.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 0 ONLY (Bot 2
-untouched). No Mini App reload needed.
-VERIFY: Queue tab "Working now" shows the gids Bot 2 is ACTUALLY logging
-(🎯 slot N claimed <gid>) with real stage text and moving pct; the old
-#510790/#665558 cards disappear on the next 8s poll.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 0 ONLY. No Mini App
+reload, no Bot 2 change.
+VERIFY: while Bot 2 logs "🎯 slot N claimed <gid>", the Queue tab shows
+that gid's card with title + stage + pct — even during long silent PDF
+waits; dead claims (expired lease) never appear.

@@ -1480,3 +1480,25 @@ claims are skipped; all-stale → empty workers[] (frontend hides panel).
 beyond the one v12.76 already required).
 **Files:** miniapp/backend/app/services/queue_bridge.py, GUIDE.md,
 GUIDE_APPEND.txt.
+
+## v12.76c — Workers panel: lease-based freshness (2026-09-06)
+**Bug:** after v12.76b the "Working now" panel vanished entirely even while
+Bot 2 was actively processing. Root cause found in fetcher.py: during the
+PDF wait, `set_progress` (the only writer of `progress.updated_at`) only
+fires when @Gallery_DLBot echoes an "N/M" page counter — a slow/silent bot
+leaves it untouched for the whole wait — and `refresh_claim` (the only
+bumper of `started_at` mid-job) fires ONCE, after the PDF arrives. So a
+legitimately working slot can show NO fresh heartbeat for 10+ minutes and
+v12.76b's 300s heartbeat filter hid it.
+**Fix (queue_bridge.py only, Bot 0 only):**
+1. Freshness now means the CLAIM LEASE: a doc counts as a live worker iff
+   `claim_expires > now` (the same lease both bots extend and the
+   staleness/recovery logic already trusts). Legacy rows with no
+   `claim_expires` fall back to last-touch ≤ 1800s.
+2. Scan widened limit 4 -> 8 (still sorted `started_at` DESC, still
+   returns at most 2 cards) so expired claims can't crowd out live ones.
+3. Projection includes `claim_expires`; title strips the nhentai
+   " » nhentai" suffix so cards show the real name.
+**Deploy:** Bot 0 only. No frontend/Bot 2 change.
+**Files:** miniapp/backend/app/services/queue_bridge.py, GUIDE.md,
+GUIDE_APPEND.txt.

@@ -290,9 +290,9 @@ def _workers(conn) -> list:
         cur = (coll.find(
                    {"status": "PROCESSING"},
                    projection={"title": 1, "pages": 1, "started_at": 1,
-                               "progress": 1})
+                               "claim_expires": 1, "progress": 1})
                .sort("started_at", -1)  # v12.76b: freshest first
-               .limit(4))
+               .limit(8))  # v12.76c: wider scan, still capped
         out = []
         for doc in cur:
             try:
@@ -301,13 +301,29 @@ def _workers(conn) -> list:
                 # started_at via refresh_claim); a stuck/abandoned claim
                 # (e.g. pre-v12.76 rows, worker crash) has neither fresh and
                 # used to pin the panel forever at 10% "Working…".
+                # v12.76c: freshness = the CLAIM LEASE, not heartbeats.
+                # progress.updated_at only ticks when @Gallery_DLBot echoes a
+                # page counter (a silent bot leaves it stale for the whole
+                # wait), and refresh_claim only bumps started_at AFTER the
+                # PDF arrives — so heartbeat-based filtering hid live
+                # workers (v12.76b bug). claim_expires is extended on every
+                # refresh/heartbeat by BOTH bots and is the same lease the
+                # staleness/recovery logic already trusts.
                 try:
-                    fresh = float((doc.get("progress") or {}).get("updated_at")
-                                  or doc.get("started_at") or 0)
+                    exp = float(doc.get("claim_expires") or 0)
                 except (TypeError, ValueError):
-                    fresh = 0.0
-                if _sf_time.time() - fresh > 300.0:
-                    continue
+                    exp = 0.0
+                if exp and exp < _sf_time.time():
+                    continue          # lease expired -> abandoned claim
+                if not exp:
+                    # legacy row with no lease: fall back to last touch
+                    try:
+                        fresh = float((doc.get("progress") or {}).get("updated_at")
+                                      or doc.get("started_at") or 0)
+                    except (TypeError, ValueError):
+                        fresh = 0.0
+                    if _sf_time.time() - fresh > 1800.0:
+                        continue
                 prog = doc.get("progress") or {}
                 if not isinstance(prog, dict):
                     prog = {}
@@ -321,7 +337,7 @@ def _workers(conn) -> list:
                 out.append({
                     "gid": str(doc.get("_id") or ""),
                     "slot": slot,
-                    "title": (doc.get("title") or "")[:80],
+                    "title": (lambda t: (t.split("\u00bb")[0].strip() or t)[:80])(str(doc.get("title") or "")),
                     "stage": stage,
                     "stage_human": _WORKER_STAGE_HUMAN.get(stage, "Working…"),
                     "page": page,
