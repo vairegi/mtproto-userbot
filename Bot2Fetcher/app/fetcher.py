@@ -33,7 +33,7 @@ import os
 import random
 import re
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import httpx
 from telethon import TelegramClient
@@ -415,7 +415,8 @@ class Fetcher:
                      self.s.bot2_username)
         # v12.72: surface a live "stage" to the mini-app right after claim.
         self.galleries.set_progress(
-            gid, stage="fallback_fetching" if route_fallback_direct else "fetching")
+            gid, stage="fallback_fetching" if route_fallback_direct else "fetching",
+            slot=idx)
         # v12.73: mark the queue ledger row as processing (if it came from there)
         self.galleries.mark_queue_status(gid, "processing")
         self.stats.claimed += 1
@@ -505,8 +506,8 @@ class Fetcher:
                               step="waiting @Gallery_DLBot")
                 # v12.72: mini-app progress — primary bot is downloading now.
                 self.galleries.set_progress(
-                    gid, stage="downloading", total=int(m.get("pages") or 0))
-                pdf_msg = await self._request_pdf(client, bot2, gid, timeout)
+                    gid, stage="downloading", total=int(m.get("pages") or 0), slot=idx)
+                pdf_msg = await self._request_pdf(client, bot2, gid, timeout, slot=idx)
                 if pdf_msg is None:
                     # v12.49 (operator spec): timeout is NOT an explicit
                     # "An error occurred" reply — keep the legacy drop path.
@@ -529,7 +530,7 @@ class Fetcher:
                                   step=f"fallback @{getattr(self.s, 'fallback_username', '')}")
                     # v12.72: primary errored — mini-app sees "handed to backup".
                     self.galleries.set_progress(gid, stage="fallback_fetching",
-                                                total=int(m.get("pages") or 0))
+                                                total=int(m.get("pages") or 0), slot=idx)
                     pdf_msg, fb_err = await self._try_fallback_pdf(
                         idx, client, gid, primary_err)
                     if pdf_msg is None:
@@ -564,7 +565,7 @@ class Fetcher:
                           pages=m.get("pages") or 0, step="downloading cover")
             # v12.72: bot has the PDF — compiling phase.
             self.galleries.set_progress(gid, stage="compiling",
-                                        total=int(m.get("pages") or 0))
+                                        total=int(m.get("pages") or 0), slot=idx)
             img_bytes, ext = await self._fetch_cover_bytes(m)
             self.galleries.refresh_claim(gid)
 
@@ -572,7 +573,7 @@ class Fetcher:
                           pages=m.get("pages") or 0, step="posting to DB channel")
             # v12.72: about to post cover + forward PDF to database channel.
             self.galleries.set_progress(gid, stage="uploading",
-                                        total=int(m.get("pages") or 0))
+                                        total=int(m.get("pages") or 0), slot=idx)
             async with self._channel_lock:
                 cover_msg_id = await self._post_cover(client, channel, m,
                                                      caption, img_bytes, ext)
@@ -752,7 +753,8 @@ class Fetcher:
             log.warning("🖼 cover post %s failed: %s", m.get("id"), e)
             return 0
 
-    async def _request_pdf(self, client: TelegramClient, bot2, gid: str, timeout: float):
+    async def _request_pdf(self, client: TelegramClient, bot2, gid: str, timeout: float,
+                           slot: Optional[int] = None):
         log.info("📨 DMing @%s: https://nhentai.net/g/%s/",
                  self.s.bot2_username, gid)
         sent = await client.send_message(bot2, f"https://nhentai.net/g/{gid}/")
@@ -805,7 +807,7 @@ class Fetcher:
                                 tot = int(mtch.group(2) or mtch.group(4) or 0)
                                 if cur > 0:
                                     self.galleries.set_progress(
-                                        gid, stage="downloading",
+                                        gid, stage="downloading", slot=slot,
                                         page=cur, total=(tot or None))
                                     last_prog_write = now
                         except Exception:

@@ -215,6 +215,7 @@ def status_summary() -> dict:
             "completed":  int(counts.get("completed", 0)),
             "failed":     int(counts.get("failed", 0)),
             "recent": [_row(r) for r in recent],
+            "workers": _workers(conn),
         }
     finally:
         try: conn.close()
@@ -247,3 +248,79 @@ def _row(r: Any) -> dict:
         except Exception:
             pass
     return out
+
+
+# ------------------------------------------------------------------ v12.76
+# Live per-worker view for the Queue tab. ONE indexed query on the
+# galleries collection (status index exists since v12.x), projection
+# only the fields we render, hard cap 4 rows, at most 2 returned to the
+# frontend. All failures degrade to [] so the status endpoint never 500s.
+_WORKER_STAGE_HUMAN = {
+    "fetching":          "Contacting download bot…",
+    "downloading":       "Downloading pages",
+    "fallback_fetching": "Backup bot downloading",
+    "compiling":         "Compiling PDF…",
+    "uploading":         "Uploading to database channel…",
+}
+_WORKER_STAGE_PCT = {"fetching": 8, "fallback_fetching": 30,
+                     "compiling": 90, "uploading": 96}
+
+
+def _worker_pct(stage: str, page: Any, total: Any) -> int:
+    """Monotonic pseudo-percent. Downloading interpolates 8..85 by
+    page/total; other stages use fixed anchors so the bar never jumps
+    backwards when stage flips."""
+    try:
+        page = int(page or 0)
+        total = int(total or 0)
+    except (TypeError, ValueError):
+        page, total = 0, 0
+    if stage == "downloading":
+        if page > 0 and total > 0:
+            return max(8, min(85, 8 + int(77 * page / max(total, 1))))
+        return 15
+    return _WORKER_STAGE_PCT.get(stage, 10)
+
+
+def _workers(conn) -> list:
+    try:
+        coll = getattr(conn, "galleries", None)
+        if coll is None:
+            return []
+        cur = (coll.find(
+                   {"status": "PROCESSING"},
+                   projection={"title": 1, "pages": 1, "started_at": 1,
+                               "progress": 1})
+               .sort("started_at", 1)
+               .limit(4))
+        out = []
+        for doc in cur:
+            try:
+                prog = doc.get("progress") or {}
+                if not isinstance(prog, dict):
+                    prog = {}
+                stage = str(prog.get("stage") or "")
+                try:
+                    slot = int(prog.get("slot")) if prog.get("slot") is not None else None
+                except (TypeError, ValueError):
+                    slot = None
+                page = prog.get("page")
+                total = prog.get("total") or doc.get("pages")
+                out.append({
+                    "gid": str(doc.get("_id") or ""),
+                    "slot": slot,
+                    "title": (doc.get("title") or "")[:80],
+                    "stage": stage,
+                    "stage_human": _WORKER_STAGE_HUMAN.get(stage, "Working…"),
+                    "page": page,
+                    "total": total,
+                    "pct": _worker_pct(stage, page, total),
+                })
+                if len(out) >= 2:
+                    break
+            except Exception:
+                continue
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning("queue workers lookup failed (degrading to []): %s", e)
+        return []

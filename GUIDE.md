@@ -1425,3 +1425,41 @@ Deploy: drop zip on repo root, commit, push, redeploy ALL THREE bots.
 CI must go green. VERIFY: logs say "⚡ [MONGO CACHE HIT]" not Turso;
 Bot 2 "📖 [MONGO READ] list_gallery_ids — N>0" with no sort errors;
 /popupmsg hii → "✅ Popup updated — 📄 Saved message: hii".
+
+## v12.76 — Queue tab rewrite: live per-worker cards, one lazy poll (2026-09-06)
+**Problem:** the Queue tab showed only counts + bare rows — no item name, no
+per-worker view, and every PROCESSING row spawned its OWN 2.5s poller
+(`/api/queue/progress/<gid>`), each poll opening a fresh Mongo connection on
+Bot 0's 512 MB instance.
+**What changed:**
+1. **Bot 2 stamps the worker slot.** `mongo_state.set_progress()` gained an
+   optional `slot=` kwarg that writes `progress.slot` (0-based userbot slot).
+   All six call sites in `fetcher.py` pass `slot=idx`; `_request_pdf` gained
+   a `slot` kwarg purely to forward it to its inner page-progress writes.
+   No extra Mongo writes — same `$set`, one more field.
+2. **Backend `status_summary()` now returns `workers[]`** (queue_bridge.py):
+   ONE indexed query on `galleries` `{status:"PROCESSING"}` (status index
+   exists since the v12.x schema), projection of only `_id/title/pages/
+   started_at/progress`, `sort started_at`, hard `limit 4`, at most 2 cards
+   returned. Per card: gid, slot, truncated title (≤80 chars), stage,
+   human stage label, page/total, and a monotonic pseudo-pct
+   (fetching 8 → downloading 8–85 by page/total → fallback 30 → compiling
+   90 → uploading 96). Any failure degrades to `[]` — the endpoint never 500s.
+3. **Frontend `pages/queue.js` rewritten from scratch.** ONE timer at 8s
+   (lazy on purpose — fewer RTTs, less RAM); zero per-row pollers, zero
+   per-row Mongo connections. New "⚙️ Working now" panel renders one compact
+   card per active worker slot side-by-side (`Worker 1` / `Worker 2`), each
+   with a 2-line-clamped half title (small size), stage label, page counter
+   and a thin progress bar. Recent list is now compact one-line rows
+   (status dot + truncated title, cap 8); completed rows keep a small
+   "🔗 Open" deep-link button; failed rows keep the friendly reason.
+   Teardown = a single `clearInterval`.
+**Compatibility:** wire change is additive — old frontends ignore `workers`;
+new frontend hides the panel when the backend doesn't send it.
+**RAM/ops delta (Bot 0):** polling drops from ~1 req / 2.5s / active job
+(each = fresh Mongo conn) to 1 req / 8s total = 1 indexed, projected,
+limit-4 query. No new collections, no Turso, no whole-table loads.
+**Deploy:** Bot 0 AND Bot 2. Users fully close + reopen the Mini App once.
+**Files:** Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
+miniapp/backend/app/services/queue_bridge.py,
+miniapp/frontend/js/pages/queue.js, GUIDE.md, GUIDE_APPEND.txt.

@@ -1,20 +1,21 @@
-GUIDE_APPEND — v12.75 (2026-09-06) — freeze follow-ups
-WHAT: (1) CI F821 fixed — suggestions.py now imports os. (2) The
-"⚡ [TURSO CACHE HIT]" lines after the freeze were STALE LOG STRINGS
-(zero turso.io calls in Bot 0's log — grep-verified); the four log
-constants now say MONGO when BOT0_TURSO_OFF=1. (3) Bot 2 Mongo-2 mirror
-bugs fixed: 32MB sort-limit abort → allow_disk_use + Python fallback;
-list_recent_search_ids returned 0 ids because Mongo-2 payloads are JSON
-STRINGS — now decoded first; get_gallery_row tolerates double-encoding;
-ensure_schema skips Turso DDL under the freeze. (4) /popupmsg stored
-literal "on" (live Mongo: popup_message='on') — on/off now redirect to
-the toggle, writes are read back and previewed in the reply. Recovery:
-/popupmsg clear, then /popupmsg <real message>.
-FILES: admin_bot.py, miniapp/backend/app/routes/suggestions.py,
-miniapp/backend/app/services/scraper_bridge.py,
-Bot2Fetcher/app/turso_store.py, GUIDE*.
-DEPLOY: drop on repo root, commit, push, redeploy ALL THREE bots; CI
-must be green. Users reopen the Mini App once.
-VERIFY: logs say "⚡ [MONGO CACHE HIT]" (not Turso); Bot 2
-"📖 [MONGO READ] list_gallery_ids — N>0" no sort errors; /popupmsg hii
-→ "✅ Popup updated — 📄 Saved message: hii" and mini-app shows "hii".
+GUIDE_APPEND — v12.76 (2026-09-06) — Queue tab: live per-worker cards, lightweight
+WHAT: Queue tab rewritten. (1) Bot 2 set_progress() accepts slot= and stamps
+progress.slot on the galleries row (all 6 fetcher call sites pass the worker
+slot; _request_pdf forwards it to its page-progress writes). (2) Bot 0
+/api/queue/status now also returns workers[] — ONE indexed, projected,
+limit-4 query on galleries {status:PROCESSING}, at most 2 cards with
+slot/title/stage/page/total/monotonic pct; degrades to [] on any error.
+(3) Frontend polls ONCE every 8s (was 5s + one 2.5s poller + one fresh
+Mongo connection PER processing row) and renders a "Working now" panel —
+Worker 1 / Worker 2 side-by-side with half-size clamped titles, stage,
+pages and progress bar — plus a compact 8-row recent list (Open button on
+completed rows kept).
+FILES: Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
+miniapp/backend/app/services/queue_bridge.py,
+miniapp/frontend/js/pages/queue.js, GUIDE.md, GUIDE_APPEND.txt.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 0 AND Bot 2; CI must
+be green. Users FULLY close + reopen the Mini App once (WebView caches JS).
+VERIFY: queue two galleries; Queue tab shows "⚙️ Working now" with two
+labeled worker cards, titles, stage text ("Downloading pages · 5/24p") and
+bars moving; Bot 2 log shows normal "🎯 slot N claimed" lines (no new log
+spam); Render memory flat — no per-row progress pollers remain.

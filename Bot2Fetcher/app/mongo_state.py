@@ -208,10 +208,14 @@ class Galleries:
     def set_progress(self, gid: str, *, stage: str,
                      page: Optional[int] = None,
                      total: Optional[int] = None,
-                     eta_s: Optional[int] = None) -> None:
+                     eta_s: Optional[int] = None,
+                     slot: Optional[int] = None) -> None:
         """v12.72: write a lightweight progress sub-doc so the mini app can
         show a live status while Bot 2 works. Best-effort — any failure is
         swallowed so a Mongo hiccup can NEVER block a slot.
+        v12.76: optional `slot` stamps which userbot slot (0-based)
+        owns this job, so the mini-app Queue tab can show one live
+        card per worker.
 
         Fields written under progress.*:
           stage      — 'fetching' | 'downloading' | 'fallback_fetching'
@@ -237,6 +241,9 @@ class Galleries:
                 except (TypeError, ValueError): pass
             if eta_s is not None:
                 try: sub["progress.eta_s"] = int(eta_s)
+                except (TypeError, ValueError): pass
+            if slot is not None:
+                try: sub["progress.slot"] = int(slot)
                 except (TypeError, ValueError): pass
             self.coll.update_one(
                 {"_id": str(gid), "status": STATUS_PROCESSING},
