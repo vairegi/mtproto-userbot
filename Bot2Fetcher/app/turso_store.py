@@ -151,6 +151,14 @@ def _extract_ids_from_search_payload(payload: Any) -> List[str]:
     return out
 
 
+# v12.74: Turso quota freeze. BOT2_TURSO_OFF=1 routes the producer and
+# job hot path to Mongo only — queue-order scans read Mongo-2's
+# turso_nhentai_cache mirror (same rows Bot 1 dual-writes), gallery rows
+# come from Mongo-2 first, and put_state writes Mongo only. Turso is
+# touched only by Bot 0's nightly 01:00 IST sync.
+_TURSO_OFF = _os.environ.get("BOT2_TURSO_OFF", "0").strip() in ("1", "true", "yes")
+
+
 class Turso:
     def __init__(self, url: str, token: str):
         self.base = _normalise_url(url)
@@ -257,6 +265,8 @@ class Turso:
         in a row (i.e. nothing new is being written — the producer should
         still see the full inventory once per rescan window).
         """
+        if _TURSO_OFF:
+            return await self._m2_list_gallery_ids()
         # v12.55: serve the memo when fresh — collapses rapid producer
         # ticks into ONE Turso scan per _LIST_MEMO_TTL_SEC window.
         _memo_exp, _memo_rows = self._list_gallery_memo
@@ -310,6 +320,83 @@ class Turso:
         self._list_gallery_memo = (time.time() + _LIST_MEMO_TTL_SEC, list(out))
         return out
 
+    async def _mongo2_coll(self):
+        """v12.74: shared Mongo-2 turso_nhentai_cache collection handle."""
+        try:
+            from . import mongo2_client as _m2  # noqa: WPS433
+            return _m2._get_coll()  # noqa: SLF001
+        except Exception as e:  # noqa: BLE001
+            log.warning("mongo2 handle failed: %s", e)
+            return None
+
+    async def _m2_list_gallery_ids(self) -> List[Dict[str, Any]]:
+        """Mongo-2 mirror of list_gallery_ids (key ^gallery:, cached_at desc)."""
+        col = await self._mongo2_coll()
+        if col is None:
+            return []
+        try:
+            import asyncio as _aio
+            def _q():
+                cur = (col.find({"key": {"$regex": "^gallery:"}},
+                                {"key": 1, "cached_at": 1})
+                         .sort("cached_at", -1).limit(50000))
+                return [{"gid": str(d.get("key", "")).split(":", 1)[1],
+                         "cached_at": d.get("cached_at")} for d in cur
+                        if str(d.get("key", "")).startswith("gallery:")]
+            rows = await _aio.to_thread(_q)
+            log.info("📖 [MONGO READ] list_gallery_ids — %d rows (BOT2_TURSO_OFF)", len(rows))
+            return rows
+        except Exception as e:  # noqa: BLE001
+            log.warning("mongo2 list_gallery_ids failed: %s", e)
+            return []
+
+    async def _m2_list_recent_search_ids(self) -> List[str]:
+        """Mongo-2 mirror of list_recent_search_ids."""
+        col = await self._mongo2_coll()
+        if col is None:
+            return []
+        try:
+            import asyncio as _aio
+            def _q():
+                cur = (col.find({"key": {"$regex": "^search:"}},
+                                {"payload": 1, "cached_at": 1})
+                         .sort("cached_at", -1).limit(500))
+                return list(cur)
+            rows = await _aio.to_thread(_q)
+            out: List[str] = []
+            seen: set = set()
+            for d in rows:
+                for gid in _extract_ids_from_search_payload(d.get("payload")):
+                    if gid not in seen:
+                        seen.add(gid); out.append(gid)
+            log.info("📖 [MONGO READ] list_recent_search_ids — %d ids (BOT2_TURSO_OFF)", len(out))
+            return out
+        except Exception as e:  # noqa: BLE001
+            log.warning("mongo2 list_recent_search_ids failed: %s", e)
+            return []
+
+    async def _m2_get_gallery_row(self, gid: str) -> Optional[Dict[str, Any]]:
+        """Mongo-2 mirror of get_gallery_row."""
+        col = await self._mongo2_coll()
+        if col is None:
+            return None
+        try:
+            import asyncio as _aio, json as _json
+            def _q():
+                return col.find_one({"key": f"gallery:{gid}"})
+            d = await _aio.to_thread(_q)
+            if not d:
+                return None
+            p = d.get("payload")
+            if isinstance(p, str):
+                try: p = _json.loads(p)
+                except Exception: return None
+            log.info("📖 [MONGO READ] gallery row %s (BOT2_TURSO_OFF)", gid)
+            return p
+        except Exception as e:  # noqa: BLE001
+            log.warning("mongo2 get_gallery_row failed: %s", e)
+            return None
+
     async def list_recent_search_ids(self) -> List[str]:
         """v12.48 (F1) — canonical-list-aware recent-first extraction.
 
@@ -327,6 +414,8 @@ class Turso:
         queries are queried second so tag-scoped 'recent' pages also feed
         the producer. Popular-today is the final fallback.
         """
+        if _TURSO_OFF:
+            return await self._m2_list_recent_search_ids()
         # v12.57: memo — payload scan, cap at 1 per window
         _exp, _rows = self._search_ids_memo
         if _rows and _exp > time.time():
@@ -382,6 +471,8 @@ class Turso:
         return out
 
     async def get_gallery_row(self, gid: str) -> Optional[Dict[str, Any]]:
+        if _TURSO_OFF:
+            return await self._m2_get_gallery_row(gid)
         result = await self.execute(
             'SELECT payload FROM nhentai_cache WHERE "key" = ?',
             [f"gallery:{gid}"])
@@ -401,6 +492,16 @@ class Turso:
             return None
 
     async def put_state(self, key: str, payload: Dict[str, Any]) -> None:
+        if _TURSO_OFF:
+            log.info("📝 [MONGO WRITE] put_state(%s) — Turso skipped (BOT2_TURSO_OFF)", key)
+            try:
+                from . import mongo2_client as _m2  # noqa: WPS433
+                import json as _json
+                _m2.put(f"state:{key}", _json.dumps(payload, default=str),
+                        expires_at=0, ttl_sec=0)
+            except Exception as e:  # noqa: BLE001
+                log.warning("mongo2 put_state(%s) failed: %s", key, e)
+            return
         await self.ensure_schema()
         import time as _t_mod
         _t0 = _t_mod.monotonic()

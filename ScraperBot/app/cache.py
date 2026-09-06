@@ -29,6 +29,12 @@ except Exception:  # noqa: BLE001 — missing package must never break the bot
 
 log = logging.getLogger("scraperbot.cache")
 
+# v12.74: Turso quota freeze — ScraperBot writes Mongo-1 + Mongo-2 only.
+_BOT1_TURSO_OFF = os.environ.get("BOT1_TURSO_OFF", "0").strip() in ("1", "true", "yes")
+if _BOT1_TURSO_OFF:
+    log.warning("🚫 [TURSO OFF] ScraperBot cache running MONGO-ONLY "
+                "(writes -> Mongo-1 + Mongo-2; nightly IST sync owns Turso)")
+
 # v1.20: Mongo cache mirror is rollback-only, OFF by default.
 _TURSO_ONLY = os.environ.get("BOT1_CACHE_MONGO_MIRROR", "0").strip() not in ("0", "", "false", "no")
 
@@ -176,8 +182,12 @@ async def put(key: str, payload: Any) -> dict:
                         "writing unnormalised", key, _e)
     import time as _t_mod, json as _json
     _t0 = _t_mod.monotonic()
-    turso_ok = await turso_client.put(key, payload, ttl)
-    mongo_ok = False if _TURSO_ONLY else mongo_client.cache_put_mongo(key, payload, ttl)
+    if _BOT1_TURSO_OFF:
+        log.info("📝 [MONGO WRITE] cache.put(%s) — Turso skipped (BOT1_TURSO_OFF)", key)
+        turso_ok = "off"
+    else:
+        turso_ok = await turso_client.put(key, payload, ttl)
+    mongo_ok = mongo_client.cache_put_mongo(key, payload, ttl) if (_BOT1_TURSO_OFF or not _TURSO_ONLY) else False
     # v1.30/v1.31: dual-write to the Mongo-2 mirror with a visible log line.
     # The import is OUTSIDE the try so a missing vendored file is LOUD
     # (Render log) instead of silently skipping the mirror.

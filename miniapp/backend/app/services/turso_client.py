@@ -87,8 +87,14 @@ _schema_ready = False
 _schema_lock = threading.Lock()
 
 
+# v12.74: global kill switch — every Bot 0 Turso call routes through here.
+_TURSO_OFF = os.environ.get("BOT0_TURSO_OFF", "0").strip() in ("1", "true", "yes")
+
+
 def turso_available() -> bool:
     """True iff both env vars are present. Cheap, side-effect free."""
+    if _TURSO_OFF:
+        return False
     return bool(_PIPELINE_URL) and bool(_TURSO_TOKEN)
 
 
@@ -141,6 +147,9 @@ def _pipeline(sql: str, args: Optional[list] = None) -> Optional[dict]:
     """One statement via POST /v2/pipeline. Returns the raw libsql `result`
     dict {"cols": [...], "rows": [...]} or None on any failure. Loud-logs
     the server-side error message (this is what libsql-client swallowed)."""
+    if _TURSO_OFF:
+        return None  # v12.74
+
     if not turso_available():
         return None
     body = {"requests": [

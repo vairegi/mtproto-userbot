@@ -62,6 +62,15 @@ _TURSO_ONLY = os.environ.get("BOT0_NH_MONGO_WRITES", "0").strip() not in ("0", "
 _MONGO_READ_FALLBACK = os.environ.get(
     "BOT0_CACHE_MONGO_READ_FALLBACK", "0").strip() in ("1", "true", "yes")
 
+# v12.74: Turso quota freeze. When BOT0_TURSO_OFF=1, nhentai_cache reads and
+# writes go to Mongo-2 ONLY — Turso is never touched (the free tier's 500M
+# rows-read/month budget hit 75%; reads are the metered killer). The nightly
+# 01:00 IST sync (turso_nightly_sync.py) is the ONLY Turso writer left.
+_TURSO_OFF = os.environ.get("BOT0_TURSO_OFF", "0").strip() in ("1", "true", "yes")
+if _TURSO_OFF:
+    log.warning("🚫 [TURSO OFF] Bot 0 nhentai_cache running MONGO-ONLY "
+                "(reads+writes -> Mongo-2; nightly IST sync owns Turso)")
+
 # v12.4: Turso-first cache layer. Import lazily so a missing package can
 # never crash the mini-app; turso_client.turso_available() gates all use.
 try:
@@ -234,6 +243,8 @@ def _turso_get(key: str, allow_stale: bool) -> Optional[dict]:
     # still fall through to nhentai and re-write. Every silent-None path
     # now emits a debug (or warning) with the failure mode so a Render
     # log tail tells you WHY the cache missed.
+    if _TURSO_OFF:
+        return None  # v12.74: Turso read frozen
     if _turso is None or not _turso.turso_available():
         log.debug("turso_get(%s): turso unavailable", key)
         return None
@@ -411,6 +422,8 @@ def hitmiss_reset() -> None:
 
 
 def get(key: str, allow_stale: bool = False) -> Optional[dict]:
+    if _TURSO_OFF:
+        log.info("📖 [MONGO READ] nhc.get(%s) — Mongo-2 engine (Turso off)", key)
     # v12.60: Mongo-2 first read — a HIT here costs ZERO Turso reads.
     if _mongo2 is not None:
         try:
@@ -576,7 +589,11 @@ def put(key: str, payload: Any, ttl_sec: Optional[int] = None):
 
     import time as _t_mod
     _t0 = _t_mod.monotonic()
-    ok_turso = _turso_put(key, payload_json, ttl)
+    if _TURSO_OFF:
+        log.info("📝 [MONGO WRITE] nhc.put(%s) — Mongo-2 engine (Turso off)", key)
+        ok_turso = "off"
+    else:
+        ok_turso = _turso_put(key, payload_json, ttl)
     ok_mongo = _mongo_put(key, payload, ttl)
     # v12.60: dual-write to the Mongo-2 mirror with a visible log line.
     if _mongo2 is not None:

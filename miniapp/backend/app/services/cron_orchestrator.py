@@ -66,7 +66,11 @@ async def _supervise(name: str, factory: Callable[[], Any]) -> None:
 
 
 async def run_forever(prefetch_cron, dedup_cron, details_cron) -> None:
-    """Supervise the three crons as child tasks. Never raises."""
+    """Supervise the crons as child tasks. Never raises.
+
+    v12.74: the nightly Turso sync (turso_nightly_sync) is supervised too
+    when importable — it is the ONLY Turso writer left while
+    BOT0_TURSO_OFF=1 keeps the hot path Mongo-only."""
     children = []
     if prefetch_cron is not None:
         children.append(asyncio.create_task(
@@ -76,6 +80,13 @@ async def run_forever(prefetch_cron, dedup_cron, details_cron) -> None:
         children.append(asyncio.create_task(
             _supervise("dedup_cron", dedup_cron.run_forever),
             name="sup:dedup_cron"))
+    try:  # v12.74: nightly Mongo-2 -> Turso sync (01:00 IST)
+        from . import turso_nightly_sync as _tsync  # noqa: WPS433
+        children.append(asyncio.create_task(
+            _supervise("turso_nightly_sync", _tsync.run_forever),
+            name="sup:turso_nightly_sync"))
+    except Exception as _e:  # noqa: BLE001
+        log.warning("turso_nightly_sync unavailable — not supervised (%s)", _e)
     if details_cron is not None:
         children.append(asyncio.create_task(
             _supervise("details_prefetch_cron", details_cron.run_forever),

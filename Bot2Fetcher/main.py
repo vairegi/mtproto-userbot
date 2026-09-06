@@ -4,6 +4,7 @@ main.py — Bot2Fetcher entrypoint (Render web service).
 from __future__ import annotations
 
 import asyncio
+import os as _os
 import logging
 import sys
 import threading
@@ -77,6 +78,10 @@ def _run_api() -> None:
 
 async def _main() -> None:
     log.info("🚀 Bot2Fetcher v12.49 booting (%d slot(s))", len(settings.sessions))
+    if _os.environ.get("BOT2_TURSO_OFF", "0").strip() in ("1", "true", "yes"):
+        log.warning("🚫 [TURSO OFF] Bot2Fetcher running MONGO-ONLY "
+                    "(producer scans + gallery rows + state -> Mongo; "
+                    "nightly IST sync owns Turso)")
     await turso.ensure_schema()
     dash_task = asyncio.create_task(dashboard.run(fetcher))
     try:

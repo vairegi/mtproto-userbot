@@ -1,24 +1,28 @@
-GUIDE_APPEND — v12.73b (2026-09-06) — dedup hotfix (JS module parse error)
-WHAT: v12.73's zip accidentally pasted the v12.72 progress-bar helpers
-into card-actions.js TWICE — `const _progressBars` duplicated is a hard
-JS SyntaxError, so the whole module failed to parse and EVERY Mini App
-tab showed "Failed to load page: Identifier '_progressBars' has already
-been declared" (not just Queue — card-actions is imported app-wide).
-Same double-apply also duplicated _STAGE_HUMAN in progress.py, the
-v12.73 queue helpers in mongo_state.py, and six call sites in
-fetcher.py (harmless double-writes). All duplicates removed and verified
-by grep-count audit; all regression suites + mongomock smoke re-run and
-pass. v12.73 functionality itself (Bot 2 queue consumption, live
-progress bar, reader fixes) is unchanged and correct — this zip is
-purely the deduped files.
-FILES: Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
-miniapp/backend/app/services/{scraper_bridge,queue_bridge,progress}.py,
-miniapp/backend/app/routes/queue.py,
-miniapp/frontend/js/plugins/{card-actions,reader}.js, GUIDE*.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 0 AND Bot 2;
-users MUST fully close + reopen the Mini App once (Telegram WebView
-cached the broken module).
-VERIFY: every tab loads (no "Failed to load page"); tap Download on an
-uncached gallery → progress row cycles fetching→downloading N/total→
-compiling→uploading→"✅ Ready"; Bot 2 log shows 📨 DMing @Gallery_DLBot
-for user-queued gids; Queue Pending count drains.
+GUIDE_APPEND — v12.74 (2026-09-06) — Turso quota freeze (Mongo-only + nightly IST sync)
+WHAT: Turso warned 75% of the 500M rows-read/month quota — at 100% the
+account hard-locks. Now: BOT0/BOT1/BOT2_TURSO_OFF=1 (already set) route
+every read+write to Mongo only. Bot 0: nhentai_cache get/put skip Turso
+(Mongo-2 only); turso_client globally gated (turso_available->False,
+_pipeline->None) which also freezes prefetch/dedup/details crons +
+suggestions fallback; similar-galleries Mongo-only. Bot 1: cache.put
+writes Mongo-1 + Mongo-2 (freeze overrides the legacy skip-Mongo-1
+flag); turso_backup (a Turso READER) suspended. Bot 2: producer +
+gallery rows + put_state read/write Mongo-2 mirrors — zero Turso in the
+hot path. NEW turso_nightly_sync.py (supervised by cron_orchestrator):
+01:00 IST upserts last-26h Mongo-2 rows into Turso, INSERT OR REPLACE
+writes-only (zero reads), batched 500, Mongo-lease single-flight, admin
+alerted BOTH ways (log channel + DM). Every bypassed call logs
+📖 [MONGO READ] / 📝 [MONGO WRITE]; each bot boots with a 🚫 [TURSO OFF]
+banner. Verified: 15 py_compile + 2 node --check clean, IST schedule
+math, URL normalisation, env gates, all regression suites pass.
+FILES: miniapp/backend/app/services/{nhentai_cache,turso_client,
+turso_nightly_sync,cron_orchestrator}.py,
+miniapp/backend/app/routes/suggestions.py, ScraperBot/app/cache.py,
+ScraperBot/app/services/turso_backup.py, Bot2Fetcher/app/turso_store.py,
+Bot2Fetcher/main.py, GUIDE*.
+DEPLOY: drop on repo root, commit, push, redeploy ALL THREE bots
+(BOT*_TURSO_OFF=1 already set). No new env vars needed.
+VERIFY: Bot 0 boot "🚫 [TURSO OFF]"; request logs 📖 [MONGO READ]
+instead of ⚡ [TURSO CACHE HIT]; Bot 2 "📖 [MONGO READ]
+list_gallery_ids"; 01:00 IST → log channel + admin DM both get
+"🌙 [TURSO SYNC] done — wrote N rows".

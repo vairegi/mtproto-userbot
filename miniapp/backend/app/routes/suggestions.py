@@ -63,7 +63,7 @@ def gallery_suggestions(
             from ..services import similar_mongo as _sm  # noqa: WPS433
             items = _sm.similar_galleries(str(gallery_id), int(limit))
             if not items:
-                log.info("similar(%s): Mongo-2 returned 0 — Turso engine fallback", gallery_id)
+                log.info(("📖 [MONGO READ] similar(%s) — Mongo-only (BOT0_TURSO_OFF)" if os.environ.get("BOT0_TURSO_OFF", "0").strip() in ("1","true","yes") else "similar(%s): Mongo-2 returned 0 — Turso engine fallback"), gallery_id)
                 items = scraper_bridge.gallery_suggestions(str(gallery_id), int(limit))
         else:
             items = scraper_bridge.gallery_suggestions(str(gallery_id), int(limit))

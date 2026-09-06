@@ -158,6 +158,11 @@ async def backup_once() -> Dict[str, Any]:
 
 
 async def run_forever(stop_event: asyncio.Event) -> None:
+    # v12.74: Turso read quota frozen — nightly Mongo->Turso sync
+    # replaced this backup direction.
+    if os.environ.get("BOT1_TURSO_OFF", "0").strip() in ("1", "true", "yes"):
+        log.warning("🚫 [TURSO OFF] turso_backup suspended (BOT1_TURSO_OFF)")
+        return
     """Loop: backup every BACKUP_EVERY_HOURS (default 12h)."""
     log.info("turso_backup: starting (every=%.1fh, enabled=%s)",
              _every_sec() / 3600.0, _enabled())

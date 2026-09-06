@@ -1339,3 +1339,60 @@ the broken module — without a full reopen the parse error persists).
 VERIFY: Mini App loads on every tab; no "Failed to load page"; Download
 progress bar works; Bot 2 picks up pending queue rows (📨 DMing
 @Gallery_DLBot appears in Bot 2 logs for user-queued gids).
+
+## v12.74 — Turso quota freeze: Mongo-only hot path + nightly IST sync (2026-09-06)
+
+Reason: Turso emailed "Rows read Usage Exceeded — 75% of quota". At 100%
+the account HARD-LOCKS and the cache becomes unreachable. All three bots
+now run Mongo-only in the hot path; Turso is touched by exactly ONE
+writer, once a night.
+
+Engine flips (env-driven; each defaults OFF so rollback = unset the var):
+- BOT0_TURSO_OFF=1 — Bot 0 (miniapp): nhentai_cache.get()/put() skip
+  Turso entirely (Mongo-2 only; get() was already Mongo-2-first since
+  v12.60, now the Turso fallback is gone). turso_client.py gets a hard
+  global gate (turso_available() returns False; _pipeline returns None),
+  which also freezes prefetch/dedup/details crons + suggestions' Turso
+  fallback. Similar-galleries runs Mongo-only (similar_mongo engine).
+- BOT1_TURSO_OFF=1 — ScraperBot: cache.put() writes Mongo-1 + Mongo-2
+  only (the _TURSO_ONLY "skip Mongo-1" legacy flag is overridden when
+  the freeze is on, so Mongo-1 still receives every write).
+  turso_backup.run_forever (the OLD Turso->Mongo-2 backup) suspends —
+  it was a Turso READER, exactly what we're freezing.
+- BOT2_TURSO_OFF=1 — Bot2Fetcher: turso_store gains Mongo-backed
+  mirrors (list_recent_search_ids / list_gallery_ids /
+  get_gallery_row read Mongo-2's turso_nhentai_cache mirror — the same
+  rows Bot 1 dual-writes; put_state writes Mongo-2 only). Producer +
+  job hot path never touch Turso. Boot banner logs the mode.
+
+Nightly sync (NEW miniapp/backend/app/services/turso_nightly_sync.py):
+supervised by cron_orchestrator. At 01:00 IST (UTC+5:30, no DST math)
+it upserts Mongo-2 rows updated in the last 26h into Turso with blind
+INSERT OR REPLACE — WRITES ONLY, zero Turso reads. Batched 500/batch,
+single-flight via a Mongo sync_lease doc (30 min TTL). On completion
+(and on crash/abort) the admin is alerted BOTH ways as required: one
+message to the log channel AND one DM to the admin user via the Bot API
+(admin bot token). The sync deliberately uses its OWN Turso HTTP writer
+because turso_client is globally frozen — the sync is the exception.
+
+Mongo-only logging (operator requirement): every bypassed call logs
+  📖 [MONGO READ] ...  /  📝 [MONGO WRITE] ...
+and each bot prints a 🚫 [TURSO OFF] ... banner at boot.
+
+Verified in sandbox: 15 files py_compile-clean; node --check clean;
+IST schedule math (01:00 IST == 19:30 UTC, both sides of the boundary);
+libsql:// and bare-host Turso URLs normalise correctly; gates read env;
+regression suites pass (test_v12_60_mongo2, test_turso_cache,
+test_english_only, test_v1_27_discovery, Bot2 fallback-chain).
+
+Live DB state verified before build: Mongo-2 turso_nhentai_cache holds
+20,147 rows (15,944 gallery:* + 2,586 search:* + misc) with
+key/payload/expires_at/updated_at — exactly what the sync upserts.
+
+Deploy: drop zip on repo root, commit, push, redeploy ALL THREE bots.
+Env vars BOT0_TURSO_OFF / BOT1_TURSO_OFF / BOT2_TURSO_OFF = 1 (operator
+already set them). No Turso reads remain outside the nightly sync.
+VERIFY: Bot 0 boot log shows "🚫 [TURSO OFF]"; request logs show
+📖 [MONGO READ] instead of ⚡ [TURSO CACHE HIT]; Bot 2 producer logs
+"📖 [MONGO READ] list_gallery_ids"; at 01:00 IST the log channel AND
+admin DM both receive "🌙 [TURSO SYNC] done — wrote N rows…".
