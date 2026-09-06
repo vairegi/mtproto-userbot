@@ -65,7 +65,6 @@ _HUMAN = {
     "FAILED_TIMEOUT":      "Failed: worker timed out",
     "FAILED_BOT2_ERROR":   "Failed: Bot 2 refused",
     "FAILED_BOT2":         "Both backup bots failed — retry available later",
-    "FAILED_BOT2":         "Both backup bots failed — retry available later",
     "FAILED_SCRAPE":       "Failed: could not scrape gallery",
     "FAILED_OTHER":        "Failed: unknown error",
     "FAILED_RECOVERED":    "Failed earlier — retry queued",
@@ -82,19 +81,6 @@ _STAGE_HUMAN = {
 
 # Both-bots park (matches Bot 2 default; env override on that side).
 _BOTH_FAIL_PARK_S = 43200
-
-# v12.72: human labels for Bot 2's live progress.stage sub-doc.
-_STAGE_HUMAN = {
-    "fetching":          "Contacting @Gallery_DLBot…",
-    "downloading":       "Downloading pages…",
-    "fallback_fetching": "Handed to backup bot — downloading…",
-    "compiling":         "Compiling PDF…",
-    "uploading":         "Uploading to database channel…",
-}
-
-# Both-bots park (matches Bot 2 default; env override on that side).
-_BOTH_FAIL_PARK_S = 43200
-
 
 def _latest_progress_event(conn, gid: str) -> Optional[Dict[str, Any]]:
     """Return the most recent progress_events row for this gallery, or

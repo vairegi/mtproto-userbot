@@ -245,37 +245,6 @@ class Galleries:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------ v12.72
-    def set_progress(self, gid: str, *, stage: str,
-                     page: Optional[int] = None,
-                     total: Optional[int] = None,
-                     eta_s: Optional[int] = None) -> None:
-        """v12.72: write a lightweight progress sub-doc so the mini app can
-        show a live status while Bot 2 works. Best-effort — any failure is
-        swallowed so a Mongo hiccup can NEVER block a slot. Only updates a
-        row already in STATUS_PROCESSING (never resurrects terminal rows)."""
-        try:
-            now = time.time()
-            sub: Dict[str, Any] = {
-                "progress.stage":      str(stage or ""),
-                "progress.updated_at": now,
-            }
-            if page is not None:
-                try: sub["progress.page"] = int(page)
-                except (TypeError, ValueError): pass
-            if total is not None:
-                try: sub["progress.total"] = int(total)
-                except (TypeError, ValueError): pass
-            if eta_s is not None:
-                try: sub["progress.eta_s"] = int(eta_s)
-                except (TypeError, ValueError): pass
-            self.coll.update_one(
-                {"_id": str(gid), "status": STATUS_PROCESSING},
-                {"$set": sub},
-            )
-        except Exception:
-            pass
-
     # ------------------------------------------------------------------ v12.73
     def _queue_col(self):
         """Bot 0's queue ledger lives in the SAME Mongo database, collection

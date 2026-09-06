@@ -1,21 +1,24 @@
-GUIDE_APPEND — v12.73 (2026-09-06) — Bot 2 consumes mini-app queue ledger
-WHAT: 'Pending: 16' never drained because Bot 2's producer only scanned
-Turso, never the Mongo `queue` collection db.enqueue() writes on
-mini-app Download. Now: Galleries.list_pending_queue() feeds the
-producer FIRST (user work before backfill); mark_queue_status() syncs
-the ledger through pending→processing→completed/failed so the Queue
-page tells the truth. Pre-DM double-download guard is the existing
-claim_ex CAS + 'done' skip — untouched. v12.72 live-progress writes
-unchanged (5 stages, throttled 1/3s/slot, mongomock-verified). Existing
-pending rows drain naturally after redeploy; manual clear if wanted:
-db.queue.updateMany({status:"pending"},{$set:{status:"cancelled",
-updated_at:<now>,error_reason:"manual clear"}}) on the relaybot DB.
+GUIDE_APPEND — v12.73b (2026-09-06) — dedup hotfix (JS module parse error)
+WHAT: v12.73's zip accidentally pasted the v12.72 progress-bar helpers
+into card-actions.js TWICE — `const _progressBars` duplicated is a hard
+JS SyntaxError, so the whole module failed to parse and EVERY Mini App
+tab showed "Failed to load page: Identifier '_progressBars' has already
+been declared" (not just Queue — card-actions is imported app-wide).
+Same double-apply also duplicated _STAGE_HUMAN in progress.py, the
+v12.73 queue helpers in mongo_state.py, and six call sites in
+fetcher.py (harmless double-writes). All duplicates removed and verified
+by grep-count audit; all regression suites + mongomock smoke re-run and
+pass. v12.73 functionality itself (Bot 2 queue consumption, live
+progress bar, reader fixes) is unchanged and correct — this zip is
+purely the deduped files.
 FILES: Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
 miniapp/backend/app/services/{scraper_bridge,queue_bridge,progress}.py,
 miniapp/backend/app/routes/queue.py,
-miniapp/frontend/js/plugins/{card-actions,reader}.js, GUIDE*. 
-DEPLOY: drop on repo root, commit, push, redeploy Bot 0 AND Bot 2; users
-reopen the Mini App once. No new env vars.
-VERIFY: Bot 2 log shows 📨 DMing @Gallery_DLBot for a user-queued gid
-within one producer cycle; Queue Pending decreases; sheet progress row
-cycles fetching→downloading N/total→compiling→uploading→"✅ Ready".
+miniapp/frontend/js/plugins/{card-actions,reader}.js, GUIDE*.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 0 AND Bot 2;
+users MUST fully close + reopen the Mini App once (Telegram WebView
+cached the broken module).
+VERIFY: every tab loads (no "Failed to load page"); tap Download on an
+uncached gallery → progress row cycles fetching→downloading N/total→
+compiling→uploading→"✅ Ready"; Bot 2 log shows 📨 DMing @Gallery_DLBot
+for user-queued gids; Queue Pending count drains.

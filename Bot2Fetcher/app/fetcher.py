@@ -418,10 +418,6 @@ class Fetcher:
             gid, stage="fallback_fetching" if route_fallback_direct else "fetching")
         # v12.73: mark the queue ledger row as processing (if it came from there)
         self.galleries.mark_queue_status(gid, "processing")
-        # v12.72: surface a live "stage" to the mini-app right after the
-        # claim. Best-effort — set_progress swallows any Mongo hiccup.
-        self.galleries.set_progress(
-            gid, stage="fallback_fetching" if route_fallback_direct else "fetching")
         self.stats.claimed += 1
         self.stats.in_flight[gid] = f"slot{idx}"
         log.info("🎯 slot %d claimed %s — starting job", idx, gid)
@@ -569,17 +565,11 @@ class Fetcher:
             # v12.72: bot has the PDF — compiling phase.
             self.galleries.set_progress(gid, stage="compiling",
                                         total=int(m.get("pages") or 0))
-            # v12.72: bot has the PDF — stitching / compiling phase.
-            self.galleries.set_progress(gid, stage="compiling",
-                                        total=int(m.get("pages") or 0))
             img_bytes, ext = await self._fetch_cover_bytes(m)
             self.galleries.refresh_claim(gid)
 
             self._d_state(idx, "posting", gid, title=m["title"],
                           pages=m.get("pages") or 0, step="posting to DB channel")
-            # v12.72: about to post cover + forward PDF to database channel.
-            self.galleries.set_progress(gid, stage="uploading",
-                                        total=int(m.get("pages") or 0))
             # v12.72: about to post cover + forward PDF to database channel.
             self.galleries.set_progress(gid, stage="uploading",
                                         total=int(m.get("pages") or 0))
@@ -773,12 +763,6 @@ class Fetcher:
         import re as _re_p
         _page_re = _re_p.compile(r"(\d{1,4})\s*/\s*(\d{1,4})|page\s+(\d{1,4})(?:\s+of\s+(\d{1,4}))?", _re_p.I)
         last_prog_write = 0.0
-        # v12.72: throttled Mongo progress writes so the mini-app sees a
-        # live page counter without hammering the collection (max 1 write
-        # every 3 s per slot). Regex parses "12/29" / "page 12 of 29" etc.
-        import re as _re_p
-        _page_re = _re_p.compile(r"(\d{1,4})\s*/\s*(\d{1,4})|page\s+(\d{1,4})(?:\s+of\s+(\d{1,4}))?", _re_p.I)
-        last_prog_write = 0.0
         while time.monotonic() < deadline:
             await asyncio.sleep(POLL_EVERY_S)
             try:
@@ -826,22 +810,6 @@ class Fetcher:
                                     last_prog_write = now
                         except Exception:
                             pass
-                    # v12.72: pick a page-number pair out of the primary
-                    # bot's reply and write it as progress (throttled).
-                    if now - last_prog_write > 3.0:
-                        try:
-                            mtch = _page_re.search(text)
-                            if mtch:
-                                cur = int(mtch.group(1) or mtch.group(3) or 0)
-                                tot = int(mtch.group(2) or mtch.group(4) or 0)
-                                if cur > 0:
-                                    self.galleries.set_progress(
-                                        gid, stage="downloading",
-                                        page=cur, total=(tot or None))
-                                    last_prog_write = now
-                        except Exception:
-                            pass
-        return None
 
     async def _try_fallback_pdf(self, idx: int, client: TelegramClient,
                                 gid: str, primary_err: str):

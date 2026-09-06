@@ -1309,3 +1309,33 @@ Deploy: drop zip on repo root, commit, push, redeploy Bot 0 AND Bot 2.
 No new env vars. VERIFY: Bot 2 log shows 📨 DMing @Gallery_DLBot for a
 user-queued gid within one producer cycle; mini-app Queue page Pending
 count decreases; progress row shows stage updates until "✅ Ready".
+
+## v12.73b — dedup hotfix: JS module parse error (2026-09-06)
+
+Bug: after deploying v12.73 the Mini App showed "Failed to load page —
+Identifier '_progressBars' has already been declared" on EVERY tab
+(Profile, Queue, Search — not just the sheet). Cause: the v12.73 zip was
+built by re-applying v12.72+v12.73 patches onto a repo that already had
+v12.72 deployed. The patch script's duplicate-detection matched only the
+first 80 chars of the new block, so helper blocks were pasted TWICE into
+card-actions.js (const _progressBars — a hard JS SyntaxError that kills
+the whole module; card-actions is imported app-wide so every tab died),
+progress.py (_STAGE_HUMAN — Python tolerates it, still wrong),
+mongo_state.py (v12.73 queue helpers), and fetcher.py (six call-site
+duplicates — harmless double-writes but sloppy).
+
+Fix: every duplicate block removed and audited by grep count —
+card-actions.js (_progressBars ×1, _pollProgress ×1), progress.py
+(_STAGE_HUMAN ×1), mongo_state.py (set_progress/list_pending_queue/
+mark_queue_status ×1 each), fetcher.py (set_progress ×6 — one per stage;
+mark_queue_status ×5 — one per distinct lifecycle branch; _page_re
+setup ×1). All regression suites + mongomock smoke re-run and pass.
+Lesson encoded: future zip builds must diff against the LATEST repo,
+never re-apply patches blind.
+
+Deploy: drop zip on repo root, commit, push, redeploy Bot 0 AND Bot 2;
+users fully close + reopen the Mini App once (Telegram's WebView cached
+the broken module — without a full reopen the parse error persists).
+VERIFY: Mini App loads on every tab; no "Failed to load page"; Download
+progress bar works; Bot 2 picks up pending queue rows (📨 DMing
+@Gallery_DLBot appears in Bot 2 logs for user-queued gids).
