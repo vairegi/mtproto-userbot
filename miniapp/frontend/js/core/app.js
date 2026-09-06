@@ -293,7 +293,7 @@ async function startQueuePolling() {
   const tick = async () => {
     try {
       const s = await api.get("/api/queue/status");
-      const total = (s.pending || 0) + (s.processing || 0);
+      const total = (s.pending || 0) + (s.processing || 0);  // v12.77: live work only — completed/failed are lifetime counters, not queue size
       badge.textContent = "📥 " + total;
       badge.className = "hdr-badge" + (total > 0 ? " warn" : "");
       store.set("queue_status", s);

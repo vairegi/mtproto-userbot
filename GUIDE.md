@@ -1502,3 +1502,18 @@ v12.76b's 300s heartbeat filter hid it.
 **Deploy:** Bot 0 only. No frontend/Bot 2 change.
 **Files:** miniapp/backend/app/services/queue_bridge.py, GUIDE.md,
 GUIDE_APPEND.txt.
+
+## v12.77 — Queue counters honest + recent list sees both ledgers (2026-09-06)
+**Bugs:** (1) header 📥 badge showed 45 while Pending=40/Processing=5 —
+  the poller summed lifetime completed/failed counts into "queue size";
+  now badge = pending + processing only. (2) Recent list said "No recent
+  jobs" while the queue had dozens of rows — Bot 0's auto-queue writes its
+  OWN `queue_jobs` collection, so the list only ever saw mini-app-sourced
+  rows from `queue`.
+**Fix:** status_summary() merges both ledgers newest-first by updated_at
+  (cap 15, silent fallback to the old list if queue_jobs is absent).
+  queue.js no longer writes the global queue_status store (app.js owns
+  that). Files: miniapp/backend/app/services/queue_bridge.py,
+  miniapp/frontend/js/core/app.js, miniapp/frontend/js/pages/queue.js,
+  GUIDE.md, GUIDE_APPEND.txt.
+**Deploy:** Bot 0 only. Users reopen the Mini App once (app.js changed).

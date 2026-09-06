@@ -208,7 +208,36 @@ def status_summary() -> dict:
     conn = _bot_db.connect()
     try:
         counts = _bot_db.counts_by_status(conn) or {}
+        # v12.77: the recent list only ever showed mini-app-sourced rows.
+        # Bot 0's auto-queue (admin_bot.py) writes its OWN 'queue_jobs'
+        # collection, so user-facing recent jobs were invisible whenever
+        # the mini-app ledger was quiet ("No recent jobs" while Pending
+        # showed 30-40). Merge both ledgers, newest-first by updated_at.
         recent = _bot_db.list_recent_jobs(conn, limit=15) if hasattr(_bot_db, "list_recent_jobs") else []
+        try:
+            extra = list(conn.db["queue_jobs"].find(
+                {}, {"url": 1, "title": 1, "cleaned_title": 1, "status": 1,
+                     "updated_at": 1, "cover_link": 1, "error_reason": 1,
+                     "username": 1, "submitted_by": 1},
+            ).sort("updated_at", -1).limit(15))
+            seen = {str(r.get("_id") or r.get("id")) for r in recent}
+            for r in extra:
+                k = "qj:" + str(r.get("_id"))
+                if k in seen:
+                    continue
+                recent.append(r)
+            def _ru(x):
+                try:
+                    v = x.get("updated_at")
+                    import datetime as _dt
+                    if isinstance(v, _dt.datetime):
+                        return v.timestamp()
+                    return float(v or 0)
+                except Exception:
+                    return 0.0
+            recent = sorted(recent, key=_ru, reverse=True)[:15]
+        except Exception:
+            pass  # queue_jobs absent on older deploys — keep v12.76 list
         return {
             "pending":    int(counts.get("pending", 0)),
             "processing": int(counts.get("processing", 0)),
