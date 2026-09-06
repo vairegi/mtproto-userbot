@@ -330,43 +330,69 @@ class Turso:
             return None
 
     async def _m2_list_gallery_ids(self) -> List[Dict[str, Any]]:
-        """Mongo-2 mirror of list_gallery_ids (key ^gallery:, cached_at desc)."""
+        """Mongo-2 mirror of list_gallery_ids (key ^gallery:, cached_at desc).
+
+        v12.75: allow_disk_use + Python-sort fallback — the cached_at sort on
+        ~20k docs exceeded Mongo's 32MB in-memory sort cap in prod
+        (QueryExceededMemoryLimitNoDiskUseAllowed)."""
         col = await self._mongo2_coll()
         if col is None:
             return []
         try:
             import asyncio as _aio
             def _q():
-                cur = (col.find({"key": {"$regex": "^gallery:"}},
-                                {"key": 1, "cached_at": 1})
-                         .sort("cached_at", -1).limit(50000))
-                return [{"gid": str(d.get("key", "")).split(":", 1)[1],
-                         "cached_at": d.get("cached_at")} for d in cur
-                        if str(d.get("key", "")).startswith("gallery:")]
+                try:
+                    cur = (col.find({"key": {"$regex": "^gallery:"}},
+                                    {"key": 1, "cached_at": 1},
+                                    allow_disk_use=True)
+                             .sort("cached_at", -1).limit(50000))
+                    return list(cur)
+                except Exception:
+                    rows = list(col.find({"key": {"$regex": "^gallery:"}},
+                                         {"key": 1, "cached_at": 1}).limit(50000))
+                    rows.sort(key=lambda d: d.get("cached_at") or 0, reverse=True)
+                    return rows
             rows = await _aio.to_thread(_q)
-            log.info("📖 [MONGO READ] list_gallery_ids — %d rows (BOT2_TURSO_OFF)", len(rows))
-            return rows
+            out = [{"gid": str(d.get("key", "")).split(":", 1)[1],
+                    "cached_at": d.get("cached_at")} for d in rows
+                   if str(d.get("key", "")).startswith("gallery:")]
+            log.info("📖 [MONGO READ] list_gallery_ids — %d rows (BOT2_TURSO_OFF)", len(out))
+            return out
         except Exception as e:  # noqa: BLE001
             log.warning("mongo2 list_gallery_ids failed: %s", e)
             return []
 
     async def _m2_list_recent_search_ids(self) -> List[str]:
-        """Mongo-2 mirror of list_recent_search_ids."""
+        """Mongo-2 mirror of list_recent_search_ids.
+
+        v12.75: Mongo-2 stores payload as a JSON STRING — decode before
+        extracting (the raw string silently yielded 0 ids in prod)."""
         col = await self._mongo2_coll()
         if col is None:
             return []
         try:
-            import asyncio as _aio
+            import asyncio as _aio, json as _json
             def _q():
-                cur = (col.find({"key": {"$regex": "^search:"}},
-                                {"payload": 1, "cached_at": 1})
-                         .sort("cached_at", -1).limit(500))
-                return list(cur)
+                try:
+                    cur = (col.find({"key": {"$regex": "^search:"}},
+                                    {"payload": 1, "cached_at": 1},
+                                    allow_disk_use=True)
+                             .sort("cached_at", -1).limit(500))
+                    return list(cur)
+                except Exception:
+                    rows = list(col.find({"key": {"$regex": "^search:"}},
+                                         {"payload": 1, "cached_at": 1}).limit(500))
+                    rows.sort(key=lambda d: d.get("cached_at") or 0, reverse=True)
+                    return rows
             rows = await _aio.to_thread(_q)
             out: List[str] = []
             seen: set = set()
             for d in rows:
-                for gid in _extract_ids_from_search_payload(d.get("payload")):
+                payload = d.get("payload")
+                if isinstance(payload, str):
+                    try: payload = _json.loads(payload)
+                    except Exception: continue
+                for gid in _extract_ids_from_search_payload(payload):
                     if gid not in seen:
                         seen.add(gid); out.append(gid)
             log.info("📖 [MONGO READ] list_recent_search_ids — %d ids (BOT2_TURSO_OFF)", len(out))
@@ -376,7 +402,8 @@ class Turso:
             return []
 
     async def _m2_get_gallery_row(self, gid: str) -> Optional[Dict[str, Any]]:
-        """Mongo-2 mirror of get_gallery_row."""
+        """Mongo-2 mirror of get_gallery_row. v12.75: tolerates
+        double-encoded payloads (json string of a json string)."""
         col = await self._mongo2_coll()
         if col is None:
             return None
@@ -388,9 +415,12 @@ class Turso:
             if not d:
                 return None
             p = d.get("payload")
-            if isinstance(p, str):
-                try: p = _json.loads(p)
-                except Exception: return None
+            for _ in range(2):
+                if isinstance(p, str):
+                    try: p = _json.loads(p)
+                    except Exception: return None
+            if not isinstance(p, dict):
+                return None
             log.info("📖 [MONGO READ] gallery row %s (BOT2_TURSO_OFF)", gid)
             return p
         except Exception as e:  # noqa: BLE001

@@ -63,10 +63,21 @@ def _hint_push(gid) -> None:
 # `grep '[TURSO CACHE HIT]'` catches BOTH the sync (scraper_bridge) and
 # async (hf_scraper) paths in the same Render log window.
 _LOG_HIT    = "⚡ [TURSO CACHE HIT] Served data from Turso  key=%s"
+_LOG_HIT_MONGO    = "⚡ [MONGO CACHE HIT] Served data from Mongo-2  key=%s"
 _LOG_STALE  = "⚠ [TURSO STALE HIT] Served STALE data (upstream 429/down)  key=%s"
 _LOG_MISS   = "🌐 [CACHE MISS] Fetched from upstream nhentai and cached to Turso  key=%s"
 _LOG_WRITE  = "📝 [TURSO WRITE] Uploaded payload to Turso  key=%s  bytes=%s"
 _LOG_DEDUP  = "🤝 [TURSO DEDUP] payload unchanged — skipped rewrite  key=%s"
+
+# v12.75: with BOT0_TURSO_OFF=1 these rows actually come from Mongo-2 —
+# swap the log strings so Render logs stop claiming "TURSO CACHE HIT"
+# while the engine is Mongo (caused a false "Bot 0 reads Turso" alarm).
+_TURSO_OFF = os.environ.get("BOT0_TURSO_OFF", "0").strip() in ("1", "true", "yes")
+if _TURSO_OFF:
+    _LOG_HIT   = _LOG_HIT_MONGO
+    _LOG_MISS  = "🌐 [CACHE MISS] Fetched from upstream nhentai and cached to Mongo-2  key=%s"
+    _LOG_WRITE = "📝 [MONGO WRITE] Uploaded payload to Mongo-2  key=%s  bytes=%s"
+    _LOG_DEDUP = "🤝 [MONGO DEDUP] payload unchanged — skipped rewrite  key=%s"
 
 
 def _sb_turso_cache():

@@ -2891,7 +2891,20 @@ async def cmd_popupmsg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             text = parts[1].strip()
     conn = db.connect()
     try:
-        if text.lower() == "clear":
+        low = text.lower()
+        # v12.75: "/popupmsg on" / "/popupmsg off" are NOT messages — they
+        # mean enable/disable. The old code stored the literal string "on"
+        # as the popup body, so the mini-app rendered a modal saying "on"
+        # (live Mongo showed popup_message="on"; screenshot confirmed).
+        if low == "on":
+            db.set_flag(conn, "popup_enabled", "1")
+            await msg.reply_text("🔔 Popup ON. (Use /popupmsg <text> to set the message.)")
+            return
+        if low == "off":
+            db.set_flag(conn, "popup_enabled", "0")
+            await msg.reply_text("🔕 Popup OFF.")
+            return
+        if low == "clear":
             db.set_flag(conn, "popup_message", "")
             db.set_flag(conn, "popup_image_file_id", "")
             await msg.reply_text("🧹 Popup message and image cleared.")
@@ -2900,6 +2913,16 @@ async def cmd_popupmsg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             db.set_flag(conn, "popup_message", text)
         if photo_file_id:
             db.set_flag(conn, "popup_image_file_id", photo_file_id)
+        # v12.75: read-back verification — the reply shows what is ACTUALLY
+        # stored in Mongo, so a failed write can never look successful.
+        if text:
+            saved = db.get_flag(conn, "popup_message", "")
+            if saved != text:
+                await msg.reply_text("⚠ Write verification failed — try again.")
+                return
+    except Exception as e:  # noqa: BLE001
+        await msg.reply_text(f"❌ Popup update failed: {e}")
+        return
     finally:
         conn.close()
     if not text and not photo_file_id:
@@ -2919,8 +2942,10 @@ async def cmd_popupmsg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         enabled = db.get_flag(conn, "popup_enabled", "0") == "1"
     finally:
         conn.close()
+    preview = (text[:80] + "…") if len(text) > 80 else text
     await msg.reply_text(
         "✅ Popup updated — " + ", ".join(bits)
+        + (f"\n📄 Saved message: {preview}" if text else "")
         + ("" if enabled else "\n(Popup is currently OFF — /popupon to enable.)")
     )
 

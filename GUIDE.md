@@ -1396,3 +1396,32 @@ VERIFY: Bot 0 boot log shows "🚫 [TURSO OFF]"; request logs show
 📖 [MONGO READ] instead of ⚡ [TURSO CACHE HIT]; Bot 2 producer logs
 "📖 [MONGO READ] list_gallery_ids"; at 01:00 IST the log channel AND
 admin DM both receive "🌙 [TURSO SYNC] done — wrote N rows…".
+
+## v12.75 — freeze follow-ups: CI fix, honest logs, Bot 2 mirror bugs, popupmsg (2026-09-06)
+
+1. CI red (F821 undefined name 'os'): v12.74's suggestions.py patch used
+   os.environ without importing os. Fixed.
+2. "Bot 0 still reading from Turso" — false alarm: Bot 0's log showed
+   ZERO turso.io/libsql network calls after the freeze (grep-verified);
+   the "⚡ [TURSO CACHE HIT]" lines were STALE LOG STRINGS in
+   scraper_bridge.py — nhentai_cache was already serving from Mongo-2.
+   The four log constants now swap to MONGO-worded strings when
+   BOT0_TURSO_OFF=1 so logs tell the truth.
+3. Bot 2 Mongo-2 mirror bugs (seen in prod log): _m2_list_gallery_ids
+   hit Mongo's 32MB in-memory sort cap on ~20k docs → allow_disk_use +
+   Python-sort fallback; _m2_list_recent_search_ids returned 0 ids
+   because Mongo-2 payloads are JSON STRINGS — now decoded first;
+   _m2_get_gallery_row tolerates double-encoded payloads;
+   ensure_schema no longer fires Turso DDL at boot under the freeze.
+4. /popupmsg "only says on": live Mongo showed control_flags
+   .popup_message = "on" — someone typed "/popupmsg on" meaning enable,
+   and the handler stored the literal text "on" as the popup body
+   (screenshot confirmed the modal rendering "on"). Now "/popupmsg on"
+   and "/popupmsg off" redirect to enable/disable; every write is read
+   back from Mongo and the reply shows the saved preview. Recovery:
+   /popupmsg clear, then /popupmsg <real message>.
+
+Deploy: drop zip on repo root, commit, push, redeploy ALL THREE bots.
+CI must go green. VERIFY: logs say "⚡ [MONGO CACHE HIT]" not Turso;
+Bot 2 "📖 [MONGO READ] list_gallery_ids — N>0" with no sort errors;
+/popupmsg hii → "✅ Popup updated — 📄 Saved message: hii".
