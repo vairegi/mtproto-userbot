@@ -282,6 +282,14 @@ class Fetcher:
         self._d_scan(phase="listing cache…")
         gallery_rows = await self.turso.list_gallery_ids()
         gallery_rows.sort(key=lambda r: r["cached_at"], reverse=True)
+        # v12.79: the sweep exists to re-verify FRESH cache rows — walking
+        # the entire (forever-growing) history every cycle is what made
+        # post-restart scans take 24min for 265 already-done gids.
+        max_scan = int(getattr(self.s, "scan_max_galleries", 2000) or 2000)
+        if len(gallery_rows) > max_scan:
+            log.info("✂️ scan window capped: %d cached gids -> newest %d",
+                     len(gallery_rows), max_scan)
+            gallery_rows = gallery_rows[:max_scan]
         seen: set = set()
         ordered: list[str] = []
         # v12.73: user-triggered queue rows (mini-app Download on uncached
@@ -320,7 +328,42 @@ class Fetcher:
                      "(%d candidates left)", filtered, len(ordered))
         return ordered
 
+    def _warm_skip_sets(self) -> None:
+        """v12.79: one projected, indexed read at boot so a restart doesn't
+        re-claim every already-done gid. Observed live: after a redeploy,
+        265 '⏭ already in DB channel — skipped' lines took ~24 minutes
+        because each skipped gid still ran a Mongo CAS before rejection.
+
+        Loads into the existing in-memory sets:
+          _known_done   <- status COMPLETED / PARTIAL  (in DB channel)
+          _known_failed <- status FAILED_TIMEOUT / FAILED_SCRAPE /
+                           FAILED_OTHER  (no retry path exists)
+
+        FAILED_BOT2_ERROR is deliberately NOT loaded — it has the 12h
+        park-then-retry path in claim_ex and MUST stay scannable.
+        User-queue rows also bypass these sets entirely, so a user
+        re-tapping Download on a previously-failed gallery still works.
+        On any error the sets stay empty and fill gradually, exactly like
+        pre-v12.79 behavior.
+        """
+        try:
+            coll = self.galleries.coll
+            d = f = 0
+            for doc in coll.find({"status": {"$in": ["COMPLETED", "PARTIAL"]}},
+                                 projection={"_id": 1}):
+                self._known_done.add(str(doc["_id"])); d += 1
+            for doc in coll.find(
+                    {"status": {"$in": ["FAILED_TIMEOUT", "FAILED_SCRAPE",
+                                        "FAILED_OTHER"]}},
+                    projection={"_id": 1}):
+                self._known_failed.add(str(doc["_id"])); f += 1
+            log.info("🧹 warmup: loaded %d done + %d permanently-failed "
+                     "gids from Mongo (skip-set warm)", d, f)
+        except Exception as e:  # noqa: BLE001
+            log.warning("warmup skip-set load failed — gradual fill: %s", e)
+
     async def _producer(self) -> None:
+        self._warm_skip_sets()
         while not self._stop.is_set():
             try:
                 ids = await self._build_queue_order()

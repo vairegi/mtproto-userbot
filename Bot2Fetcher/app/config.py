@@ -60,6 +60,7 @@ class Settings:
     fetch_gap_max: int
     stale_processing_s: int
     rescan_sleep_s: int
+    scan_max_galleries: int
     port: int
 
     def __repr__(self) -> str:
@@ -100,5 +101,6 @@ def load() -> Settings:
         fetch_gap_max=_int("FETCH_GAP_MAX_S", 8),
         stale_processing_s=_int("STALE_PROCESSING_S", 900),
         rescan_sleep_s=_int("RESCAN_SLEEP_S", 300),
+        scan_max_galleries=_int("SCAN_MAX_GALLERIES", 2000),
         port=_int("PORT", 8080),
     )

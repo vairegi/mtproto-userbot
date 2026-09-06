@@ -1,12 +1,18 @@
-GUIDE_APPEND — v12.78 (2026-09-06) — instant pickup for user downloads
-WHAT: user-tapped Downloads waited up to RESCAN_SLEEP_S (300s default) for
-Bot 2's next scan cycle even with both slots idle (#661490: ~5min queued,
-22s to complete). The producer's idle sleep is now interruptible: it polls
-the queue ledger every 5s (one find_one-sized read) and wakes the moment a
-user row lands; the full rescan cadence is unchanged. Peek errors are
-swallowed.
-FILES: Bot2Fetcher/app/fetcher.py, GUIDE.md, GUIDE_APPEND.txt.
+GUIDE_APPEND — v12.79 (2026-09-06) — scan de-duplication
+WHAT: post-restart Bot 2 scans wasted ~24min on 265 already-done gids
+(each still cost a Mongo CAS) because the done/failed skip-sets are
+in-memory and start empty on boot; the Turso sweep also scanned all
+history forever. Fix: (1) producer start loads COMPLETED/PARTIAL into
+_known_done and FAILED_TIMEOUT/FAILED_SCRAPE/FAILED_OTHER into
+_known_failed via one projected indexed Mongo read — FAILED_BOT2_ERROR
+stays scannable (12h park retry), user queue rows bypass the sets; (2)
+sweep capped at newest SCAN_MAX_GALLERIES (env, default 2000). Failures
+degrade to old behavior. claim_ex stays the atomic final check.
+FILES: Bot2Fetcher/app/fetcher.py, Bot2Fetcher/app/config.py, GUIDE.md,
+GUIDE_APPEND.txt.
 DEPLOY: drop on repo root, commit, push, redeploy Bot 2 ONLY.
-VERIFY: queue a gallery from the mini app while Bot 2 logs "💤 queue
-drained — idle-waiting"; within ~5s the log shows "⚡ user queue row
-detected — waking producer early" then "🎯 slot N claimed <gid>".
+VERIFY: boot log shows "🧹 warmup: loaded N done + M permanently-failed
+gids"; scan cycles show "🧹 queue: pre-filtered N known-done/failed gids
+(K candidates left)" with small K; "⏭ already in DB channel" lines
+essentially disappear; "✂️ scan window capped" appears only if cache
+exceeds 2000 rows.

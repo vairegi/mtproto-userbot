@@ -1532,3 +1532,28 @@ so idle cost is one tiny Mongo read per 5s (negligible). Mongo errors
 inside the peek are swallowed so a hiccup can never kill the idle loop.
 **Deploy:** Bot 2 only. No Bot 0 / frontend change.
 **Files:** Bot2Fetcher/app/fetcher.py, GUIDE.md, GUIDE_APPEND.txt.
+
+## v12.79 — scan de-duplication: warm skip-sets + capped sweep (2026-09-06)
+**Problem (measured in prod logs):** after every Bot 2 restart, one scan
+cycle spent ~24 minutes emitting 265 '⏭ already in DB channel — skipped'
+lines — every skipped gid still ran a Mongo CAS via claim_ex before being
+rejected, because _known_done/_known_failed are in-memory sets that start
+EMPTY on each boot. The Turso sweep also walks the entire cache history,
+so the cost grew forever.
+**Fix (Bot 2 only):**
+1. _warm_skip_sets() runs once at producer start: ONE projected (_id-only)
+   indexed read on galleries loads COMPLETED/PARTIAL into _known_done and
+   FAILED_TIMEOUT/FAILED_SCRAPE/FAILED_OTHER into _known_failed.
+   FAILED_BOT2_ERROR is NOT loaded — its 12h park-then-retry path in
+   claim_ex requires it to stay scannable. User queue rows bypass these
+   sets entirely, so user re-downloads of failed galleries still work.
+   Any Mongo error degrades to pre-v12.79 gradual fill.
+2. The Turso sweep is capped at the newest SCAN_MAX_GALLERIES (default
+   2000, env-tunable) cached gids — the sweep's job is re-verifying FRESH
+   rows, not re-walking all history.
+**Result:** post-restart scans go from 265 wasted CAS round-trips to ~0;
+steady-state cost is flat regardless of history size. claim_ex remains
+the final atomic arbiter — the skip-set is a shortcut, never the authority.
+**Deploy:** Bot 2 only. No Bot 0 / frontend change.
+**Files:** Bot2Fetcher/app/fetcher.py, Bot2Fetcher/app/config.py, GUIDE.md,
+GUIDE_APPEND.txt.
