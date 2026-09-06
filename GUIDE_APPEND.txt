@@ -1,22 +1,36 @@
-GUIDE_APPEND — v12.71 (2026-09-05) — Reader skip-fix
-WHAT: Read worked but images loaded with holes (pages 1-4 blank, 5-7
-loaded, 8-10 blank...). Cause: reader.js trimWindow() dropped a trimmed
-page's <img> and left an EMPTY placeholder; scrolling back up never
-re-mounted it (bottom-only sentinel + advanced nextIdx), so trimmed
-pages stayed blank forever. Now: mountPage() is idempotent + keyed by
-page number (mountedByN); placeholders keep their data-page stamp and
-are REUSED in place on re-mount; new ensureVisibleWindow() on every
-scroll tick mounts any unmounted page within ±5 of the viewport;
-trimWindow() drops pages by DISTANCE from the viewport; progress counter
-tracks the visible page; img.onerror leaves a "tap to retry" placeholder
-instead of an invisible gap. RAM cap unchanged (MAX_MOUNTED=21).
-Server cost: ZERO image bandwidth on Render (pages hotlink
-i1-i4.nhentai.net — verified 200 image/webp on all four hosts). Mongo
-stores only pages_meta JSON (~1.5 KB/gallery), never images.
-FILES: miniapp/frontend/js/plugins/reader.js, GUIDE.md, GUIDE_APPEND.txt.
-(No backend change.)
-DEPLOY: drop on repo root, commit, push, redeploy Bot 0 only; users must
-fully close + reopen the Mini App once to pick up the new reader.js.
-VERIFY: open any gallery with 10+ pages, scroll to bottom, scroll back
-up — every page re-loads in place, progress tracks the visible page, no
-blank holes. CI green.
+GUIDE_APPEND — v12.72 (2026-09-06) — Read-through Download + live progress
+WHAT: Mini App Download button now works for unseen galleries too. If
+the PDF isn't in the DB channel yet, Bot 0 transparently enqueues (same
+single-writer path /api/queue uses) and the sheet shows a compact live
+progress row that polls /api/queue/progress/<gid> every 3s until the
+PDF lands. Bot 2 writes 5 stages to a new `progress` sub-doc on the
+galleries row (fetching / downloading / fallback_fetching / compiling /
+uploading) at existing choke points — never touching the v12.49
+fallback state machine. Compiling shows "Compiling PDF…" (lightweight,
+indeterminate). FAILED_BOT2 (both bots failed → 12h park) shows a
+disabled Retry with countdown. Additive contract: older frontends fall
+back to the pre-v12.72 coarse status; older Bot 2 falls back to no
+`stage` field. Bot 2 progress writes throttled to 1/3s per slot.
+Bot 0 has a process-local single-flight guard (3s TTL) on enqueue so a
+double-tap coalesces to ONE write; Bot 2's CAS remains the real safety.
+The earlier "getUpdates Conflict" is NOT a bug — admin_bot.py already
+has the deleteWebhook boot call + /tmp/admin_bot.lock fcntl guard; the
+Conflict was a rolling-deploy overlap and the duplicate instance exits
+cleanly. Image bandwidth on Render remains ZERO (reader.js hotlinks
+i1-i4.nhentai.net); Turso reads unchanged; Mongo growth ~200B/row.
+FILES: Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
+miniapp/backend/app/services/queue_bridge.py,
+miniapp/backend/app/services/progress.py,
+miniapp/backend/app/routes/queue.py,
+miniapp/frontend/js/plugins/card-actions.js, GUIDE.md, GUIDE_APPEND.txt.
+DEPLOY: drop on repo root, commit, push, redeploy BOTH Bot 0 (miniapp)
+AND Bot 2 (fetcher). Order doesn't matter (additive contract). Users
+must fully close + reopen the Mini App once to pick up card-actions.js.
+No new env vars.
+VERIFY: tap Download on an unseen gallery — Bot 0 log shows
+`POST /api/queue/deliver/<gid> → 200 {queued:true, poll:...}`; sheet
+shows "Queued #<gid> — progress below"; the progress row cycles
+through fetching → downloading (with N/total) → compiling → uploading;
+on delivery, toast reads "✅ Ready — tap Download to open in DM". A
+double-tap or a second user on the same gid should see the SAME live
+progress bar (single-flight coalesces to one enqueue).

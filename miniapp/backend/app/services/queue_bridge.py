@@ -143,9 +143,42 @@ class EnqueueEmptyResult(RuntimeError):
         self.rejected                = list(rejected or [])
 
 
+# v12.72: process-local single-flight guard. When two users (or a
+# double-tap) POST /api/queue for the same URL within a couple of
+# seconds, we return the SAME already-in-flight result to the second
+# caller instead of double-writing. Bot 2's Mongo CAS is still the real
+# safety net; this just cuts the window down at the door.
+import threading as _sf_threading
+import time as _sf_time
+_SF_TTL_S = 3.0
+_sf_lock = _sf_threading.Lock()
+_sf_inflight: dict = {}  # url -> (expires_at, result_dict)
+
+
+def _sf_get(url: str):
+    now = _sf_time.time()
+    with _sf_lock:
+        row = _sf_inflight.get(url)
+        if row and row[0] > now:
+            return row[1]
+        # opportunistic cleanup
+        for k in [k for k, v in _sf_inflight.items() if v[0] <= now]:
+            _sf_inflight.pop(k, None)
+    return None
+
+
+def _sf_put(url: str, result: dict):
+    with _sf_lock:
+        _sf_inflight[url] = (_sf_time.time() + _SF_TTL_S, dict(result))
+
+
 def enqueue(url: str, user_id: int, username: str | None) -> dict:
     if not HAVE_BOT:
         raise RuntimeError("queue_service not available in this deployment")
+    # v12.72: single-flight coalesce for concurrent identical requests.
+    dup = _sf_get(url)
+    if dup is not None:
+        return dict(dup)
     result = _qs.enqueue_batch(
         url,
         max_links=1,
@@ -163,7 +196,9 @@ def enqueue(url: str, user_id: int, username: str | None) -> dict:
             rejected=list(getattr(result, "rejected", []) or []),
         )
     job_id, gallery_url = result.queued[0][0], result.queued[0][1]
-    return {"job_id": job_id, "url": gallery_url}
+    out = {"job_id": job_id, "url": gallery_url}
+    _sf_put(url, out)
+    return out
 
 
 def status_summary() -> dict:

@@ -1180,3 +1180,94 @@ only. Users must fully close + reopen the Mini App once to pick up the
 new reader.js. VERIFY: open any gallery with 10+ pages, scroll to the
 bottom, scroll back up — every page re-loads in place; progress counter
 tracks the visible page; no blank holes.
+
+## v12.72 — Read-through Download + live progress bar (2026-09-06)
+
+Feature: the Mini App's Download button now works even when the PDF is
+NOT yet in the database channel. If the user taps Download on an unseen
+gallery, Bot 0 transparently enqueues it (same single-writer path
+/api/queue already uses), and the sheet shows a compact live progress
+row that polls every 3 s until the PDF is delivered.
+
+Live status surfaces the 5 fetcher choke points as Bot 2 progresses:
+  fetching           — Contacting @Gallery_DLBot
+  downloading        — Downloading pages  (with N/total counter)
+  fallback_fetching  — Handed to @pdfdownloadcinbot (primary said "no
+                       images"; v12.49 fallback chain is untouched)
+  compiling          — Compiling PDF     (indeterminate, lightweight)
+  uploading          — Uploading to database channel
+
+Everything is additive. If Bot 2 hasn't been redeployed yet, the mini
+app falls back to the pre-v12.72 coarse status ("Your PDF is being
+generated…") — no frontend crash.
+
+Files (5 code + 2 docs):
+- Bot2Fetcher/app/mongo_state.py  — new Galleries.set_progress(gid, *,
+  stage, page, total, eta_s). Best-effort; only updates rows already in
+  STATUS_PROCESSING (never resurrects a terminal COMPLETED/FAILED row).
+- Bot2Fetcher/app/fetcher.py — 6 set_progress call sites at the choke
+  points above; page-N is picked out of @Gallery_DLBot's reply text via
+  a small regex, throttled to 1 Mongo write per 3 s per slot. All calls
+  are wrapped so a Mongo hiccup can never block the slot loop.
+- miniapp/backend/app/services/queue_bridge.py — process-local single-
+  flight guard on enqueue() (3 s TTL) so a double-tap / two users on
+  the same gid coalesce to ONE queue_service.enqueue_batch call. Bot 2's
+  CAS is still the real safety net; this just closes the window.
+- miniapp/backend/app/services/progress.py — surfaces the new
+  progress.stage / page / total / progress_updated_at fields to the
+  frontend; adds FAILED_BOT2 handling with retry_available_in_s
+  computed from both_failed_at + both_fail_park_s.
+- miniapp/backend/app/routes/queue.py — POST /api/queue/deliver/{gid}
+  now: (COMPLETED → DM as before), (PROCESSING → return poll URL, no
+  new enqueue), (FAILED_BOT2 in park → refuse cleanly with countdown),
+  (unseen / retryable FAILED_* → enqueue transparently, return poll URL).
+- miniapp/frontend/js/plugins/card-actions.js — Download button now
+  hands off to a lightweight live progress row (single <div> above the
+  action row, polls 3 s, self-destructs on terminal state or when the
+  sheet closes). Compiling stage shows "Compiling PDF…" with no fake
+  bar; FAILED_BOT2 shows "retry available in <countdown>".
+
+Load/RAM budget:
+- Turso reads unchanged (progress lives in Mongo galleries collection).
+- Mongo growth ~200 B/row for the progress sub-doc; writes throttled
+  to 1 per 3 s per slot × up to 4 slots = worst case ~1.3 writes/s.
+- Frontend poll is 3 s, stops immediately on terminal state or when
+  the sheet closes (MutationObserver watches the anchor).
+- Image bandwidth to Render remains ZERO — reader.js still hotlinks
+  i1-i4.nhentai.net directly to the user's browser.
+
+Verified in sandbox (mongomock — real Mongo semantics):
+- set_progress writes nested progress sub-doc (dotted-key $set → nested
+  find_one result) with correct stage/page/total
+- terminal (COMPLETED / FAILED_*) rows are never touched
+- all 5 stages accepted; garbage inputs (page=str, eta=str) swallowed
+- progress.py exposes stage_human + FAILED_BOT2 label
+- queue_bridge single-flight guard coalesces + expires cleanly
+- FAILED_BOT2 countdown math matches Bot 2's 12h park (~39599s @ 1h in)
+- Bot2Fetcher/tests/test_fallback_chain.py (v12.49 regression) STILL PASSES
+  — the set_progress hooks did NOT change any state-machine behavior.
+
+Regression suites (all pass): test_v12_60_mongo2, test_turso_cache,
+ScraperBot/tests/test_english_only, test_v1_27_discovery,
+Bot2Fetcher/tests/test_fallback_chain.
+
+Deploy: drop zip on repo root, commit, push, redeploy Bot 0 (miniapp)
+AND Bot 2 (fetcher). Order does not matter: Bot 2 first → mini app sees
+progress fields as soon as it goes live; mini app first → falls back
+cleanly to the pre-v12.72 coarse status until Bot 2 catches up.
+
+Note on the earlier "getUpdates Conflict" log line: no code change
+needed. admin_bot.py already ships (a) a boot-time deleteWebhook +
+drop_pending_updates call at build_app() (~line 3231) and (b) a
+single-instance /tmp/admin_bot.lock guard via fcntl.flock at main()
+(~line 3348). The Conflict was a transient overlap during a rolling
+Render deploy — the second instance exits with code 3 by design.
+
+VERIFY (Render logs, first Download of a fresh gallery):
+  Bot 0:  POST /api/queue/deliver/<gid> → 200 {queued:true, poll:...}
+  Bot 2:  📨 DMing @Gallery_DLBot: https://nhentai.net/g/<gid>/
+          (progress writes are silent unless DEBUG-level)
+  Bot 0:  GET /api/queue/progress/<gid> → 200 {stage:"downloading",
+                                                page:7, total:29, ...}
+Sheet: compact progress row appears above the action buttons, updates
+every 3 s, disappears on COMPLETED (toast: "✅ Ready — tap Download").

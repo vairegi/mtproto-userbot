@@ -397,6 +397,10 @@ class Fetcher:
                      "@%s (skipping @%s)", gid,
                      getattr(self.s, "fallback_username", "") or "?",
                      self.s.bot2_username)
+        # v12.72: surface a live "stage" to the mini-app right after the
+        # claim. Best-effort — set_progress swallows any Mongo hiccup.
+        self.galleries.set_progress(
+            gid, stage="fallback_fetching" if route_fallback_direct else "fetching")
         self.stats.claimed += 1
         self.stats.in_flight[gid] = f"slot{idx}"
         log.info("🎯 slot %d claimed %s — starting job", idx, gid)
@@ -482,6 +486,9 @@ class Fetcher:
                 self._d_state(idx, "waiting_pdf", gid, title=m["title"],
                               pages=m.get("pages") or 0,
                               step="waiting @Gallery_DLBot")
+                # v12.72: mini-app progress — primary bot is downloading now.
+                self.galleries.set_progress(
+                    gid, stage="downloading", total=int(m.get("pages") or 0))
                 pdf_msg = await self._request_pdf(client, bot2, gid, timeout)
                 if pdf_msg is None:
                     # v12.49 (operator spec): timeout is NOT an explicit
@@ -503,6 +510,9 @@ class Fetcher:
                     self._d_state(idx, "waiting_pdf", gid, title=m["title"],
                                   pages=m.get("pages") or 0,
                                   step=f"fallback @{getattr(self.s, 'fallback_username', '')}")
+                    # v12.72: primary errored — mini-app sees "handed to backup".
+                    self.galleries.set_progress(gid, stage="fallback_fetching",
+                                                total=int(m.get("pages") or 0))
                     pdf_msg, fb_err = await self._try_fallback_pdf(
                         idx, client, gid, primary_err)
                     if pdf_msg is None:
@@ -532,11 +542,17 @@ class Fetcher:
 
             self._d_state(idx, "working", gid, title=m["title"],
                           pages=m.get("pages") or 0, step="downloading cover")
+            # v12.72: bot has the PDF — stitching / compiling phase.
+            self.galleries.set_progress(gid, stage="compiling",
+                                        total=int(m.get("pages") or 0))
             img_bytes, ext = await self._fetch_cover_bytes(m)
             self.galleries.refresh_claim(gid)
 
             self._d_state(idx, "posting", gid, title=m["title"],
                           pages=m.get("pages") or 0, step="posting to DB channel")
+            # v12.72: about to post cover + forward PDF to database channel.
+            self.galleries.set_progress(gid, stage="uploading",
+                                        total=int(m.get("pages") or 0))
             async with self._channel_lock:
                 cover_msg_id = await self._post_cover(client, channel, m,
                                                      caption, img_bytes, ext)
@@ -721,6 +737,12 @@ class Fetcher:
         sent_id = int(getattr(sent, "id", 0) or 0)
         deadline = time.monotonic() + timeout
         last_progress_log = 0.0
+        # v12.72: throttled Mongo progress writes so the mini-app sees a
+        # live page counter without hammering the collection (max 1 write
+        # every 3 s per slot). Regex parses "12/29" / "page 12 of 29" etc.
+        import re as _re_p
+        _page_re = _re_p.compile(r"(\d{1,4})\s*/\s*(\d{1,4})|page\s+(\d{1,4})(?:\s+of\s+(\d{1,4}))?", _re_p.I)
+        last_prog_write = 0.0
         while time.monotonic() < deadline:
             await asyncio.sleep(POLL_EVERY_S)
             try:
@@ -753,6 +775,21 @@ class Fetcher:
                         log.info("⏳ %s — waiting for PDF (%ds left) · Bot 2: %r",
                                  gid, remain, head)
                         last_progress_log = now
+                    # v12.72: pick a page-number pair out of the primary
+                    # bot's reply and write it as progress (throttled).
+                    if now - last_prog_write > 3.0:
+                        try:
+                            mtch = _page_re.search(text)
+                            if mtch:
+                                cur = int(mtch.group(1) or mtch.group(3) or 0)
+                                tot = int(mtch.group(2) or mtch.group(4) or 0)
+                                if cur > 0:
+                                    self.galleries.set_progress(
+                                        gid, stage="downloading",
+                                        page=cur, total=(tot or None))
+                                    last_prog_write = now
+                        except Exception:
+                            pass
         return None
 
     async def _try_fallback_pdf(self, idx: int, client: TelegramClient,

@@ -153,7 +153,13 @@ def enqueue(body: EnqueueBody, user: dict = Depends(get_current_user)) -> dict:
 @router.post("/deliver/{gallery_id}")
 def deliver(gallery_id: str, user: dict = Depends(get_current_user)) -> dict:
     """BUG 1 fix — forward the cover + PDF from the database channel into
-    the requester's DM using the admin bot's copyMessage endpoint."""
+    the requester's DM using the admin bot's copyMessage endpoint.
+
+    v12.72: if the gallery isn't yet in the library, transparently enqueue
+    it (with the same single-flight + dedup guarantees POST /api/queue
+    uses) and return a poll URL so the frontend can render a live
+    progress bar instead of a hard 404.
+    """
     uid = int(user["id"])
     # If app is private, still block non-admins (same rule as enqueue).
     if not db.get_public_mode() and uid != int(settings.admin_user_id):
@@ -166,18 +172,69 @@ def deliver(gallery_id: str, user: dict = Depends(get_current_user)) -> dict:
                 "blocked_by_force_join": True,
                 "gallery_id": res.get("gallery_id"),
                 "message": res.get("reason") or "Join the required channel(s)."}
-    if not res.get("ok"):
-        # 404 when the gallery isn't in the library; 502 when Telegram
-        # itself refused the copy; 500 for anything else.
-        reason = res.get("reason") or ""
-        if "not found" in reason.lower():
-            raise HTTPException(404, reason)
-        if "not configured" in reason.lower():
-            raise HTTPException(500, reason)
-        if reason:
-            raise HTTPException(502, reason)
-        raise HTTPException(500, "DM delivery failed")
-    return {"ok": True, "delivered": True, "gallery_id": res.get("gallery_id")}
+    if res.get("ok"):
+        return {"ok": True, "delivered": True,
+                "gallery_id": res.get("gallery_id")}
+
+    # --- v12.72 read-through path -------------------------------------------
+    # The gallery isn't in the library yet OR is currently being downloaded.
+    # Peek the status: if PROCESSING, just tell the frontend to poll; if
+    # unseen / retryable FAILED_*, enqueue (transparently reusing the same
+    # queue_bridge single-flight guard the /api/queue route already uses).
+    reason = (res.get("reason") or "").lower()
+    if "not configured" in reason:
+        raise HTTPException(500, res.get("reason"))
+    try:
+        info = queue_bridge.gallery_status(str(gallery_id))
+    except Exception as e:  # noqa: BLE001
+        info = {"known": False, "error": str(e)}
+    status_str = str(info.get("status") or "").upper()
+    # Already processing — no new enqueue, just point the client at the poll.
+    if status_str == "PROCESSING":
+        return {
+            "ok": True, "delivered": False, "queued": True, "deduped": True,
+            "gallery_id": gallery_id, "status": status_str,
+            "poll": f"/api/queue/progress/{gallery_id}",
+            "message": "Already downloading — hang tight",
+        }
+    # FAILED_BOT2 within the 12h park — refuse cleanly so the frontend can
+    # show "Retry in Xh Ym" instead of firing a doomed retry.
+    if status_str == "FAILED_BOT2":
+        try:
+            prog = progress.lookup(str(gallery_id)) or {}
+        except Exception:
+            prog = {}
+        remain = int(prog.get("retry_available_in_s") or 0)
+        if remain > 0:
+            return {
+                "ok": False, "delivered": False, "queued": False,
+                "gallery_id": gallery_id, "status": status_str,
+                "retry_available_in_s": remain,
+                "message": "Both backup bots failed — try again later.",
+            }
+    # Unseen or retryable FAILED_* — transparently enqueue.
+    url = f"https://nhentai.net/g/{gallery_id}/"
+    try:
+        job = queue_bridge.enqueue(url, uid, user.get("username"))
+    except queue_bridge.EnqueueEmptyResult:
+        # queue_service filtered the URL (completed/pending tombstone).
+        # Poll anyway — the row exists; the frontend will resolve it.
+        return {
+            "ok": True, "delivered": False, "queued": True, "deduped": True,
+            "gallery_id": gallery_id, "status": status_str or "PENDING",
+            "poll": f"/api/queue/progress/{gallery_id}",
+            "message": "Queued",
+        }
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"Enqueue failed: {e}")
+    return {
+        "ok": True, "delivered": False, "queued": True, "deduped": False,
+        "gallery_id": gallery_id, "status": "PENDING",
+        "job": job, "poll": f"/api/queue/progress/{gallery_id}",
+        "message": "Queued — downloading now",
+    }
 
 
 @router.get("/status")

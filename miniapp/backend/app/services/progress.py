@@ -64,10 +64,23 @@ _HUMAN = {
     "PARTIAL":             "Delivered (cover posted, PDF partial)",
     "FAILED_TIMEOUT":      "Failed: worker timed out",
     "FAILED_BOT2_ERROR":   "Failed: Bot 2 refused",
+    "FAILED_BOT2":         "Both backup bots failed — retry available later",
     "FAILED_SCRAPE":       "Failed: could not scrape gallery",
     "FAILED_OTHER":        "Failed: unknown error",
     "FAILED_RECOVERED":    "Failed earlier — retry queued",
 }
+
+# v12.72: human labels for Bot 2's live progress.stage sub-doc.
+_STAGE_HUMAN = {
+    "fetching":          "Contacting @Gallery_DLBot…",
+    "downloading":       "Downloading pages…",
+    "fallback_fetching": "Handed to backup bot — downloading…",
+    "compiling":         "Compiling PDF…",
+    "uploading":         "Uploading to database channel…",
+}
+
+# Both-bots park (matches Bot 2 default; env override on that side).
+_BOTH_FAIL_PARK_S = 43200
 
 
 def _latest_progress_event(conn, gid: str) -> Optional[Dict[str, Any]]:
@@ -166,6 +179,39 @@ def lookup(url_or_id: str) -> Dict[str, Any]:
                 out["phase"]       = ev["phase"]
                 out["detail"]      = ev["detail"]
                 out["last_event_ts"] = _epoch(ev.get("ts"))
+            # v12.72: surface Bot 2's live progress.* sub-doc. Additive —
+            # older frontends that don't know these keys keep working.
+            prog = doc.get("progress") if isinstance(doc, dict) else None
+            if isinstance(prog, dict):
+                stage = str(prog.get("stage") or "").strip()
+                if stage:
+                    out["stage"]        = stage
+                    out["stage_human"]  = _STAGE_HUMAN.get(stage, stage)
+                    if prog.get("page") is not None:
+                        try: out["page"] = int(prog.get("page"))
+                        except (TypeError, ValueError): pass
+                    if prog.get("total") is not None:
+                        try: out["total"] = int(prog.get("total"))
+                        except (TypeError, ValueError): pass
+                    if prog.get("eta_s") is not None:
+                        try: out["eta_s"] = int(prog.get("eta_s"))
+                        except (TypeError, ValueError): pass
+                    out["progress_updated_at"] = _epoch(prog.get("updated_at"))
+            # v12.72: FAILED_BOT2 park countdown (see mongo_state
+            # set_both_failed). Frontend disables Retry until it hits 0.
+            if status == "FAILED_BOT2":
+                try:
+                    ref = 0.0
+                    for k in ("both_failed_at", "failed_at",
+                              "completed_at", "updated_at"):
+                        v = _epoch(doc.get(k)) or 0.0
+                        if v > ref: ref = v
+                    park = float(doc.get("both_fail_park_s") or _BOTH_FAIL_PARK_S)
+                    if ref > 0 and park > 0:
+                        remain = int(ref + park - time.time())
+                        out["retry_available_in_s"] = max(0, remain)
+                except Exception:
+                    pass
             return out
 
         # --- Path B: fall back to the queue table ----------------------
