@@ -254,6 +254,24 @@ _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 
 # v12.69: private-key parity with hf_scraper / hf_scraper_lite. When
 # NHENTAI_API_KEY is set, EVERY upstream call from this module must send
+# `Authorization: Key <token>` — anonymous responses can be stubbed.
+_NHENTAI_API_KEY = os.environ.get("NHENTAI_API_KEY", "").strip()
+
+
+def _nh_headers() -> dict:
+    """Shared header dict for every direct nhentai HTTP call in this module.
+    Includes Authorization when NHENTAI_API_KEY is configured."""
+    h = {
+        "User-Agent": _UA,
+        "Accept":     "application/json",
+        "Referer":    "https://nhentai.net/",
+    }
+    if _NHENTAI_API_KEY:
+        h["Authorization"] = f"Key {_NHENTAI_API_KEY}"
+    return h
+
+# v12.69: private-key parity with hf_scraper / hf_scraper_lite. When
+# NHENTAI_API_KEY is set, EVERY upstream call from this module must send
 # `Authorization: Key <token>` — without it nhentai returns a stub
 # response (title/tags only, no `media_id`, no `images.pages`), which
 # silently killed pages_meta on both `_direct_nhentai_detail` (write path)
@@ -1145,29 +1163,22 @@ def _pages_meta_of(d: dict) -> list:
 
 
 def _pages_meta_backfill(gid: str, row: dict) -> dict:
-    """v12.68: cached gallery rows written before the Read viewer have no
-    pages_meta. On first open of such a row, fetch the nhentai v2 detail
-    ONCE (~400ms), build pages_meta from raw images.pages + media_id, and
-    persist the enriched row. Best-effort: any failure returns row unchanged.
+    """v12.68/69/70: cached gallery rows written before the Read viewer have
+    no pages_meta. On first open of such a row, fetch the nhentai v2 detail
+    ONCE (~400ms), build pages_meta from the top-level `pages` array, and
+    persist the enriched row via nhentai_cache.put (DUAL-WRITES Turso +
+    Mongo-2, dedup-guarded). Best-effort: any failure returns row unchanged.
 
-    v12.67 BUG FIX: the previous version called `_hf.fetch_detail(gid)` —
-    a function that DOES NOT EXIST in hf_scraper.py (it only exposes the
-    ASYNC fetch_gallery_meta, whose GalleryMeta carries no images). Every
-    backfill raised AttributeError, was swallowed, and returned the row
-    unchanged — so NO legacy row ever got pages_meta and Read showed
-    'Reader unavailable' forever. We now do the upstream fetch ourselves
-    (direct httpx to /api/v2/galleries/<id>) and write through
-    nhentai_cache.put, which DUAL-WRITES Turso + Mongo-2 (dedup-guarded).
+    v12.67 BUG: it called `_hf.fetch_detail(gid)` — a function that DOES NOT
+    EXIST in hf_scraper.py — so every backfill raised AttributeError and no
+    legacy row ever got pages_meta. v12.69: sends NHENTAI_API_KEY. v12.70:
+    reads the REAL payload shape (top-level `pages`, not `images.pages`).
     """
     try:
         if row.get("pages_meta"):
             return row
     except Exception:
         return row
-    # --- one upstream fetch (respects the shared 429 backoff budget) -------
-    # v12.69: use _nh_headers() so NHENTAI_API_KEY (when set) is sent.
-    # Anonymous v2 responses omit media_id/images.pages entirely, which is
-    # exactly what v12.68 mis-diagnosed as "gallery removed upstream".
     try:
         r = httpx.get(
             f"{_NH_API}/galleries/{gid}",
@@ -1182,7 +1193,6 @@ def _pages_meta_backfill(gid: str, row: dict) -> dict:
     except Exception as e:  # noqa: BLE001
         log.info("pages_meta backfill: fetch failed for %s (%s)", gid, e)
         return row
-    # --- build pages_meta + persist -----------------------------------------
     try:
         meta = _pages_meta_from_raw(item)
         if not meta:
@@ -1193,9 +1203,6 @@ def _pages_meta_backfill(gid: str, row: dict) -> dict:
             row["pages"] = int(item.get("num_pages") or len(meta))
         try:
             from . import nhentai_cache as _nhc2  # noqa: WPS433
-            # Pass the DICT (not a json.dumps string) so put's canonical
-            # gate + JSON-serialisation guard work correctly; put DUAL-WRITES
-            # Turso AND Mongo-2 best-effort.
             _ok = _nhc2.put(f"gallery:{gid}", row, ttl_sec=None)
             log.info("📖 [PAGES BACKFILL] gid=%s pages=%d cached for Read (put=%s)",
                      gid, len(meta), _ok)

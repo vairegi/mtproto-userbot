@@ -284,6 +284,16 @@ class Fetcher:
         gallery_rows.sort(key=lambda r: r["cached_at"], reverse=True)
         seen: set = set()
         ordered: list[str] = []
+        # v12.73: user-triggered queue rows (mini-app Download on uncached
+        # galleries) go FIRST — Bot 0 writes them to Mongo 'queue' with
+        # status='pending'; without this the producer only ever saw the
+        # Turso cache and user downloads were never picked up.
+        try:
+            for qgid in self.galleries.list_pending_queue():
+                if qgid not in seen:
+                    seen.add(qgid); ordered.append(qgid)
+        except Exception:
+            pass
         for gid in recent_ids:
             if gid not in seen:
                 seen.add(gid); ordered.append(gid)
@@ -377,6 +387,12 @@ class Fetcher:
         # this gid double-failed 12h+ ago (or is a legacy FAILED_BOT2_ERROR
         # permanent skip) and goes STRAIGHT to the fallback bot.
         decision, _prior = self.galleries.claim_ex(gid)
+        # v12.73: keep Bot 0's queue ledger in sync for user-triggered rows
+        if decision == "done":
+            self.galleries.mark_queue_status(gid, "completed")
+        elif decision == "failed":
+            self.galleries.mark_queue_status(gid, "failed",
+                                             error="previously failed/parked")
         if decision == "done":
             self.stats.skipped_done += 1
             self._known_done.add(gid)          # v12.44: never re-queue
@@ -397,6 +413,11 @@ class Fetcher:
                      "@%s (skipping @%s)", gid,
                      getattr(self.s, "fallback_username", "") or "?",
                      self.s.bot2_username)
+        # v12.72: surface a live "stage" to the mini-app right after claim.
+        self.galleries.set_progress(
+            gid, stage="fallback_fetching" if route_fallback_direct else "fetching")
+        # v12.73: mark the queue ledger row as processing (if it came from there)
+        self.galleries.mark_queue_status(gid, "processing")
         # v12.72: surface a live "stage" to the mini-app right after the
         # claim. Best-effort — set_progress swallows any Mongo hiccup.
         self.galleries.set_progress(
@@ -516,6 +537,9 @@ class Fetcher:
                     pdf_msg, fb_err = await self._try_fallback_pdf(
                         idx, client, gid, primary_err)
                     if pdf_msg is None:
+                        # v12.73: queue ledger sync (both bots failed)
+                        self.galleries.mark_queue_status(
+                            gid, "failed", error="both bots failed (parked 12h)")
                         # BOTH bots failed → park 12h + log-channel alert.
                         log.error("🚫 %s — BOTH bots failed "
                                   "(primary=%r | fallback=%r) — parking 12h",
@@ -542,6 +566,9 @@ class Fetcher:
 
             self._d_state(idx, "working", gid, title=m["title"],
                           pages=m.get("pages") or 0, step="downloading cover")
+            # v12.72: bot has the PDF — compiling phase.
+            self.galleries.set_progress(gid, stage="compiling",
+                                        total=int(m.get("pages") or 0))
             # v12.72: bot has the PDF — stitching / compiling phase.
             self.galleries.set_progress(gid, stage="compiling",
                                         total=int(m.get("pages") or 0))
@@ -550,6 +577,9 @@ class Fetcher:
 
             self._d_state(idx, "posting", gid, title=m["title"],
                           pages=m.get("pages") or 0, step="posting to DB channel")
+            # v12.72: about to post cover + forward PDF to database channel.
+            self.galleries.set_progress(gid, stage="uploading",
+                                        total=int(m.get("pages") or 0))
             # v12.72: about to post cover + forward PDF to database channel.
             self.galleries.set_progress(gid, stage="uploading",
                                         total=int(m.get("pages") or 0))
@@ -580,6 +610,8 @@ class Fetcher:
             self.galleries.mark_completed(
                 gid, title=m["title"], cover_msg_id=cover_msg_id,
                 pdf_msg_id=pdf_msg_id, open_link=link, pages=m.get("pages") or 0)
+            # v12.73: queue ledger sync (success)
+            self.galleries.mark_queue_status(gid, "completed")
             await self.turso.put_state(gid, {
                 "status": "COMPLETED", "cover_msg_id": cover_msg_id,
                 "pdf_msg_id": pdf_msg_id, "open_link": link,
@@ -737,6 +769,10 @@ class Fetcher:
         sent_id = int(getattr(sent, "id", 0) or 0)
         deadline = time.monotonic() + timeout
         last_progress_log = 0.0
+        # v12.72: throttled Mongo progress writes (max 1 per 3s per slot).
+        import re as _re_p
+        _page_re = _re_p.compile(r"(\d{1,4})\s*/\s*(\d{1,4})|page\s+(\d{1,4})(?:\s+of\s+(\d{1,4}))?", _re_p.I)
+        last_prog_write = 0.0
         # v12.72: throttled Mongo progress writes so the mini-app sees a
         # live page counter without hammering the collection (max 1 write
         # every 3 s per slot). Regex parses "12/29" / "page 12 of 29" etc.
@@ -775,6 +811,21 @@ class Fetcher:
                         log.info("⏳ %s — waiting for PDF (%ds left) · Bot 2: %r",
                                  gid, remain, head)
                         last_progress_log = now
+                    # v12.72: parse "12/29" style page counters from the
+                    # primary bot's reply and write throttled progress.
+                    if now - last_prog_write > 3.0:
+                        try:
+                            mtch = _page_re.search(text)
+                            if mtch:
+                                cur = int(mtch.group(1) or mtch.group(3) or 0)
+                                tot = int(mtch.group(2) or mtch.group(4) or 0)
+                                if cur > 0:
+                                    self.galleries.set_progress(
+                                        gid, stage="downloading",
+                                        page=cur, total=(tot or None))
+                                    last_prog_write = now
+                        except Exception:
+                            pass
                     # v12.72: pick a page-number pair out of the primary
                     # bot's reply and write it as progress (throttled).
                     if now - last_prog_write > 3.0:

@@ -1271,3 +1271,41 @@ VERIFY (Render logs, first Download of a fresh gallery):
                                                 page:7, total:29, ...}
 Sheet: compact progress row appears above the action buttons, updates
 every 3 s, disappears on COMPLETED (toast: "✅ Ready — tap Download").
+
+## v12.73 — Bot 2 consumes the mini-app queue ledger (2026-09-06)
+
+Bug: the mini app's Queue page showed "Pending: 16" forever and Bot 2
+never DM'd @Gallery_DLBot. Cause: Bot 2's producer (_build_queue_order)
+only scanned Turso (recent searches + gallery cache) — it NEVER read the
+Mongo `queue` collection that db.enqueue() writes when a user taps
+Download on an uncached gallery. The two ledgers were disconnected.
+
+Fix (Bot2Fetcher only):
+- mongo_state.Galleries: new list_pending_queue() (reads `queue` with
+  status='pending', oldest-first, gid from gallery_id or /g/<id>/ in
+  url) + mark_queue_status(gid, status, error) (best-effort sync).
+- fetcher._build_queue_order: pending queue rows are PREPENDED to the
+  work list — user-triggered downloads before backfill sweeps.
+- fetcher._do_job: after claim_ex, sync the ledger (done→completed,
+  failed→failed); on claim mark 'processing'; on both-bots-failed mark
+  'failed'; after mark_completed mark 'completed'. claim_ex CAS +
+  COMPLETED/PARTIAL skip (decision='done') is the pre-DM guard against
+  double-downloads — unchanged, still the single safety net.
+- v12.72 progress writes (fetching/downloading/fallback_fetching/
+  compiling/uploading, throttled 1/3s/slot) ride along unchanged.
+
+The mini app's 'Pending' count now drains as Bot 2 works. After deploy,
+existing pending rows are consumed naturally — no manual clearing
+needed (manual clear if ever wanted: Mongo relaybot db,
+db.queue.updateMany({status:"pending"},{$set:{status:"cancelled",
+updated_at:<now>, error_reason:"manual clear"}})).
+
+Verified in sandbox (mongomock — real Mongo semantics): pending pickup,
+ledger lifecycle sync, completed rows not re-picked, progress sub-doc
+shape, terminal rows untouched, claim_ex expired-park still routes to
+fallback. All regression suites pass incl. test_fallback_chain.py.
+
+Deploy: drop zip on repo root, commit, push, redeploy Bot 0 AND Bot 2.
+No new env vars. VERIFY: Bot 2 log shows 📨 DMing @Gallery_DLBot for a
+user-queued gid within one producer cycle; mini-app Queue page Pending
+count decreases; progress row shows stage updates until "✅ Ready".

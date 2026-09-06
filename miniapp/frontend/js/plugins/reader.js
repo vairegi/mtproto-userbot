@@ -1,36 +1,17 @@
 /*
   plugins/reader.js — v12.71: in-app "Read" viewer (skip-fix).
 
-  Webtoon-style vertical continuous scroll with progressive windowing:
-    - open        -> mount pages 1..3 (sized shimmer placeholders from the
-                     API's real width/height — zero layout jump)
-    - sentinel    -> IntersectionObserver at the window edge appends +2
-                     pages per scroll step
-    - window cap  -> max ±10 mounted pages; far-away pages swap back to
-                     sized placeholders (Telegram WebViews are RAM-weak)
-    - preload     -> 2 images ahead into browser cache for smooth scroll
-
+  Webtoon-style vertical continuous scroll with progressive windowing.
   v12.71 BUG FIX (skipped pages): the old trimWindow() dropped a trimmed
-  page's <img> and replaced it with an EMPTY placeholder. When the user
-  scrolled back up, the placeholder was never re-mounted — the
-  IntersectionObserver only watches the bottom sentinel, and nextIdx had
-  already advanced past those pages — so the page stayed blank forever.
-  That's why users saw "1-4 blank, 5-7 load, 8-10 blank" on long
-  galleries: they were pages that had been mounted once, trimmed, and
-  never re-attached.
-
-  Fix:
-    - mountPage() is now IDEMPOTENT: ph() stamps a data-page attribute
-      and the mounted-window registry is keyed by page number, so a page
-      can be mounted, trimmed, and RE-mounted as many times as needed.
-    - New ensureVisibleWindow(): on every scroll event, walk a ±AHEAD/
-      BEHIND window around the current viewport and mount any page in it
-      that isn't currently mounted. This runs alongside the bottom
-      sentinel, so scrolling back UP re-hydrates previously-trimmed
-      pages instead of leaving blank placeholders.
-    - img.onerror now LEAVES the sized placeholder (background + page
-      number badge) instead of clearing it, so a flaky CDN response is
-      visible as "page N failed to load" rather than an invisible hole.
+  page's <img> and replaced it with an EMPTY placeholder. Scrolling back
+  up never re-mounted those pages — the IntersectionObserver only watches
+  the bottom sentinel and nextIdx had already advanced past them — so any
+  trimmed page stayed blank forever ("1-4 blank, 5-7 load, 8-10 blank").
+  Fix: mountPage() is idempotent and keyed by page number; placeholders
+  keep a data-page stamp and are REUSED in place on re-mount; a new
+  ensureVisibleWindow() runs on every scroll tick and mounts any unmounted
+  page within ±5 of the viewport; img.onerror leaves a visible
+  "tap to retry" placeholder instead of an invisible gap.
 
   Server cost: ZERO image bandwidth — pages hotlink nhentai's CDN exactly
   like cover cards already do. The reader only consumes detail.pages_meta
@@ -58,8 +39,8 @@ export function openReader(gallery) {
   const meta = (gallery && gallery.pages_meta) || [];
   const gid = (gallery && gallery.id) || "?";
   if (!meta.length) {
-    // v12.67: first-ever open of a legacy cached row — the backend is
-    // backfilling pages_meta right now; tell the user to retry.
+    // First-ever open of a legacy cached row — the backend is backfilling
+    // pages_meta right now; tell the user to retry.
     try {
       var tg = (typeof window !== "undefined") ? window.Telegram : null;
       if (tg && tg.WebApp && tg.WebApp.showPopup) {
@@ -104,12 +85,10 @@ export function openReader(gallery) {
   _overlay = scroller;
   document.body.style.overflow = "hidden";
 
-  // v12.71: the mounted-window registry is keyed by PAGE NUMBER so a
-  // trimmed page can be re-mounted when the user scrolls back to it.
-  // nextIdx only tracks "furthest page we've ever mounted" so the bottom
-  // sentinel still knows where to continue appending from.
-  const mountedByN = new Map();  // n -> el (currently in the DOM as <img>)
-  let nextIdx = 0;               // next page index (0-based) to append at bottom
+  // Mounted-window registry keyed by PAGE NUMBER so a trimmed page can be
+  // re-mounted when the user scrolls back to it.
+  const mountedByN = new Map();  // n -> el
+  let nextIdx = 0;
 
   const ph = (m) => h("div", {
     dataset: { page: String(m.n) },
@@ -122,11 +101,7 @@ export function openReader(gallery) {
   }, `page ${m.n}`);
 
   function mountPage(m) {
-    // Idempotent: if this page is already mounted, do nothing.
     if (mountedByN.has(m.n)) return;
-    // If a placeholder for this page already exists in the DOM (we left
-    // it there when trimming), reuse it instead of appending a new node
-    // at the bottom — keeps page ORDER intact on re-mount.
     let el = body.querySelector(`[data-page="${m.n}"]`);
     if (!el) {
       el = ph(m);
@@ -136,16 +111,11 @@ export function openReader(gallery) {
     img.alt = `page ${m.n}`;
     img.style.cssText = "width:100%;display:block;";
     img.onload = () => {
-      // Keep the element's dataset.page stamp so future scrolls can find
-      // it; just swap the placeholder content for the loaded image.
       el.replaceChildren(img);
       el.style.aspectRatio = "auto";
       el.style.display = "";
     };
     img.onerror = () => {
-      // v12.71: leave the sized placeholder (with page number visible)
-      // instead of clearing it — a failed CDN fetch shows up as a marked
-      // hole instead of an invisible gap.
       el.textContent = `page ${m.n} — tap to retry`;
       el.style.cursor = "pointer";
       el.onclick = () => { el.onclick = null; el.textContent = ""; img.src = pageUrl(m); };
@@ -159,8 +129,6 @@ export function openReader(gallery) {
     if (!el) return;
     const m = meta.find(x => x.n === n);
     if (m) {
-      // Replace the mounted <img> with a sized placeholder IN PLACE so
-      // re-mounting later restores the page at the correct position.
       const fresh = ph(m);
       el.replaceWith(fresh);
     }
@@ -168,11 +136,9 @@ export function openReader(gallery) {
   }
 
   function trimWindow() {
-    // keep at most MAX_MOUNTED around the scroll position
     if (mountedByN.size <= MAX_MOUNTED) return;
     const viewTop = scroller.scrollTop;
     const viewBot = viewTop + scroller.clientHeight;
-    // Rank mounted pages by distance from the viewport; drop the furthest.
     const ranked = [...mountedByN.entries()].map(([n, el]) => {
       const top = el.offsetTop, bot = top + el.offsetHeight;
       const dist = (bot < viewTop) ? (viewTop - bot)
@@ -184,16 +150,9 @@ export function openReader(gallery) {
       unmountPage(ranked[i].n);
   }
 
-  // v12.71: re-hydrate any page inside the viewport ±AHEAD/BEHIND that
-  // was previously trimmed (its placeholder is still in the DOM). This is
-  // what makes scrolling back UP show images again instead of blanks.
+  // Re-hydrate any page inside viewport ±BEHIND/AHEAD that was trimmed.
   function ensureVisibleWindow() {
     const viewTop = scroller.scrollTop;
-    const viewBot = viewTop + scroller.clientHeight;
-    // Find the meta index whose page is nearest the middle of the viewport.
-    // Cheap linear scan over <= ~500 entries, only on scroll ticks.
-    let lo = Math.max(0, nextIdx - MAX_MOUNTED - 1);  // window around nextIdx
-    // Binary-ish search by offsetTop over the DOM placeholders we have.
     const kids = body.children;
     let curIdx = 0;
     for (let i = 0; i < kids.length; i++) {
@@ -201,7 +160,6 @@ export function openReader(gallery) {
       if (el.offsetTop + el.offsetHeight >= viewTop) { curIdx = i; break; }
       curIdx = i;
     }
-    // Map DOM index -> meta index via the data-page stamp.
     const curN = parseInt(kids[curIdx] && kids[curIdx].dataset
       ? kids[curIdx].dataset.page : "1", 10) || 1;
     const curMetaIdx = Math.max(0, meta.findIndex(m => m.n === curN));
@@ -218,8 +176,6 @@ export function openReader(gallery) {
   }
 
   function updateProgress() {
-    // Progress = the page at the TOP of the viewport (not "furthest ever
-    // mounted") so it doesn't jump around when the user scrolls back up.
     const viewTop = scroller.scrollTop;
     const kids = body.children;
     let curN = 1;
@@ -234,10 +190,8 @@ export function openReader(gallery) {
     if (el) el.textContent = `${curN} / ${meta.length}`;
   }
 
-  // initial chunk (1..FIRST_CHUNK)
   for (let i = 0; i < FIRST_CHUNK && nextIdx < meta.length; i++, nextIdx++)
     mountPage(meta[nextIdx]);
-  // preload 2 ahead
   for (let i = nextIdx; i < Math.min(nextIdx + 2, meta.length); i++)
     new Image().src = pageUrl(meta[i]);
 

@@ -38,6 +38,124 @@ import { store } from "core/state.js";
 import { showActionLoader, hideActionLoader,
          showInlineLoader, hideInlineLoader } from "ui/action-loader.js";
 
+// v12.72: live-progress overlay for the Download button. Lightweight —
+// one <div> pinned above the sheet's action row, polls /api/queue/progress
+// every 3s, self-destructs on terminal state or when the sheet closes.
+const _progressBars = new Map();
+
+function _fmtCountdown(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${sec}s`;
+}
+
+function _stopProgress(gid) {
+  const row = _progressBars.get(String(gid));
+  if (!row) return;
+  row.stopped = true;
+  if (row.timer) { try { clearInterval(row.timer); } catch (_) {} }
+  if (row.el && row.el.parentNode) row.el.parentNode.removeChild(row.el);
+  _progressBars.delete(String(gid));
+}
+
+function _renderProgressBar(gid, initialText) {
+  _stopProgress(gid);
+  const wrap = document.createElement("div");
+  wrap.setAttribute("data-progress-gid", String(gid));
+  wrap.style.cssText = [
+    "margin:8px 12px 0", "padding:10px 12px", "border-radius:10px",
+    "background:rgba(255,255,255,0.06)", "color:#e8e8ee",
+    "font-size:12px", "font-weight:600", "display:flex",
+    "align-items:center", "gap:10px",
+  ].join(";");
+  const spin = document.createElement("span");
+  spin.textContent = "⏳";
+  spin.style.cssText = "animation:duSpin 1.2s linear infinite;display:inline-block";
+  const txt = document.createElement("span");
+  txt.className = "du-progress-text";
+  txt.textContent = initialText || "Queued…";
+  txt.style.cssText = "flex:1 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+  wrap.append(spin, txt);
+  const anchor = document.querySelector("[data-detail-sheet] .actions")
+              || document.querySelector(".detail-sheet .actions")
+              || document.body;
+  if (anchor === document.body) {
+    wrap.style.position = "fixed";
+    wrap.style.left = "12px"; wrap.style.right = "12px";
+    wrap.style.bottom = "12px"; wrap.style.zIndex = "9998";
+  } else {
+    anchor.parentNode.insertBefore(wrap, anchor);
+  }
+  if (!document.getElementById("du-progress-kf")) {
+    const st = document.createElement("style");
+    st.id = "du-progress-kf";
+    st.textContent = "@keyframes duSpin{to{transform:rotate(360deg)}}";
+    document.head.appendChild(st);
+  }
+  return { wrap, txt };
+}
+
+function _pollProgress(gid, gallery, onDone) {
+  const key = String(gid);
+  if (_progressBars.has(key)) return;
+  const { wrap, txt } = _renderProgressBar(gid, "Queued — waiting for a worker…");
+  const row = { el: wrap, timer: null, stopped: false };
+  _progressBars.set(key, row);
+
+  const tick = async () => {
+    if (row.stopped) return;
+    let p = null;
+    try { p = await api.get(`/api/queue/progress/${encodeURIComponent(gid)}`); }
+    catch (_) { return; }
+    if (row.stopped || !p) return;
+    if (p.is_done) {
+      _stopProgress(gid);
+      gallery.v2_status = Object.assign({}, gallery.v2_status || {}, {
+        known: true, status: p.status || "COMPLETED",
+        open_link: p.open_link || "",
+      });
+      toast("✅ Ready — tap Download to open in DM", "success");
+      if (typeof onDone === "function") onDone(p);
+      return;
+    }
+    if (p.is_failed) {
+      const remain = p.retry_available_in_s || 0;
+      if (String(p.status).toUpperCase() === "FAILED_BOT2" && remain > 0) {
+        txt.textContent = `Both backup bots failed — retry available in ${_fmtCountdown(remain)}`;
+      } else {
+        txt.textContent = p.human || ("Failed: " + (p.failed_reason || "unknown"));
+      }
+      setTimeout(() => _stopProgress(gid), 4000);
+      if (row.timer) { try { clearInterval(row.timer); } catch (_) {} }
+      row.timer = null;
+      return;
+    }
+    const stage = String(p.stage || "").toLowerCase();
+    let line = p.stage_human || p.human || "Downloading…";
+    if ((stage === "downloading" || stage === "fallback_fetching")
+        && p.page && p.total) {
+      line += `  —  ${p.page} / ${p.total}`;
+    } else if (stage === "downloading" && p.page) {
+      line += `  —  page ${p.page}`;
+    }
+    txt.textContent = line;
+  };
+
+  tick();
+  row.timer = setInterval(tick, 3000);
+
+  const observer = new MutationObserver(() => {
+    if (!document.body.contains(wrap)) {
+      _stopProgress(gid);
+      try { observer.disconnect(); } catch (_) {}
+    }
+  });
+  try { observer.observe(document.body, { childList: true, subtree: true }); }
+  catch (_) {}
+}
+
 const toast = (text, kind) => make("toast", { text, kind });
 
 // v12.72: live-progress overlay for the Download button. Lightweight —

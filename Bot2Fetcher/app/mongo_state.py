@@ -245,6 +245,91 @@ class Galleries:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------ v12.72
+    def set_progress(self, gid: str, *, stage: str,
+                     page: Optional[int] = None,
+                     total: Optional[int] = None,
+                     eta_s: Optional[int] = None) -> None:
+        """v12.72: write a lightweight progress sub-doc so the mini app can
+        show a live status while Bot 2 works. Best-effort — any failure is
+        swallowed so a Mongo hiccup can NEVER block a slot. Only updates a
+        row already in STATUS_PROCESSING (never resurrects terminal rows)."""
+        try:
+            now = time.time()
+            sub: Dict[str, Any] = {
+                "progress.stage":      str(stage or ""),
+                "progress.updated_at": now,
+            }
+            if page is not None:
+                try: sub["progress.page"] = int(page)
+                except (TypeError, ValueError): pass
+            if total is not None:
+                try: sub["progress.total"] = int(total)
+                except (TypeError, ValueError): pass
+            if eta_s is not None:
+                try: sub["progress.eta_s"] = int(eta_s)
+                except (TypeError, ValueError): pass
+            self.coll.update_one(
+                {"_id": str(gid), "status": STATUS_PROCESSING},
+                {"$set": sub},
+            )
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ v12.73
+    def _queue_col(self):
+        """Bot 0's queue ledger lives in the SAME Mongo database, collection
+        'queue' (written by db.enqueue when a mini-app user taps Download on
+        a gallery not yet in the DB channel)."""
+        try:
+            return self.coll.database["queue"]
+        except Exception:
+            return None
+
+    def list_pending_queue(self, limit: int = 300):
+        """v12.73: gids from the queue ledger with status='pending'
+        (user-triggered Downloads). Oldest first. Without this the producer
+        only ever saw the Turso cache and user downloads were never picked
+        up — the 'Pending: N' count in the mini app never drained."""
+        out = []
+        try:
+            col = self._queue_col()
+            if col is None:
+                return out
+            import re as _re
+            cur = col.find({"status": "pending"}).sort("_id", 1).limit(int(limit))
+            for row in cur:
+                gid = str(row.get("gallery_id") or "").strip()
+                if not gid:
+                    m = _re.search(r"/g/(\d+)/?", str(row.get("url") or ""))
+                    gid = m.group(1) if m else ""
+                if gid:
+                    out.append(gid)
+        except Exception:
+            pass
+        return out
+
+    def mark_queue_status(self, gid: str, status: str, error: str = "") -> None:
+        """v12.73: best-effort sync of the queue ledger so the mini app's
+        Queue page reflects reality (pending -> processing -> completed /
+        failed). Never raises."""
+        try:
+            col = self._queue_col()
+            if col is None:
+                return
+            gid = str(gid)
+            upd = {"status": str(status), "updated_at": time.time()}
+            if error:
+                upd["error_reason"] = str(error)[:200]
+            col.update_many(
+                {"status": {"$in": ["pending", "processing"]},
+                 "$or": [{"gallery_id": gid},
+                         {"url": {"$regex": f"/g/{gid}/?"}}]},
+                {"$set": upd},
+            )
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------ v12.49
     def get(self, gid: str) -> Optional[Dict[str, Any]]:
         try:

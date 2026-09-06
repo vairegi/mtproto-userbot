@@ -1,36 +1,21 @@
-GUIDE_APPEND — v12.72 (2026-09-06) — Read-through Download + live progress
-WHAT: Mini App Download button now works for unseen galleries too. If
-the PDF isn't in the DB channel yet, Bot 0 transparently enqueues (same
-single-writer path /api/queue uses) and the sheet shows a compact live
-progress row that polls /api/queue/progress/<gid> every 3s until the
-PDF lands. Bot 2 writes 5 stages to a new `progress` sub-doc on the
-galleries row (fetching / downloading / fallback_fetching / compiling /
-uploading) at existing choke points — never touching the v12.49
-fallback state machine. Compiling shows "Compiling PDF…" (lightweight,
-indeterminate). FAILED_BOT2 (both bots failed → 12h park) shows a
-disabled Retry with countdown. Additive contract: older frontends fall
-back to the pre-v12.72 coarse status; older Bot 2 falls back to no
-`stage` field. Bot 2 progress writes throttled to 1/3s per slot.
-Bot 0 has a process-local single-flight guard (3s TTL) on enqueue so a
-double-tap coalesces to ONE write; Bot 2's CAS remains the real safety.
-The earlier "getUpdates Conflict" is NOT a bug — admin_bot.py already
-has the deleteWebhook boot call + /tmp/admin_bot.lock fcntl guard; the
-Conflict was a rolling-deploy overlap and the duplicate instance exits
-cleanly. Image bandwidth on Render remains ZERO (reader.js hotlinks
-i1-i4.nhentai.net); Turso reads unchanged; Mongo growth ~200B/row.
+GUIDE_APPEND — v12.73 (2026-09-06) — Bot 2 consumes mini-app queue ledger
+WHAT: 'Pending: 16' never drained because Bot 2's producer only scanned
+Turso, never the Mongo `queue` collection db.enqueue() writes on
+mini-app Download. Now: Galleries.list_pending_queue() feeds the
+producer FIRST (user work before backfill); mark_queue_status() syncs
+the ledger through pending→processing→completed/failed so the Queue
+page tells the truth. Pre-DM double-download guard is the existing
+claim_ex CAS + 'done' skip — untouched. v12.72 live-progress writes
+unchanged (5 stages, throttled 1/3s/slot, mongomock-verified). Existing
+pending rows drain naturally after redeploy; manual clear if wanted:
+db.queue.updateMany({status:"pending"},{$set:{status:"cancelled",
+updated_at:<now>,error_reason:"manual clear"}}) on the relaybot DB.
 FILES: Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
-miniapp/backend/app/services/queue_bridge.py,
-miniapp/backend/app/services/progress.py,
+miniapp/backend/app/services/{scraper_bridge,queue_bridge,progress}.py,
 miniapp/backend/app/routes/queue.py,
-miniapp/frontend/js/plugins/card-actions.js, GUIDE.md, GUIDE_APPEND.txt.
-DEPLOY: drop on repo root, commit, push, redeploy BOTH Bot 0 (miniapp)
-AND Bot 2 (fetcher). Order doesn't matter (additive contract). Users
-must fully close + reopen the Mini App once to pick up card-actions.js.
-No new env vars.
-VERIFY: tap Download on an unseen gallery — Bot 0 log shows
-`POST /api/queue/deliver/<gid> → 200 {queued:true, poll:...}`; sheet
-shows "Queued #<gid> — progress below"; the progress row cycles
-through fetching → downloading (with N/total) → compiling → uploading;
-on delivery, toast reads "✅ Ready — tap Download to open in DM". A
-double-tap or a second user on the same gid should see the SAME live
-progress bar (single-flight coalesces to one enqueue).
+miniapp/frontend/js/plugins/{card-actions,reader}.js, GUIDE*. 
+DEPLOY: drop on repo root, commit, push, redeploy Bot 0 AND Bot 2; users
+reopen the Mini App once. No new env vars.
+VERIFY: Bot 2 log shows 📨 DMing @Gallery_DLBot for a user-queued gid
+within one producer cycle; Queue Pending decreases; sheet progress row
+cycles fetching→downloading N/total→compiling→uploading→"✅ Ready".
