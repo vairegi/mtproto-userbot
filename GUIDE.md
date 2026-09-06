@@ -1517,3 +1517,18 @@ GUIDE_APPEND.txt.
   miniapp/frontend/js/core/app.js, miniapp/frontend/js/pages/queue.js,
   GUIDE.md, GUIDE_APPEND.txt.
 **Deploy:** Bot 0 only. Users reopen the Mini App once (app.js changed).
+
+## v12.78 — instant pickup for user downloads (2026-09-06)
+**Bug:** a mini-app Download tapped while Bot 2 was idle waited out the
+full producer rescan sleep (RESCAN_SLEEP_S, default 300s) before being
+claimed — observed live: #661490 queued ~5min, then completed in 22s once
+scan cycle 10 ran. The producer only read the queue ledger at scan
+boundaries and hard-slept between them.
+**Fix (Bot2Fetcher/app/fetcher.py only):** the idle sleep is now
+interruptible — the producer peeks at the queue ledger
+(list_pending_queue limit=1) every 5s and wakes immediately when a user
+row appears. The expensive full cache rescan keeps its original cadence,
+so idle cost is one tiny Mongo read per 5s (negligible). Mongo errors
+inside the peek are swallowed so a hiccup can never kill the idle loop.
+**Deploy:** Bot 2 only. No Bot 0 / frontend change.
+**Files:** Bot2Fetcher/app/fetcher.py, GUIDE.md, GUIDE_APPEND.txt.

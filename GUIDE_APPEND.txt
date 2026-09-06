@@ -1,15 +1,12 @@
-GUIDE_APPEND — v12.77 (2026-09-06) — queue counters + recent list fixes
-WHAT: (1) Header 📥 badge counted lifetime completed/failed rows — now it
-shows pending + processing only, so it moves as Bot 2 drains the queue.
-(2) "No recent jobs" despite a busy queue: Bot 0's auto-queue writes the
-separate queue_jobs collection; /api/queue/status now merges queue +
-queue_jobs newest-first (cap 15, degrades gracefully if queue_jobs is
-absent). queue.js's stale global-store write removed.
-FILES: miniapp/backend/app/services/queue_bridge.py,
-miniapp/frontend/js/core/app.js, miniapp/frontend/js/pages/queue.js,
-GUIDE.md, GUIDE_APPEND.txt.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 0 ONLY. Users FULLY
-close + reopen the Mini App once (app.js changed).
-VERIFY: header badge == Pending + Processing on the Queue tab and drops as
-jobs complete; recent list shows auto-queue items (e.g. Bot-0 auto-queued
-titles) mixed with mini-app downloads, newest first.
+GUIDE_APPEND — v12.78 (2026-09-06) — instant pickup for user downloads
+WHAT: user-tapped Downloads waited up to RESCAN_SLEEP_S (300s default) for
+Bot 2's next scan cycle even with both slots idle (#661490: ~5min queued,
+22s to complete). The producer's idle sleep is now interruptible: it polls
+the queue ledger every 5s (one find_one-sized read) and wakes the moment a
+user row lands; the full rescan cadence is unchanged. Peek errors are
+swallowed.
+FILES: Bot2Fetcher/app/fetcher.py, GUIDE.md, GUIDE_APPEND.txt.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 2 ONLY.
+VERIFY: queue a gallery from the mini app while Bot 2 logs "💤 queue
+drained — idle-waiting"; within ~5s the log shows "⚡ user queue row
+detected — waking producer early" then "🎯 slot N claimed <gid>".

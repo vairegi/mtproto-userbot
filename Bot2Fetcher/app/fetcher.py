@@ -341,9 +341,28 @@ class Fetcher:
             while not self._queue.empty() and not self._stop.is_set():
                 await asyncio.sleep(10)
             self._d_scan(phase="queue drained — idle")
-            log.info("💤 queue drained — sleeping %ds before next scan",
-                     self.s.rescan_sleep_s)
-            await asyncio.sleep(self.s.rescan_sleep_s)
+            log.info("💤 queue drained — idle-waiting (user downloads wake "
+                     "instantly; full rescan in %ds)", self.s.rescan_sleep_s)
+            # v12.78: interruptible idle sleep. Before this, a mini-app
+            # Download tapped right after a scan waited out the ENTIRE
+            # rescan_sleep_s (default 300s) even with both slots free —
+            # observed live: #661490 sat ~5min queued, then finished in 22s.
+            # Now the producer peeks at the queue ledger every few seconds
+            # (one find_one-sized read — negligible) and wakes the moment a
+            # user row appears. The expensive full cache/Turso rescan still
+            # runs on the original cadence, so idle read cost stays flat.
+            waited = 0.0
+            step = 5.0
+            while waited < float(self.s.rescan_sleep_s) and not self._stop.is_set():
+                await asyncio.sleep(step)
+                waited += step
+                try:
+                    if self.galleries.list_pending_queue(limit=1):
+                        log.info("⚡ user queue row detected — waking producer "
+                                 "early (%.0fs into idle wait)", waited)
+                        break
+                except Exception:
+                    pass  # a Mongo hiccup must never kill the idle loop
 
     async def _slot_loop(self, idx: int, client: TelegramClient) -> None:
         log.info("🧵 slot %d worker started", idx)
