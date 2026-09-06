@@ -1463,3 +1463,20 @@ limit-4 query. No new collections, no Turso, no whole-table loads.
 **Files:** Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
 miniapp/backend/app/services/queue_bridge.py,
 miniapp/frontend/js/pages/queue.js, GUIDE.md, GUIDE_APPEND.txt.
+
+## v12.76b — Workers panel stale-claim hotfix (2026-09-06)
+**Bug:** after v12.76 deployed, the "Working now" cards froze on two old
+gids (#510790/#665558) at 10% "Working…" forever while Bot 2 completed
+10+ PDFs. Root cause: `_workers` sorted `started_at` ASC and Bot 2's
+`refresh_claim` heartbeat bumps `started_at` every cycle — so LIVE workers
+are the NEWEST rows and stale/abandoned PROCESSING claims (pre-v12.76 rows,
+crashed workers; no `progress.*` at all → empty stage → 10%) were the
+OLDEST, pinned the limit-4 window, and the real workers were cut off.
+**Fix (queue_bridge.py only, Bot 0 only):** sort `started_at` DESC + a
+freshness filter — a doc only counts as a live worker if
+`progress.updated_at` (or `started_at` fallback) is ≤300s old. Stale
+claims are skipped; all-stale → empty workers[] (frontend hides panel).
+**Deploy:** Bot 0 only. No frontend change (no Mini App reload needed
+beyond the one v12.76 already required).
+**Files:** miniapp/backend/app/services/queue_bridge.py, GUIDE.md,
+GUIDE_APPEND.txt.

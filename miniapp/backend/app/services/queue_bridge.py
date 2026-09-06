@@ -291,11 +291,23 @@ def _workers(conn) -> list:
                    {"status": "PROCESSING"},
                    projection={"title": 1, "pages": 1, "started_at": 1,
                                "progress": 1})
-               .sort("started_at", 1)
+               .sort("started_at", -1)  # v12.76b: freshest first
                .limit(4))
         out = []
         for doc in cur:
             try:
+                # v12.76b: drop stale claims. A live Bot 2 worker heartbeats
+                # progress.updated_at at every stage/page tick (and bumps
+                # started_at via refresh_claim); a stuck/abandoned claim
+                # (e.g. pre-v12.76 rows, worker crash) has neither fresh and
+                # used to pin the panel forever at 10% "Working…".
+                try:
+                    fresh = float((doc.get("progress") or {}).get("updated_at")
+                                  or doc.get("started_at") or 0)
+                except (TypeError, ValueError):
+                    fresh = 0.0
+                if _sf_time.time() - fresh > 300.0:
+                    continue
                 prog = doc.get("progress") or {}
                 if not isinstance(prog, dict):
                     prog = {}
