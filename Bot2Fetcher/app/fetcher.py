@@ -281,7 +281,15 @@ class Fetcher:
         recent_ids = await self.turso.list_recent_search_ids()
         self._d_scan(phase="listing cache…")
         gallery_rows = await self.turso.list_gallery_ids()
-        gallery_rows.sort(key=lambda r: r["cached_at"], reverse=True)
+        # v12.80: same mixed-type trap as turso_store — Mongo-2 cached_at can
+        # be str on some rows; an unguarded sort would crash the whole scan
+        # cycle (outer except -> sleep 30 -> retry forever).
+        def _ca_key(r):
+            try:
+                return float(r.get("cached_at") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        gallery_rows.sort(key=_ca_key, reverse=True)
         # v12.79: the sweep exists to re-verify FRESH cache rows — walking
         # the entire (forever-growing) history every cycle is what made
         # post-restart scans take 24min for 265 already-done gids.

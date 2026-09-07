@@ -329,6 +329,19 @@ class Turso:
             log.warning("mongo2 handle failed: %s", e)
             return None
 
+    @staticmethod
+    def _ca_sort_key(d) -> float:
+        """v12.80: Mongo-2 cached_at is MIXED TYPE in prod (str on some
+        rows, int on others — Bot 1/Bot 0 wrote different shapes). Both the
+        Python fallback sort AND the primary allow_disk_use path need one
+        canonical numeric key: the fallback crashes on str<int, and the
+        primary path's BSON type-ordering silently mis-orders mixed types.
+        """
+        try:
+            return float(d.get("cached_at") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     async def _m2_list_gallery_ids(self) -> List[Dict[str, Any]]:
         """Mongo-2 mirror of list_gallery_ids (key ^gallery:, cached_at desc).
 
@@ -350,9 +363,21 @@ class Turso:
                 except Exception:
                     rows = list(col.find({"key": {"$regex": "^gallery:"}},
                                          {"key": 1, "cached_at": 1}).limit(50000))
-                    rows.sort(key=lambda d: d.get("cached_at") or 0, reverse=True)
+                    # v12.80: Mongo-2 cached_at is MIXED TYPE in prod (some
+                    # docs str, some int — Bot 1/Bot 0 wrote different shapes).
+                    # A naive sort throws "'<' not supported between str and
+                    # int", the outer except swallows it, and list_gallery_ids
+                    # returned [] every cycle — Bot 2 went blind to the cache
+                    # (dashboard: 'Lifetime cached (Turso): 0'). Coerce.
+                    def _ck(d):
+                        try:
+                            return float(d.get("cached_at") or 0)
+                        except (TypeError, ValueError):
+                            return 0.0
+                    rows.sort(key=_ck, reverse=True)
                     return rows
             rows = await _aio.to_thread(_q)
+            rows.sort(key=self._ca_sort_key, reverse=True)  # v12.80: canonical order on either path
             out = [{"gid": str(d.get("key", "")).split(":", 1)[1],
                     "cached_at": d.get("cached_at")} for d in rows
                    if str(d.get("key", "")).startswith("gallery:")]
@@ -382,9 +407,21 @@ class Turso:
                 except Exception:
                     rows = list(col.find({"key": {"$regex": "^search:"}},
                                          {"payload": 1, "cached_at": 1}).limit(500))
-                    rows.sort(key=lambda d: d.get("cached_at") or 0, reverse=True)
+                    # v12.80: Mongo-2 cached_at is MIXED TYPE in prod (some
+                    # docs str, some int — Bot 1/Bot 0 wrote different shapes).
+                    # A naive sort throws "'<' not supported between str and
+                    # int", the outer except swallows it, and list_gallery_ids
+                    # returned [] every cycle — Bot 2 went blind to the cache
+                    # (dashboard: 'Lifetime cached (Turso): 0'). Coerce.
+                    def _ck(d):
+                        try:
+                            return float(d.get("cached_at") or 0)
+                        except (TypeError, ValueError):
+                            return 0.0
+                    rows.sort(key=_ck, reverse=True)
                     return rows
             rows = await _aio.to_thread(_q)
+            rows.sort(key=self._ca_sort_key, reverse=True)  # v12.80: canonical order on either path
             out: List[str] = []
             seen: set = set()
             for d in rows:

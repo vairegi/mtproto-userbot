@@ -1,18 +1,16 @@
-GUIDE_APPEND — v12.79 (2026-09-06) — scan de-duplication
-WHAT: post-restart Bot 2 scans wasted ~24min on 265 already-done gids
-(each still cost a Mongo CAS) because the done/failed skip-sets are
-in-memory and start empty on boot; the Turso sweep also scanned all
-history forever. Fix: (1) producer start loads COMPLETED/PARTIAL into
-_known_done and FAILED_TIMEOUT/FAILED_SCRAPE/FAILED_OTHER into
-_known_failed via one projected indexed Mongo read — FAILED_BOT2_ERROR
-stays scannable (12h park retry), user queue rows bypass the sets; (2)
-sweep capped at newest SCAN_MAX_GALLERIES (env, default 2000). Failures
-degrade to old behavior. claim_ex stays the atomic final check.
-FILES: Bot2Fetcher/app/fetcher.py, Bot2Fetcher/app/config.py, GUIDE.md,
-GUIDE_APPEND.txt.
+GUIDE_APPEND — v12.80 (2026-09-07) — Bot 2 cache-blindness fix
+WHAT: Bot 2 downloaded nothing from Bot 1's overnight scrape (1200+ items).
+Every cycle: "mongo2 list_gallery_ids failed: '<' not supported between
+instances of 'str' and 'int'" — Mongo-2 cached_at is mixed str/int, the
+Python fallback sort crashed, and the function returned [] every cycle
+(dashboard: "Lifetime cached (Turso): 0"). Fix: cached_at is coerced with
+float() (garbage -> 0.0) in BOTH turso_store fallback sorts AND the
+producer's gallery_rows sort (same landmine, would have crashed next).
+FILES: Bot2Fetcher/app/turso_store.py, Bot2Fetcher/app/fetcher.py,
+GUIDE.md, GUIDE_APPEND.txt.
 DEPLOY: drop on repo root, commit, push, redeploy Bot 2 ONLY.
-VERIFY: boot log shows "🧹 warmup: loaded N done + M permanently-failed
-gids"; scan cycles show "🧹 queue: pre-filtered N known-done/failed gids
-(K candidates left)" with small K; "⏭ already in DB channel" lines
-essentially disappear; "✂️ scan window capped" appears only if cache
-exceeds 2000 rows.
+VERIFY: first cycle after deploy logs "📖 [MONGO READ] list_gallery_ids —
+N rows (BOT2_TURSO_OFF)" with N in the thousands (was absent/crashing);
+"📡 scan cycle N: M candidate galleries queued" with large M; dashboard
+"Lifetime cached" climbs from 0; slots start claiming the backlog. The
+warning line disappears.

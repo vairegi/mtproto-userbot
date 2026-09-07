@@ -1557,3 +1557,27 @@ the final atomic arbiter — the skip-set is a shortcut, never the authority.
 **Deploy:** Bot 2 only. No Bot 0 / frontend change.
 **Files:** Bot2Fetcher/app/fetcher.py, Bot2Fetcher/app/config.py, GUIDE.md,
 GUIDE_APPEND.txt.
+
+## v12.80 — Bot 2 blind to cache: mixed-type cached_at crash (2026-09-07)
+**Bug (prod-verified):** Bot 1 scraped 1200+ new galleries overnight but
+Bot 2 downloaded none of them. Every scan cycle logged
+`mongo2 list_gallery_ids failed: '<' not supported between instances of
+'str' and 'int'` and the dashboard showed "Lifetime cached (Turso): 0".
+Cause: Mongo-2's `cached_at` is MIXED TYPE (Bot 1/Bot 0 wrote some rows as
+str, some as int). When the server-side sort path falls back to Python
+(mongomock-style or 32MB fallback), `rows.sort(key=cached_at)` throws
+comparing str<int, the outer except swallows it, and the function returns
+[] — so _build_queue_order only ever saw list_recent_search_ids (6031
+ids, nearly all already done) and never the gallery inventory.
+**Fix (Bot 2 only):**
+1. turso_store.py — both Mongo-2 Python-sort fallbacks
+   (_m2_list_gallery_ids + _m2_list_recent_search_ids) now coerce
+   cached_at via float() with 0.0 on garbage.
+2. fetcher.py — the producer's gallery_rows sort had the SAME landmine
+   (would crash every scan cycle once rows flowed again); same coercion.
+**Deploy:** Bot 2 only. On the first scan after deploy the producer sees
+the full gallery cache and works through the backlog automatically —
+already-done rows are pre-filtered by v12.79's warm skip-sets, so only
+genuinely-missing PDFs get claimed.
+**Files:** Bot2Fetcher/app/turso_store.py, Bot2Fetcher/app/fetcher.py,
+GUIDE.md, GUIDE_APPEND.txt.
