@@ -70,13 +70,34 @@ class Settings:
 
 
 def load() -> Settings:
-    sessions = []
-    for name in ("STRING_SESSION", "STRING_SESSION_2"):
-        v = _first(name)
-        if v:
-            sessions.append(v)
-    if not sessions:
+    # v12.82: open-ended session discovery — read STRING_SESSION,
+    # STRING_SESSION_2, STRING_SESSION_3, ... until the first empty slot
+    # (or the safety cap). Add a new userbot by setting STRING_SESSION_N
+    # in Render env; remove one by unsetting the var. All downstream code
+    # (slot loops, dashboard sections, v12.81 5h digest) is already
+    # dynamic on len(sessions), so the new slot shows up in the log
+    # channel automatically alongside the existing two.
+    _MAX_SESSIONS = 20   # safety cap: env typo (e.g. STRING_SESSION_9999)
+                         # can never spin up a runaway loop
+    # v12.82: STRING_SESSION is REQUIRED (Bot 2 must never boot half-
+    # configured on _2/_3 alone). After that we discover STRING_SESSION_2,
+    # _3, ... until the first empty slot.
+    primary = _first("STRING_SESSION")
+    if not primary:
         raise RuntimeError("Missing required env var: STRING_SESSION")
+    sessions = [primary]
+    loaded_names = ["STRING_SESSION"]
+    n = 2
+    while n <= _MAX_SESSIONS:
+        v = _first(f"STRING_SESSION_{n}")
+        if not v:
+            break                     # first gap ends discovery
+        sessions.append(v); loaded_names.append(f"STRING_SESSION_{n}")
+        n += 1
+    import logging as _lg
+    _lg.getLogger("bot2fetcher").info(
+        "📱 Sessions loaded: %d userbot(s) — %s",
+        len(sessions), ", ".join(loaded_names))
     return Settings(
         api_id=int(_req("API_ID", "TELEGRAM_API_ID")),
         api_hash=_req("API_HASH", "TELEGRAM_API_HASH"),

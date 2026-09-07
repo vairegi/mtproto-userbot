@@ -1,15 +1,19 @@
-GUIDE_APPEND — v12.81 (2026-09-07) — 5h log digest + repost-spam fix
-WHAT: (1) NEW log-channel message every 5h (LOG_SUMMARY_HOURS env,
-default 5) with window totals: fetched/failed/dropped/floodwaits/claimed/
-cycles + per-slot breakdown + lifetime done; window resets per digest.
-(2) Live status now edits every 20s (was 30s). (3) Fixed new-message spam:
-failed edits retry next tick; a fresh live-status message is only sent
-after 10min of continuous edit failures, max one per 10min.
-FILES: Bot2Fetcher/app/dashboard.py, Bot2Fetcher/app/config.py, GUIDE.md,
-GUIDE_APPEND.txt.
+GUIDE_APPEND — v12.82 (2026-09-07) — open-ended userbot slots
+WHAT: STRING_SESSION_3 (and _4, _5, ...) now supported without a code
+change — config.py discovers sessions until the first empty slot, capped
+at 20 for safety. Backwards compatible: unset _3 -> 2 slots -> Bot 2
+behaves exactly like today. Every downstream piece was already dynamic on
+len(sessions) (slot workers, live dashboard, v12.81 5h digest) — new
+slots show up in the log channel automatically. Priority order UNCHANGED:
+user mini-app queue first, then recent scrapes, then bulk cache; all
+slots pull in parallel from one shared queue.
+FILES: Bot2Fetcher/app/config.py, GUIDE.md, GUIDE_APPEND.txt.
 DEPLOY: drop on repo root, commit, push, redeploy Bot 2 ONLY.
-VERIFY: Render log every 20s shows edit traffic (no new sendMessage
-storms); at boot+5h the log channel receives "BOT 2 — 5H DIGEST" with
-window counts matching the slots' completed jobs. To test sooner, set
-LOG_SUMMARY_HOURS=0 (0h) is NOT supported — use a small value like 1 for a
-quick check, then set back to 5.
+SETUP for a 3rd userbot: (1) the new Telegram account must DM
+@Gallery_DLBot once and join the DB channel; (2) generate its
+StringSession; (3) set STRING_SESSION_3 in Render; (4) redeploy Bot 2.
+VERIFY: boot log shows "📱 Sessions loaded: 3 userbot(s) — STRING_SESSION,
+STRING_SESSION_2, STRING_SESSION_3"; live dashboard has three slot
+sections; the next 5h digest lists three slot lines. Watch FloodWaits in
+the digest — 3-4 slots is usually the sweet spot before @Gallery_DLBot
+starts rate-limiting.

@@ -1600,3 +1600,28 @@ per-slot breakdown + lifetime done); (2) live status refresh sped up.
 **Deploy:** Bot 2 only. No Bot 0 / ScraperBot / Mini App change.
 **Files:** Bot2Fetcher/app/dashboard.py, Bot2Fetcher/app/config.py,
 GUIDE.md, GUIDE_APPEND.txt.
+
+## v12.82 — open-ended userbot slots (2026-09-07)
+**Operator ask:** add a 3rd userbot (STRING_SESSION_3), and be able to add
+more later without a code change.
+**Change (Bot 2 only, config.py):** the session loader was hardcoded to
+`("STRING_SESSION", "STRING_SESSION_2")`. Now it discovers STRING_SESSION
+then STRING_SESSION_2, _3, _4, ... until the FIRST EMPTY slot or a hard
+safety cap of 20 (so an env typo like STRING_SESSION_9999 can never spin
+up a runaway loop). Boot logs "📱 Sessions loaded: N userbot(s) — <names>".
+Everything downstream is already dynamic on len(sessions) — start()
+iterates the tuple, _slot_loop spins one worker per client, the live
+dashboard renders `for idx in range(1, n_slots+1)`, and v12.81's 5h
+digest loops `for idx in sorted(window["slots"])` — so slot 3 shows up
+in the log channel automatically next to slots 1 and 2.
+**Backwards compat:** if STRING_SESSION_3 is unset, discovery stops at 2
+and Bot 2 runs exactly like today. STRING_SESSION missing still raises,
+so Bot 2 can never boot half-configured.
+**Priority (unchanged, verified in _build_queue_order):** mini-app user
+Download queue rows go FIRST, then recent-search ids, then the rest of
+the gallery cache. All slots pull from one shared asyncio.Queue in
+parallel — a user Download is grabbed by whichever slot frees up first
+(~20-60s) while the other slots keep working the backlog. Mongo CAS in
+claim_ex prevents two slots grabbing the same gid.
+**Deploy:** Bot 2 only. No Bot 0 / ScraperBot / Mini App change.
+**Files:** Bot2Fetcher/app/config.py, GUIDE.md, GUIDE_APPEND.txt.
