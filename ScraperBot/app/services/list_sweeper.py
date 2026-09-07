@@ -309,6 +309,24 @@ async def _fetch_and_cache(
                     sort, page, new_ids)
                 log.info("🆕 %s page %d: %d new galleries %s",
                          sort, page, len(new_ids), new_ids[:5])
+                # v12.85: hand discoveries to Bot 2 directly. Bot 2 polls
+                # relaybot.scrape_notify during its idle wait AND merges it
+                # into every scan order, so a fresh scrape is claimed by a
+                # slot within seconds instead of waiting for the next
+                # rescan cycle + memo expiry (~5-7min worst case before).
+                try:
+                    import time as _t85
+                    from .. import mongo_client as _mc85
+                    _db85 = _mc85.db()
+                    if _db85 is not None:
+                        _db85["scrape_notify"].update_one(
+                            {"_id": "pending"},
+                            {"$push": {"gids": {"$each": [str(g) for g in new_ids],
+                                                "$slice": -500}},
+                             "$set": {"updated_at": _t85.time()}},
+                            upsert=True)
+                except Exception:
+                    pass  # notify is best-effort; the scan still finds them
     except Exception as e:  # noqa: BLE001
         log.debug("list_sweeper discovery record failed (non-fatal): %s", e)
 

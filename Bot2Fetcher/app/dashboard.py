@@ -198,6 +198,10 @@ def _build_message(stats, scan_info: dict, mongo_counts: dict,
             f"🧵 **Slot {idx}** — @{_md(acct)}",
             f"State: {state_emoji} `{state}`",
         ]
+        # v12.85: an idle slot that worked seconds ago must not look dead
+        if state == "idle" and slot.get("touched"):
+            ago = int(time.time() - slot["touched"])
+            lines.append(f"   🕒 last active {_fmt_uptime(max(ago, 0))} ago")
         cur = slot.get("current")
         if cur:
             title = (cur.get("title") or "")[:60]
@@ -290,6 +294,7 @@ class Dashboard:
         d = self.slots.setdefault(idx, {"state": "idle", "completed": 0,
                                         "failed": 0, "dropped": 0,
                                         "floodwaits": 0, "recent": []})
+        d["touched"] = time.time()   # v12.85: last-activity heartbeat
         d["state"] = state
         if gid:
             d["current"] = {"gid": gid, "title": title, "pages": pages, "step": step}

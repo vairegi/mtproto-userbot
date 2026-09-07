@@ -55,7 +55,7 @@ _WATERMARK_SLACK_SEC = max(0, int(_os.getenv("BOT2_LIST_WATERMARK_SLACK_S", "300
 
 # v12.55: short in-process memo for list_gallery_ids — collapses
 # rapid producer ticks into ONE Turso scan per window.
-_LIST_MEMO_TTL_SEC = max(1, int(_os.getenv("BOT2_LIST_MEMO_TTL_SEC", "120") or 120))  # v12.57: was 10s
+_LIST_MEMO_TTL_SEC = max(1, int(_os.getenv("BOT2_LIST_MEMO_TTL_SEC", "15") or 15))  # v12.85: 120s -> 15s — the memo was hiding fresh Bot-1 scrapes from the producer for up to 2 minutes ON TOP of the 300s rescan sleep
 
 
 def _normalise_url(raw: str) -> str:

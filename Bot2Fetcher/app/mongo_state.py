@@ -252,6 +252,28 @@ class Galleries:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------ v12.85
+    def pop_scrape_notifications(self, limit: int = 500):
+        """Atomically drain relaybot.scrape_notify (Bot 1's discovery
+        handoff). find_one_and_delete is atomic, so gids Bot 1 writes while
+        we work simply start a fresh doc — nothing is lost. Returns [] on
+        any error so a Mongo hiccup never stalls the producer."""
+        try:
+            doc = self.coll.database["scrape_notify"].find_one_and_delete(
+                {"_id": "pending"})
+            ids = (doc or {}).get("gids") or []
+            out = []
+            seen = set()
+            for g in ids:
+                g = str(g)
+                if g and g not in seen:
+                    seen.add(g); out.append(g)
+                if len(out) >= int(limit):
+                    break
+            return out
+        except Exception:
+            return []
+
     # ------------------------------------------------------------------ v12.84
     def reap_zombies(self) -> int:
         """Reset definitively-dead PROCESSING claims to FAILED_RECOVERED.

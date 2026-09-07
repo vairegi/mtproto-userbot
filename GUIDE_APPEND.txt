@@ -1,17 +1,17 @@
-GUIDE_APPEND — v12.84 (2026-09-07) — zombie reaper + repost throttle
-WHAT: (1) Bot 2 idled while 40 mini-app queue rows sat pending: 3 dead
-PROCESSING claims in galleries (zero-timestamp pre-v12.76 zombies + a
-28h-expired lease) made claim_ex answer "busy" forever (87 busy-skips).
-New reap_zombies() runs once per scan cycle: dead claims (no live lease)
-become FAILED_RECOVERED — queue rows flip to failed (user can re-tap,
-dedup_peek allows retry) and slots stop spinning. The legit 12h
-both-failed park (#655846, future lease) is untouched. (2) Failed
-log-channel reposts are now throttled by ATTEMPT (10min), fixing the
-sendMessage-400-every-20s loop seen when the log bot lost admin rights.
-FILES: Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
+GUIDE_APPEND — v12.85 (2026-09-07) — Bot1→Bot2 scrape handoff + dashboard honesty
+WHAT: Bot 1 discoveries now reach Bot 2 in seconds. list_sweeper pushes
+true new-gallery ids into relaybot.scrape_notify ($push $slice -500);
+Bot 2 pops it atomically — during the 5s idle poll (instant slot queue,
+no rescan) AND at every scan (priority: user queue > fresh scrapes >
+recent search > cache sweep). Search/gallery memo TTL 120s -> 15s
+(env BOT2_LIST_MEMO_TTL_SEC). Dashboard honesty: phase no longer freezes
+("slots working — N queued" while draining), idle slots show "last active
+Xm ago", and slot_state failures warn once instead of vanishing.
+FILES: ScraperBot/app/services/list_sweeper.py, Bot2Fetcher/app/
+mongo_state.py, Bot2Fetcher/app/fetcher.py, Bot2Fetcher/app/turso_store.py,
 Bot2Fetcher/app/dashboard.py, GUIDE.md, GUIDE_APPEND.txt.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 2 ONLY.
-VERIFY: first scan cycle logs "🧹 reaped 3 zombie PROCESSING claim(s)";
-mini-app Queue tab Pending drops from 40 as rows flip; dashboard Busy
-stops climbing; "Remaining" reflects real work (fresh Bot-1 scrapes —
-~197 uncached ids were waiting); no sendMessage-400 loops in Render logs.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 1 AND Bot 2.
+VERIFY: Bot 1 log "🆕 <sort> page N: M new galleries" followed within
+~5-10s by Bot 2 log "⚡ M fresh scrape id(s) from Bot 1 — queueing
+instantly" and "🎯 slot N claimed <gid>"; dashboard Phase flips between
+scan/drain states; idle slots show "last active Xm ago".

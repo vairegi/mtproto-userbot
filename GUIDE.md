@@ -1668,3 +1668,32 @@ successes.
 **Deploy:** Bot 2 only.
 **Files:** Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
 Bot2Fetcher/app/dashboard.py, GUIDE.md, GUIDE_APPEND.txt.
+
+## v12.85 — Bot 1 → Bot 2 direct scrape handoff + dashboard honesty (2026-09-07)
+**Problem 1 (prod-verified):** Bot 1 kept discovering new galleries all
+night (dashboard: 361 this phase / 2,240 in 24h) while Bot 2 sat idle —
+three stacked delays: RESCAN_SLEEP_S=300 between scans, the v12.78 wake
+poller only watched the user queue ledger, and the 120s search-ids memo
+(_LIST_MEMO_TTL_SEC) could serve a 2-min-stale id list even mid-scan.
+Worst case scrape->fetch: ~7 minutes; typical idle case: the full 300s.
+**Problem 2:** dashboard lies — "Phase" froze mid-scan after the queue
+drained ("listing cache…" forever), slots showed 😴 idle with no
+last-activity info, and _d_state failures were 100% silent.
+**Fixes:**
+1. Bot 1 list_sweeper: the existing v1.27 new_ids discovery (gids with no
+   gallery:<id> row) now also pushes into relaybot.scrape_notify
+   (single doc, $push $slice -500, upsert) — one update_one per page.
+2. Bot 2: pop_scrape_notifications() (atomic find_one_and_delete — Bot 1
+   writes during work start a fresh doc, nothing lost). The 5s idle
+   poller pops it and hands gids STRAIGHT to the slot queue (instant,
+   no rescan needed); scan order becomes user-queue > fresh scrapes >
+   recent-search > cache sweep.
+3. Memo TTL 120s -> 15s (BOT2_LIST_MEMO_TTL_SEC env override kept).
+4. Dashboard: phase updates every 10s while slots drain ("slots working —
+   N queued"); idle slots show "🕒 last active Xm ago"; _d_state failure
+   warns once instead of staying silent.
+**Deploy:** Bot 1 AND Bot 2. No Bot 0 / Mini App change.
+**Files:** ScraperBot/app/services/list_sweeper.py,
+Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
+Bot2Fetcher/app/turso_store.py, Bot2Fetcher/app/dashboard.py,
+GUIDE.md, GUIDE_APPEND.txt.

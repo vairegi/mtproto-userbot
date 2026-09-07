@@ -143,8 +143,12 @@ class Fetcher:
         if self.dash:
             try:
                 self.dash.slot_state(idx, state, gid, title, pages, step)
-            except Exception:
-                pass
+            except Exception as e:
+                # v12.85: dashboard state failures were 100% silent —
+                # the "slots always show idle" class of bug. Warn once.
+                if not getattr(self, "_d_state_warned", False):
+                    self._d_state_warned = True
+                    log.warning("📊 dashboard slot_state update failed: %s", e)
 
     def _d_event(self, idx, kind, gid):
         if self.dash:
@@ -310,6 +314,15 @@ class Fetcher:
                     seen.add(qgid); ordered.append(qgid)
         except Exception:
             pass
+        # v12.85: Bot 1 scrape notifications sit right behind user queue
+        # rows (ahead of the background sweep) — they are by definition
+        # brand-new galleries that need their PDF fetched.
+        try:
+            for ngid in self.galleries.pop_scrape_notifications():
+                if ngid not in seen:
+                    seen.add(ngid); ordered.append(ngid)
+        except Exception:
+            pass
         for gid in recent_ids:
             if gid not in seen:
                 seen.add(gid); ordered.append(gid)
@@ -396,6 +409,9 @@ class Fetcher:
                 await self._queue.put(gid)
             self.stats.cycles += 1
             while not self._queue.empty() and not self._stop.is_set():
+                # v12.85: keep the dashboard phase truthful while slots
+                # drain the queue (it used to freeze on "listing cache…").
+                self._d_scan(phase=f"slots working — {self._queue.qsize()} queued")
                 await asyncio.sleep(10)
             self._d_scan(phase="queue drained — idle")
             log.info("💤 queue drained — idle-waiting (user downloads wake "
@@ -413,6 +429,18 @@ class Fetcher:
             while waited < float(self.s.rescan_sleep_s) and not self._stop.is_set():
                 await asyncio.sleep(step)
                 waited += step
+                try:
+                    # v12.85: Bot 1 discoveries wake us TOO — pop the
+                    # notify doc and hand the gids straight to the slots.
+                    fresh = self.galleries.pop_scrape_notifications()
+                    if fresh:
+                        log.info("⚡ %d fresh scrape id(s) from Bot 1 — "
+                                 "queueing instantly", len(fresh))
+                        for fg in fresh:
+                            await self._queue.put(fg)
+                        break
+                except Exception:
+                    pass
                 try:
                     if self.galleries.list_pending_queue(limit=1):
                         log.info("⚡ user queue row detected — waking producer "
