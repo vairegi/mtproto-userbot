@@ -374,6 +374,12 @@ class Fetcher:
         self._warm_skip_sets()
         while not self._stop.is_set():
             try:
+                # v12.84: one cheap update_many per cycle — resets dead
+                # PROCESSING claims so their queue rows can finally drain.
+                try:
+                    self.galleries.reap_zombies()
+                except Exception:
+                    pass
                 ids = await self._build_queue_order()
             except Exception as e:
                 log.exception("🚨 producer scan crashed: %s", e)

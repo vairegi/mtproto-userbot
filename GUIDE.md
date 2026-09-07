@@ -1646,3 +1646,25 @@ generic edit failures still take the 10-minute path. Repost rate-limit
 **Deploy:** Bot 2 only.
 **Files:** Bot2Fetcher/app/dashboard.py, Bot2Fetcher/main.py,
 Bot2Fetcher/requirements.txt, GUIDE.md, GUIDE_APPEND.txt.
+
+## v12.84 — zombie-claim reaper + repost-attempt throttle (2026-09-07)
+**Bug 1 (prod DB-verified):** relaybot.galleries held 4 stale PROCESSING
+docs — #510790/#665558 (pre-v12.76, started_at=0, claim_expires=0) and
+#674768 (lease expired 28h) — while #655846 was a LEGIT 12h both-failed
+park (future lease). claim_ex answered "busy" forever (dashboard: 87
+busy-skips, 0 new work), and 40 pending mini-app queue rows pinned to
+those gids could never drain.
+**Fix 1:** Galleries.reap_zombies() — one update_many per scan cycle
+flips dead claims to FAILED_RECOVERED: zero-timestamp zombies
+(started_at<=0, no live lease) and leases expired >stale_s ago. Future-
+lease parks are never touched. FAILED_RECOVERED is already recognised
+downstream; claim_ex returns "failed" for it, mark_queue_status flips
+the queue row, and dedup_peek treats it as retryable on re-tap.
+**Bug 2 (prod log-verified):** after the log-channel bot lost admin
+rights, v12.83's deleted-message recovery zeroed _last_repost and a
+FAILED send retried every 20s tick (sendMessage 400 loop at 05:40).
+**Fix 2:** the 10-minute gate now throttles repost ATTEMPTS, not just
+successes.
+**Deploy:** Bot 2 only.
+**Files:** Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
+Bot2Fetcher/app/dashboard.py, GUIDE.md, GUIDE_APPEND.txt.

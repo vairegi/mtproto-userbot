@@ -252,6 +252,51 @@ class Galleries:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------ v12.84
+    def reap_zombies(self) -> int:
+        """Reset definitively-dead PROCESSING claims to FAILED_RECOVERED.
+
+        Prod-verified (2026-09-07, relaybot.galleries): pre-v12.76 rows
+        (#510790/#665558: started_at=0, claim_expires=0) and a 28h-expired
+        lease (#674768) sat in PROCESSING forever. claim_ex kept answering
+        "busy" (dashboard: 87 busy-skips, 0 progress) and the 40 pending
+        mini-app queue rows pinned to those gids could never flip.
+
+        Reaped shapes (both require NO live lease):
+          * zero-timestamp zombies: started_at<=0 AND claim_expires<=now
+          * long-expired leases:    0 < claim_expires < now - stale_s
+
+        Future-lease docs (the 12h both-bots-failed park — e.g. #655846,
+        fallback_pending=True) are NEVER touched: the park is intentional.
+        FAILED_RECOVERED is a recognised status downstream (progress.py
+        _HUMAN maps it "Failed earlier — retry queued"); claim_ex returns
+        "failed" for it, which flips the queue-ledger row to failed via
+        mark_queue_status — and a user re-tap proceeds normally because
+        dedup_peek treats FAILED_* as retryable.
+        """
+        try:
+            now = time.time()
+            res = self.coll.update_many(
+                {"status": STATUS_PROCESSING,
+                 "$or": [
+                     {"started_at": {"$lte": 0},
+                      "claim_expires": {"$lte": now}},
+                     {"claim_expires": {"$gt": 0,
+                                        "$lt": now - float(self.stale_s)}},
+                 ]},
+                {"$set": {"status": "FAILED_RECOVERED",
+                          "failed_reason": "stale claim reaped (v12.84)",
+                          "updated_at": now}},
+            )
+            n = int(getattr(res, "modified_count", 0) or 0)
+            if n:
+                log.warning("🧹 reaped %d zombie PROCESSING claim(s) -> "
+                            "FAILED_RECOVERED", n)
+            return n
+        except Exception as e:  # noqa: BLE001
+            log.warning("reap_zombies failed (non-fatal): %s", e)
+            return 0
+
     # ------------------------------------------------------------------ v12.73
     def _queue_col(self):
         """Bot 0's queue ledger lives in the SAME Mongo database, collection

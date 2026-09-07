@@ -420,10 +420,14 @@ class Dashboard:
                     self.msg_id = 0
         if not self.msg_id and time.time() - self._last_repost >= 600:
             new_id = await self.bot.send_markdown(text)
+            # v12.84: throttle the ATTEMPT, not just the success — prod
+            # 2026-09-07: bot lost channel admin rights, v12.83's deleted-
+            # message path zeroed _last_repost, and a FAILED repost then
+            # retried every 20s tick ("sendMessage 400" log loop).
+            self._last_repost = time.time()
             if new_id:
                 self.msg_id = new_id
                 self._edit_fail_since = 0.0
-                self._last_repost = time.time()
                 await self.turso.put_state(
                     "_dashboard", {"bot_msg_id": self.msg_id})
 
