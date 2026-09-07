@@ -1,17 +1,14 @@
-GUIDE_APPEND — v12.85 (2026-09-07) — Bot1→Bot2 scrape handoff + dashboard honesty
-WHAT: Bot 1 discoveries now reach Bot 2 in seconds. list_sweeper pushes
-true new-gallery ids into relaybot.scrape_notify ($push $slice -500);
-Bot 2 pops it atomically — during the 5s idle poll (instant slot queue,
-no rescan) AND at every scan (priority: user queue > fresh scrapes >
-recent search > cache sweep). Search/gallery memo TTL 120s -> 15s
-(env BOT2_LIST_MEMO_TTL_SEC). Dashboard honesty: phase no longer freezes
-("slots working — N queued" while draining), idle slots show "last active
-Xm ago", and slot_state failures warn once instead of vanishing.
-FILES: ScraperBot/app/services/list_sweeper.py, Bot2Fetcher/app/
-mongo_state.py, Bot2Fetcher/app/fetcher.py, Bot2Fetcher/app/turso_store.py,
-Bot2Fetcher/app/dashboard.py, GUIDE.md, GUIDE_APPEND.txt.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 1 AND Bot 2.
-VERIFY: Bot 1 log "🆕 <sort> page N: M new galleries" followed within
-~5-10s by Bot 2 log "⚡ M fresh scrape id(s) from Bot 1 — queueing
-instantly" and "🎯 slot N claimed <gid>"; dashboard Phase flips between
-scan/drain states; idle slots show "last active Xm ago".
+GUIDE_APPEND — v12.86 (2026-09-07) — queue-ledger reaper
+WHAT: the Queue tab's Pending badge (41) was phantom backlog — 42 pending
+ledger rows all pointed at gids already COMPLETED in the DB channel, and
+nothing reconciled the ledger against the state machine. Bot 2 now runs
+reap_queue_ledger() once per scan cycle: pending rows whose gid is
+COMPLETED/PARTIAL flip to 'completed' (one batched $in read, max 300 rows
+per cycle). Parked (12h both-failed) and never-claimed gids stay pending.
+FILES: Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
+GUIDE.md, GUIDE_APPEND.txt.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 2 ONLY.
+VERIFY: first scan cycle logs "🧹 ledger reaper: flipped N stale pending
+row(s)"; the mini-app Queue tab Pending count drops to the true value;
+📥 badges in Discover are Bot 1's detail-hydration backlog (unrelated —
+those galleries hydrate as Bot 1's sweeper gets to them).

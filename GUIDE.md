@@ -1697,3 +1697,24 @@ last-activity info, and _d_state failures were 100% silent.
 Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
 Bot2Fetcher/app/turso_store.py, Bot2Fetcher/app/dashboard.py,
 GUIDE.md, GUIDE_APPEND.txt.
+
+## v12.86 — queue-ledger reaper: the phantom "41 pending" badge (2026-09-07)
+**Bug (prod DB-verified):** all 42 'pending' rows in relaybot.queue
+pointed at gids already COMPLETED in galleries. claim_ex answers "done"
+for them every scan (the ✅ counter climbs) but the LEDGER row itself was
+never flipped — mark_queue_status only runs on the live claim path
+(v12.73) and these rows predated it or raced it — so the mini-app Queue
+tab showed a permanent fake Pending badge.
+**Fix (Bot 2 only):** Galleries.reap_queue_ledger() runs once per scan
+cycle, right after reap_zombies(): pulls up to 300 pending rows, one
+batched $in read against galleries, flips rows whose gid is COMPLETED/
+PARTIAL to 'completed'. Parked (12h both-failed) and unknown gids stay
+pending — the user retry path and real work are preserved.
+**Also confirmed from the same probe:** newest-2000 cached gids -> 0
+missing from the DB channel; zero cache rows written in the last hour —
+Bot 2's idleness was real absence of work, not a stall. The remaining
+PROCESSING row (#655846) is a legitimate 12h park that self-retries.
+**Deploy:** Bot 2 only. The Queue tab badge drops to the true count on
+the first scan cycle after deploy.
+**Files:** Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
+GUIDE.md, GUIDE_APPEND.txt.

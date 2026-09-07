@@ -391,6 +391,9 @@ class Fetcher:
                 # PROCESSING claims so their queue rows can finally drain.
                 try:
                     self.galleries.reap_zombies()
+                    # v12.86: reconcile the mini-app ledger — pending rows
+                    # whose gid is already COMPLETED are phantom backlog.
+                    self.galleries.reap_queue_ledger()
                 except Exception:
                     pass
                 ids = await self._build_queue_order()

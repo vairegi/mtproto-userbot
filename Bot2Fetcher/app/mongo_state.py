@@ -252,6 +252,58 @@ class Galleries:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------ v12.86
+    def reap_queue_ledger(self, limit: int = 300) -> int:
+        """Flip queue rows whose gid already has a terminal galleries doc.
+
+        Prod-verified (2026-09-07): 42 'pending' ledger rows pointed at
+        COMPLETED galleries — the mini-app Queue tab showed a fake '41'
+        badge forever because nothing ever reconciled the ledger against
+        the state machine when the claim path answered 'done' (the v12.73
+        mark_queue_status sync only covers the live claim path; older rows
+        and races slipped through).
+
+        One pass: pull up to `limit` pending rows, batch-read their
+        galleries docs with a single $in query, flip done gids to
+        'completed'. Failed/parked gids are left pending on purpose — the
+        producer will retry or park them through the normal claim path.
+        """
+        try:
+            q = self._queue_col()
+            if q is None:
+                return 0
+            rows = list(q.find({"status": "pending"},
+                               {"url": 1}).sort("_id", 1).limit(int(limit)))
+            if not rows:
+                return 0
+            import re as _re
+            gid_of = {}
+            for r in rows:
+                m = _re.search(r"/g/(\d+)", str(r.get("url") or ""))
+                if m:
+                    gid_of[m.group(1)] = r["_id"]
+            if not gid_of:
+                return 0
+            done = set()
+            for d in self.coll.find(
+                    {"_id": {"$in": list(gid_of)},
+                     "status": {"$in": list(DONE_STATUSES)}},
+                    {"_id": 1}):
+                done.add(str(d["_id"]))
+            n = 0
+            for gid in done:
+                res = q.update_one({"_id": gid_of[gid], "status": "pending"},
+                                   {"$set": {"status": "completed",
+                                             "updated_at": time.time()}})
+                n += int(getattr(res, "modified_count", 0) or 0)
+            if n:
+                log.info("🧹 ledger reaper: flipped %d stale pending row(s) "
+                         "-> completed (gid already in DB channel)", n)
+            return n
+        except Exception as e:  # noqa: BLE001
+            log.warning("reap_queue_ledger failed (non-fatal): %s", e)
+            return 0
+
     # ------------------------------------------------------------------ v12.85
     def pop_scrape_notifications(self, limit: int = 500):
         """Atomically drain relaybot.scrape_notify (Bot 1's discovery
