@@ -1,16 +1,15 @@
-GUIDE_APPEND — v12.80 (2026-09-07) — Bot 2 cache-blindness fix
-WHAT: Bot 2 downloaded nothing from Bot 1's overnight scrape (1200+ items).
-Every cycle: "mongo2 list_gallery_ids failed: '<' not supported between
-instances of 'str' and 'int'" — Mongo-2 cached_at is mixed str/int, the
-Python fallback sort crashed, and the function returned [] every cycle
-(dashboard: "Lifetime cached (Turso): 0"). Fix: cached_at is coerced with
-float() (garbage -> 0.0) in BOTH turso_store fallback sorts AND the
-producer's gallery_rows sort (same landmine, would have crashed next).
-FILES: Bot2Fetcher/app/turso_store.py, Bot2Fetcher/app/fetcher.py,
-GUIDE.md, GUIDE_APPEND.txt.
+GUIDE_APPEND — v12.81 (2026-09-07) — 5h log digest + repost-spam fix
+WHAT: (1) NEW log-channel message every 5h (LOG_SUMMARY_HOURS env,
+default 5) with window totals: fetched/failed/dropped/floodwaits/claimed/
+cycles + per-slot breakdown + lifetime done; window resets per digest.
+(2) Live status now edits every 20s (was 30s). (3) Fixed new-message spam:
+failed edits retry next tick; a fresh live-status message is only sent
+after 10min of continuous edit failures, max one per 10min.
+FILES: Bot2Fetcher/app/dashboard.py, Bot2Fetcher/app/config.py, GUIDE.md,
+GUIDE_APPEND.txt.
 DEPLOY: drop on repo root, commit, push, redeploy Bot 2 ONLY.
-VERIFY: first cycle after deploy logs "📖 [MONGO READ] list_gallery_ids —
-N rows (BOT2_TURSO_OFF)" with N in the thousands (was absent/crashing);
-"📡 scan cycle N: M candidate galleries queued" with large M; dashboard
-"Lifetime cached" climbs from 0; slots start claiming the backlog. The
-warning line disappears.
+VERIFY: Render log every 20s shows edit traffic (no new sendMessage
+storms); at boot+5h the log channel receives "BOT 2 — 5H DIGEST" with
+window counts matching the slots' completed jobs. To test sooner, set
+LOG_SUMMARY_HOURS=0 (0h) is NOT supported — use a small value like 1 for a
+quick check, then set back to 5.

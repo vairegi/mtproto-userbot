@@ -1581,3 +1581,22 @@ already-done rows are pre-filtered by v12.79's warm skip-sets, so only
 genuinely-missing PDFs get claimed.
 **Files:** Bot2Fetcher/app/turso_store.py, Bot2Fetcher/app/fetcher.py,
 GUIDE.md, GUIDE_APPEND.txt.
+
+## v12.81 — 5-hourly log digest + repost-spam fix (2026-09-07)
+**Operator asks:** (1) a NEW message in the log channel every 5 hours with
+that window's totals (fetched / failed / dropped / floodwaits / cycles /
+per-slot breakdown + lifetime done); (2) live status refresh sped up.
+**Changes (Bot 2 only):**
+1. dashboard.py EDIT_EVERY_S 30 -> 20s (operator request).
+2. New _build_digest() + window counters fed by slot_event (completed/
+   failed/dropped/floodwait) and stats snapshot (claimed/cycles). Every
+   LOG_SUMMARY_HOURS (env, default 5) a NEW digest message is posted —
+   channel-notifying by design. Window resets after each post. Digest
+   failures are swallowed and retried next tick.
+3. Repost-spam fix: a failed live-status edit no longer posts a fresh
+   channel message immediately. Edits are retried each tick; a new live
+   message is only sent after 10 continuous minutes of edit failures (and
+   new-message sends are capped at one per 10 minutes overall).
+**Deploy:** Bot 2 only. No Bot 0 / ScraperBot / Mini App change.
+**Files:** Bot2Fetcher/app/dashboard.py, Bot2Fetcher/app/config.py,
+GUIDE.md, GUIDE_APPEND.txt.
