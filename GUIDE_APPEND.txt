@@ -1,19 +1,18 @@
-GUIDE_APPEND — v12.82 (2026-09-07) — open-ended userbot slots
-WHAT: STRING_SESSION_3 (and _4, _5, ...) now supported without a code
-change — config.py discovers sessions until the first empty slot, capped
-at 20 for safety. Backwards compatible: unset _3 -> 2 slots -> Bot 2
-behaves exactly like today. Every downstream piece was already dynamic on
-len(sessions) (slot workers, live dashboard, v12.81 5h digest) — new
-slots show up in the log channel automatically. Priority order UNCHANGED:
-user mini-app queue first, then recent scrapes, then bulk cache; all
-slots pull in parallel from one shared queue.
-FILES: Bot2Fetcher/app/config.py, GUIDE.md, GUIDE_APPEND.txt.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 2 ONLY.
-SETUP for a 3rd userbot: (1) the new Telegram account must DM
-@Gallery_DLBot once and join the DB channel; (2) generate its
-StringSession; (3) set STRING_SESSION_3 in Render; (4) redeploy Bot 2.
-VERIFY: boot log shows "📱 Sessions loaded: 3 userbot(s) — STRING_SESSION,
-STRING_SESSION_2, STRING_SESSION_3"; live dashboard has three slot
-sections; the next 5h digest lists three slot lines. Watch FloodWaits in
-the digest — 3-4 slots is usually the sweet spot before @Gallery_DLBot
-starts rate-limiting.
+GUIDE_APPEND — v12.83 (2026-09-07) — log recovery + RAM visibility
+WHAT: (1) If the live status message is deleted from the log channel
+(prod: edits 400ed "message to edit not found" from 05:10 on), the
+dashboard now reposts on the next ~20s tick instead of waiting out the
+10min anti-spam path; generic edit failures unchanged. (2) RAM everywhere:
+live message footer "RAM: NNNMB / 512MB (NN%)", same line in the 5h
+digest, "🧠 boot RAM" line in Render logs, and a new /checkram command in
+the log channel (polled once per 20s tick via getUpdates timeout=0).
+psutil added to Bot2Fetcher/requirements.txt; missing psutil degrades to
+"RAM: n/a", never crashes.
+FILES: Bot2Fetcher/app/dashboard.py, Bot2Fetcher/main.py,
+Bot2Fetcher/requirements.txt, GUIDE.md, GUIDE_APPEND.txt.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 2 ONLY (Render
+installs psutil from requirements automatically).
+VERIFY: Render boot log shows "🧠 boot RAM: NNN MB RSS"; live status
+message footer shows the RAM line and refreshes every 20s; send /checkram
+in the log channel -> bot replies with current RSS; delete the live
+status message -> a fresh one appears within ~20s.

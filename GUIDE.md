@@ -1625,3 +1625,24 @@ parallel — a user Download is grabbed by whichever slot frees up first
 claim_ex prevents two slots grabbing the same gid.
 **Deploy:** Bot 2 only. No Bot 0 / ScraperBot / Mini App change.
 **Files:** Bot2Fetcher/app/config.py, GUIDE.md, GUIDE_APPEND.txt.
+
+## v12.83 — log-channel recovery + RAM everywhere (2026-09-07)
+**Bug (prod-verified):** live status edits began failing at 05:10 with
+`400 Bad Request: message to edit not found` — the dashboard message had
+been deleted from the log channel. v12.81's 10min anti-spam throttle held
+(no repost storm) but left the channel blind for up to 10 minutes.
+**Fix:** when the edit error is specifically "message to edit not found",
+the dashboard flags the message gone and reposts on the NEXT tick (~20s);
+generic edit failures still take the 10-minute path. Repost rate-limit
+(one new message / 10min) unchanged.
+**RAM (operator ask, mirrors Bot 1 /checkram):**
+1. Live status message now ends with `RAM: NNNMB / 512MB (NN%)`.
+2. The 5h digest carries the same line.
+3. Render boot log prints `🧠 boot RAM: NNN MB RSS` at startup.
+4. NEW /checkram command in the log channel: dashboard polls getUpdates
+   once per 20s tick (timeout=0, no long-poll) and replies with live RSS.
+5. Bot2Fetcher/requirements.txt gains psutil>=5.9,<6.0 (same pin family as
+   Bot 0). psutil missing anywhere degrades to "RAM: n/a" — never crashes.
+**Deploy:** Bot 2 only.
+**Files:** Bot2Fetcher/app/dashboard.py, Bot2Fetcher/main.py,
+Bot2Fetcher/requirements.txt, GUIDE.md, GUIDE_APPEND.txt.

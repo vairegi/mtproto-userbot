@@ -27,6 +27,12 @@ logging.basicConfig(
 log = logging.getLogger("bot2fetcher")
 
 settings = load()
+try:  # v12.83: RAM visibility in Render logs from first boot
+    import psutil as _ps
+    log.info("🧠 boot RAM: %.0f MB RSS (Render free tier: 512 MB)",
+             _ps.Process().memory_info().rss / (1024 * 1024))
+except Exception:
+    log.info("🧠 boot RAM: psutil unavailable")
 stats = Stats()
 _db = mongo_connect(settings.mongo_uri, settings.mongo_db)
 galleries = Galleries(_db, settings.stale_processing_s)

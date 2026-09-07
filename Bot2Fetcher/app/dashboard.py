@@ -74,6 +74,7 @@ class LogBot:
         # so send/edit never hit a silent "chat not found".
         self.chat_id = _coerce_chat_id(chat_id)
         self._me: Optional[Dict[str, Any]] = None
+        self._last_error_desc: str = ""   # v12.83
 
     async def _call(self, method: str, payload: dict) -> Optional[dict]:
         # v12.41: loud-logging port of ScraperBot v1.21 _tg_api. Every non-ok
@@ -90,6 +91,7 @@ class LogBot:
             return None
         if not data.get("ok"):
             desc = str(data.get("description", ""))[:400]
+            self._last_error_desc = desc   # v12.83: lets _tick distinguish deleted-message 400s
             code = data.get("error_code")
             # "message is not modified" is harmless — edit called with same text.
             if "message is not modified" in desc.lower():
@@ -141,6 +143,17 @@ class LogBot:
                 "text": text, "disable_web_page_preview": True,
             })
         return r is not None
+
+
+def _ram_line() -> str:
+    """v12.83: live RSS of this Bot 2 process vs the 512MB Render free
+    tier. Never raises — missing psutil renders n/a."""
+    try:
+        import psutil
+        rss = psutil.Process().memory_info().rss / (1024 * 1024)
+        return f"RAM: {rss:.0f}MB / 512MB ({rss / 512 * 100:.0f}%)"
+    except Exception:
+        return "RAM: n/a (psutil missing)"
 
 
 def _build_message(stats, scan_info: dict, mongo_counts: dict,
@@ -261,6 +274,7 @@ class Dashboard:
         self._last_digest = time.time()
         self._last_repost = 0.0      # rate-limit new live-status messages
         self._edit_fail_since = 0.0
+        self._upd_offset = 0            # v12.83: /checkram poller
 
     def set_account(self, idx: int, username: str) -> None:
         self.accounts[idx] = username
@@ -304,6 +318,28 @@ class Dashboard:
             d["recent"].append(f"{mark} #{gid}")
             d["recent"] = d["recent"][-3:]
 
+    async def _poll_commands(self) -> None:
+        """v12.83: /checkram for the log channel. One short getUpdates
+        poll per 20s tick (timeout=0 — no long-poll hold). All failures
+        swallowed so a Telegram hiccup can never stall the dashboard."""
+        try:
+            r = await self.bot._call("getUpdates", {
+                "offset": self._upd_offset, "timeout": 0,
+                "allowed_updates": ["message"]})
+            if not r:
+                return
+            for u in r:
+                try:
+                    self._upd_offset = int(u.get("update_id", 0)) + 1
+                except Exception:
+                    pass
+                m = u.get("message") or {}
+                txt = str(m.get("text") or "").strip().split("@")[0].lower()
+                if txt == "/checkram":
+                    await self.bot.send_markdown("🧠 " + _ram_line())
+        except Exception:
+            pass
+
     async def run(self, fetcher) -> None:
         if not self.s.log_channel_id:
             log.info("📭 dashboard disabled (LOG_CHANNEL_ID unset)")
@@ -333,6 +369,7 @@ class Dashboard:
         while not fetcher._stop.is_set():
             try:
                 await self._tick(len(fetcher.clients))
+                await self._poll_commands()   # v12.83
             except Exception as e:
                 log.warning("📊 dashboard tick failed: %s", e)
             await asyncio.sleep(EDIT_EVERY_S)
@@ -351,6 +388,7 @@ class Dashboard:
                                         "floodwaits": 0, "recent": []})
         text = _build_message(self.stats, self.scan_info, mongo_counts,
                               self.slots, self.accounts)
+        text += "\n" + _ram_line()   # v12.83
         # Telegram caps at 4096 chars.
         if len(text) > 4000:
             text = text[:3990] + "\n…"
@@ -369,6 +407,14 @@ class Dashboard:
                 # have been failing continuously for >= 10 minutes.
                 if not self._edit_fail_since:
                     self._edit_fail_since = time.time()
+                # v12.83: hard-deleted message -> recover on THIS tick,
+                # not after 10min (prod 2026-09-07: edits 400ed "message to
+                # edit not found" from 05:10 on; channel went blind).
+                if "message to edit not found" in \
+                        (getattr(self.bot, "_last_error_desc", "") or "").lower():
+                    log.info("📊 live status message deleted — reposting now")
+                    self.msg_id = 0
+                    self._last_repost = 0.0
                 if time.time() - self._edit_fail_since >= 600:
                     log.info("📊 edits failing 10min — reposting live status")
                     self.msg_id = 0
@@ -391,7 +437,8 @@ class Dashboard:
                 lifetime = int(self.stats.snapshot().get("completed", 0) or 0)
                 up = now - float(self.stats.started_at or now)
                 await self.bot.send_markdown(
-                    _build_digest(w, lifetime, up, self.accounts))
+                    _build_digest(w, lifetime, up, self.accounts)
+                    + "\n\n" + _ram_line())   # v12.83
             except Exception as e:  # noqa: BLE001
                 log.warning("📊 digest post failed (non-fatal): %s", e)
             self._window = {"started": time.time(), "claimed": 0, "done": 0,
