@@ -23,7 +23,7 @@ import httpx
 
 log = logging.getLogger("bot2fetcher.dashboard")
 
-EDIT_EVERY_S = 30
+EDIT_EVERY_S = 20   # v12.81: operator-set live refresh (was 30)
 _API = "https://api.telegram.org"
 
 # Markdown special chars that must NOT be inside our field values.
@@ -213,6 +213,35 @@ def _build_message(stats, scan_info: dict, mongo_counts: dict,
     return body
 
 
+def _build_digest(window: dict, lifetime_done: int, up_s: float,
+                  accounts: Dict[int, str]) -> str:
+    """v12.81: 5-hourly window summary — a NEW message that pings the log
+    channel. `window` holds counters accumulated since the last digest."""
+    def _hrs(secs: float) -> str:
+        h = int(secs // 3600); m = int((secs % 3600) // 60)
+        return f"{h}h{m:02d}m" if h else f"{m}m"
+    lines = [
+        "BOT 2 — 5H DIGEST",
+        f"window: {_hrs(window.get('window_s', 0))} (uptime {_hrs(up_s)})",
+        "",
+        f"fetched this window: {window.get('done', 0)} "
+        f"(lifetime: {lifetime_done})",
+        f"claimed: {window.get('claimed', 0)}  "
+        f"scan cycles: {window.get('cycles', 0)}",
+        f"failed: {window.get('failed', 0)}  "
+        f"dropped: {window.get('dropped', 0)}  "
+        f"floodwaits: {window.get('floodwaits', 0)}",
+        "",
+    ]
+    for idx in sorted(window.get("slots", {})):
+        sw = window["slots"][idx]
+        uname = accounts.get(idx) or "(no username)"
+        lines.append(
+            f"  slot {idx} @{uname}: ok={sw.get('done', 0)} "
+            f"fail={sw.get('failed', 0)} drop={sw.get('dropped', 0)}")
+    return "\n".join(lines)
+
+
 class Dashboard:
     def __init__(self, settings, turso, stats):
         self.s = settings
@@ -224,6 +253,14 @@ class Dashboard:
         self.accounts: Dict[int, str] = {}
         self.galleries = None
         self.bot: Optional[LogBot] = None
+
+        # v12.81: 5h window digest + repost throttle
+        self._window = {"started": time.time(), "claimed": 0, "done": 0,
+                        "failed": 0, "dropped": 0, "floodwaits": 0,
+                        "cycles": 0, "slots": {}}
+        self._last_digest = time.time()
+        self._last_repost = 0.0      # rate-limit new live-status messages
+        self._edit_fail_since = 0.0
 
     def set_account(self, idx: int, username: str) -> None:
         self.accounts[idx] = username
@@ -253,9 +290,16 @@ class Dashboard:
                                         "floodwaits": 0, "recent": []})
         if kind == "floodwait":
             d["floodwaits"] += 1
+            self._window["floodwaits"] += 1
             return
         if kind in ("completed", "failed", "dropped"):
             d[kind] += 1
+            sw = self._window["slots"].setdefault(
+                idx, {"done": 0, "failed": 0, "dropped": 0})
+            key = {"completed": "done", "failed": "failed",
+                   "dropped": "dropped"}[kind]
+            self._window[key] += 1
+            sw[key] += 1
             mark = {"completed": "✅", "failed": "❌", "dropped": "🧹"}[kind]
             d["recent"].append(f"{mark} #{gid}")
             d["recent"] = d["recent"][-3:]
@@ -311,12 +355,46 @@ class Dashboard:
         if len(text) > 4000:
             text = text[:3990] + "\n…"
 
+        # v12.81: window accounting from stats snapshot
+        snap = self.stats.snapshot()
+        self._window["cycles"] = int(snap.get("cycles", 0) or 0)
+        self._window["claimed"] = int(snap.get("claimed", 0) or 0)
+
         if self.msg_id:
             if await self.bot.edit_markdown(self.msg_id, text):
-                return
-            log.info("📊 edit failed — reposting")
-            self.msg_id = 0
-        new_id = await self.bot.send_markdown(text)
-        if new_id:
-            self.msg_id = new_id
-            await self.turso.put_state("_dashboard", {"bot_msg_id": self.msg_id})
+                self._edit_fail_since = 0.0
+            else:
+                # v12.81: do NOT repost instantly — a flaky edit used to spam
+                # a new channel message every cycle. Only repost after edits
+                # have been failing continuously for >= 10 minutes.
+                if not self._edit_fail_since:
+                    self._edit_fail_since = time.time()
+                if time.time() - self._edit_fail_since >= 600:
+                    log.info("📊 edits failing 10min — reposting live status")
+                    self.msg_id = 0
+        if not self.msg_id and time.time() - self._last_repost >= 600:
+            new_id = await self.bot.send_markdown(text)
+            if new_id:
+                self.msg_id = new_id
+                self._edit_fail_since = 0.0
+                self._last_repost = time.time()
+                await self.turso.put_state(
+                    "_dashboard", {"bot_msg_id": self.msg_id})
+
+        # v12.81: 5-hourly digest — a NEW message (pings the channel)
+        now = time.time()
+        due_s = float(getattr(self.s, "log_summary_hours", 5)) * 3600.0
+        if now - self._last_digest >= due_s:
+            try:
+                w = dict(self._window)
+                w["window_s"] = now - w["started"]
+                lifetime = int(self.stats.snapshot().get("completed", 0) or 0)
+                up = now - float(self.stats.started_at or now)
+                await self.bot.send_markdown(
+                    _build_digest(w, lifetime, up, self.accounts))
+            except Exception as e:  # noqa: BLE001
+                log.warning("📊 digest post failed (non-fatal): %s", e)
+            self._window = {"started": time.time(), "claimed": 0, "done": 0,
+                            "failed": 0, "dropped": 0, "floodwaits": 0,
+                            "cycles": 0, "slots": {}}
+            self._last_digest = now

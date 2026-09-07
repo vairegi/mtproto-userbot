@@ -61,6 +61,7 @@ class Settings:
     stale_processing_s: int
     rescan_sleep_s: int
     scan_max_galleries: int
+    log_summary_hours: int
     port: int
 
     def __repr__(self) -> str:
@@ -102,5 +103,6 @@ def load() -> Settings:
         stale_processing_s=_int("STALE_PROCESSING_S", 900),
         rescan_sleep_s=_int("RESCAN_SLEEP_S", 300),
         scan_max_galleries=_int("SCAN_MAX_GALLERIES", 2000),
+        log_summary_hours=_int("LOG_SUMMARY_HOURS", 5),
         port=_int("PORT", 8080),
     )
