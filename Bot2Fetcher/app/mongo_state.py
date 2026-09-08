@@ -326,6 +326,60 @@ class Galleries:
         except Exception:
             return []
 
+    # ------------------------------------------------------------------ v12.88
+    def log_starving_queue(self, warn_after_s: int = 900) -> None:
+        """Loud-log user queue rows stuck 'pending' with no galleries doc.
+
+        A row in this state means the producer can see it but no slot ever
+        claims it (or every claim is dropped without a trace) — exactly the
+        v12.44 in-memory blackhole class that stranded gid 679381 for 4h.
+        One batched $in read per scan cycle; rate-limited to one log line
+        per gid per hour. Never raises."""
+        try:
+            col = self._queue_col()
+            if col is None:
+                return
+            now = time.time()
+            rows = list(col.find(
+                {"status": "pending",
+                 "updated_at": {"$lt": now - int(warn_after_s)}},
+                {"url": 1, "gallery_id": 1, "updated_at": 1}).limit(20))
+            if not rows:
+                return
+            import re as _re
+            gid_of = {}
+            for r in rows:
+                gid = str(r.get("gallery_id") or "").strip()
+                if not gid:
+                    m = _re.search(r"/g/(\d+)/?", str(r.get("url") or ""))
+                    gid = m.group(1) if m else ""
+                if gid:
+                    gid_of[gid] = r
+            if not gid_of:
+                return
+            have = set()
+            for d in self.coll.find({"_id": {"$in": list(gid_of)}}, {"_id": 1}):
+                have.add(str(d["_id"]))
+            cache = getattr(self, "_starve_warned", None)
+            if cache is None:
+                cache = self._starve_warned = {}
+            for gid, row in gid_of.items():
+                if gid in have:
+                    continue          # doc exists -> normal claim path owns it
+                last = float(cache.get(gid) or 0)
+                if now - last < 3600:
+                    continue          # already alarmed this hour
+                cache[gid] = now
+                try:
+                    age = int(now - float(row.get("updated_at") or now))
+                except (TypeError, ValueError):
+                    age = -1
+                log.error("🚨 user queue row STARVING: #%s pending %ds with "
+                          "no galleries doc — user download is not being "
+                          "picked up by any slot", gid, age)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------ v12.84
     def reap_zombies(self) -> int:
         """Reset definitively-dead PROCESSING claims to FAILED_RECOVERED.

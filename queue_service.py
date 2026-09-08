@@ -28,7 +28,8 @@ from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import db
-from url_utils import BatchParseResult, ParsedGalleryURL, parse_batch
+import gallery_state as _gs  # v12.88: extract gallery_id for queue rows
+from url_utils import BatchParseResult, parse_batch  # v12.88: dropped unused ParsedGalleryURL (lint-clean)
 
 
 @dataclass
@@ -112,8 +113,12 @@ def enqueue_batch(
                 if db.has_pending_or_processing(conn, p.url_hash):
                     res.skipped_already_pending.append(p.normalised)
                     continue
+                # v12.88: stamp gallery_id on the queue row so Bot 2's
+                # list_pending_queue never depends on the URL regex fallback.
+                _gid = _gs.extract_gallery_id(p.normalised)
                 job_id = db.enqueue(
                     conn, p.normalised, p.url_hash,
+                    gallery_id=_gid,
                     submitted_by=submitted_by,
                     chat_id=chat_id,
                     via_search=via_search,

@@ -129,6 +129,13 @@ class Fetcher:
         # slots never spend claim+cache-read time on known-finished work.
         self._known_done: set = set()
         self._known_failed: set = set()
+        # v12.88: time-boxed cooldown for transient drop_claim failures
+        # (primary timeout / unusable meta). Replaces the permanent
+        # _known_failed.add() blackhole that stranded user queue rows
+        # until the next process restart (live case: gid 679381).
+        self._retry_after: dict = {}
+        self._retry_cooldown_s = int(
+            getattr(self.s, "retry_cooldown_s", 1800) or 1800)
         self._queue: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
         self._channel_per_slot: dict[int, Any] = {}
@@ -308,10 +315,12 @@ class Fetcher:
         # galleries) go FIRST — Bot 0 writes them to Mongo 'queue' with
         # status='pending'; without this the producer only ever saw the
         # Turso cache and user downloads were never picked up.
+        user_gids: set = set()
         try:
             for qgid in self.galleries.list_pending_queue():
                 if qgid not in seen:
                     seen.add(qgid); ordered.append(qgid)
+                user_gids.add(qgid)          # v12.88: exempt from pre-filter
         except Exception:
             pass
         # v12.85: Bot 1 scrape notifications sit right behind user queue
@@ -321,6 +330,7 @@ class Fetcher:
             for ngid in self.galleries.pop_scrape_notifications():
                 if ngid not in seen:
                     seen.add(ngid); ordered.append(ngid)
+                user_gids.add(ngid)          # v12.88: exempt from pre-filter
         except Exception:
             pass
         for gid in recent_ids:
@@ -340,9 +350,22 @@ class Fetcher:
         # failed. On a warm process this eliminates nearly every
         # "⏭ already in DB channel — skipped" cycle (the 146-PDFs-in-15h
         # problem: most slot time was being spent re-claiming known rows).
+        # v12.88: purge expired transient-retry cooldowns, and NEVER apply
+        # the known-done/known-failed pre-filter to user-queue or
+        # scrape-notify gids — an explicit queue row must always reach a
+        # slot so claim_ex (the durable Mongo state machine) makes the
+        # done/failed/claim decision. The v12.44 in-memory sets blackholed
+        # exactly these rows while slots kept working background items.
+        now_ts = time.time()
+        if self._retry_after:
+            self._retry_after = {g: t for g, t in self._retry_after.items()
+                                 if t > now_ts}
         before = len(ordered)
         ordered = [g for g in ordered
-                   if g not in self._known_done and g not in self._known_failed]
+                   if g in user_gids
+                   or (g not in self._known_done
+                       and g not in self._known_failed
+                       and g not in self._retry_after)]
         filtered = before - len(ordered)
         if filtered:
             log.info("🧹 queue: pre-filtered %d known-done/failed gids "
@@ -394,6 +417,9 @@ class Fetcher:
                     # v12.86: reconcile the mini-app ledger — pending rows
                     # whose gid is already COMPLETED are phantom backlog.
                     self.galleries.reap_queue_ledger()
+                    # v12.88: loud alarm for user queue rows stuck pending
+                    # with no galleries doc (must never be silent again).
+                    self.galleries.log_starving_queue()
                 except Exception:
                     pass
                 ids = await self._build_queue_order()
@@ -564,7 +590,8 @@ class Fetcher:
                                 "dropping claim", gid)
                     self.galleries.drop_claim(gid)
                     self.stats.dropped += 1
-                    self._known_failed.add(gid)
+                    # v12.88: cooldown, not a permanent blackhole.
+                    self._retry_after[gid] = time.time() + self._retry_cooldown_s
                     self._d_event(idx, "dropped", gid)
                     return True
             timeout = compute_pdf_timeout(m.get("pages") or 0)
@@ -622,7 +649,10 @@ class Fetcher:
                               gid, int(timeout))
                     self.galleries.drop_claim(gid)
                     self.stats.dropped += 1
-                    self._known_failed.add(gid)
+                    # v12.88: cooldown, not a permanent blackhole — the gid
+                    # re-enters the scan after retry_cooldown_s. Durable
+                    # failures keep using mark_failed / set_both_failed.
+                    self._retry_after[gid] = time.time() + self._retry_cooldown_s
                     self._d_event(idx, "dropped", gid)
                     return True
                 if isinstance(pdf_msg, str):

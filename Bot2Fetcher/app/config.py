@@ -58,6 +58,8 @@ class Settings:
     log_bot_token: str
     fetch_gap_min: int
     fetch_gap_max: int
+    retry_cooldown_s: int   # v12.88: transient-failure cooldown (replaces the
+                          # permanent _known_failed blackhole on drop paths)
     stale_processing_s: int
     rescan_sleep_s: int
     scan_max_galleries: int
@@ -121,6 +123,9 @@ def load() -> Settings:
                              "DASHBOARD_BOT_TOKEN", "TELEGRAM_LOG_BOT_TOKEN"),
         fetch_gap_min=_int("FETCH_GAP_MIN_S", 3),
         fetch_gap_max=_int("FETCH_GAP_MAX_S", 8),
+        # v12.88: how long a transient drop_claim failure (primary timeout,
+        # unusable meta) keeps a gid out of the scan before auto-retry.
+        retry_cooldown_s=_int("RETRY_COOLDOWN_S", 1800),          # 30 min
         stale_processing_s=_int("STALE_PROCESSING_S", 900),
         rescan_sleep_s=_int("RESCAN_SLEEP_S", 300),
         scan_max_galleries=_int("SCAN_MAX_GALLERIES", 2000),

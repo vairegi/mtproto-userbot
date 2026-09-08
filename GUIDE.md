@@ -1755,3 +1755,43 @@ background loop started", then after the next user download completes:
 **Files:** miniapp/backend/app/services/delivery_watcher.py (NEW),
 miniapp/backend/main.py, miniapp/frontend/js/plugins/card-actions.js,
 GUIDE.md, GUIDE_APPEND.txt.
+
+## v12.88 — queue starvation fix: user downloads blackholed by the v12.44 pre-filter (2026-09-08)
+**Bug (prod DB-verified, gid 679381):** a mini-app user tapped Download;
+the queue row sat `pending` for 4+ hours with NO galleries doc while both
+slots kept processing background items. Root cause chain: (1) an early
+attempt hit the @Gallery_DLBot timeout path in _do_job, which does
+drop_claim (deletes the galleries doc) + `_known_failed.add(gid)` — a
+PERMANENT in-process blackhole; (2) the v12.44 pre-filter in
+_build_queue_order removed the gid from every subsequent scan cycle, with
+no exemption for user-queue rows — even though _warm_skip_sets' own
+docstring promises user-queue rows bypass these sets; (3) the v12.78
+idle-wake check saw the pending row every 5s, woke the producer, which
+filtered it out again — the system looked perfectly healthy.
+**Fix:**
+1. fetcher._build_queue_order: user-queue and scrape-notify gids are now
+   EXEMPT from the known-done/known-failed pre-filter. Explicit user
+   intent always reaches a slot; claim_ex (the durable Mongo state
+   machine) makes the done/failed/claim decision. Background sweep rows
+   keep the fast path.
+2. fetcher._do_job: the two transient drop paths (primary timeout,
+   unusable direct-fetch meta) now use a time-boxed `_retry_after`
+   cooldown (default 30 min, RETRY_COOLDOWN_S) instead of the permanent
+   _known_failed blackhole. Durable failures (404 mark_failed, both-bots
+   12h park) are unchanged — they persist in Mongo and survive restarts.
+3. mongo_state.log_starving_queue: once per scan cycle, any queue row
+   still 'pending' >15min with NO galleries doc raises a loud
+   "🚨 user queue row STARVING" log (rate-limited 1/gid/hour). This bug
+   class must never be silent again.
+4. db.enqueue + queue_service: queue rows now carry `gallery_id`
+   (extracted via gallery_state.extract_gallery_id) so Bot 2's reader
+   never depends on the URL regex fallback. Backward-compatible: old
+   rows without the field still parse via regex.
+**Deploy:** Bot 2 AND Bot 0 (files 1-3 are Bot 2; file 4 is Bot 0).
+Existing stuck rows (e.g. 679381) are picked up automatically on the
+first scan cycle after the Bot 2 deploy — no DB surgery needed. Once
+completed, v12.87's delivery_watcher auto-DMs the user.
+**Env knobs (optional):** RETRY_COOLDOWN_S (default 1800).
+**Files:** Bot2Fetcher/app/fetcher.py, Bot2Fetcher/app/mongo_state.py,
+Bot2Fetcher/app/config.py, db.py, queue_service.py, GUIDE.md,
+GUIDE_APPEND.txt.

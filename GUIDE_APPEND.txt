@@ -1,18 +1,20 @@
-GUIDE_APPEND — v12.87 (2026-09-08) — delivery watcher (auto-DM on Bot 2 completion)
-WHAT: since worker.py's removal (v12.66) nothing delivered a Bot-2-fetched
-PDF to the requesting mini-app user — they had to tap Download twice. Bot 0
-now runs delivery_watcher: a 10s background loop that picks queue rows
-flipped to 'completed' (boot watermark = boot-1h, so no retro-spam), waits
-for the galleries doc to carry both db_cover_msg_id + db_pdf_msg_id, then
-DMs cover+PDF via the existing dm_delivery pipeline (force-join, BackupDB
-toggle, share-guard, auto-delete all apply). Ledger gets delivered=True /
-"force_join" / "skipped" / "failed" stamps; transient errors retry for up
-to 6h. Completion toast now reads "📨 Check your DM".
-FILES: miniapp/backend/app/services/delivery_watcher.py (NEW),
-miniapp/backend/main.py, miniapp/frontend/js/plugins/card-actions.js,
-GUIDE.md, GUIDE_APPEND.txt.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 0 ONLY. No new env
-vars required (rollback switch: DELIVERY_WATCHER_OFF=1).
-VERIFY: Render logs show "delivery_watcher background loop started"; after
-a user-queued download finishes, "📨 delivery_watcher: #<gid> auto-DM'd to
-user <uid>" and the PDF lands in the user's DM without a second tap.
+GUIDE_APPEND — v12.88 (2026-09-08) — queue starvation fix (user downloads blackholed)
+WHAT: gid 679381 sat 'pending' 4h with no galleries doc — a primary-bot
+timeout put the gid into fetcher's PERMANENT in-memory _known_failed set,
+and the v12.44 pre-filter removed it from every scan cycle with no
+user-queue exemption (contradicting _warm_skip_sets' own contract). Now:
+user-queue + scrape-notify gids are exempt from the pre-filter (claim_ex
+decides durably); the two transient drop paths use a 30-min _retry_after
+cooldown (RETRY_COOLDOWN_S) instead of the permanent blackhole; a
+per-cycle starvation alarm logs any pending row >15min with no galleries
+doc; Bot 0 stamps gallery_id on queue rows (regex fallback still works).
+FILES: Bot2Fetcher/app/fetcher.py, Bot2Fetcher/app/mongo_state.py,
+Bot2Fetcher/app/config.py, db.py, queue_service.py, GUIDE.md,
+GUIDE_APPEND.txt.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 2 AND Bot 0.
+Stuck pending rows are picked up on the first scan cycle after the Bot 2
+deploy — no DB surgery. v12.87 delivery_watcher then auto-DMs the user.
+VERIFY: Render Bot 2 logs show the pending gid claimed within one cycle
+("🎯 slot N claimed 679381"); any future stall raises
+"🚨 user queue row STARVING: #<gid>". No "already failed — skipped" line
+for user-queued gids.

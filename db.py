@@ -472,6 +472,8 @@ def enqueue(
     conn: MongoHandle,
     url: str,
     url_hash: str,
+    gallery_id: Optional[str] = None,   # v12.88: Bot 2's queue reader prefers
+                                        # this field over the URL regex
     submitted_by: Optional[int] = None,
     chat_id: Optional[int] = None,
     requested_tag: bool = False,
@@ -485,6 +487,7 @@ def enqueue(
             "_id": job_id,
             "url": url,
             "url_hash": url_hash,
+            "gallery_id": gallery_id or None,   # v12.88
             "status": "pending",
             "created_at": ts,
             "updated_at": ts,
