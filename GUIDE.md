@@ -1718,3 +1718,40 @@ PROCESSING row (#655846) is a legitimate 12h park that self-retries.
 the first scan cycle after deploy.
 **Files:** Bot2Fetcher/app/mongo_state.py, Bot2Fetcher/app/fetcher.py,
 GUIDE.md, GUIDE_APPEND.txt.
+
+## v12.87 — delivery watcher: auto-DM when Bot 2 finishes a user download (2026-09-08)
+**Bug (audit-verified):** since worker.py was removed (v12.66), nothing in
+Bot 0 delivered a freshly-fetched PDF to the mini-app user who requested
+it. Bot 2 completed the job, flipped the queue ledger row to 'completed'
+and wrote the galleries doc — but relay_v2's auto-DM requester path died
+with worker.py, and the frontend poll loop only said "tap Download
+again". Users had to tap Download TWICE: once to queue, once to trigger
+the dedup instant-delivery path.
+**Fix (Bot 0 only):** new background loop
+`miniapp/backend/app/services/delivery_watcher.py`, started from
+`main.py` startup (same idempotent pattern as deletion_scheduler). Every
+10s it reads up to 20 `queue` rows with status='completed',
+delivered != True, updated_at >= boot watermark (boot - 1h lookback, so
+pre-v12.87 history is never retro-spammed but completions during a
+redeploy window are covered). For each row it requires the galleries doc
+to be COMPLETED/PARTIAL with BOTH db_cover_msg_id + db_pdf_msg_id, then
+calls the EXISTING dm_delivery.deliver_to_dm() — force-join gate,
+/usebackupDB toggle, share-guard and auto-delete all apply unchanged.
+Ledger `delivered` stamping: True = sent; "force_join" = gated (the
+'I've joined' callback re-delivers; watcher stops polling the row);
+"skipped" = admin/no requester; "failed" = permanent (bot blocked /
+never /start'd / doc never became deliverable within 6h MAX_WAIT) with
+delivery_error for triage. Transient errors retry next tick. All Mongo
+work runs via asyncio.to_thread — the FastAPI loop is never blocked.
+**Frontend:** card-actions.js completion toast now says "📨 Check your
+DM" instead of telling the user to tap Download again.
+**Env knobs (all optional):** DELIVERY_WATCHER_INTERVAL_S (10),
+DELIVERY_WATCHER_BATCH (20), DELIVERY_WATCHER_LOOKBACK_S (3600),
+DELIVERY_WATCHER_MAX_WAIT_S (21600), DELIVERY_WATCHER_OFF=1 (rollback).
+**RAM:** one small indexed find per 10s tick — negligible on 512 MB.
+**Deploy:** Bot 0 only. Verify in Render logs: "delivery_watcher
+background loop started", then after the next user download completes:
+"📨 delivery_watcher: #<gid> auto-DM'd to user <uid>".
+**Files:** miniapp/backend/app/services/delivery_watcher.py (NEW),
+miniapp/backend/main.py, miniapp/frontend/js/plugins/card-actions.js,
+GUIDE.md, GUIDE_APPEND.txt.

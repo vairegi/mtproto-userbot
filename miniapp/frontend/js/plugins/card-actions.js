@@ -116,7 +116,10 @@ function _pollProgress(gid, gallery, onDone) {
         known: true, status: p.status || "COMPLETED",
         open_link: p.open_link || "",
       });
-      toast("✅ Ready — tap Download to open in DM", "success");
+      // v12.87: Bot 0's delivery_watcher auto-DMs the cover+PDF the moment
+      // the queue ledger flips to completed — the second Download tap is no
+      // longer needed. Keep the button state updated as a fallback.
+      toast("📨 Check your DM — your PDF is on its way", "success");
       if (typeof onDone === "function") onDone(p);
       return;
     }

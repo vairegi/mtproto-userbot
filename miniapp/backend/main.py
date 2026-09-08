@@ -130,6 +130,21 @@ async def _start_deletion_scheduler() -> None:
         log.warning("deletion_scheduler failed to start (non-fatal): %s", e)
 
 
+@app.on_event("startup")
+async def _start_delivery_watcher() -> None:
+    """v12.87: auto-DM the cover+PDF to a mini-app user the moment Bot 2
+    finishes their queued download (flips the queue ledger row to
+    'completed'). Uses the existing dm_delivery pipeline — force-join gate,
+    BackupDB toggle, share-guard and auto-delete all apply. Idempotent —
+    safe on every (re)boot. Disable with DELIVERY_WATCHER_OFF=1."""
+    try:
+        from app.services import delivery_watcher
+        delivery_watcher.start_background_loop()
+        log.info("delivery_watcher background loop started")
+    except Exception as e:  # noqa: BLE001
+        log.warning("delivery_watcher failed to start (non-fatal): %s", e)
+
+
 # ---------------------------------------------------------------------------
 # HTML shell — served at "/" and also as an SPA fallback for unknown paths
 # ---------------------------------------------------------------------------
