@@ -85,8 +85,10 @@ check("digest explicit since_ts: total=1", total == 1)
 src = (SB / "app/services/list_sweeper.py").read_text(encoding="utf-8")
 check("list_sweeper: discovery hook wired",
       "record_new_galleries_on_page" in src)
-check("list_sweeper: PK IN-query for existing gallery rows",
-      'WHERE "key" IN' in src and "gallery:" in src)
+# v12.89: discovery moved from a Turso SELECT to a Mongo-1 $in find.
+check("list_sweeper: Mongo-1 $in query for existing gallery rows",
+      'nhentai_cache' in src and '"$in"' in src and "gallery:" in src
+      and "turso_client" not in src)
 
 # ---- 4) Bot2 dashboard relabel present ------------------------------------
 dsrc = (ROOT / "Bot2Fetcher/app/dashboard.py").read_text(encoding="utf-8")

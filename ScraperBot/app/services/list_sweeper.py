@@ -290,19 +290,16 @@ async def _fetch_and_cache(
         ids = [str(it["id"]) for it in payload
                if isinstance(it, dict) and it.get("id") is not None]
         if ids:
-            from .. import turso_client as _tc
-            ph = ",".join("?" for _ in ids)
-            res = await _tc.execute(
-                f'SELECT "key" FROM nhentai_cache WHERE "key" IN ({ph})',
-                [f"gallery:{g}" for g in ids])
+            # v12.89: discovery check reads Mongo-1 (was a Turso SELECT).
+            # Same semantics: a gid is "new" iff no gallery:<id> cache row.
+            from .. import mongo_client as _mcd
             known: set = set()
-            if res:
-                for row in res.get("rows") or []:
-                    cell = row[0] if isinstance(row, list) and row else None
-                    val = (cell.get("value") if isinstance(cell, dict)
-                           else cell)
-                    if val:
-                        known.add(str(val).split(":", 1)[-1])
+            _db = _mcd.db()
+            if _db is not None:
+                for _d in _db["nhentai_cache"].find(
+                        {"_id": {"$in": [f"gallery:{g}" for g in ids]}},
+                        {"_id": 1}):
+                    known.add(str(_d["_id"]).split(":", 1)[-1])
             new_ids = [g for g in ids if g not in known]
             if new_ids:
                 channel_dashboard.record_new_galleries_on_page(

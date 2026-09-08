@@ -339,89 +339,11 @@ def cache_put_mongo(key: str, payload: Any, ttl_sec: int) -> bool:
 # refill math. Mongo `nhentai_bucket` is kept ONLY as a fail-open fallback
 # when Turso is unreachable, so a Turso outage doesn't stall the sweep.
 # ---------------------------------------------------------------------------
-BUCKET_COLL = "nhentai_bucket"   # kept for the Mongo fallback only
-
-
-async def _turso_bucket_try_consume(bucket: str, capacity_per_min: int) -> Optional[bool]:
-    """Turso-backed atomic consume — byte-identical algorithm to BOT 0's
-    `_turso_try_consume` so both bots share one bucket.
-
-    Returns True on success, False when the bucket is exhausted, None when
-    Turso is unreachable (caller falls back to Mongo)."""
-    try:
-        from . import turso_client
-    except Exception:  # noqa: BLE001
-        return None
-    if not turso_client.turso_available():
-        return None
-
-    now = time.time()
-    rate_per_sec = float(capacity_per_min) / 60.0
-
-    # INSERT OR IGNORE — no-op if the row exists.
-    try:
-        res = await turso_client.execute(
-            "INSERT OR IGNORE INTO nhentai_ratelimit "
-            "(bucket_id, tokens, capacity, rate_per_sec, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [bucket, float(capacity_per_min), float(capacity_per_min),
-             rate_per_sec, now],
-        )
-        if res is None:
-            return None
-    except Exception as e:  # noqa: BLE001
-        log.debug("bucket_try_consume turso insert failed: %s", e)
-        return None
-
-    # Atomic refill-and-spend — same SQL BOT 0 uses. The WHERE clause
-    # prevents over-spend; if it fails, zero rows are affected and we
-    # return False without touching updated_at (so the next caller still
-    # gets the full refill they earned).
-    try:
-        res = await turso_client.execute(
-            "UPDATE nhentai_ratelimit SET "
-            "  tokens = MIN(CAST(capacity AS REAL), tokens + MAX(0, ? - updated_at) * rate_per_sec) - ?, "
-            "  updated_at = ? "
-            "WHERE bucket_id = ? "
-            "  AND MIN(CAST(capacity AS REAL), tokens + MAX(0, ? - updated_at) * rate_per_sec) >= ?",
-            [now, 1.0, now, bucket, now, 1.0],
-        )
-        if res is None:
-            return None
-    except Exception as e:  # noqa: BLE001
-        log.debug("bucket_try_consume turso update failed: %s", e)
-        return None
-
-    # libsql returns affected-row count in rows_affected; guard both.
-    affected = res.get("affected_row_count")
-    if affected is None:
-        affected = res.get("rows_affected")
-    if affected is None:
-        # Older response shape — probe the row to see if tokens went negative.
-        try:
-            probe = await turso_client.execute(
-                "SELECT tokens FROM nhentai_ratelimit WHERE bucket_id = ?",
-                [bucket],
-            )
-            if probe and probe.get("rows"):
-                row = probe["rows"][0]
-                # libsql cells are {type, value} dicts
-                cell = row[0] if isinstance(row, list) and row else None
-                tok = None
-                if isinstance(cell, dict):
-                    v = cell.get("value")
-                    try:
-                        tok = float(v)
-                    except (TypeError, ValueError):
-                        tok = None
-                if tok is not None:
-                    return tok >= 0
-        except Exception:  # noqa: BLE001
-            pass
-        return None
-    return bool(int(affected) > 0)
-
-
+# v12.89: PRIMARY bucket, and repointed to Bot 0's collection. With
+# Turso removed, Bot 1 must spend from the SAME `nhentai_ratelimit` rows
+# Bot 0 uses — otherwise the shared 10/min nhentai quota silently splits
+# into two independent buckets and both bots hammer nhentai together.
+BUCKET_COLL = "nhentai_ratelimit"
 def _mongo_bucket_try_consume(bucket: str, capacity_per_min: int) -> bool:
     """Mongo fallback — original sliding-window logic from pre-v1.14.
     Used ONLY when Turso is unreachable so a Turso outage doesn't stall
@@ -479,7 +401,6 @@ async def bucket_try_consume(bucket: str, capacity_per_min: int) -> bool:
     region-suffixed id (e.g. "search_ap-singapore") transparently uses
     its own row via the existing INSERT OR IGNORE bootstrap (no schema
     migration)."""
-    turso_result = await _turso_bucket_try_consume(bucket, capacity_per_min)
-    if turso_result is not None:
-        return turso_result
+    # v12.89: Turso leg removed — Mongo-1 (Bot 0's shared collection) is
+    # now the primary and only token-bucket store.
     return _mongo_bucket_try_consume(bucket, capacity_per_min)

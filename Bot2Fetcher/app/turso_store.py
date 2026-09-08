@@ -321,12 +321,26 @@ class Turso:
         return out
 
     async def _mongo2_coll(self):
-        """v12.74: shared Mongo-2 turso_nhentai_cache collection handle."""
+        """v12.89: repointed to Mongo-1's nhentai_cache (the live cache).
+
+        Bot 1 now writes Mongo-1 ONLY (Mongo-2 dual-write + Turso write
+        removed in v12.89), so Bot 2's cache scans + gallery-meta reads
+        must read the same live rows. Kept the method name so every
+        caller (list_gallery_ids / list_recent_search_ids / get_gallery_row)
+        works unchanged. Field mapping handled per-query: Mongo-1 keys on
+        `_id` and stamps `updated_at`, Mongo-2 used `key`/`cached_at`.
+        """
         try:
-            from . import mongo2_client as _m2  # noqa: WPS433
-            return _m2._get_coll()  # noqa: SLF001
+            conn = getattr(self, "_m1_conn", None)
+            if conn is None:
+                from pymongo import MongoClient  # noqa: WPS433
+                conn = MongoClient(_os.environ["MONGO_URI"],
+                                   serverSelectionTimeoutMS=8000)
+                self._m1_conn = conn
+            db_name = (_os.environ.get("MONGO_DB_NAME") or "relaybot").strip()
+            return conn[db_name]["nhentai_cache"]
         except Exception as e:  # noqa: BLE001
-            log.warning("mongo2 handle failed: %s", e)
+            log.warning("mongo1 cache handle failed: %s", e)
             return None
 
     @staticmethod
@@ -338,7 +352,8 @@ class Turso:
         primary path's BSON type-ordering silently mis-orders mixed types.
         """
         try:
-            return float(d.get("cached_at") or 0)
+            # v12.89: Mongo-1 stamps updated_at; Mongo-2 used cached_at.
+            return float(d.get("cached_at") or d.get("updated_at") or 0)
         except (TypeError, ValueError):
             return 0.0
 
@@ -354,33 +369,29 @@ class Turso:
         try:
             import asyncio as _aio
             def _q():
+                # v12.89: Mongo-1 nhentai_cache — _id (not key),
+                # updated_at (not cached_at).
                 try:
-                    cur = (col.find({"key": {"$regex": "^gallery:"}},
-                                    {"key": 1, "cached_at": 1},
+                    cur = (col.find({"_id": {"$regex": "^gallery:"}},
+                                    {"_id": 1, "updated_at": 1},
                                     allow_disk_use=True)
-                             .sort("cached_at", -1).limit(50000))
+                             .sort("updated_at", -1).limit(50000))
                     return list(cur)
                 except Exception:
-                    rows = list(col.find({"key": {"$regex": "^gallery:"}},
-                                         {"key": 1, "cached_at": 1}).limit(50000))
-                    # v12.80: Mongo-2 cached_at is MIXED TYPE in prod (some
-                    # docs str, some int — Bot 1/Bot 0 wrote different shapes).
-                    # A naive sort throws "'<' not supported between str and
-                    # int", the outer except swallows it, and list_gallery_ids
-                    # returned [] every cycle — Bot 2 went blind to the cache
-                    # (dashboard: 'Lifetime cached (Turso): 0'). Coerce.
+                    rows = list(col.find({"_id": {"$regex": "^gallery:"}},
+                                         {"_id": 1, "updated_at": 1}).limit(50000))
                     def _ck(d):
                         try:
-                            return float(d.get("cached_at") or 0)
+                            return float(d.get("updated_at") or 0)
                         except (TypeError, ValueError):
                             return 0.0
                     rows.sort(key=_ck, reverse=True)
                     return rows
             rows = await _aio.to_thread(_q)
-            rows.sort(key=self._ca_sort_key, reverse=True)  # v12.80: canonical order on either path
-            out = [{"gid": str(d.get("key", "")).split(":", 1)[1],
-                    "cached_at": d.get("cached_at")} for d in rows
-                   if str(d.get("key", "")).startswith("gallery:")]
+            rows.sort(key=self._ca_sort_key, reverse=True)  # canonical order on either path
+            out = [{"gid": str(d.get("_id", "")).split(":", 1)[1],
+                    "cached_at": d.get("updated_at")} for d in rows
+                   if str(d.get("_id", "")).startswith("gallery:")]
             log.info("📖 [MONGO READ] list_gallery_ids — %d rows (BOT2_TURSO_OFF)", len(out))
             return out
         except Exception as e:  # noqa: BLE001
@@ -398,24 +409,20 @@ class Turso:
         try:
             import asyncio as _aio, json as _json
             def _q():
+                # v12.89: Mongo-1 nhentai_cache — _id (not key),
+                # updated_at (not cached_at).
                 try:
-                    cur = (col.find({"key": {"$regex": "^search:"}},
-                                    {"payload": 1, "cached_at": 1},
+                    cur = (col.find({"_id": {"$regex": "^search:"}},
+                                    {"payload": 1, "updated_at": 1},
                                     allow_disk_use=True)
-                             .sort("cached_at", -1).limit(500))
+                             .sort("updated_at", -1).limit(500))
                     return list(cur)
                 except Exception:
-                    rows = list(col.find({"key": {"$regex": "^search:"}},
-                                         {"payload": 1, "cached_at": 1}).limit(500))
-                    # v12.80: Mongo-2 cached_at is MIXED TYPE in prod (some
-                    # docs str, some int — Bot 1/Bot 0 wrote different shapes).
-                    # A naive sort throws "'<' not supported between str and
-                    # int", the outer except swallows it, and list_gallery_ids
-                    # returned [] every cycle — Bot 2 went blind to the cache
-                    # (dashboard: 'Lifetime cached (Turso): 0'). Coerce.
+                    rows = list(col.find({"_id": {"$regex": "^search:"}},
+                                         {"payload": 1, "updated_at": 1}).limit(500))
                     def _ck(d):
                         try:
-                            return float(d.get("cached_at") or 0)
+                            return float(d.get("updated_at") or 0)
                         except (TypeError, ValueError):
                             return 0.0
                     rows.sort(key=_ck, reverse=True)
@@ -447,7 +454,7 @@ class Turso:
         try:
             import asyncio as _aio, json as _json
             def _q():
-                return col.find_one({"key": f"gallery:{gid}"})
+                return col.find_one({"_id": f"gallery:{gid}"})  # v12.89: Mongo-1 keys on _id
             d = await _aio.to_thread(_q)
             if not d:
                 return None
@@ -561,13 +568,21 @@ class Turso:
     async def put_state(self, key: str, payload: Dict[str, Any]) -> None:
         if _TURSO_OFF:
             log.info("📝 [MONGO WRITE] put_state(%s) — Turso skipped (BOT2_TURSO_OFF)", key)
+            # v12.89: Mongo-1 instead of Mongo-2 (Mongo-2 retired from hot path).
             try:
-                from . import mongo2_client as _m2  # noqa: WPS433
-                import json as _json
-                _m2.put(f"state:{key}", _json.dumps(payload, default=str),
-                        expires_at=0, ttl_sec=0)
+                import asyncio as _aio, json as _json, time as _t2
+                col = await self._mongo2_coll()   # v12.89: now Mongo-1 nhentai_cache
+                if col is not None:
+                    def _w():
+                        col.update_one(
+                            {"_id": f"state:{key}"},
+                            {"$set": {"payload": _json.dumps(payload, default=str),
+                                      "expires_at": 0, "updated_at": _t2.time(),
+                                      "writer": "bot2fetcher"}},
+                            upsert=True)
+                    await _aio.to_thread(_w)
             except Exception as e:  # noqa: BLE001
-                log.warning("mongo2 put_state(%s) failed: %s", key, e)
+                log.warning("mongo1 put_state(%s) failed: %s", key, e)
             return
         await self.ensure_schema()
         import time as _t_mod
@@ -589,6 +604,27 @@ class Turso:
             log.warning("mongo2 put_state(%s) failed (non-fatal): %s", key, _e)
 
     async def get_state(self, key: str) -> Optional[Dict[str, Any]]:
+        if _TURSO_OFF:
+            # v12.89: read dashboard state back from Mongo-1.
+            try:
+                import asyncio as _aio, json as _json
+                col = await self._mongo2_coll()   # v12.89: now Mongo-1
+                if col is None:
+                    return None
+                def _q():
+                    return col.find_one({"_id": f"state:{key}"})
+                d = await _aio.to_thread(_q)
+                if not d:
+                    return None
+                p = d.get("payload")
+                for _ in range(2):
+                    if isinstance(p, str):
+                        try: p = _json.loads(p)
+                        except Exception: return None
+                return p if isinstance(p, dict) else None
+            except Exception as e:  # noqa: BLE001
+                log.warning("mongo1 get_state(%s) failed: %s", key, e)
+                return None
         await self.ensure_schema()
         result = await self.execute(
             f'SELECT payload FROM {STATE_TABLE} WHERE "key" = ?', [key])

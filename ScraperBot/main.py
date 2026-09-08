@@ -12,7 +12,6 @@ Shutdown: set the shared stop-event; sweepers cooperate and exit.
 from __future__ import annotations
 
 import asyncio
-import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,11 +19,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.logging_setup import setup_logging
 from app.routes import mount_all
-from app import mongo_client, turso_client
-from app.services import turso_schema
+from app import mongo_client  # v12.89: turso_client removed — Mongo-1 only
 from app.services import list_sweeper, details_sweeper, channel_dashboard
 from app.services import discovery_digest  # v1.25: daily 10:00 IST admin digest
-from app.services import turso_backup  # v1.28: Turso -> 2nd Mongo backup
 
 log = setup_logging("scraperbot")
 
@@ -88,7 +85,7 @@ async def _startup() -> None:
     # Spawn sweepers — fail-open: any startup exception here just gets
     # logged; the HTTP surface must stay up so UptimeRobot / admin routes
     # keep working even if a sweeper is misconfigured.
-    if settings.mongo_uri and settings.turso_url:
+    if settings.mongo_uri:  # v12.89: Turso no longer required
         # v1.22.8: staggered starts — the old code spawned all three at the
         # same instant as db warmup, so the boot memory peak (Mongo index
         # build + Turso bootstrap + first sweep page + dashboard) landed in
@@ -109,14 +106,12 @@ async def _startup() -> None:
         _tasks.append(asyncio.create_task(
             _delayed(discovery_digest.run_forever, 50, _stop_event),
             name="discovery_digest"))
-        # v1.28: Turso -> second-Mongo backup (every 12h; idles w/o URI)
-        _tasks.append(asyncio.create_task(
-            _delayed(turso_backup.run_forever, 120, _stop_event),
-            name="turso_backup"))
+        # v12.89: turso_backup (Turso -> Mongo-2 mirror) removed — Turso
+        # is Bot 0's nightly-backup target; Mongo-2 is cold storage.
         log.info("sweepers + dashboard spawned: %s",
                  [t.get_name() for t in _tasks])
     else:
-        log.error("Sweepers NOT started — missing MONGO_URI or TURSO_DATABASE_URL")
+        log.error("Sweepers NOT started — missing MONGO_URI")
 
 
 async def _delayed(fn, delay_s: int, *args) -> None:
@@ -133,19 +128,11 @@ async def _bg_db_warmup() -> None:
     loop = asyncio.get_event_loop()
     try:
         await loop.run_in_executor(None, mongo_client.cache_ensure_indexes)
-        log.info("db warmup stage 1/2 done (mongo indexes)")
+        log.info("db warmup done (mongo indexes)")
     except Exception as e:  # noqa: BLE001
         log.warning("cache_ensure_indexes failed: %s", e)
-    await asyncio.sleep(20)  # v1.22.8: let the Mongo peak subside first
-    try:
-        await turso_client.bootstrap_schema()
-        try:
-            await turso_schema.ensure_schema()
-        except Exception as e:
-            log.warning("turso schema migration failed (non-fatal): %s", e)
-    except Exception as e:  # noqa: BLE001
-        log.warning("turso bootstrap failed: %s", e)
-    log.info("db warmup finished (mongo indexes + turso schema)")
+    # v12.89: Turso bootstrap/schema stage removed — Mongo-1 is the sole
+    # live database; Bot 0's 01:00 IST sync owns Turso.
 
 
 async def _ram_watchdog() -> None:
@@ -210,8 +197,5 @@ async def _shutdown() -> None:
             t.cancel()
         except Exception as e:  # noqa: BLE001
             log.warning("sweeper %s exit error: %s", t.get_name(), e)
-    try:
-        await turso_client.close()
-    except Exception:  # noqa: BLE001
-        pass
+    # v12.89: turso_client.close() removed — no Turso connection to close.
     log.info("bye.")

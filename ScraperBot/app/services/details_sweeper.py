@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from .. import cache, mongo_client, turso_client, hf_scraper_lite, normalize
+from .. import cache, mongo_client, hf_scraper_lite, normalize  # v12.89: turso_client removed
 from ..config import settings
 from . import list_sweeper
 
@@ -117,10 +117,8 @@ async def _read_search_cache(sort: str, page: int) -> Optional[Any]:
         keys.append(cache.bot0_search_key(tag, "popular", page))
     keys.append(cache.search_key("", sort, page))  # legacy fallback
 
+    # v12.89: Mongo-1 only (Turso read removed).
     for key in keys:
-        hit = await turso_client.get(key)
-        if hit and hit.get("payload"):
-            return hit["payload"]
         m = mongo_client.cache_get_mongo(key)
         if m and m.get("payload"):
             return m["payload"]
@@ -201,15 +199,11 @@ async def _gallery_is_fresh(gid: str) -> bool:
 
     v12.48 (F3): sentinel-aware via _cache_row_is_fresh().
     """
-    key = cache.gallery_key(gid)
+    # v12.89: Mongo-1 only (Turso read removed) — one round-trip per gid
+    # instead of two. Mongo-1 is now the live cache (Bot 0 reads it too).
     now = time.time()
-    hit = await turso_client.get(key)
-    if _cache_row_is_fresh(hit, now):
-        return True
-    m = mongo_client.cache_get_mongo(key)
-    if _cache_row_is_fresh(m, now):
-        return True
-    return False
+    m = mongo_client.cache_get_mongo(cache.gallery_key(gid))
+    return _cache_row_is_fresh(m, now)
 
 
 async def _fetch_one_gallery(

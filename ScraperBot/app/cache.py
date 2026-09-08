@@ -14,9 +14,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import os  # v12.39: hoisted to top so the BOT1_CACHE_MONGO_MIRROR env-gate works
-from typing import Any, Optional
+from typing import Any
 
-from . import mongo_client, turso_client
+from . import mongo_client   # v12.89: Turso removed — Mongo-1 is the sole writer
 from .config import settings
 
 # v12.47: shared canonical payload layer. ScraperBot deploys as a SUBTREE
@@ -77,16 +77,6 @@ def bot0_search_key(query: str, sort: str, page: int) -> str:
     q = " ".join((query or "").lower().split())
     s = (sort or "popular").strip().lower()
     return f"search:q={q}|sort={s}|page={int(page or 1)}"
-
-
-def bucket_for_key(key: str) -> str:
-    # Route new key formats to the right nhentai bucket. Chip + q= keys
-    # both hit /api/v2/search — same bucket.
-    if key.startswith("gallery:"):    return "galleries"
-    if key.startswith("search:"):     return "search"
-    if key.startswith("suggest:"):    return "suggestions"
-    if key.startswith("trending:"):   return "popular"
-    return "galleries_list"
 
 
 def trending_key(kind: str = "popular") -> str:
@@ -156,12 +146,16 @@ def bucket_capacity(bucket: str) -> int:
 
 # ---- write path ----------------------------------------------------------
 async def put(key: str, payload: Any) -> dict:
-    """Write to Turso first, mirror to Mongo. Both are best-effort.
+    """Write to Mongo-1 ONLY. v12.89: Turso + Mongo-2 legs removed.
 
-    v1.12: chip and tag keys pass ttl_sec=0 to signal never-expire. Both
-    writers (turso_client.put, mongo_client.cache_put_mongo) treat ttl==0
-    as "stamp expires_at=0 sentinel" — BOT 0's read path recognises the
-    sentinel and always serves the row without falling back to nhentai.
+    Turso is now Bot 0's 01:00 IST nightly backup target, not a live write
+    path; the Mongo-2 mirror is retired from the hot path (kept as cold
+    storage). This halves Bot 1's outbound bandwidth per cache row.
+
+    v1.12: chip and tag keys pass ttl_sec=0 to signal never-expire.
+    mongo_client.cache_put_mongo treats ttl==0 as "stamp expires_at=0
+    sentinel" — BOT 0's read path recognises the sentinel and always
+    serves the row without falling back to nhentai.
     """
     if NEVER_EXPIRE_CHIP_TAG and is_chip_or_tag_key(key):
         ttl = 0
@@ -180,29 +174,10 @@ async def put(key: str, payload: Any) -> dict:
         except Exception as _e:  # noqa: BLE001
             log.warning("cache.put(%s): canonical gate raised %s — "
                         "writing unnormalised", key, _e)
-    import time as _t_mod, json as _json
-    _t0 = _t_mod.monotonic()
-    if _BOT1_TURSO_OFF:
-        log.info("📝 [MONGO WRITE] cache.put(%s) — Turso skipped (BOT1_TURSO_OFF)", key)
-        turso_ok = "off"
-    else:
-        turso_ok = await turso_client.put(key, payload, ttl)
-    mongo_ok = mongo_client.cache_put_mongo(key, payload, ttl) if (_BOT1_TURSO_OFF or not _TURSO_ONLY) else False
-    # v1.30/v1.31: dual-write to the Mongo-2 mirror with a visible log line.
-    # The import is OUTSIDE the try so a missing vendored file is LOUD
-    # (Render log) instead of silently skipping the mirror.
-    from . import mongo2_client as _m2
-    try:
-        if _m2 is not None:
-            _pj = _json.dumps(payload, separators=(",", ":"), default=str)
-            _now_e = int(_t_mod.time())
-            _exp = 0 if (NEVER_EXPIRE_CHIP_TAG and is_chip_or_tag_key(key)) else _now_e + ttl
-            _m2_ok = _m2.put(key, _pj, _exp, ttl, cached_at=_now_e)
-            _m2.log_dual_write(key, bool(turso_ok), bool(_m2_ok),
-                               int((_t_mod.monotonic() - _t0) * 1000))
-    except Exception as _e:  # noqa: BLE001
-        log.error("🚨 mongo2 dual-write(%s) FAILED — mirror drifting: %s", key, _e)
-    return {"turso": bool(turso_ok), "mongo": bool(mongo_ok), "ttl": ttl}
+    # v12.89: single write — Mongo-1 relaybot.nhentai_cache. Bot 0's
+    # nightly sync owns Turso; Mongo-2 stays as cold storage.
+    mongo_ok = mongo_client.cache_put_mongo(key, payload, ttl)
+    return {"turso": False, "mongo": bool(mongo_ok), "ttl": ttl}
 
 
 async def try_consume(key: str) -> bool:

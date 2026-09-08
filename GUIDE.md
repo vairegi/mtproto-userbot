@@ -1795,3 +1795,62 @@ completed, v12.87's delivery_watcher auto-DMs the user.
 **Files:** Bot2Fetcher/app/fetcher.py, Bot2Fetcher/app/mongo_state.py,
 Bot2Fetcher/app/config.py, db.py, queue_service.py, GUIDE.md,
 GUIDE_APPEND.txt.
+
+## v12.89 — Mongo-1 consolidation: Bot 1 single-writer + Bot 2 repoint (2026-09-08)
+**Driver:** Bot 1 burned 6.36 GB outbound in 3 days on Render. Audit found
+the fanout: every cache row was written to Turso + Mongo-1 + Mongo-2 (3×
+every payload) by `cache.put()`, and `turso_backup` bulk-copied the whole
+Turso table into Mongo-2 every 12h — all redundant once Turso became a
+01:00 IST backup target (BOT*_TURSO_OFF=1 set on all three services).
+**Changes (Bot 1 = ScraperBot):**
+1. `cache.put()` writes Mongo-1 `relaybot.nhentai_cache` ONLY. Turso leg
+   and Mongo-2 dual-write block deleted.
+2. `details_sweeper`: `_gallery_is_fresh` + `_read_search_page` read
+   Mongo-1 only (one round-trip per gid instead of Turso+Mongo).
+3. `list_sweeper`: discovery check ("which ids lack a gallery:<id> row")
+   switched from a Turso SELECT to a Mongo-1 `$in` find. scrape_notify
+   handoff to Bot 2 unchanged.
+4. **Rate-limit bucket fix (critical):** Bot 1's Turso bucket lived in
+   `nhentai_ratelimit` while its Mongo fallback used `nhentai_bucket` —
+   and Bot 0's Mongo bucket uses `nhentai_ratelimit`. With the Turso leg
+   deleted, Bot 1's Mongo bucket is repointed to `nhentai_ratelimit` so
+   the shared 10/min nhentai quota stays genuinely shared (otherwise both
+   bots would have had independent buckets = 2× hammering).
+5. DELETED: `app/turso_client.py`, `app/services/turso_backup.py`,
+   `app/services/turso_schema.py`, `app/mongo2_client.py`,
+   `app/turso_cache/` + their wiring in `main.py` (imports, turso_backup
+   spawn, Turso bootstrap stage, shutdown close). `turso_url/turso_token`
+   no longer required at boot. status/health now show Turso as
+   "backup-only (Bot 0 nightly sync)". Mongo-2 stays as cold storage —
+   nothing writes to it, but nothing is deleted from it either.
+**Changes (Bot 2 = Bot2Fetcher):**
+6. `turso_store.py`: the `BOT2_TURSO_OFF=1` path repointed from Mongo-2's
+   `turso_nhentai_cache` to Mongo-1's `relaybot.nhentai_cache`
+   (`_id`/`updated_at` field mapping; `_ca_sort_key` accepts both
+   `cached_at` and `updated_at`). This covers producer scans
+   (`list_gallery_ids`, `list_recent_search_ids`), gallery-meta reads
+   (`get_gallery_row`), and `put_state`/`get_state` (dashboard persistence
+   — which had ALREADY been writing to Mongo-2 since v12.74, so its
+   contents were invisible to Bot 0's nightly Turso backup; now they land
+   in Mongo-1 and get backed up like everything else).
+   MONGO2_READS/MONGO2_WRITES envs become inert (safe to delete from
+   Render later). Bot 0 is UNTOUCHED: it already reads Mongo-1 live and
+   owns the 01:00 IST Turso backup.
+**Expected bandwidth:** Bot 1 outbound drops ~50-65% (single writer, no
+12h table copy, single-read freshness checks).
+**Deploy:** Bot 1 AND Bot 2. No new env vars; TURSO_* on Bot 1 may be
+deleted from Render at leisure.
+**Verify:** Bot 1 Render log: no `DUAL-WRITE` lines, no Turso bootstrap,
+sweepers start with MONGO_URI only. Bot 2 Render log: first scan cycle
+shows "📖 [MONGO READ] list_gallery_ids — N rows (BOT2_TURSO_OFF)" with
+N matching the Mongo-1 gallery count; dashboard edits resume (state now
+in Mongo-1).
+**Files:** ScraperBot/app/cache.py, ScraperBot/app/mongo_client.py,
+ScraperBot/app/config.py, ScraperBot/main.py,
+ScraperBot/app/services/details_sweeper.py,
+ScraperBot/app/services/list_sweeper.py,
+ScraperBot/app/services/telegram_bot.py, ScraperBot/app/routes/status.py,
+Bot2Fetcher/app/turso_store.py, GUIDE.md, GUIDE_APPEND.txt.
+(Deletions: ScraperBot/app/turso_client.py, ScraperBot/app/mongo2_client.py,
+ScraperBot/app/services/turso_backup.py, ScraperBot/app/services/turso_schema.py,
+ScraperBot/app/turso_cache/ — remove these paths when applying the zip.)

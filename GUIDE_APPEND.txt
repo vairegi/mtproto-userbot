@@ -1,20 +1,27 @@
-GUIDE_APPEND — v12.88 (2026-09-08) — queue starvation fix (user downloads blackholed)
-WHAT: gid 679381 sat 'pending' 4h with no galleries doc — a primary-bot
-timeout put the gid into fetcher's PERMANENT in-memory _known_failed set,
-and the v12.44 pre-filter removed it from every scan cycle with no
-user-queue exemption (contradicting _warm_skip_sets' own contract). Now:
-user-queue + scrape-notify gids are exempt from the pre-filter (claim_ex
-decides durably); the two transient drop paths use a 30-min _retry_after
-cooldown (RETRY_COOLDOWN_S) instead of the permanent blackhole; a
-per-cycle starvation alarm logs any pending row >15min with no galleries
-doc; Bot 0 stamps gallery_id on queue rows (regex fallback still works).
-FILES: Bot2Fetcher/app/fetcher.py, Bot2Fetcher/app/mongo_state.py,
-Bot2Fetcher/app/config.py, db.py, queue_service.py, GUIDE.md,
-GUIDE_APPEND.txt.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 2 AND Bot 0.
-Stuck pending rows are picked up on the first scan cycle after the Bot 2
-deploy — no DB surgery. v12.87 delivery_watcher then auto-DMs the user.
-VERIFY: Render Bot 2 logs show the pending gid claimed within one cycle
-("🎯 slot N claimed 679381"); any future stall raises
-"🚨 user queue row STARVING: #<gid>". No "already failed — skipped" line
-for user-queued gids.
+GUIDE_APPEND — v12.89 (2026-09-08) — Mongo-1 consolidation (Bot 1 single-writer + Bot 2 repoint)
+WHAT: Bot 1's cache.put fanned every row out to Turso + Mongo-1 + Mongo-2
+and turso_backup re-copied the full Turso table to Mongo-2 every 12h —
+6.36 GB outbound in 3 days. Now Bot 1 writes Mongo-1 ONLY; Turso is Bot 0's
+01:00 IST backup target; Mongo-2 retired to cold storage (nothing deleted
+from it). Bot 2's BOT2_TURSO_OFF path repointed from Mongo-2 to Mongo-1
+(_id/updated_at field mapping) for scans, gallery meta and dashboard
+state — the dashboard state had been invisible to Bot 0's nightly backup
+since v12.74 and is now backed up too. Bot 1's rate-limit bucket repointed
+to nhentai_ratelimit so the shared 10/min nhentai quota stays shared with
+Bot 0 (was about to silently split into nhentai_bucket). details_sweeper
+freshness + search-page reads and list_sweeper discovery now hit Mongo-1
+only. scrape_notify handoff unchanged.
+FILES: ScraperBot/app/cache.py, ScraperBot/app/mongo_client.py,
+ScraperBot/app/config.py, ScraperBot/main.py,
+ScraperBot/app/services/details_sweeper.py,
+ScraperBot/app/services/list_sweeper.py,
+ScraperBot/app/services/telegram_bot.py, ScraperBot/app/routes/status.py,
+Bot2Fetcher/app/turso_store.py, GUIDE.md, GUIDE_APPEND.txt.
+DELETE: ScraperBot/app/turso_client.py, ScraperBot/app/mongo2_client.py,
+ScraperBot/app/services/turso_backup.py, ScraperBot/app/services/turso_schema.py,
+ScraperBot/app/turso_cache/ (delete these paths when applying).
+DEPLOY: drop on repo root, commit, push, redeploy Bot 1 AND Bot 2. Bot 0
+untouched. No new env vars.
+VERIFY: Bot 1 boots with MONGO_URI only, no DUAL-WRITE log lines, sweeps
+write Mongo-1; Bot 2 logs "📖 [MONGO READ] list_gallery_ids — N rows
+(BOT2_TURSO_OFF)" with N matching Mongo-1's gallery count.

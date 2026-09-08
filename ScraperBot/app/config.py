@@ -67,6 +67,9 @@ class Settings:
     # Shared with BOT 0
     mongo_uri: str = os.getenv("MONGO_URI", "").strip()
     mongo_db_name: str = os.getenv("MONGO_DB_NAME", "relaybot").strip() or "relaybot"
+    # v12.89: Turso removed from the live path — Bot 0's 01:00 IST nightly
+    # sync owns Turso. These envs are read only so a stale Render env never
+    # confuses anyone; nothing in Bot 1 uses them anymore.
     turso_url: str = os.getenv("TURSO_DATABASE_URL", "").strip()
     turso_token: str = os.getenv("TURSO_AUTH_TOKEN", "").strip()
 
@@ -231,10 +234,7 @@ class Settings:
         errs: list[str] = []
         if not self.mongo_uri:
             errs.append("MONGO_URI is required")
-        if not self.turso_url:
-            errs.append("TURSO_DATABASE_URL is required")
-        if not self.turso_token:
-            errs.append("TURSO_AUTH_TOKEN is required")
+        # v12.89: Turso envs no longer required — Mongo-1 only.
         if not self.admin_key:
             errs.append("BOT1_ADMIN_KEY is required (protects /trigger /pause /resume)")
         return errs

@@ -13,15 +13,16 @@ def load(path, name):
     return m
 
 # 1) byte-parity of the three shipped copies
+# v12.89: ScraperBot's vendored copy deleted (Bot 1 is Mongo-1-only now).
+# Byte-identity contract now covers the two remaining live copies.
 a = (ROOT / "common/turso_cache/normalize.py").read_bytes()
-b = (ROOT / "ScraperBot/app/turso_cache/normalize.py").read_bytes()
+b = a  # ScraperBot copy removed in v12.89
 c = (ROOT / "Bot2Fetcher/app/turso_cache/normalize.py").read_bytes()
 assert a == b == c, "normalize.py copies DRIFTED — resync them"
 print("parity: normalize.py x3 byte-identical OK")
 
 w = (ROOT / "common/turso_cache/writer.py").read_bytes()
-for x in ("ScraperBot/app/turso_cache/writer.py",
-          "Bot2Fetcher/app/turso_cache/writer.py"):
+for x in ("Bot2Fetcher/app/turso_cache/writer.py",):  # v12.89: ScraperBot copy removed
     assert w == (ROOT / x).read_bytes(), f"writer.py drifted in {x}"
 print("parity: writer.py x3 byte-identical OK")
 

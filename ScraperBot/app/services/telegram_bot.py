@@ -7,10 +7,9 @@ idle.
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import httpx
 
@@ -97,7 +96,7 @@ _HEALTH_HARD_LIMIT = 3900
 
 
 def _health_text() -> str:
-    from .. import mongo_client, turso_client
+    from .. import mongo_client  # v12.89: turso_client removed
     from . import channel_dashboard as cd
     import html as _html
     import time as _t
@@ -112,7 +111,6 @@ def _health_text() -> str:
     new_2h = sum(1 for ts in hring
                  if isinstance(ts, (int, float)) and now - ts < 7200)
     mongo_ok = mongo_client.db() is not None
-    turso_ok = turso_client.turso_available()
     paused = mongo_client.is_paused()
     banner = "🟢 running" if not paused else "⏸️ paused"
 
@@ -124,7 +122,7 @@ def _health_text() -> str:
     header = (
         f"<b>ScraperBot health</b> — {banner}\n"
         f"• Mongo: {'✅' if mongo_ok else '❌'}   "
-        f"Turso: {'✅' if turso_ok else '❌'}\n"
+        f"Turso: 🗄 backup-only (Bot 0 nightly sync)\n"  # v12.89
         f"• Total galleries: {int(t.get('total_galleries', 0))}\n"
         f"• New last 2h: {new_2h}\n"
         f"• New last 24h: {new_24h}\n"
@@ -245,14 +243,12 @@ async def handle_update(update: Dict[str, Any]) -> None:
         if cmd == "/checkram":
             # v1.22.8: read this process's resident set from /proc — same
             # numbers the RAM watchdog logs every 60s.
-            rss = avail = 0.0
+            rss = 0.0
             try:
                 with open("/proc/self/status") as fh:
                     for line in fh:
                         if line.startswith("VmRSS:"):
                             rss = int(line.split()[1]) / 1024.0
-                        elif line.startswith("VmAvail:"):
-                            avail = int(line.split()[1]) / 1024.0
             except Exception as e:  # noqa: BLE001
                 await send_message(chat_id, f"❌ /checkram failed: {e}")
                 return
