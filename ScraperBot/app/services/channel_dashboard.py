@@ -67,6 +67,12 @@ _K_HEARTBEAT   = "dash_heartbeat_last"
 _K_HEARTBEAT_R = "dash_heartbeat_ring"
 
 _MIN_WRITE_INTERVAL = 3.0
+# v12.90 (bandwidth diet): the dashboard card no longer edits on a fixed
+# ~15s tick. It edits ONLY when the rendered text actually CHANGES (i.e. the
+# bot did something), throttled to at most one edit per _MIN_EDIT_GAP_SEC,
+# plus a slow _IDLE_HEARTBEAT_SEC refresh so the card never looks dead.
+_MIN_EDIT_GAP_SEC   = 30               # min seconds between card edits
+_IDLE_HEARTBEAT_SEC = 5 * 60           # 5-min idle heartbeat (user-chosen)
 _HEARTBEAT_SEC      = 2 * 3600
 _TEXT_HARD_LIMIT    = 3900          # safe under Telegram's 4096
 _MAX_CONSEC_FAIL    = 5             # then pause for _PAUSE_ON_FAIL_SEC
@@ -645,8 +651,11 @@ async def _send_or_edit(text: str) -> Optional[int]:
 
 async def _writer_loop(stop_event: asyncio.Event) -> None:
     log.info("dashboard writer: starting")
-    last_text: str = ""
     last_hb: float = 0.0
+    # v12.90: the card's 5-min idle refresh gets its OWN timer — sharing
+    # last_hb with the 2h standalone heartbeat message would mean card
+    # refreshes keep resetting it and the 2h "bot alive" message never fires.
+    last_card_idle: float = 0.0
     backoff_until: float = 0.0
     consec_fail: int = 0
 
@@ -673,14 +682,35 @@ async def _writer_loop(stop_event: asyncio.Event) -> None:
                 await asyncio.sleep(max(1, backoff_until - now))
                 continue
 
-            text = _render()
-            if text != last_text:
+            # v12.90: activity-driven — the card edits ONLY when the bot
+            # actually did something. Countdown timers render into the text
+            # every tick, so a text-diff would fire constantly; instead we
+            # fingerprint the DATA (counters/totals/phase/activity) — pure
+            # countdown churn produces the same signature and is skipped.
+            try:
+                import json as _json
+                sig = _json.dumps(
+                    [_counters(), _totals(), _phase_num(), _activity()],
+                    sort_keys=True, default=str)
+            except Exception:  # noqa: BLE001
+                sig = ""
+            idle_due = (now - last_card_idle) >= _IDLE_HEARTBEAT_SEC
+            gap_ok = (now - getattr(_writer_loop, "_last_edit", 0.0)) \
+                >= _MIN_EDIT_GAP_SEC
+            want_edit = bool(sig) and sig != \
+                getattr(_writer_loop, "_last_sig", None) and gap_ok
+            if want_edit or (idle_due and _phase_num()):
                 if not _phase_num():
                     pass
                 else:
+                    text = _render()
                     mid = await _send_or_edit(text)
                     if mid:
-                        last_text = text
+                        _writer_loop._last_edit = time.time()
+                        _writer_loop._last_sig = sig
+                        if idle_due:
+                            last_card_idle = now
+                    if mid:
                         consec_fail = 0
                     else:
                         # v1.21: bail-out on persistent failed sends so we

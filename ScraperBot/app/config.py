@@ -159,6 +159,15 @@ class Settings:
     details_rest_sec: float = _env_float("DETAILS_REST_SEC", 3.0)
     details_per_tick: int = _env_int("DETAILS_PER_TICK", 5)
     details_page_cap: int = _env_int("DETAILS_PAGE_CAP", 20)
+    # v12.90 (bandwidth diet): adaptive idle backoff. When a tick is fully
+    # warm (zero new fetches) the loop sleeps LONGER each round, doubling up
+    # to this cap; any new gallery resets it to the base tick. This kills the
+    # ~25-doc Mongo-1 freshness read every ~60s that burned ~100+ MB/hr idle.
+    details_idle_max_sec: int = _env_int("DETAILS_IDLE_MAX_SEC", 300)   # 5 min
+    # v12.90: slim gallery fetch — stop asking nhentai for
+    # related,suggestions,comments (Bot 0 lazy-fetches suggestions itself via
+    # its own suggest:<gid> endpoint; Bot 2 never reads them). 1 = slim.
+    details_slim_fetch: int = _env_int("DETAILS_SLIM_FETCH", 1)
 
     # TTLs (must match BOT 0)
     ttl_gallery_sec: int = _env_int("NHCACHE_TTL_GALLERY_SEC", 30 * 24 * 3600)

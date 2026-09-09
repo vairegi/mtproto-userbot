@@ -148,13 +148,19 @@ async def fetch_gallery(
     client: httpx.AsyncClient,
     gallery_id: str | int,
 ) -> Dict[str, Any]:
-    """One /api/v2/galleries/<id> call, with related+suggestions+comments
-    included so BOT 0's detail view has everything on the first read."""
-    return await _get_json(
-        client,
-        f"/galleries/{gallery_id}",
-        {"include": "related,suggestions,comments"},
-    )
+    """One /api/v2/galleries/<id> call.
+
+    v12.90 (bandwidth diet): the verbose `?include=related,suggestions,comments`
+    is now OPT-OUT. Those three embedded arrays are dead weight on the
+    sweeper path — Bot 0 lazy-fetches `suggestions` through its own
+    `suggest:<gid>` endpoint and Bot 2 never reads related/suggestions/
+    comments from the cache — so by default we fetch the SLIM gallery
+    (core fields only). Set DETAILS_SLIM_FETCH=0 to restore the legacy
+    verbose payload (rollback)."""
+    from .config import settings as _s
+    params = None if int(getattr(_s, "details_slim_fetch", 1)) == 1 \
+        else {"include": "related,suggestions,comments"}
+    return await _get_json(client, f"/galleries/{gallery_id}", params)
 
 
 def extract_ids_from_search(payload: Dict[str, Any]) -> List[str]:

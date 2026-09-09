@@ -201,8 +201,19 @@ async def _gallery_is_fresh(gid: str) -> bool:
     """
     # v12.89: Mongo-1 only (Turso read removed) — one round-trip per gid
     # instead of two. Mongo-1 is now the live cache (Bot 0 reads it too).
+    #
+    # v12.90 (bandwidth diet): freshness only needs expires_at plus proof
+    # the row EXISTS. cache_put_mongo ALWAYS stamps payload on write and
+    # Bot 1 has no tombstone/delete path, so document-existence == payload
+    # present. We therefore project ONLY expires_at (~80 B over the wire)
+    # — projecting `payload: 1` would return the field's full ~50 KB VALUE
+    # and defeat the whole point. _cache_row_is_fresh requires a truthy
+    # payload key, so we inject a placeholder True to mark existence.
     now = time.time()
-    m = mongo_client.cache_get_mongo(cache.gallery_key(gid))
+    m = mongo_client.cache_get_mongo(cache.gallery_key(gid),
+                                     projection={"expires_at": 1})
+    if m is not None:
+        m["payload"] = True   # existence marker (row exists ⇒ payload set)
     return _cache_row_is_fresh(m, now)
 
 
@@ -409,17 +420,41 @@ async def run_forever(stop_event: asyncio.Event) -> None:
         return
     except asyncio.TimeoutError:
         pass
+    # v12.90 (bandwidth diet): adaptive idle backoff. A fully-warm tick
+    # (ok==0, rate==0, error==0 — nothing was fetched) means the cache is
+    # already warm, so polling Mongo-1 again in 60s just re-reads ~25 docs
+    # for zero benefit. Back off exponentially to details_idle_max_sec; any
+    # real activity (a fetch, a 429, an error) snaps back to the base tick.
+    base_tick = max(1, int(settings.details_tick_sec or 60))
+    idle_max = max(base_tick, int(getattr(settings, "details_idle_max_sec", 300) or 300))
+    idle_tick = base_tick
     while not stop_event.is_set():
         if not settings.scraper_enabled:
             log.info("scraper disabled via SCRAPER_ENABLED=0 — idling")
+            idle_tick = base_tick
         else:
             try:
-                await sweep_once()
+                res = await sweep_once()
+                active = bool(res) and (
+                    res.get("ok", 0) > 0 or res.get("rate", 0) > 0
+                    or res.get("error", 0) > 0 or res.get("external_hints", 0) > 0)
+                if active:
+                    if idle_tick != base_tick:
+                        log.info("details_sweeper: activity detected — resetting "
+                                 "idle backoff to base tick %ds", base_tick)
+                    idle_tick = base_tick
+                else:
+                    new_tick = min(idle_max, max(base_tick, idle_tick * 2))
+                    if new_tick != idle_tick:
+                        log.info("details_sweeper: cache warm — backing off "
+                                 "next sweep to %ds (cap %ds)", new_tick, idle_max)
+                    idle_tick = new_tick
             except Exception as e:  # noqa: BLE001
                 log.exception("details_sweeper: unhandled: %s", e)
                 _stats_bump(errors=1)
+                idle_tick = base_tick
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=settings.details_tick_sec)
+            await asyncio.wait_for(stop_event.wait(), timeout=idle_tick)
         except asyncio.TimeoutError:
             pass
     log.info("details_sweeper: stopped")

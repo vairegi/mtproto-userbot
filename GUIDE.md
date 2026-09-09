@@ -1854,3 +1854,42 @@ Bot2Fetcher/app/turso_store.py, GUIDE.md, GUIDE_APPEND.txt.
 (Deletions: ScraperBot/app/turso_client.py, ScraperBot/app/mongo2_client.py,
 ScraperBot/app/services/turso_backup.py, ScraperBot/app/services/turso_schema.py,
 ScraperBot/app/turso_cache/ — remove these paths when applying the zip.)
+
+## v12.90 — bandwidth diet: adaptive sweep backoff + slim fetches + activity-driven card (2026-09-09)
+
+Bot 1's Render outbound meter kept climbing after v12.89 (~6.36 GB → ~8 GB
+month-to-date, ~100–200 MB/hour service-initiated). Diagnosis: the dual-write
+legs were only part of the burn — the dominant cost was the details sweeper's
+CONTINUOUS Mongo-1 freshness reads (~25 fat docs/tick/min ≈ 75–150 MB/hr
+idle), the verbose `?include=related,suggestions,comments` on every cold
+gallery fetch, and the log-channel status card editing on a fixed ~15s tick.
+
+Changes (Bot 1 only; zero data-contract changes — no shapes Bot 0/Bot 2 read
+are affected):
+
+1. **Adaptive idle backoff** (`details_sweeper.run_forever`): a fully-warm
+   tick (ok=0, rate=0, error=0, no user hints) doubles the sleep up to
+   DETAILS_IDLE_MAX_SEC (default 300s). Any real activity snaps back to the
+   base DETAILS_TICK_SEC (60s) on the very next tick.
+2. **Slim gallery fetch** (`hf_scraper_lite.fetch_gallery`): the
+   related/suggestions/comments include is now opt-out (DETAILS_SLIM_FETCH=0
+   restores it). Verified safe: Bot 0 lazy-fetches suggestions via its own
+   suggest:<gid> endpoint and never reads related/comments from gallery
+   rows; Bot 2 never reads them either. Old rows keep their extras — they
+   stay valid, we just stop requesting them.
+3. **Lightweight freshness probe** (`_gallery_is_fresh`): projection fetch of
+   ONLY expires_at (~80 B/row instead of the full ~50 KB payload). Safe
+   because cache_put_mongo always stamps payload and Bot 1 has no tombstone
+   path — document existence == payload present. `cache_get_mongo` gained an
+   optional projection kwarg (default None = full doc, unchanged callers).
+4. **Activity-driven status card** (`channel_dashboard._writer_loop`): edits
+   only when the counters/totals/phase/activity fingerprint CHANGES (≥30s
+   apart), plus a 5-min idle card refresh so it never looks dead. Countdown
+   text churn no longer triggers edits. The 2h standalone heartbeat message
+   keeps its own timer (not shared with the card).
+
+Expected effect: idle burn drops from ~100–200 MB/hr to low single-digit
+MB/hr; active scraping cost per gallery drops ~60–80%. Test gate: py_compile
++ pyflakes clean on all 5 touched files, all 8 regression suites pass
+(script mode), mongomock smoke on the projection freshness path (sentinel /
+fresh / expired / missing all correct, payload never crosses the wire).

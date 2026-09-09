@@ -288,12 +288,19 @@ def cache_ensure_indexes() -> None:
         log.warning("cache index create failed: %s", e)
 
 
-def cache_get_mongo(key: str) -> Optional[Dict[str, Any]]:
+def cache_get_mongo(key: str,
+                    projection: Optional[Dict[str, int]] = None
+                    ) -> Optional[Dict[str, Any]]:
+    """v12.90: optional `projection` — a pymongo projection dict like
+    {"payload": 1, "expires_at": 1}. When supplied, only those fields cross
+    the wire (~100 B instead of the full ~50 KB payload); when omitted the
+    full document is returned exactly as before (zero behaviour change for
+    every existing caller)."""
     d = db()
     if d is None:
         return None
     try:
-        return d[CACHE_COLL].find_one({"_id": key})
+        return d[CACHE_COLL].find_one({"_id": key}, projection)
     except PyMongoError as e:
         log.warning("cache_get_mongo(%s) failed: %s", key, e)
         return None

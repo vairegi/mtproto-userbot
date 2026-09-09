@@ -1,27 +1,28 @@
-GUIDE_APPEND — v12.89 (2026-09-08) — Mongo-1 consolidation (Bot 1 single-writer + Bot 2 repoint)
-WHAT: Bot 1's cache.put fanned every row out to Turso + Mongo-1 + Mongo-2
-and turso_backup re-copied the full Turso table to Mongo-2 every 12h —
-6.36 GB outbound in 3 days. Now Bot 1 writes Mongo-1 ONLY; Turso is Bot 0's
-01:00 IST backup target; Mongo-2 retired to cold storage (nothing deleted
-from it). Bot 2's BOT2_TURSO_OFF path repointed from Mongo-2 to Mongo-1
-(_id/updated_at field mapping) for scans, gallery meta and dashboard
-state — the dashboard state had been invisible to Bot 0's nightly backup
-since v12.74 and is now backed up too. Bot 1's rate-limit bucket repointed
-to nhentai_ratelimit so the shared 10/min nhentai quota stays shared with
-Bot 0 (was about to silently split into nhentai_bucket). details_sweeper
-freshness + search-page reads and list_sweeper discovery now hit Mongo-1
-only. scrape_notify handoff unchanged.
-FILES: ScraperBot/app/cache.py, ScraperBot/app/mongo_client.py,
-ScraperBot/app/config.py, ScraperBot/main.py,
+GUIDE_APPEND — v12.90 (2026-09-09) — bandwidth diet (adaptive backoff + slim fetches + activity card)
+WHAT: Bot 1's outbound bandwidth kept climbing after v12.89 because the
+write-destination fix didn't touch the real hogs: the details sweeper's
+nonstop Mongo-1 freshness reads (~25 full docs/tick/min ≈ 75–150 MB/hr
+idle), the verbose ?include=related,suggestions,comments on every cold
+gallery fetch (dead weight — Bot 0 lazy-fetches suggestions itself, Bot 2
+never reads them), and the log-channel status card editing every ~15s. Now:
+(1) the sweeper backs off exponentially to a 5-min cap when the cache is
+fully warm and snaps back to the 60s base tick on any activity; (2) gallery
+fetches are slim by default (DETAILS_SLIM_FETCH=0 restores the verbose
+include); (3) the freshness check projects ONLY expires_at (~80 B/row —
+document existence proves payload presence since Bot 1 has no tombstone
+path); (4) the status card edits only when its data fingerprint changes
+(≥30s apart) plus a 5-min idle refresh. Zero data-contract changes.
+FILES: ScraperBot/app/config.py, ScraperBot/app/hf_scraper_lite.py,
 ScraperBot/app/services/details_sweeper.py,
-ScraperBot/app/services/list_sweeper.py,
-ScraperBot/app/services/telegram_bot.py, ScraperBot/app/routes/status.py,
-Bot2Fetcher/app/turso_store.py, GUIDE.md, GUIDE_APPEND.txt.
-DELETE: ScraperBot/app/turso_client.py, ScraperBot/app/mongo2_client.py,
-ScraperBot/app/services/turso_backup.py, ScraperBot/app/services/turso_schema.py,
-ScraperBot/app/turso_cache/ (delete these paths when applying).
-DEPLOY: drop on repo root, commit, push, redeploy Bot 1 AND Bot 2. Bot 0
-untouched. No new env vars.
-VERIFY: Bot 1 boots with MONGO_URI only, no DUAL-WRITE log lines, sweeps
-write Mongo-1; Bot 2 logs "📖 [MONGO READ] list_gallery_ids — N rows
-(BOT2_TURSO_OFF)" with N matching Mongo-1's gallery count.
+ScraperBot/app/services/channel_dashboard.py, ScraperBot/app/mongo_client.py,
+GUIDE.md, GUIDE_APPEND.txt.
+DELETE: none.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 1 (bk2Scraper) ONLY.
+Bot 0 and Bot 2 untouched. New optional env vars: DETAILS_IDLE_MAX_SEC
+(default 300), DETAILS_SLIM_FETCH (default 1) — safe to leave unset.
+VERIFY: Bot 1 log shows "details_sweeper: cache warm — backing off next
+sweep to 120s/240s/300s" during idle stretches; 📝 detail WRITE lines still
+show mongo=True turso=False; status card in the log channel stops editing
+when idle (max one edit per 30s during activity, one per 5 min idle);
+Render Metrics "Service-Initiated" outbound drops to single-digit MB/hr
+within a few hours.
