@@ -1893,3 +1893,39 @@ MB/hr; active scraping cost per gallery drops ~60–80%. Test gate: py_compile
 + pyflakes clean on all 5 touched files, all 8 regression suites pass
 (script mode), mongomock smoke on the projection freshness path (sentinel /
 fresh / expired / missing all correct, payload never crosses the wire).
+
+## v12.91 — front-page fast lane: mini-app page 1 froze for days (2026-09-14)
+
+Symptom: the mini app's landing pages (page 1 of the core sorts) showed the
+same galleries for days. Log analysis showed Bot 1 WAS writing page 1 rows
+(`search:date:page1` etc.), so this was not a "skips page 1" bug — the real
+freeze had three stacked causes:
+
+  1. Chip/tag search rows carry the never-expire sentinel (ttl=0), so Bot 0
+     serves the cached page forever and NEVER self-refreshes from nhentai —
+     only list_sweeper can update them.
+  2. list_sweeper only rewrites each sort on its own interval (date 2h,
+     popular-today 6h, popular-week 12h, popular 24h).
+  3. When the shared nhentai bucket was exhausted, page fetches were pushed
+     to the priority retry queue — but when every sort was fresh, sweep_once
+     returned EARLY ("all sorts fresh — idling") BEFORE draining that queue,
+     and the sort was still stamped fresh at phase end. A skipped page 1
+     could therefore wait a full 6h tick × a full 2–24h interval = days.
+
+Fixes (Bot 1 only, zero data-contract changes):
+
+  A. Front-page fast lane (`_frontpage_tick`): every FRONTPAGE_TICK_SEC
+     (default 3600s) re-fetches ONLY page 1 of each core chip sort and
+     rewrites those keys. ~4 small search calls/hour (~0.15 MB/hr). Does
+     not touch freshness stamps — full sweeps still run on schedule.
+     FRONTPAGE_TICK_SEC=0 disables.
+  B. Idle-drain: when no sort is due, sweep_once now drains the priority
+     retry queue BEFORE idling, so a bucket-skipped page 1 is retried
+     within minutes instead of hours.
+  C. Fresh-stamp guard: a sort whose page 1 is still pending retry is NOT
+     stamped fresh at phase end, so the next tick retries it instead of
+     waiting a full 2–24h interval.
+
+Test gate: py_compile + pyflakes clean; all 8 regression suites pass in
+script mode. Deploy scope: Bot 1 only.
+
