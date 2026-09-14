@@ -168,6 +168,10 @@ class Settings:
     # related,suggestions,comments (Bot 0 lazy-fetches suggestions itself via
     # its own suggest:<gid> endpoint; Bot 2 never reads them). 1 = slim.
     details_slim_fetch: int = _env_int("DETAILS_SLIM_FETCH", 1)
+    # v12.91: front-page fast lane — refresh page 1 of each core chip sort
+    # every hour so the mini app's landing pages never freeze for a full
+    # 2–24h sort interval. ~4 small search calls/hour (~0.15 MB/hr). 0 = off.
+    frontpage_tick_sec: int = _env_int("FRONTPAGE_TICK_SEC", 3600)
 
     # TTLs (must match BOT 0)
     ttl_gallery_sec: int = _env_int("NHCACHE_TTL_GALLERY_SEC", 30 * 24 * 3600)
