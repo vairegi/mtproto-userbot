@@ -36,6 +36,7 @@ from ..config import settings
 log = logging.getLogger("scraperbot.list_sweeper")
 
 _PRIO_KEY = "list_priority"
+_K_FRONTPAGE_LAST = "list_frontpage_last"  # v12.91 fast-lane schedule
 _STATS_KEY = "list_stats"
 _LAST_KEY = "list_last_run"
 _PRIO_CAP = 40
@@ -378,6 +379,35 @@ async def sweep_once() -> Dict[str, Any]:
                  fresh, len(sorts_this_phase))
     sorts_this_phase = due
     if not sorts_this_phase:
+        # v12.91: even when no sort is due, drain the retry queue first — a
+        # bucket-skipped page (often page 1 of a core sort) must not sit in
+        # the queue untouched for the whole 6h tick. This was the mechanism
+        # behind multi-day-frozen front pages.
+        retry = _priority_pop_all()
+        if retry:
+            log.info("v12.91: all sorts fresh but %d page(s) pending retry — draining", len(retry))
+            client = await hf_scraper_lite.make_client()
+            try:
+                for (sort, page) in retry:
+                    if mongo_client.is_paused():
+                        _priority_push(sort, page)  # put it back
+                        continue
+                    pres = await _fetch_and_cache(client, sort, page)
+                    if pres == "ok":     ok += 1
+                    elif pres == "skip": skip += 1
+                    elif pres == "rate": rate += 1
+                    else:                err += 1
+                    await _inter_attempt_sleep()
+            finally:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+            if ok or skip or rate or err:
+                log.info("v12.91 idle-drain done ok=%d skip=%d rate=%d err=%d",
+                         ok, skip, rate, err)
+                return {"ok": ok, "skip": skip, "rate_limited": rate,
+                        "errors": err, "duration_sec": 0, "idle": False}
         channel_dashboard.record_activity(
             sweeping="💤 idle — all sorts fresh, waiting for next due slot")
         log.info("list sweep: all sorts fresh — idling")
@@ -493,7 +523,23 @@ async def sweep_once() -> Dict[str, Any]:
 
     # v1.22.4: stamp last-swept time for every sort actually swept, so the
     # freshness filter skips them until their own interval elapses.
+    # v12.91 fresh-stamp guard: if a sort's page 1 is still sitting in the
+    # retry queue (bucket-skipped / 429'd this phase), the sort is NOT fresh —
+    # stamping it would freeze the mini app's front page for a full interval
+    # (up to 24h for 'popular'). Leave it unstamped so the next tick retries.
+    _retry_now = mongo_client.state_get(_PRIO_KEY, []) or []
+    _retry_p1 = set()
+    for _e in _retry_now:
+        try:
+            if int(_e[1]) == 1:
+                _retry_p1.add(str(_e[0]))
+        except (IndexError, TypeError, ValueError):
+            continue
     for _s in swept_sorts:
+        if _s in _retry_p1:
+            log.info("v12.91: NOT stamping %s fresh — its page 1 is still "
+                     "pending retry", _s)
+            continue
         try:
             mongo_client.state_set(f"list_sort_last:{_s}", time.time())
         except Exception:  # noqa: BLE001
@@ -544,6 +590,40 @@ def _next_tick_sec(last: Dict[str, Any]) -> int:
     return nxt
 
 
+async def _frontpage_tick(now_ts: float) -> None:
+    """v12.91: fast lane — refresh ONLY page 1 of each core chip sort every
+    FRONTPAGE_TICK_SEC (default 3600s), independent of the big 2–24h sort
+    intervals, so the mini app's landing pages are never more than ~1h stale.
+    Does NOT touch the sorts' freshness stamps — full sweeps still run on
+    their own schedule. ~4 small search calls/hour (~0.15 MB/hr)."""
+    tick = int(getattr(settings, "frontpage_tick_sec", 3600) or 0)
+    if tick <= 0:
+        return
+    last = float(mongo_client.state_get(_K_FRONTPAGE_LAST, 0) or 0)
+    if now_ts - last < tick:
+        return
+    mongo_client.state_set(_K_FRONTPAGE_LAST, now_ts)
+    core = [s for s in (settings.list_sorts or [])
+            if not str(s).startswith("tag:")]
+    if not core:
+        return
+    client = await hf_scraper_lite.make_client()
+    try:
+        for sort in core:
+            if mongo_client.is_paused():
+                break
+            res = await _fetch_and_cache(client, sort, 1)
+            if res == "ok":
+                log.info("v12.91 fast lane: refreshed %s page 1", sort)
+            await _inter_attempt_sleep()
+            gc.collect()
+    finally:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def run_forever(stop_event: asyncio.Event) -> None:
     """Boot task: sweep, then sleep (fixed or adaptive), forever."""
     log.info("list_sweeper: starting (tick=%ds sorts=%s chip_max_pages=%d tag_max_pages=%d adaptive=%s)",
@@ -571,6 +651,18 @@ async def run_forever(stop_event: asyncio.Event) -> None:
                 last_result = {"skip": 0, "rate_limited": 0, "errors": 1}
         # v1.22.4: never sleep past the moment the next-freshest sort is due
         gap = min(_next_tick_sec(last_result), _next_due_gap_sec())
+        # v12.91: run the front-page fast lane, then wake in time for its
+        # next slot even when the phase gap is hours long.
+        if settings.scraper_enabled and not mongo_client.is_paused():
+            try:
+                await _frontpage_tick(time.time())
+            except Exception as e:  # noqa: BLE001
+                log.warning("frontpage tick failed (non-fatal): %s", e)
+        _fp_tick = int(getattr(settings, "frontpage_tick_sec", 3600) or 0)
+        if _fp_tick > 0:
+            _fp_last = float(mongo_client.state_get(_K_FRONTPAGE_LAST, 0) or 0)
+            _fp_gap = max(30, _fp_tick - int(time.time() - _fp_last))
+            gap = min(gap, _fp_gap)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=gap)
         except asyncio.TimeoutError:
