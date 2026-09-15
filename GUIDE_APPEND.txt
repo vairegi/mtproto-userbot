@@ -1,22 +1,22 @@
-GUIDE_APPEND — v12.91 (2026-09-14) — front-page fast lane (page 1 froze for days)
-WHAT: The mini app's page-1 landing pages showed the same galleries for
-days. Chip/tag search rows are never-expire (ttl=0), so only list_sweeper
-can refresh them — and a bucket-skipped page 1 could wait a whole 6h tick
-plus a full 2–24h sort interval because (a) sweep_once idled WITHOUT
-draining the retry queue when all sorts were fresh and (b) the sort was
-still stamped fresh at phase end. Now: (A) a fast lane refreshes ONLY page 1
-of the 4 core chip sorts every FRONTPAGE_TICK_SEC (default 3600s, 0=off,
-~0.15 MB/hr) without touching the big sort intervals; (B) the idle path
-drains the retry queue before idling; (C) a sort whose page 1 is still
-pending retry is not stamped fresh, so the next tick retries it.
-FILES: ScraperBot/app/config.py, ScraperBot/app/services/list_sweeper.py,
-GUIDE.md, GUIDE_APPEND.txt.
+GUIDE_APPEND — v12.92 (2026-09-15) — /cleanrequest: unstick the queue badge + Bot 2 flip hardening
+WHAT: The mini-app queue badge was pinned (e.g. 12 for days) by zombie queue
+rows — Bot 2 had completed the downloads (galleries=COMPLETED) but the
+best-effort queue-row flip missed pre-v12.88 rows that carry no gallery_id
+field (URL-regex match silently failed). Now: (A) admin command
+/cleanrequest (preview) + /cleanrequest confirm (apply) reconciles the queue
+ledger against galleries truth — completed galleries get their queue rows
+marked done (delivered="cleanup", no DM floods), rows >7d old with no
+gallery activity in 24h get cancelled, genuinely active rows are untouched;
+(B) Bot 2's mark_queue_status also matches by url_hash (sha256 of the
+normalised URL) so legacy rows flip going forward; (C) /help now lists the
+everyday commands hidden since v11.6 (/fetch /search /queue /status /token)
+plus /cleanrequest.
+FILES: admin_bot.py, Bot2Fetcher/app/mongo_state.py, GUIDE.md,
+GUIDE_APPEND.txt.
 DELETE: none.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 1 (bk2Scraper) ONLY.
-Bot 0 and Bot 2 untouched. New optional env: FRONTPAGE_TICK_SEC (default
-3600) — safe to leave unset.
-VERIFY: Bot 1 log shows "v12.91 fast lane: refreshed <sort> page 1" roughly
-hourly; after a bucket-skip phase, "v12.91: NOT stamping <sort> fresh — its
-page 1 is still pending retry"; during idle stretches with a backlog,
-"v12.91 idle-drain done ok=...". Mini-app page 1 content rotates at most ~1h
-behind nhentai for the 4 core sorts.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 0 AND Bot 2. Bot 1
+untouched. No new env vars.
+VERIFY: in Bot 0's admin chat, /cleanrequest shows the preview counts;
+/cleanrequest confirm replies "marked done (were completed): N" and the
+mini-app badge drops immediately (queue pending+processing count falls).
+New downloads complete with the badge returning to 0 without manual cleanup.

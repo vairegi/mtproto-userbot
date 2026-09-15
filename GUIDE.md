@@ -1929,3 +1929,40 @@ Fixes (Bot 1 only, zero data-contract changes):
 Test gate: py_compile + pyflakes clean; all 8 regression suites pass in
 script mode. Deploy scope: Bot 1 only.
 
+## v12.92 — /cleanrequest: unstick the queue badge + Bot 2 queue-flip hardening (2026-09-15)
+
+Symptom: the mini-app queue badge sat at 12 for 5–6 days even though Bot 2
+had downloaded those galleries and posted them to the DB channel.
+
+Root cause (verified in code): two ledgers. Bot 2 writes the download truth
+to `galleries` (COMPLETED) and best-effort flips the matching `queue` row —
+but pre-v12.88 queue rows carry no `gallery_id` field, so the flip matched
+only via a URL regex and silently missed those rows. Mongo writes are
+best-effort by contract (failures swallowed), so a missed flip is forever.
+The badge counts pending+processing queue rows, so zombie rows pin it.
+
+Fixes:
+
+  A. `/cleanrequest` (admin-only, Bot 0 admin_bot): two-step —
+     `/cleanrequest` previews, `/cleanrequest confirm` applies. Scans
+     pending/processing queue rows, resolves gallery_id (field first,
+     URL-extract fallback for legacy rows), and:
+       * galleries COMPLETED/PARTIAL  → queue row marked done
+         (delivered="cleanup" so the v12.87 delivery watcher never DMs
+         ancient PDFs; its boot-watermark also excludes these rows)
+       * row >7d old AND no gallery progress (gallery doc's own
+         claimed_at/started_at/updated_at/completed_at all silent >24h)
+         → marked cancelled. Rows with fresh gallery activity are spared.
+  B. Bot 2 hardening (mongo_state.mark_queue_status): the queue flip now
+     also matches by url_hash (sha256 of the normalised URL, trailing slash
+     stripped — verified against url_utils.py), so legacy rows get flipped
+     even when the URL regex misses.
+  C. /help catch-up: restored the everyday commands hidden since v11.6
+     (/fetch, /search, /queue, /status, /token) and added /cleanrequest.
+
+Test gate: py_compile + pyflakes clean on touched files (9 admin_bot.py
+pyflakes notes verified pre-existing at HEAD bf75ab8); all 8 regression
+suites pass; mongomock functional smoke of the scan: zombie/cancel/active
+classification, atomic apply, badge count, and delivery-watcher safety all
+verified. Deploy scope: Bot 0 AND Bot 2.
+

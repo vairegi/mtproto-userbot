@@ -320,6 +320,148 @@ async def cmd_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(text)
 
 
+# ---------------------------------------------------------------------------
+# v12.92 — /cleanrequest: reconcile the queue ledger against the galleries
+# truth. Rows whose gallery is already COMPLETED/PARTIAL in `galleries` but
+# whose queue row is still 'pending'/'processing' are ZOMBIES — Bot 2
+# finished them (PDF is in the DB channel) but the queue flip never landed
+# (best-effort write, or a pre-v12.88 row with no gallery_id field). The
+# mini-app badge counts pending+processing, so zombies pin the badge for
+# days. Two-step: `/cleanrequest` previews, `/cleanrequest confirm` applies.
+# Also (user-approved) cancels rows >7 days old with no gallery progress.
+# ---------------------------------------------------------------------------
+_CLEANREQ_AGE_S = 7 * 24 * 3600          # cancel threshold for dead rows
+
+
+def _cleanrequest_scan(conn):
+    """Pure read. Returns (zombies, cancels, active) row lists."""
+    rows = list(conn.queue.find(
+        {"status": {"$in": ["pending", "processing"]}},
+        {"_id": 1, "url": 1, "gallery_id": 1, "status": 1,
+         "created_at": 1, "updated_at": 1},
+    ))
+    zombies, cancels, active = [], [], []
+    now = db.now_ts()
+    for r in rows:
+        gid = r.get("gallery_id")
+        if not gid:
+            try:
+                gid = _gs.extract_gallery_id(r.get("url") or "")
+            except Exception:  # noqa: BLE001
+                gid = None
+        gdoc = None
+        if gid:
+            try:
+                gdoc = _gs.get(conn, str(gid))
+            except Exception:  # noqa: BLE001
+                gdoc = None
+        gst = str((gdoc or {}).get("status") or "").upper()
+        if gst in ("COMPLETED", "PARTIAL"):
+            zombies.append((r, str(gid), gst))
+            continue
+        # No finished gallery behind it — age out if the row is ancient.
+        ref = r.get("updated_at") or r.get("created_at") or 0
+        try:
+            ref = float(ref)
+        except (TypeError, ValueError):
+            ref = 0.0
+        if ref and (now - ref) < _CLEANREQ_AGE_S:
+            active.append(r)
+            continue
+        # Row IS ancient — but never cancel a gallery that is genuinely
+        # mid-download: check the gallery doc's own activity clock too.
+        # Bot 2 stamps claimed_at/started_at/updated_at on live claims; if
+        # any is < 24h old the download is real and the row stays.
+        g_ref = 0.0
+        for k in ("claimed_at", "started_at", "updated_at", "completed_at"):
+            try:
+                v = float((gdoc or {}).get(k) or 0)
+            except (TypeError, ValueError):
+                v = 0.0
+            g_ref = max(g_ref, v)
+        if g_ref and (now - g_ref) < 24 * 3600:
+            active.append(r)     # gallery has fresh activity — leave it
+        else:
+            cancels.append((r, str(gid) if gid else "", gst or "none"))
+    return zombies, cancels, active
+
+
+@only_admin
+async def cmd_cleanrequest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    confirm = bool(msg and msg.text and "confirm" in msg.text.lower())
+    conn = db.connect()
+    try:
+        zombies, cancels, active = _cleanrequest_scan(conn)
+        if not confirm:
+            lines = [
+                "🧹 /cleanrequest — preview (nothing changed yet)",
+                "",
+                f"  ✅ completed but stuck (will mark done):   {len(zombies)}",
+                f"  🗑 dead >7d, no progress (will cancel):     {len(cancels)}",
+                f"  ⏳ genuinely active (left untouched):      {len(active)}",
+            ]
+            if zombies:
+                lines.append("")
+                lines.append("Stuck-but-done gallery ids: "
+                             + ", ".join(g for _, g, _ in zombies[:15])
+                             + (" …" if len(zombies) > 15 else ""))
+            if zombies or cancels:
+                lines.append("")
+                lines.append("Run /cleanrequest confirm to apply.")
+            else:
+                lines.append("")
+                lines.append("Queue is clean — nothing to do. ✅")
+            await msg.reply_text("\n".join(lines))
+            return
+
+        zdone = zfail = 0
+        now = db.now_ts()
+        for r, gid, gst in zombies:
+            res = conn.queue.update_one(
+                {"_id": r["_id"],
+                 "status": {"$in": ["pending", "processing"]}},
+                {"$set": {
+                    "status": "done",
+                    "updated_at": now,
+                    "delivered": "cleanup",   # watcher only DM's updated_at>=boot & delivered!=True
+                    "error_reason": None,
+                    "cleanup_note": f"v12.92 cleanrequest: galleries={gst}",
+                }},
+            )
+            if res.modified_count:
+                zdone += 1
+            else:
+                zfail += 1
+        cdone = 0
+        for r, gid, gst in cancels:
+            res = conn.queue.update_one(
+                {"_id": r["_id"],
+                 "status": {"$in": ["pending", "processing"]}},
+                {"$set": {
+                    "status": "cancelled",
+                    "updated_at": now,
+                    "error_reason": "v12.92 cleanrequest: no progress in 7d",
+                }},
+            )
+            if res.modified_count:
+                cdone += 1
+        c = db.counts_by_status(conn)
+    finally:
+        conn.close()
+
+    await msg.reply_text(
+        "🧹 /cleanrequest — done\n"
+        f"  ✅ marked done (were completed): {zdone}"
+        + (f"  ({zfail} raced/already changed)" if zfail else "") + "\n"
+        f"  🗑 cancelled (dead >7d):          {cdone}\n"
+        f"  ⏳ still active:                  {len(active)}\n"
+        "\n"
+        f"Badge now → pending: {c.get('pending', 0)} · "
+        f"processing: {c.get('processing', 0)}"
+    )
+
+
 # v12.34f: decorator removed — _resolve_msg_id is a sync helper, not a bot handler.
 # v1.22 BackupDB — manual disaster-recovery toggle. When ON, Bot 0's
 # delivery path (auto-DM / Mini App download) forwards cover+PDF from the
@@ -1991,6 +2133,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append("🔹 Everyday:")
     lines.append("  /help          compact command list")
     lines.append("  /description   full screenshot-style command reference")
+    # v12.92: these were registered but hidden from /help since v11.6 —
+    # restoring them so users can actually discover them.
+    lines.append("  /fetch <url>   download a gallery to your DM")
+    lines.append("  /search <q>    search nhentai")
+    lines.append("  /queue         show live queue depth")
+    lines.append("  /status        bot status")
+    lines.append("  /token         your remaining daily tokens")
     lines.append("")
 
     # ---- Admin -----------------------------------------------------------
@@ -2012,6 +2161,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("  /app                               open the mini-app")
         lines.append("  /appon                             show mini-app to everyone")
         lines.append("  /appoff                            hide mini-app from non-admins")
+        lines.append("  /cleanrequest [confirm]            clear stuck queue rows (badge fix, v12.92)")
         lines.append("")
 
     # ---- Super-admin -----------------------------------------------------
@@ -3283,6 +3433,7 @@ def build_app() -> Application:
     app.add_handler(ChatMemberHandler(cb_chat_member_update,
                                       ChatMemberHandler.ANY_CHAT_MEMBER))
     app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CommandHandler("cleanrequest", cmd_cleanrequest))   # v12.92
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
