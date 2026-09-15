@@ -23,6 +23,7 @@ from .. import db, ratelimit
 from ..auth import get_current_user
 from ..config import settings
 from ..services import dm_delivery, progress, queue_bridge
+from ..services import shortener as _shortener
 
 router = APIRouter(prefix="/api/queue", tags=["queue"])
 
@@ -38,6 +39,20 @@ def enqueue(body: EnqueueBody, user: dict = Depends(get_current_user)) -> dict:
     # If app is private, block non-admins.
     if not db.get_public_mode() and uid != int(settings.admin_user_id):
         raise HTTPException(403, "App is currently private (admin only).")
+
+    # v13.0: shortener verification gate — locked users cannot queue
+    # downloads. Fails open (any error → let them through). Admins bypass.
+    try:
+        if not _shortener.is_verified(uid, int(settings.admin_user_id)):
+            raise HTTPException(
+                403,
+                "🔐 Verification required — complete the link sent to your "
+                "Telegram DM, then try again.",
+            )
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001
+        pass  # fail open
 
     # ---- V2 dedup gate -----------------------------------------------------
     # Runs BEFORE the rate-limit consume on purpose: tapping "Queue" on a

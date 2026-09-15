@@ -1966,3 +1966,61 @@ suites pass; mongomock functional smoke of the scan: zombie/cancel/active
 classification, atomic apply, badge count, and delivery-watcher safety all
 verified. Deploy scope: Bot 0 AND Bot 2.
 
+
+## v13.0 — Link-shortener verification gate (VPLINK, Bot 0 only) (2026-09-15)
+
+Big feature. Locks the mini app AND the Download action behind a paid
+link-shortener verification. Bot 1 and Bot 2 are untouched — the gate lives
+entirely in Bot 0.
+
+Flow: user opens the mini app → boot polls GET /api/shortener/status → if
+locked, a non-bypassable overlay shows the mini-app message + a hardcoded
+"🔓 Verify & Unlock" button (+ optional admin buttons) and the backend DMs
+the user the same via Bot 0. Tapping the button mints a one-time token,
+builds a deep link https://t.me/<bot>?start=verify_<TOKEN>, shortens it via
+the VPLINK api, and opens it. The user completes the hops, lands on the
+deep link, and Bot 0's /start handler verifies the token and writes
+shortener_unlocks[uid].unlocked_until = now + /setverifytime hours. The
+overlay polls status and auto-clears.
+
+Gate order: shortener → force-join → popup. Admins always bypass. Every
+check FAILS OPEN (provider down / not configured / db error → let users in).
+
+Storage (control_flags + 2 collections, epoch floats per §5.5):
+  shortener_enabled "1"|"0"           shortener_api_url  (VPLINK base)
+  shortener_limit (visits/day, d=1)   shortener_hours    (TTL, d=6)
+  shortener_app_msg / shortener_bot_msg / shortener_buttons (JSON list)
+  shortener_tokens {_id:token, uid, created, used}
+  shortener_unlocks {_id:uid, unlocked_until, visits_today, day, visits_total}
+
+Admin commands (Bot 0 admin chat):
+  /shortener on|off|status      toggle + inspect
+  /shortenerapi <url>           set the VPLINK api base (...?api=TOKEN&url=)
+  /shortenerlimit <n>           completed visits per user per day (default 1)
+  /setverifytime <hours>        how long one verify unlocks (default 6)
+  /shortenermsg <text>          mini-app overlay text ("clear" = default)
+  /shortenerbotmsg <text>       bot DM verification text ("clear" = default)
+  /shortenerbtn <label> | <url> add a secondary button ("clear" = remove all)
+
+Backend endpoints (miniapp/backend/app/routes/shortener.py, auto-mounted):
+  GET /api/shortener/status  → {enabled, verified, locked, message, buttons}
+  GET /api/shortener/link    → mint token + return shortened URL
+  GET /api/shortener/verify  → browser fallback landing (deep link is primary)
+
+Frontend: js/plugins/shortener-gate.js self-runs on app boot (imported in
+core/app.js before the popup), paints the blocking overlay, polls status
+every 4s, auto-clears when verified. Download gate: routes/queue.py POST
+raises 403 for locked users.
+
+Files: miniapp/backend/app/services/shortener.py (NEW),
+miniapp/backend/app/routes/shortener.py (NEW),
+miniapp/backend/app/routes/queue.py, admin_bot.py,
+miniapp/frontend/js/plugins/shortener-gate.js (NEW),
+miniapp/frontend/js/core/app.js, miniapp/frontend/index.html,
+miniapp/frontend/css/components.css, GUIDE.md, GUIDE_APPEND.txt.
+
+Deploy: Bot 0 only. No new env vars required — set the provider live via
+/shortenerapi (BOT_USERNAME optional; bot username is read live via getMe).
+Verify: /shortener on, /shortenerapi <vplink base>, then open the mini app
+as a non-admin → overlay + DM appear; complete the link → ✅ Verified and
+the overlay clears; Download works again.

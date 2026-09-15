@@ -30,6 +30,10 @@ import { store } from "core/state.js";
 import { prefs } from "core/prefs.js";
 import { pages, findPage } from "core/registry.js";
 import { h } from "core/components.js";
+// v13.0: link-shortener verification gate. Imported for its side effect —
+// it self-runs on import and paints the blocking overlay BEFORE any page
+// renders (and before the popup), then auto-clears once the user verifies.
+import "plugins/shortener-gate.js";
 
 const $header  = document.getElementById("app-header");
 const $main    = document.getElementById("app-main");
@@ -79,6 +83,8 @@ async function boot() {
   // v12.3: admin-configurable popup. Runs ONCE per mini-app open,
   // throttled server-side per user by /popuptime (default 2 hours).
   // Fire-and-forget — never block boot on a popup fetch failure.
+  // v13.0: the shortener gate already self-ran on import above (it is the
+  // FIRST gate, ahead of the popup). Now the normal admin popup.
   try { _maybeShowPopup(); } catch (_) { /* popup is best-effort */ }
 
   // v11.6: apply the server-side default background theme, but ONLY when

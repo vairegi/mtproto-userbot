@@ -1,22 +1,22 @@
-GUIDE_APPEND — v12.92 (2026-09-15) — /cleanrequest: unstick the queue badge + Bot 2 flip hardening
-WHAT: The mini-app queue badge was pinned (e.g. 12 for days) by zombie queue
-rows — Bot 2 had completed the downloads (galleries=COMPLETED) but the
-best-effort queue-row flip missed pre-v12.88 rows that carry no gallery_id
-field (URL-regex match silently failed). Now: (A) admin command
-/cleanrequest (preview) + /cleanrequest confirm (apply) reconciles the queue
-ledger against galleries truth — completed galleries get their queue rows
-marked done (delivered="cleanup", no DM floods), rows >7d old with no
-gallery activity in 24h get cancelled, genuinely active rows are untouched;
-(B) Bot 2's mark_queue_status also matches by url_hash (sha256 of the
-normalised URL) so legacy rows flip going forward; (C) /help now lists the
-everyday commands hidden since v11.6 (/fetch /search /queue /status /token)
-plus /cleanrequest.
-FILES: admin_bot.py, Bot2Fetcher/app/mongo_state.py, GUIDE.md,
-GUIDE_APPEND.txt.
+GUIDE_APPEND — v13.0 (2026-09-15) — Link-shortener verification gate (VPLINK, Bot 0)
+WHAT: Locks the mini app + Download behind a paid shortener. Unverified
+users get a blocking overlay (mini-app text, /shortenermsg) + a Bot 0 DM
+(bot text, /shortenerbotmsg) with a hardcoded "🔓 Verify & Unlock" button
+(+ optional /shortenerbtn buttons). The button mints a one-time token,
+shortens a t.me/<bot>?start=verify_<TOKEN> deep link via VPLINK, and opens
+it; /start verifies the token and unlocks for /setverifytime hours (def 6).
+One visit unlocks; /shortenerlimit caps visits/day (def 1). Order:
+shortener→force-join→popup. Admins bypass; everything fails open.
+Bot 1 and Bot 2 untouched.
+FILES: miniapp/backend/app/services/shortener.py (NEW),
+miniapp/backend/app/routes/shortener.py (NEW),
+miniapp/backend/app/routes/queue.py, admin_bot.py,
+miniapp/frontend/js/plugins/shortener-gate.js (NEW),
+miniapp/frontend/js/core/app.js, miniapp/frontend/index.html,
+miniapp/frontend/css/components.css, GUIDE.md, GUIDE_APPEND.txt.
 DELETE: none.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 0 AND Bot 2. Bot 1
-untouched. No new env vars.
-VERIFY: in Bot 0's admin chat, /cleanrequest shows the preview counts;
-/cleanrequest confirm replies "marked done (were completed): N" and the
-mini-app badge drops immediately (queue pending+processing count falls).
-New downloads complete with the badge returning to 0 without manual cleanup.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 0 ONLY. No new env
+vars; set the provider live: /shortenerapi https://vplink.in/api?api=TOKEN&url=
+VERIFY: /shortener on → open mini app as non-admin → overlay + DM appear;
+complete the link → bot replies "✅ Verified" and the overlay auto-clears;
+/shortener status shows api/limit/ttl; Download queues again for the user.
