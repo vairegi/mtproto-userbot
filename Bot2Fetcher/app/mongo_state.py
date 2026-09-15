@@ -470,10 +470,19 @@ class Galleries:
             upd = {"status": str(status), "updated_at": time.time()}
             if error:
                 upd["error_reason"] = str(error)[:200]
+            # v12.92: also match by url_hash (Bot 0's canonical dedup key —
+            # sha256 of the normalised URL, which strips the trailing slash,
+            # so the hashed form is "https://nhentai.net/g/<gid>"). Pre-v12.88
+            # rows have no gallery_id field and their URL form can miss the
+            # /g/<id>/ regex — those were the zombie rows pinning the badge.
+            import hashlib as _hl
+            _or = [{"gallery_id": gid},
+                   {"url": {"$regex": f"/g/{gid}/?"}},
+                   {"url_hash": _hl.sha256(
+                       f"https://nhentai.net/g/{gid}".encode()).hexdigest()}]
             col.update_many(
                 {"status": {"$in": ["pending", "processing"]},
-                 "$or": [{"gallery_id": gid},
-                         {"url": {"$regex": f"/g/{gid}/?"}}]},
+                 "$or": _or},
                 {"$set": upd},
             )
         except Exception:
