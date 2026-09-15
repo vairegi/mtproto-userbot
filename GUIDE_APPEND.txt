@@ -1,22 +1,17 @@
-GUIDE_APPEND — v13.0 (2026-09-15) — Link-shortener verification gate (VPLINK, Bot 0)
-WHAT: Locks the mini app + Download behind a paid shortener. Unverified
-users get a blocking overlay (mini-app text, /shortenermsg) + a Bot 0 DM
-(bot text, /shortenerbotmsg) with a hardcoded "🔓 Verify & Unlock" button
-(+ optional /shortenerbtn buttons). The button mints a one-time token,
-shortens a t.me/<bot>?start=verify_<TOKEN> deep link via VPLINK, and opens
-it; /start verifies the token and unlocks for /setverifytime hours (def 6).
-One visit unlocks; /shortenerlimit caps visits/day (def 1). Order:
-shortener→force-join→popup. Admins bypass; everything fails open.
-Bot 1 and Bot 2 untouched.
-FILES: miniapp/backend/app/services/shortener.py (NEW),
-miniapp/backend/app/routes/shortener.py (NEW),
-miniapp/backend/app/routes/queue.py, admin_bot.py,
-miniapp/frontend/js/plugins/shortener-gate.js (NEW),
-miniapp/frontend/js/core/app.js, miniapp/frontend/index.html,
-miniapp/frontend/css/components.css, GUIDE.md, GUIDE_APPEND.txt.
+GUIDE_APPEND — v13.01 (2026-09-15) — shortener polish: drop /shortenerlimit, add /verifymsg
+WHAT: Follow-up on the v13.0 link-shortener gate. (A) /shortenerlimit removed
+entirely — it was counted but never enforced, and a daily cap would have
+broken the 6h re-verify loop; TTL (/setverifytime, def 6) is now the only
+unlock-duration control (visits still counted for stats). (B) New admin
+command /verifymsg <text> edits the post-verification SUCCESS message Bot 0
+DMs ("Verified! Full access unlocked for {hours} hour(s)."); {hours} fills
+the current TTL, "clear" resets to default. Re-verifying does NOT stack
+hours — each verify resets unlocked_until = now + TTL.
+FILES: admin_bot.py, miniapp/backend/app/services/shortener.py, GUIDE.md,
+GUIDE_APPEND.txt.
 DELETE: none.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 0 ONLY. No new env
-vars; set the provider live: /shortenerapi https://vplink.in/api?api=TOKEN&url=
-VERIFY: /shortener on → open mini app as non-admin → overlay + DM appear;
-complete the link → bot replies "✅ Verified" and the overlay auto-clears;
-/shortener status shows api/limit/ttl; Download queues again for the user.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 0 ONLY. No new env vars.
+VERIFY: /shortener status no longer shows a limit line; /verifymsg Enjoy! ✅
+then complete a verify as a non-admin → the bot replies "Enjoy! ✅" instead
+of the default; /verifymsg clear restores the default. /help's shortener
+section lists /verifymsg and no longer lists /shortenerlimit.

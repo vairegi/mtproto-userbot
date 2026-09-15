@@ -1988,18 +1988,18 @@ check FAILS OPEN (provider down / not configured / db error → let users in).
 
 Storage (control_flags + 2 collections, epoch floats per §5.5):
   shortener_enabled "1"|"0"           shortener_api_url  (VPLINK base)
-  shortener_limit (visits/day, d=1)   shortener_hours    (TTL, d=6)
-  shortener_app_msg / shortener_bot_msg / shortener_buttons (JSON list)
+  shortener_hours    (TTL, d=6)
+  shortener_app_msg / shortener_bot_msg / shortener_verify_msg / shortener_buttons (JSON list)
   shortener_tokens {_id:token, uid, created, used}
   shortener_unlocks {_id:uid, unlocked_until, visits_today, day, visits_total}
 
 Admin commands (Bot 0 admin chat):
   /shortener on|off|status      toggle + inspect
   /shortenerapi <url>           set the VPLINK api base (...?api=TOKEN&url=)
-  /shortenerlimit <n>           completed visits per user per day (default 1)
   /setverifytime <hours>        how long one verify unlocks (default 6)
   /shortenermsg <text>          mini-app overlay text ("clear" = default)
   /shortenerbotmsg <text>       bot DM verification text ("clear" = default)
+  /verifymsg <text>             post-verification success text ({hours} = TTL, "clear" = default)
   /shortenerbtn <label> | <url> add a secondary button ("clear" = remove all)
 
 Backend endpoints (miniapp/backend/app/routes/shortener.py, auto-mounted):
@@ -2024,3 +2024,20 @@ Deploy: Bot 0 only. No new env vars required — set the provider live via
 Verify: /shortener on, /shortenerapi <vplink base>, then open the mini app
 as a non-admin → overlay + DM appear; complete the link → ✅ Verified and
 the overlay clears; Download works again.
+
+## v13.01 — shortener polish: drop /shortenerlimit, add /verifymsg (2026-09-15)
+
+Two follow-ups on v13.0, same gate:
+- Removed /shortenerlimit entirely. It was tracked-but-not-enforced and, if
+  enforced as a daily cap, would have broken the TTL re-verify loop. TTL
+  (/setverifytime) is now the ONLY unlock-duration control. Visits are still
+  counted (shortener_unlocks.visits_today / visits_total) for stats.
+- New /verifymsg <text> sets the post-verification SUCCESS message Bot 0
+  sends (default "Verified! Full access unlocked for {hours} hour(s).").
+  {hours} is replaced with the current TTL. "clear" resets to default.
+  Stored in control_flags key shortener_verify_msg.
+
+Note on stacking: re-verifying does NOT stack hours — each verify resets
+unlocked_until = now + TTL.
+Files: admin_bot.py, miniapp/backend/app/services/shortener.py, GUIDE.md,
+GUIDE_APPEND.txt. Deploy: Bot 0 only.

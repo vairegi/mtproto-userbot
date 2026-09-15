@@ -2168,10 +2168,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("🔗 Link shortener:")
         lines.append("  /shortener on|off|status           toggle + inspect the verification gate (v13.0)")
         lines.append("  /shortenerapi <url>                set the VPLINK api base (…?api=TOKEN&url=)")
-        lines.append("  /shortenerlimit <n>                completed visits per user per day (default 1)")
         lines.append("  /setverifytime <hours>             how long one verify unlocks (default 6)")
         lines.append("  /shortenermsg <text>               mini-app overlay text (clear = default)")
         lines.append("  /shortenerbotmsg <text>            bot DM verification text (clear = default)")
+        lines.append("  /verifymsg <text>                  post-verification success text (clear = default)")
         lines.append("  /shortenerbtn <label> | <url>      add a secondary button (clear = remove all)")
 
     # ---- Super-admin -----------------------------------------------------
@@ -3410,8 +3410,8 @@ def _set_miniapp_visibility(public: bool) -> None:
 # v13.0 — Link-shortener verification gate (admin commands + /start verify)
 # ---------------------------------------------------------------------------
 # Config lives in control_flags (see miniapp/backend/app/services/shortener.py):
-#   shortener_enabled / shortener_api_url / shortener_limit / shortener_hours
-#   shortener_app_msg / shortener_bot_msg / shortener_buttons (JSON list)
+#   shortener_enabled / shortener_api_url / shortener_hours
+#   shortener_app_msg / shortener_bot_msg / shortener_verify_msg / shortener_buttons (JSON list)
 # Per-user state in Mongo: shortener_tokens, shortener_unlocks.
 # All commands are admin-only. The gate fails open for everyone else.
 # ===========================================================================
@@ -3423,6 +3423,9 @@ _SHORTENER_DEFAULT_APP_MSG = (
 _SHORTENER_DEFAULT_BOT_MSG = (
     "🔐 Verification required. Tap the button below and complete the short "
     "link to unlock full access to the Universe."
+)
+_SHORTENER_DEFAULT_VERIFY_MSG = (
+    "✅ Verified! Full access unlocked for {hours} hour(s)."
 )
 
 
@@ -3652,9 +3655,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🌌 Open Universe", web_app=WebAppInfo(url=MINIAPP_URL))
         ]])
-    await msg.reply_text(
-        f"✅ Verified! Full access unlocked for {hours} hour(s).",
-        reply_markup=kb)
+    vmsg = (_shortener_flag("shortener_verify_msg", "")
+            or _SHORTENER_DEFAULT_VERIFY_MSG).replace("{hours}", str(hours))
+    await msg.reply_text(vmsg, reply_markup=kb)
 
 
 # ---- /shortener on|off|status ----------------------------------------------
@@ -3679,7 +3682,6 @@ async def cmd_shortener(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # status
     enabled = _shortener_flag("shortener_enabled", "0") == "1"
     api = _shortener_flag("shortener_api_url", "")
-    limit = _shortener_flag("shortener_limit", "1")
     hours = _shortener_flag("shortener_hours", "6")
     btns = _shortener_buttons()
     api_disp = (api[:40] + "…") if len(api) > 40 else (api or "(not set)")
@@ -3687,7 +3689,6 @@ async def cmd_shortener(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "🔗 Link shortener status",
         f"  state   : {'ON' if enabled else 'OFF'}",
         f"  api     : {api_disp}",
-        f"  limit   : {limit} visit(s)/day",
         f"  ttl     : {hours} hour(s)",
         f"  app msg : {_shortener_flag('shortener_app_msg', _SHORTENER_DEFAULT_APP_MSG)[:50]}",
         f"  bot msg : {_shortener_flag('shortener_bot_msg', _SHORTENER_DEFAULT_BOT_MSG)[:50]}",
@@ -3716,28 +3717,6 @@ async def cmd_shortenerapi(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
     _shortener_set_flag("shortener_api_url", url)
     await msg.reply_text("🔗 Shortener API saved.")
-
-
-async def cmd_shortenerlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if msg is None:
-        return
-    if not _shortener_is_admin(update):
-        await msg.reply_text("⛔ Admin only.")
-        return
-    if not ctx.args:
-        await msg.reply_text(
-            f"Usage: /shortenerlimit <n>\nCurrent: {_shortener_flag('shortener_limit', '1')} visit(s)/day.")
-        return
-    try:
-        n = int(str(ctx.args[0]).strip())
-        if n < 1:
-            raise ValueError
-    except ValueError:
-        await msg.reply_text("Limit must be a whole number ≥ 1.")
-        return
-    _shortener_set_flag("shortener_limit", str(n))
-    await msg.reply_text(f"🔗 Shortener daily visit limit: {n}.")
 
 
 async def cmd_setverifytime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3802,6 +3781,33 @@ async def cmd_shortenerbotmsg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         return
     _shortener_set_flag("shortener_bot_msg", text)
     await msg.reply_text("🔗 Bot DM text updated.")
+
+
+async def cmd_verifymsg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the post-verification SUCCESS message (pass 'clear' for default).
+
+    The text may include {hours} — replaced with the current unlock TTL.
+    Default: "✅ Verified! Full access unlocked for {hours} hour(s)."
+    """
+    msg = update.effective_message
+    if msg is None:
+        return
+    if not _shortener_is_admin(update):
+        await msg.reply_text("⛔ Admin only.")
+        return
+    text = (msg.text or "").split(None, 1)[1].strip() if msg.text and " " in msg.text else ""
+    if not text:
+        await msg.reply_text(
+            "Usage: /verifymsg <success text>\n"
+            "Use {hours} to show the current unlock duration.\n"
+            "Pass \"clear\" to reset to default.")
+        return
+    if text.lower() == "clear":
+        _shortener_set_flag("shortener_verify_msg", "")
+        await msg.reply_text("🔗 Verification success message reset to default.")
+        return
+    _shortener_set_flag("shortener_verify_msg", text)
+    await msg.reply_text("🔗 Verification success message updated.")
 
 
 async def cmd_shortenerbtn(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3935,10 +3941,10 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("shortener", cmd_shortener))
     app.add_handler(CommandHandler("shortenerapi", cmd_shortenerapi))
-    app.add_handler(CommandHandler("shortenerlimit", cmd_shortenerlimit))
     app.add_handler(CommandHandler("setverifytime", cmd_setverifytime))
     app.add_handler(CommandHandler("shortenermsg", cmd_shortenermsg))
     app.add_handler(CommandHandler("shortenerbotmsg", cmd_shortenerbotmsg))
+    app.add_handler(CommandHandler("verifymsg", cmd_verifymsg))
     app.add_handler(CommandHandler("shortenerbtn", cmd_shortenerbtn))
 
     # Absorb everything else silently (Yeh ALWAYS bilkul LAST mein hona chahiye)
