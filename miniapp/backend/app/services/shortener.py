@@ -11,10 +11,10 @@ All config lives in `control_flags` (string store, same as popup flags):
     shortener_enabled        "1" | "0"                     (/shortener on|off)
     shortener_api_url        full VPLINK api base, e.g.
                              "https://vplink.in/api?api=TOKEN&url="  (/shortenerapi)
-    shortener_limit          per-day completed-visit cap, default 1  (/shortenerlimit)
     shortener_hours          unlock TTL hours, default 6             (/setverifytime)
     shortener_app_msg        mini-app overlay text                   (/shortenermsg)
     shortener_bot_msg        bot DM text                             (/shortenerbotmsg)
+    shortener_verify_msg     post-verify success text (bot, /verifymsg)
     shortener_buttons        JSON list [{"label","url"}]             (/shortenerbtn)
 
 Per-user state lives in two Mongo collections (best-effort writes,
@@ -48,7 +48,6 @@ _db = _load_root_db()
 # ---------------------------------------------------------------------------
 # Defaults (out-of-the-box, per spec)
 # ---------------------------------------------------------------------------
-DEFAULT_LIMIT = 1            # one completed visit unlocks
 DEFAULT_HOURS = 6            # unlock TTL hours
 DEFAULT_APP_MSG = (
     "⚠️ Verification Required: We have sent a verification link to your "
@@ -94,14 +93,6 @@ def is_enabled() -> bool:
 
 def api_url() -> str:
     return _flag("shortener_api_url", "").strip()
-
-
-def limit_per_day() -> int:
-    try:
-        n = int(_flag("shortener_limit", str(DEFAULT_LIMIT)))
-        return n if n > 0 else DEFAULT_LIMIT
-    except (TypeError, ValueError):
-        return DEFAULT_LIMIT
 
 
 def ttl_hours() -> int:
