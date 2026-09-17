@@ -1,17 +1,17 @@
-GUIDE_APPEND — v13.01 (2026-09-15) — shortener polish: drop /shortenerlimit, add /verifymsg
-WHAT: Follow-up on the v13.0 link-shortener gate. (A) /shortenerlimit removed
-entirely — it was counted but never enforced, and a daily cap would have
-broken the 6h re-verify loop; TTL (/setverifytime, def 6) is now the only
-unlock-duration control (visits still counted for stats). (B) New admin
-command /verifymsg <text> edits the post-verification SUCCESS message Bot 0
-DMs ("Verified! Full access unlocked for {hours} hour(s)."); {hours} fills
-the current TTL, "clear" resets to default. Re-verifying does NOT stack
-hours — each verify resets unlocked_until = now + TTL.
-FILES: admin_bot.py, miniapp/backend/app/services/shortener.py, GUIDE.md,
-GUIDE_APPEND.txt.
+GUIDE_APPEND — v13.02 (2026-09-17) — start.sh: userbot session check now NON-FATAL
+WHAT: Telegram revoked STRING_SESSION → Bot 0 was crash-looping at boot
+("userbot.py session check failed (code=3)" → exit), taking the Mini App
+down even though the Mini App never uses the session (worker.py removed in
+v12.66; Bot 2 fetches). start.sh §1b now logs WARN and CONTINUES boot on a
+failed session check. Degraded while the session is dead: relay_v2 PDF-DM
+fallback + legacy cover posting only. Everything else (Mini App, admin bot,
+shortener gate, downloads via Bot 2) unaffected.
+ENV: none required. Optional: REQUIRE_USERBOT_SESSION=1 restores the old
+hard-fail. To fix the fallback, regenerate via scripts/gen_session.py and
+update STRING_SESSION on Render.
+FILES: start.sh, GUIDE.md, GUIDE_APPEND.txt.
 DELETE: none.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 0 ONLY. No new env vars.
-VERIFY: /shortener status no longer shows a limit line; /verifymsg Enjoy! ✅
-then complete a verify as a non-admin → the bot replies "Enjoy! ✅" instead
-of the default; /verifymsg clear restores the default. /help's shortener
-section lists /verifymsg and no longer lists /shortenerlimit.
+DEPLOY: drop on repo root, commit, push, redeploy Bot 0 ONLY.
+VERIFY: Render log shows "WARN: userbot session check failed ... CONTINUING
+boot" then "launching background supervised processes" then "starting Mini
+App backend (uvicorn)" — service goes Live instead of crash-looping.

@@ -2041,3 +2041,26 @@ Note on stacking: re-verifying does NOT stack hours — each verify resets
 unlocked_until = now + TTL.
 Files: admin_bot.py, miniapp/backend/app/services/shortener.py, GUIDE.md,
 GUIDE_APPEND.txt. Deploy: Bot 0 only.
+
+## v13.02 — start.sh: userbot session check is now NON-FATAL (2026-09-17)
+
+Symptom: Bot 0 Mini App down in a crash loop. Render log showed
+"userbot.py: FATAL — the session string is NOT authorised" then
+"FATAL: userbot.py session check failed (code=3)" → exit → Render restart,
+forever. Cause: Telegram revoked STRING_SESSION (Settings > Devices >
+Terminate session).
+
+Verified in code: the Mini App backend (main.py) imports zero userbot code,
+and worker.py was removed in v12.66 (Bot 2 owns fetching). The session only
+powers relay_v2's PDF-DM *fallback* and legacy cover posting. The fatal
+pre-flight check was the ONLY thing taking the Mini App down.
+
+Fix: start.sh §1b now logs a loud WARN and CONTINUES boot when the session
+check fails. Mini App + admin bot come up normally. To restore the old
+hard-fail behavior, set env REQUIRE_USERBOT_SESSION=1. To restore the DM
+fallback, regenerate the session (python scripts/gen_session.py), update
+STRING_SESSION on Render, redeploy.
+
+Tested: end-to-end boot with a simulated revoked session — boot continued
+past the check to process launch; bash -n clean.
+Files: start.sh, GUIDE.md, GUIDE_APPEND.txt. Deploy: Bot 0 only.

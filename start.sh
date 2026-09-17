@@ -3,6 +3,7 @@
 # start.sh — single entrypoint (v12.33 3-process topology, 512MB-safe).
 #   1) Pre-flight: env + MongoDB + ONE-SHOT Telethon session check
 #      (userbot.py runs blocking here, then exits — not resident).
+#      v13.02: the session check is NON-FATAL by default (see 1b below).
 #      v12.33: only STRING_SESSION (slot 1) is checked here. Slot 2's
 #      STRING_SESSION_2 is validated later by UserbotPool.start() inside
 #      worker.py; a missing/blank STRING_SESSION_2 silently falls back
@@ -85,14 +86,36 @@ else
 fi
 
 # --- 1b. One-shot Telethon session check (then exits; not resident) -------
-log "validating Telethon STRING_SESSION..."
-${PY} -u userbot.py
-USERBOT_CODE=$?
-if [ ${USERBOT_CODE} -ne 0 ]; then
-  log "FATAL: userbot.py session check failed (code=${USERBOT_CODE})"
-  exit ${USERBOT_CODE}
+# v13.02: NON-FATAL. The Mini App backend + admin bot do NOT need the userbot
+# session (worker.py was removed in v12.66; Bot 2 owns fetching). The session
+# only powers the relay_v2 PDF-DM *fallback* and legacy cover posting. A dead
+# / revoked STRING_SESSION used to hard-abort the whole boot here (exit 3),
+# taking the Mini App down with it. Now we log a loud warning and CONTINUE so
+# the Mini App + admin bot come up even with a broken session. Re-enable the
+# hard fail by setting REQUIRE_USERBOT_SESSION=1. Regenerate the session with:
+#   python scripts/gen_session.py
+if [ "${REQUIRE_USERBOT_SESSION:-0}" = "1" ]; then
+  log "validating Telethon STRING_SESSION (REQUIRED)..."
+  ${PY} -u userbot.py
+  USERBOT_CODE=$?
+  if [ ${USERBOT_CODE} -ne 0 ]; then
+    log "FATAL: userbot.py session check failed (code=${USERBOT_CODE}) and REQUIRE_USERBOT_SESSION=1"
+    exit ${USERBOT_CODE}
+  fi
+  log "Telethon session verified"
+else
+  log "validating Telethon STRING_SESSION (best-effort, non-fatal)..."
+  ${PY} -u userbot.py
+  USERBOT_CODE=$?
+  if [ ${USERBOT_CODE} -ne 0 ]; then
+    log "WARN: userbot session check failed (code=${USERBOT_CODE}) — CONTINUING boot."
+    log "WARN: Mini App + admin bot do not need it; only the relay_v2 PDF-DM fallback"
+    log "WARN: and legacy cover posting are degraded until you regenerate STRING_SESSION"
+    log "WARN: (python scripts/gen_session.py) and redeploy."
+  else
+    log "Telethon session verified"
+  fi
 fi
-log "Telethon session verified"
 
 # --- 2. Supervision helpers ------------------------------------------------
 PIDS=""
