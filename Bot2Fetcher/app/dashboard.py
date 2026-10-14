@@ -286,6 +286,10 @@ class Dashboard:
         self._last_repost = 0.0      # rate-limit new live-status messages
         self._edit_fail_since = 0.0
         self._upd_offset = 0            # v12.83: /checkram poller
+        # v13.12: Mongo-backed log channel (/addlog) — hot-reloaded each tick
+        self._config_provider = None    # callable -> channel id str | None
+        self._cfg_fp = None
+        self._no_cfg_warned = False
 
     def set_account(self, idx: int, username: str) -> None:
         self.accounts[idx] = username
@@ -334,7 +338,10 @@ class Dashboard:
         """v12.83: /checkram for the log channel. One short getUpdates
         poll per 20s tick (timeout=0 — no long-poll hold). All failures
         swallowed so a Telegram hiccup can never stall the dashboard."""
-        if self.s.log_bot_token == (os.getenv("BOT2_TOKEN") or "").strip():
+        if self.bot is None:
+            return
+        # v13.12: compare the EFFECTIVE token (may be BOT2_TOKEN itself now)
+        if self.bot.token == (os.getenv("BOT2_TOKEN") or "").strip():
             return  # PTB owns updates for the shared token; never compete.
         try:
             r = await self.bot._call("getUpdates", {
@@ -354,37 +361,68 @@ class Dashboard:
         except Exception:
             pass
 
-    async def run(self, fetcher) -> None:
-        if not self.s.log_channel_id:
-            log.info("📭 dashboard disabled (LOG_CHANNEL_ID unset)")
-            return
-        if not self.s.log_bot_token:
-            log.error("📊 dashboard disabled — BOT_2_PDF_FECTHER (log bot "
-                      "token) is not set. Create a Telegram bot via "
-                      "@BotFather, add it as admin to the log channel, and "
-                      "set BOT_2_PDF_FECTHER in Render.")
-            return
-        self.bot = LogBot(self.s.log_bot_token, self.s.log_channel_id)
-        if not await self.bot.check():
-            log.error("📊 dashboard disabled — BOT_2_PDF_FECTHER token "
-                      "rejected by Telegram. Double-check the token value.")
-            return
-
-        saved = await self.turso.get_state("_dashboard")
-        if saved:
-            v = saved.get("bot_msg_id") or saved.get("global")
+    def _resolve_log_config(self):
+        """v13.12: effective (token, chat). Mongo /addlog value wins for the
+        channel; env LOG_CHANNEL_ID is the fallback. Sender token: dedicated
+        dashboard token env, else the BOT2_TOKEN worker admin bot."""
+        token = (getattr(self.s, "log_bot_token", "") or "").strip()
+        if not token:
+            token = (os.getenv("BOT2_TOKEN") or "").strip()
+        chat = ""
+        if self._config_provider is not None:
             try:
-                self.msg_id = int(v) if v else 0
-            except (TypeError, ValueError):
-                self.msg_id = 0
-        log.info("📊 dashboard started via Bot API (msg id: %s)",
-                 self.msg_id or "will post new")
+                chat = (self._config_provider() or "").strip()
+            except Exception:  # noqa: BLE001
+                chat = ""
+        if not chat:
+            chat = (getattr(self.s, "log_channel_id", "") or "").strip()
+        return token, chat
 
+    async def run(self, fetcher) -> None:
+        # v13.12: never early-return on missing env config. The log channel
+        # is Mongo-backed (/addlog) and re-read every tick; a set/changed/
+        # removed channel takes effect within ~EDIT_EVERY_S with no restart.
         while not fetcher._stop.is_set():
             try:
+                token, chat = self._resolve_log_config()
+                if not token or not chat:
+                    if self.bot is not None:
+                        log.info("📭 log channel removed — dashboard idling")
+                    elif not self._no_cfg_warned:
+                        log.info("📭 dashboard idle — no log channel. Set one "
+                                 "via /addlog <channel id> (Bot 2 admin bot) "
+                                 "or LOG_CHANNEL_ID env.")
+                    self._no_cfg_warned = True
+                    self.bot = None
+                    self._cfg_fp = None
+                    self.msg_id = 0
+                    await asyncio.sleep(EDIT_EVERY_S)
+                    continue
+                self._no_cfg_warned = False
+                fp = f"{token}|{chat}"
+                if self.bot is None or fp != self._cfg_fp:
+                    self._cfg_fp = fp
+                    self.bot = LogBot(token, chat)
+                    self.msg_id = 0   # never reuse another channel's message
+                    if not await self.bot.check():
+                        log.error("📊 log bot token rejected by Telegram — "
+                                  "dashboard idles until /addlog or the token "
+                                  "is fixed")
+                        self.bot = None
+                        await asyncio.sleep(EDIT_EVERY_S)
+                        continue
+                    try:
+                        saved = await self.turso.get_state("_dashboard")
+                        if saved and str(saved.get("channel") or "") == str(chat):
+                            v = saved.get("bot_msg_id") or saved.get("global")
+                            self.msg_id = int(v) if v else 0
+                    except Exception:  # noqa: BLE001
+                        self.msg_id = 0
+                    log.info("📊 dashboard started via Bot API (channel %s, "
+                             "msg id: %s)", chat, self.msg_id or "will post new")
                 await self._tick(len(fetcher.clients))
                 await self._poll_commands()   # v12.83
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 log.warning("📊 dashboard tick failed: %s", e)
             await asyncio.sleep(EDIT_EVERY_S)
 
@@ -443,7 +481,8 @@ class Dashboard:
                 self.msg_id = new_id
                 self._edit_fail_since = 0.0
                 await self.turso.put_state(
-                    "_dashboard", {"bot_msg_id": self.msg_id})
+                    "_dashboard", {"bot_msg_id": self.msg_id,
+                                   "channel": str(self.bot.chat_id)})
 
         # v12.81: 5-hourly digest — a NEW message (pings the channel)
         now = time.time()

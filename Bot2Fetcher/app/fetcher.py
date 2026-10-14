@@ -1204,14 +1204,36 @@ class Fetcher:
             return None, res
         return res, ""
 
+
+    def _log_config(self):
+        """v13.12: effective (token, chat) for log-channel posts.
+        Chat  : Mongo /addlog value (bot2_workers{_id:'log_channel'}) wins;
+                env LOG_CHANNEL_ID is only a fallback.
+        Token : dedicated dashboard token env (BOT_2_PDF_FECTHER etc.), else
+                the BOT2_TOKEN worker admin bot — no separate bot required."""
+        token = (getattr(self.s, "log_bot_token", "") or "").strip()
+        if not token:
+            token = (os.getenv("BOT2_TOKEN") or "").strip()
+        chat = ""
+        db = getattr(self, "workers_db", None)
+        if db is not None:
+            try:
+                from . import workers as _w
+                chat = (_w.get_log_channel(db) or "").strip()
+            except Exception:  # noqa: BLE001
+                chat = ""
+        if not chat:
+            chat = (getattr(self.s, "log_channel_id", "") or "").strip()
+        return token, chat
+
     async def _alert_log_channel(self, text: str) -> None:
         """v12.49: post a double-failure alert to the Bot 2 LOG_CHANNEL via
         the Bot API bot (same transport the dashboard uses). Rate-limited
         to one alert per 60s process-wide; failures are logged, never raise."""
-        token = (getattr(self.s, "log_bot_token", "") or "").strip()
-        chat = (getattr(self.s, "log_channel_id", "") or "").strip()
+        token, chat = self._log_config()
         if not token or not chat:
-            log.warning("alert not sent (LOG_CHANNEL_ID / log bot token unset): %s",
+            log.warning("alert not sent (no log channel — /addlog <channel id> "
+                        "in the Bot 2 admin bot, or LOG_CHANNEL_ID env): %s",
                         text[:120])
             return
         async with self._alert_lock:

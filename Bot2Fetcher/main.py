@@ -50,6 +50,9 @@ galleries = Galleries(_db, settings.stale_processing_s)
 turso = Turso(settings.turso_url, settings.turso_token)
 dashboard = Dashboard(settings, turso, stats)
 dashboard.galleries = galleries
+# v13.12: Mongo-backed log channel (/addlog) wins over LOG_CHANNEL_ID env.
+from app import workers as _workers_mod
+dashboard._config_provider = lambda: _workers_mod.get_log_channel(_db)
 fetcher = Fetcher(settings, galleries, turso, stats, dashboard=dashboard)
 # v12.41: per-slot InputPeer cache (Mongo). Warm restarts skip the
 # 200-dialog iter_dialogs scan; session rotation auto-invalidates via
@@ -100,7 +103,7 @@ def _run_api() -> None:
 
 
 async def _main() -> None:
-    log.info("🚀 Bot2Fetcher v13.11 booting (Mongo-backed workers; "
+    log.info("🚀 Bot2Fetcher v13.12 booting (Mongo-backed workers; "
              "standby until /addworker)")
     if _os.environ.get("BOT2_TURSO_OFF", "0").strip() in ("1", "true", "yes"):
         log.warning("🚫 [TURSO OFF] Bot2Fetcher running MONGO-ONLY "

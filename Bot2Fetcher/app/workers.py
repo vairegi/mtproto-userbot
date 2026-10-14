@@ -138,3 +138,41 @@ def clear_workers(db) -> int:
         return len(workers)
     except Exception:  # noqa: BLE001
         return 0
+
+# ---------------------------------------------------------------------------
+# Log channel (v13.12) — Mongo-backed, set via /addlog, no env dependency.
+# Same collection as the workers; doc id never collides with "slot:N".
+# ---------------------------------------------------------------------------
+_LOG_ID = "log_channel"
+
+
+def get_log_channel(db) -> Optional[str]:
+    try:
+        d = _col(db).find_one({"_id": _LOG_ID})
+        if not d:
+            return None
+        v = str(d.get("channel_id", "")).strip()
+        return v or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def set_log_channel(db, channel_id: str) -> bool:
+    try:
+        _col(db).update_one(
+            {"_id": _LOG_ID},
+            {"$set": {"channel_id": str(channel_id).strip(),
+                      "updated_at": time.time()}},
+            upsert=True,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def clear_log_channel(db) -> bool:
+    try:
+        _col(db).delete_one({"_id": _LOG_ID})
+        return True
+    except Exception:  # noqa: BLE001
+        return False

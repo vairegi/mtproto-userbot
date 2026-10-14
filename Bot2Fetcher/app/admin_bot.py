@@ -115,6 +115,9 @@ class WorkerAdminBot:
         app.add_handler(CommandHandler("listworker", self._cmd_listworker))
         app.add_handler(CommandHandler("removeworker", self._cmd_removeworker))
         app.add_handler(CommandHandler("changeapiandhash", self._cmd_changeapi))
+        app.add_handler(CommandHandler("addlog", self._cmd_addlog))
+        app.add_handler(CommandHandler("removelog", self._cmd_removelog))
+        app.add_handler(CommandHandler("logstatus", self._cmd_logstatus))
         app.add_handler(CommandHandler("cancel", self._cmd_cancel))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
                                        self._on_text))
@@ -140,8 +143,11 @@ class WorkerAdminBot:
     async def _cmd_start(self, update, ctx):
         if self._is_admin(int(update.effective_user.id)):
             await update.effective_message.reply_text(
-                "🛠 Bot 2 worker management\n/addworker · /listworker · "
-                "/removeworker <n…|all> · /changeapiandhash · /checkram")
+                "🛠 Bot 2 admin\n"
+                "Workers: /addworker · /listworker · /removeworker <n…|all> · "
+                "/changeapiandhash\n"
+                "Log channel: /addlog <channel id> · /removelog · /logstatus\n"
+                "Misc: /checkram")
 
     async def _cmd_checkram(self, update, ctx):
         if self._is_admin(int(update.effective_user.id)):
@@ -260,6 +266,89 @@ class WorkerAdminBot:
         await msg.reply_text(
             f"🗑 Removed worker(s): {', '.join(map(str, removed))}. "
             f"{left} worker(s) remain (renumbered).")
+
+    # -- log channel commands (v13.12) --------------------------------------
+    async def _cmd_addlog(self, update, ctx):
+        msg = update.effective_message
+        uid = int(update.effective_user.id)
+        if not self._is_admin(uid):
+            return
+        args = [a.strip() for a in (ctx.args or []) if a.strip()]
+        if not args:
+            await msg.reply_text(
+                "Usage: /addlog <channel id>\n"
+                "Example: /addlog -1003796521529\n"
+                "This bot must be an ADMIN in that channel with the "
+                "'Post Messages' right.")
+            return
+        target = args[0]
+        if not (re.fullmatch(r"-?\d{6,20}", target)
+                or re.fullmatch(r"@[A-Za-z0-9_]{4,}", target)):
+            await msg.reply_text("⚠️ Bad channel id. Send a numeric id like "
+                                 "-100… or a @publicusername.")
+            return
+        chat_id = int(target) if re.fullmatch(r"-?\d+", target) else target
+        try:
+            sent = await ctx.bot.send_message(
+                chat_id=chat_id,
+                text="📡 Bot 2 log channel connected via /addlog.\n"
+                     "Status dashboard and alerts will post here.")
+        except Exception as e:  # noqa: BLE001
+            await msg.reply_text(
+                f"❌ Could not post to {target}: {e}\n"
+                "Add this bot as a channel ADMIN with 'Post Messages' and "
+                "retry /addlog.")
+            return
+        canon = str(getattr(getattr(sent, "chat", None), "id", chat_id))
+        if _workers.set_log_channel(self._db, canon):
+            self._reload()
+            await msg.reply_text(
+                f"✅ Log channel set to {canon}. No restart needed — the "
+                "dashboard picks it up within ~20s. Remove with /removelog.")
+        else:
+            await msg.reply_text("❌ Test post worked but Mongo save failed. "
+                                 "Check logs and retry /addlog.")
+
+    async def _cmd_removelog(self, update, ctx):
+        msg = update.effective_message
+        uid = int(update.effective_user.id)
+        if not self._is_admin(uid):
+            return
+        cur = _workers.get_log_channel(self._db)
+        if not cur:
+            await msg.reply_text("ℹ️ No Mongo log channel set (env "
+                                 "LOG_CHANNEL_ID, if set, still applies).")
+            return
+        if _workers.clear_log_channel(self._db):
+            self._reload()
+            await msg.reply_text(
+                f"🗑 Log channel {cur} removed. Dashboard and alerts stop; "
+                "env LOG_CHANNEL_ID (if set) becomes the fallback again.")
+        else:
+            await msg.reply_text("❌ Mongo error — could not remove the log "
+                                 "channel. Check logs.")
+
+    async def _cmd_logstatus(self, update, ctx):
+        msg = update.effective_message
+        uid = int(update.effective_user.id)
+        if not self._is_admin(uid):
+            return
+        mongo = _workers.get_log_channel(self._db)
+        env_ch = _first("LOG_CHANNEL_ID")
+        eff = mongo or env_ch or "(none)"
+        tok_src = ("dashboard token env" if _first(
+            "BOT_2_PDF_FECTHER", "LOG_BOT_TOKEN", "DASHBOARD_BOT_TOKEN",
+            "TELEGRAM_LOG_BOT_TOKEN") else ("BOT2_TOKEN" if self._token
+                                            else "(none)"))
+        await msg.reply_text("\n".join([
+            "📡 Bot 2 log channel",
+            f"Mongo (/addlog): {mongo or '(not set)'}",
+            f"Env LOG_CHANNEL_ID: {env_ch or '(not set)'}",
+            f"Effective target: {eff}",
+            f"Sender token: {tok_src}",
+            "",
+            "/addlog <channel id> · /removelog",
+        ]))
 
     async def _on_text(self, update, ctx):
         msg = update.effective_message
