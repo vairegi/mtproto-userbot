@@ -47,13 +47,18 @@ fetcher.peer_cache = PeerCache(_db)
 # v12.49: Layer B single-flight lease for the fallback downloader bot
 # (covers the multi-instance / restart window; Layer A lock lives in fetcher).
 fetcher.fallback_lease = FallbackLease(_db, settings.fallback_lease_s)
+# v13.10: Mongo-backed workers + admin command listener (/addworker,
+# /listworker, /removeworker, /changeapiandhash on BOT2_TOKEN).
+fetcher.workers_db = _db
+from app.admin_bot import WorkerAdminBot
+_admin_bot = WorkerAdminBot(_db, notify_reload=fetcher.request_reconcile)
 
 app = FastAPI(title="Bot2Fetcher")
 
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "slots": len(settings.sessions)}
+    return {"ok": True, "slots": len(fetcher.clients)}
 
 
 @app.get("/status")
@@ -83,11 +88,14 @@ def _run_api() -> None:
 
 
 async def _main() -> None:
-    log.info("🚀 Bot2Fetcher v12.49 booting (%d slot(s))", len(settings.sessions))
+    log.info("🚀 Bot2Fetcher v13.10 booting (Mongo-backed workers; "
+             "standby until /addworker)")
     if _os.environ.get("BOT2_TURSO_OFF", "0").strip() in ("1", "true", "yes"):
         log.warning("🚫 [TURSO OFF] Bot2Fetcher running MONGO-ONLY "
                     "(producer scans + gallery rows + state -> Mongo; "
                     "nightly IST sync owns Turso)")
+    fetcher._main_loop = asyncio.get_running_loop()
+    _admin_bot.start()
     await turso.ensure_schema()
     dash_task = asyncio.create_task(dashboard.run(fetcher))
     try:

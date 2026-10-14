@@ -2064,3 +2064,30 @@ STRING_SESSION on Render, redeploy.
 Tested: end-to-end boot with a simulated revoked session — boot continued
 past the check to process launch; bash -n clean.
 Files: start.sh, GUIDE.md, GUIDE_APPEND.txt. Deploy: Bot 0 only.
+
+## v13.10 — Bot 2 Mongo-backed workers + /addworker admin bot (2026-10-14)
+
+Bot 2 no longer reads STRING_SESSION* env vars and no longer crashes when
+none is set. Workers (Telethon userbot sessions) + shared API creds live in
+Mongo (bot2_workers collection) and hot-reload — add/remove/replace with NO
+redeploy.
+
+New admin commands, answered by a small PTB listener inside Bot 2
+(BOT2_TOKEN, admin = ADMIN_USER_ID only):
+  /addworker            wizard: api_id → api_hash → session (first time);
+                        session only after creds are stored
+  /listworker           numbered workers + masked sessions + api_id/hash
+  /removeworker 2 | 1 2 4 | all   remove slots; renumbers down
+  /changeapiandhash     wizard: new api_id → new api_hash (sessions kept)
+
+Boot with zero workers = STANDBY (status page stays up, fetcher idles until
+a worker appears via /addworker). A revoked session only skips its own slot
+— it never takes the service down. Creds change reconnects all slots.
+
+ENV cleanup (Bot 2 service): you may DELETE STRING_SESSION, STRING_SESSION_2..N.
+KEEP: BOT2_TOKEN (now REQUIRED for the commands), ADMIN_USER_ID, MONGO_URI,
+TURSO_*, DB_CHANNEL_ID, BOT2_USERNAME. API_ID/API_HASH may stay as a
+bootstrap fallback but Mongo creds win.
+Files: Bot2Fetcher/app/workers.py (NEW), Bot2Fetcher/app/admin_bot.py (NEW),
+Bot2Fetcher/app/config.py, Bot2Fetcher/app/fetcher.py, Bot2Fetcher/main.py,
+Bot2Fetcher/requirements.txt, GUIDE.md, GUIDE_APPEND.txt. Deploy: Bot 2 only.

@@ -123,6 +123,16 @@ class Fetcher:
         self.stats = stats
         self.dash = dashboard
         self.clients: list[TelegramClient] = []
+        # v13.10: Mongo-backed workers with hot-reload. workers_db is wired
+        # in main.py; _slot_clients/_slot_tasks track live slots by number;
+        # _creds_fp forces a full reconnect when api_id/hash change.
+        self.workers_db = None
+        self._slot_clients: Dict[int, TelegramClient] = {}
+        self._slot_sessions: Dict[int, str] = {}
+        self._slot_tasks: Dict[int, asyncio.Task] = {}
+        self._creds_fp: str = ""
+        self._reconcile_evt = asyncio.Event()
+        self._main_loop = None
         self._channel_lock = asyncio.Lock()
         # v12.44: process-lifetime memory of gids already delivered or
         # permanently failed. The producer drops these BEFORE the queue so
@@ -266,22 +276,130 @@ class Fetcher:
                           idx, fb, e, fb)
 
     async def start(self) -> None:
-        for i, sess in enumerate(self.s.sessions, 1):
-            c = TelegramClient(StringSession(sess), self.s.api_id, self.s.api_hash)
-            await c.connect()
-            if not await c.is_user_authorized():
-                raise RuntimeError(f"STRING_SESSION slot {i} is not authorized")
-            me = await c.get_me()
-            uname = getattr(me, "username", None) or "(no username)"
-            log.info("🤖 slot %d authorized as @%s (id=%s)", i, uname, me.id)
+        # v13.10: no env sessions — populate from the Mongo worker store.
+        # Zero workers = standby (never raise). A revoked session only skips
+        # its own slot; it can never take the service down.
+        await self.reconcile_workers(initial=True)
+
+    # ---- v13.10 worker reconcile (hot-reload, no restart needed) ----------
+    def request_reconcile(self) -> None:
+        """Thread-safe nudge from the admin bot after a worker change."""
+        try:
+            loop = self._main_loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(self._reconcile_evt.set)
+            else:
+                self._reconcile_evt.set()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _worker_config(self):
+        """(creds, [(slot, session)]) from Mongo. Fail-open: (None, []).
+        Creds fall back to env API_ID/API_HASH only when Mongo has none."""
+        if self.workers_db is None:
+            return None, []
+        try:
+            from . import workers as _wk
+            creds = _wk.get_creds(self.workers_db)
+            if not creds and self.s.api_id and self.s.api_hash:
+                creds = (str(self.s.api_id), str(self.s.api_hash))
+            rows = [(w["slot"], w["session"]) for w in _wk.list_workers(self.workers_db)]
+            return creds, rows
+        except Exception as e:  # noqa: BLE001
+            log.warning("worker config read failed (fail-open, standby): %s", e)
+            return None, []
+
+    async def _connect_slot(self, idx: int, session: str, api_id: str, api_hash: str) -> None:
+        c = TelegramClient(StringSession(session), int(api_id), api_hash)
+        await c.connect()
+        if not await c.is_user_authorized():
+            try:
+                await c.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            log.error("🤖 slot %d session NOT authorized — slot skipped "
+                      "(revoked session; re-add via /addworker)", idx)
             if self.dash:
-                self.dash.set_account(i, uname)
-            self.clients.append(c)
-            await self._warm_and_resolve(i, c)
+                try:
+                    self.dash.set_account(idx, "(unauthorized)")
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        me = await c.get_me()
+        uname = getattr(me, "username", None) or "(no username)"
+        log.info("🤖 slot %d authorized as @%s (id=%s)", idx, uname, me.id)
+        if self.dash:
+            self.dash.set_account(idx, uname)
+        self._slot_clients[idx] = c
+        self._slot_sessions[idx] = session
+        self.clients = [self._slot_clients[k] for k in sorted(self._slot_clients)]
+        await self._warm_and_resolve(idx, c)
+        self._slot_tasks[idx] = asyncio.create_task(self._slot_loop(idx, c))
+
+    async def _drop_slot(self, idx: int) -> None:
+        t = self._slot_tasks.pop(idx, None)
+        if t:
+            t.cancel()
+        self._slot_sessions.pop(idx, None)
+        c = self._slot_clients.pop(idx, None)
+        if c:
+            try:
+                await c.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+        self.clients = [self._slot_clients[k] for k in sorted(self._slot_clients)]
+        if self.dash:
+            try:
+                self.dash.set_account(idx, "(removed)")
+            except Exception:  # noqa: BLE001
+                pass
+        log.info("🗑 slot %d disconnected (worker removed)", idx)
+
+    async def reconcile_workers(self, initial: bool = False) -> None:
+        creds, rows = await asyncio.to_thread(self._worker_config)
+        want = {slot: sess for slot, sess in rows}
+        if not want:
+            if initial:
+                log.warning("🛌 Bot 2 STANDBY — no workers configured. "
+                            "Add one via /addworker (BOT2_TOKEN admin bot).")
+            for idx in list(self._slot_clients):
+                await self._drop_slot(idx)
+            return
+        if not creds:
+            log.warning("🛌 worker(s) exist but API creds missing — finish "
+                        "/addworker or run /changeapiandhash")
+            return
+        fp = f"{creds[0]}|{creds[1]}"
+        if fp != self._creds_fp:
+            if self._creds_fp:
+                log.info("🔑 API creds changed — reconnecting all slots")
+            self._creds_fp = fp
+            for idx in list(self._slot_clients):
+                await self._drop_slot(idx)
+        for idx in list(self._slot_clients):
+            if idx not in want or self._slot_sessions.get(idx) != want[idx]:
+                await self._drop_slot(idx)
+        for idx in sorted(want):
+            if idx not in self._slot_clients:
+                await self._connect_slot(idx, want[idx], creds[0], creds[1])
+
+    async def _reconcile_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._reconcile_evt.clear()
+                await self.reconcile_workers()
+            except Exception as e:  # noqa: BLE001
+                log.warning("worker reconcile failed (retrying): %s", e)
+            try:
+                await asyncio.wait_for(self._reconcile_evt.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
 
     async def stop(self) -> None:
         self._stop.set()
-        for c in self.clients:
+        for t in list(self._slot_tasks.values()):
+            t.cancel()
+        for c in list(self._slot_clients.values()):
             try:
                 await c.disconnect()
             except Exception:
@@ -409,6 +527,10 @@ class Fetcher:
     async def _producer(self) -> None:
         self._warm_skip_sets()
         while not self._stop.is_set():
+            # v13.10: standby when no workers — don't burn RAM/CPU scanning.
+            if not self._slot_clients:
+                await asyncio.sleep(5)
+                continue
             try:
                 # v12.84: one cheap update_many per cycle — resets dead
                 # PROCESSING claims so their queue rows can finally drain.
@@ -1093,11 +1215,16 @@ class Fetcher:
             log.warning("🗄 %s backup forward returned no ids", gid)
 
     async def run(self) -> None:
+        self._main_loop = asyncio.get_running_loop()
         await self.start()
-        tasks = [asyncio.create_task(self._producer())]
-        for i, c in enumerate(self.clients, 1):
-            tasks.append(asyncio.create_task(self._slot_loop(i, c)))
+        # v13.10: slot tasks are owned by reconcile_workers (hot-reload);
+        # the producer + the reconcile watcher are the fixed tasks here.
+        tasks = [asyncio.create_task(self._producer()),
+                 asyncio.create_task(self._reconcile_loop())]
         await self._stop.wait()
         for t in tasks:
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        for t in list(self._slot_tasks.values()):
+            t.cancel()
+        await asyncio.gather(*tasks, *list(self._slot_tasks.values()),
+                             return_exceptions=True)

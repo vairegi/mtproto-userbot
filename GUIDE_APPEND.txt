@@ -1,17 +1,20 @@
-GUIDE_APPEND — v13.02 (2026-09-17) — start.sh: userbot session check now NON-FATAL
-WHAT: Telegram revoked STRING_SESSION → Bot 0 was crash-looping at boot
-("userbot.py session check failed (code=3)" → exit), taking the Mini App
-down even though the Mini App never uses the session (worker.py removed in
-v12.66; Bot 2 fetches). start.sh §1b now logs WARN and CONTINUES boot on a
-failed session check. Degraded while the session is dead: relay_v2 PDF-DM
-fallback + legacy cover posting only. Everything else (Mini App, admin bot,
-shortener gate, downloads via Bot 2) unaffected.
-ENV: none required. Optional: REQUIRE_USERBOT_SESSION=1 restores the old
-hard-fail. To fix the fallback, regenerate via scripts/gen_session.py and
-update STRING_SESSION on Render.
-FILES: start.sh, GUIDE.md, GUIDE_APPEND.txt.
-DELETE: none.
-DEPLOY: drop on repo root, commit, push, redeploy Bot 0 ONLY.
-VERIFY: Render log shows "WARN: userbot session check failed ... CONTINUING
-boot" then "launching background supervised processes" then "starting Mini
-App backend (uvicorn)" — service goes Live instead of crash-looping.
+GUIDE_APPEND — v13.10 (2026-10-14) — Bot 2 Mongo workers + /addworker admin bot
+WHAT: Bot 2 workers (Telethon sessions) + API creds now live in Mongo
+(bot2_workers), hot-reloaded by the fetcher. New admin commands on BOT2_TOKEN:
+/addworker (wizard: api_id→api_hash→session first time, session-only after),
+/listworker (numbered + creds), /removeworker <n…|all> (renumbers),
+/changeapiandhash. Bot 2 boots in STANDBY with zero workers (no crash);
+revoked sessions skip their slot without taking the service down.
+ENV: on the Bot 2 Render service DELETE STRING_SESSION and STRING_SESSION_2..N.
+KEEP BOT2_TOKEN (now REQUIRED for commands), ADMIN_USER_ID, MONGO_URI, TURSO_*,
+DB_CHANNEL_ID, BOT2_USERNAME. API_ID/API_HASH optional (bootstrap fallback).
+FILES: Bot2Fetcher/app/workers.py (NEW), Bot2Fetcher/app/admin_bot.py (NEW),
+Bot2Fetcher/app/config.py, Bot2Fetcher/app/fetcher.py, Bot2Fetcher/main.py,
+Bot2Fetcher/requirements.txt, GUIDE.md, GUIDE_APPEND.txt.
+DELETE: none (env vars removed via Render dashboard, not files).
+DEPLOY: drop on repo root, commit, push, redeploy BOT 2 ONLY (Render installs
+python-telegram-bot automatically from requirements.txt).
+VERIFY: Bot 2 log shows "Workers: Mongo-backed (v13.10) — standby until
+/addworker" and "worker admin bot started (BOT2_TOKEN)". In Telegram DM to the
+Bot-2 bot: /addworker → walk the wizard → /listworker shows the worker; the
+Render log shows "slot 1 authorized as @…". /removeworker 1 → slot drops live.

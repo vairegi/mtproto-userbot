@@ -6,3 +6,4 @@ httpx>=0.27
 python-dotenv>=1.0
 pillow>=10.0
 psutil>=5.9,<6.0  # v12.83: /checkram + live RAM line
+python-telegram-bot>=21.0  # v13.10: /addworker admin listener
