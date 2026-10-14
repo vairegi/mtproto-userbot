@@ -176,3 +176,44 @@ def clear_log_channel(db) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+# ---------------------------------------------------------------------------
+# Worker pause flags (v13.13) — Mongo-backed, /pauseworker /resumeworker.
+# Same collection; doc id never collides with slot:N / creds / log_channel.
+# ---------------------------------------------------------------------------
+_PAUSE_ID = "paused"
+
+
+def get_paused(db) -> set:
+    try:
+        d = _col(db).find_one({"_id": _PAUSE_ID})
+        if not d:
+            return set()
+        return {int(x) for x in d.get("slots", []) if str(x).isdigit()}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _save_paused(db, slots: set) -> bool:
+    try:
+        _col(db).update_one(
+            {"_id": _PAUSE_ID},
+            {"$set": {"slots": sorted(int(x) for x in slots),
+                      "updated_at": time.time()}},
+            upsert=True,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def pause_workers(db, nums):
+    cur = get_paused(db)
+    cur |= {int(n) for n in nums}
+    return cur if _save_paused(db, cur) else None
+
+
+def resume_workers(db, nums=None):
+    cur = get_paused(db)
+    cur = cur - {int(n) for n in nums} if nums is not None else set()
+    return cur if _save_paused(db, cur) else None

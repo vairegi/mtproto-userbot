@@ -71,14 +71,40 @@ _admin_bot = WorkerAdminBot(_db, notify_reload=fetcher.request_reconcile,
 app = FastAPI(title="Bot2Fetcher")
 
 
+def _health():
+    return {"ok": True, "service": "bot2fetcher", "slots": len(fetcher.clients)}
+
+
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "slots": len(fetcher.clients)}
+    return _health()
+
+
+# v13.13: UptimeRobot default monitors send HEAD; without these a HEAD probe
+# gets 405 and Render marks the free service idle -> it spins down.
+@app.head("/healthz")
+def healthz_head():
+    return JSONResponse({})
+
+
+@app.get("/ping")
+def ping():
+    return _health()
+
+
+@app.head("/ping")
+def ping_head():
+    return JSONResponse({})
 
 
 @app.get("/status")
 def status():
     return JSONResponse(stats.snapshot())
+
+
+@app.head("/")
+def index_head():
+    return JSONResponse({})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -103,7 +129,7 @@ def _run_api() -> None:
 
 
 async def _main() -> None:
-    log.info("🚀 Bot2Fetcher v13.12 booting (Mongo-backed workers; "
+    log.info("🚀 Bot2Fetcher v13.13 booting (Mongo-backed workers; "
              "standby until /addworker)")
     if _os.environ.get("BOT2_TURSO_OFF", "0").strip() in ("1", "true", "yes"):
         log.warning("🚫 [TURSO OFF] Bot2Fetcher running MONGO-ONLY "

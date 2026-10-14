@@ -322,11 +322,16 @@ class Fetcher:
     def worker_status(self) -> Dict[int, Dict[str, Any]]:
         """Thread-readable, secret-free snapshot for /listworker."""
         out = {}
+        paused = getattr(self, "_paused", set())
         for idx, rt in list(self._slot_runtime.items()):
             row = dict(rt)
             task = self._slot_tasks.get(idx)
             row["running"] = bool(task and not task.done())
+            row["paused"] = idx in paused
             out[idx] = row
+        for idx in paused:  # paused-but-never-connected still shows
+            out.setdefault(idx, {"state": "paused", "running": False,
+                                 "completed": 0, "paused": True})
         return out
 
     async def start(self) -> None:
@@ -347,6 +352,16 @@ class Fetcher:
                 self._reconcile_evt.set()
         except Exception:  # noqa: BLE001
             pass
+
+    def _pause_flags(self) -> set:
+        db = getattr(self, "workers_db", None)
+        if db is None:
+            return set()
+        try:
+            from . import workers as _w
+            return _w.get_paused(db)
+        except Exception:  # noqa: BLE001
+            return set()
 
     def _worker_config(self):
         """(creds, [(slot, session)]) from Mongo. Fail-open: (None, []).
@@ -427,7 +442,15 @@ class Fetcher:
 
     async def reconcile_workers(self, initial: bool = False) -> None:
         creds, rows = await asyncio.to_thread(self._worker_config)
-        want = {slot: sess for slot, sess in rows}
+        # v13.13: /pauseworker — paused slots are excluded from `want`, so the
+        # normal reconcile path below disconnects them live (no restart).
+        paused = await asyncio.to_thread(self._pause_flags)
+        self._paused = paused
+        want = {slot: sess for slot, sess in rows if slot not in paused}
+        if paused:
+            dropping = [i for i in self._slot_clients if i in paused]
+            if dropping:
+                log.info("⏸ pauseworker: pausing slot(s) %s", sorted(dropping))
         if not want:
             if initial:
                 log.warning("🛌 Bot 2 STANDBY — no workers configured. "

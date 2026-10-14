@@ -118,6 +118,8 @@ class WorkerAdminBot:
         app.add_handler(CommandHandler("addlog", self._cmd_addlog))
         app.add_handler(CommandHandler("removelog", self._cmd_removelog))
         app.add_handler(CommandHandler("logstatus", self._cmd_logstatus))
+        app.add_handler(CommandHandler("pauseworker", self._cmd_pauseworker))
+        app.add_handler(CommandHandler("resumeworker", self._cmd_resumeworker))
         app.add_handler(CommandHandler("cancel", self._cmd_cancel))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
                                        self._on_text))
@@ -147,6 +149,7 @@ class WorkerAdminBot:
                 "Workers: /addworker · /listworker · /removeworker <n…|all> · "
                 "/changeapiandhash\n"
                 "Log channel: /addlog <channel id> · /removelog · /logstatus\n"
+                "Pause: /pauseworker <n…|all> · /resumeworker <n…|all>\n"
                 "Misc: /checkram")
 
     async def _cmd_checkram(self, update, ctx):
@@ -220,6 +223,8 @@ class WorkerAdminBot:
                 label = rt.get("state", "pending connection")
                 if not live and label != "error":
                     label = "pending connection"
+                if rt.get("paused"):
+                    label = "⏸ paused"
                 lines.append(f"  {w['slot']}. session {masked}")
                 lines.append(f"     {label} · task={'running' if live else 'not running'} · "
                              f"completed={rt.get('completed', 0)}")
@@ -349,6 +354,63 @@ class WorkerAdminBot:
             "",
             "/addlog <channel id> · /removelog",
         ]))
+
+    # -- pause / resume workers (v13.13) ------------------------------------
+    async def _cmd_pauseworker(self, update, ctx):
+        msg = update.effective_message
+        if not self._is_admin(int(update.effective_user.id)):
+            return
+        args = [a.strip() for a in (ctx.args or []) if a.strip()]
+        ws = _workers.list_workers(self._db)
+        if not ws:
+            await msg.reply_text("\u2139\ufe0f No workers to pause. Add one via /addworker.")
+            return
+        valid = {w["slot"] for w in ws}
+        if args and args[0].lower() == "all":
+            nums = valid
+        else:
+            try:
+                nums = {int(a) for a in args}
+            except ValueError:
+                nums = set()
+            bad = nums - valid
+            if bad:
+                await msg.reply_text(f"\u26a0\ufe0f No such worker(s): {sorted(bad)}. Check /listworker.")
+                return
+        if not nums:
+            await msg.reply_text("Usage: /pauseworker 1 | 1 2 3 | all")
+            return
+        res = _workers.pause_workers(self._db, nums)
+        if res is None:
+            await msg.reply_text("\u274c Mongo error \u2014 could not save pause state.")
+            return
+        self._reload()
+        await msg.reply_text(
+            f"\u23f8 Paused worker(s): {sorted(nums)} \u2014 no restart needed; they "
+            "disconnect within seconds. Resume with /resumeworker. "
+            "/listworker to confirm.")
+
+    async def _cmd_resumeworker(self, update, ctx):
+        msg = update.effective_message
+        if not self._is_admin(int(update.effective_user.id)):
+            return
+        args = [a.strip() for a in (ctx.args or []) if a.strip()]
+        nums = None
+        if args and args[0].lower() != "all":
+            try:
+                nums = {int(a) for a in args}
+            except ValueError:
+                await msg.reply_text("Usage: /resumeworker 1 | 1 2 | all")
+                return
+        res = _workers.resume_workers(self._db, nums)
+        if res is None:
+            await msg.reply_text("\u274c Mongo error \u2014 could not save resume state.")
+            return
+        self._reload()
+        label = "all" if nums is None else " ".join(map(str, sorted(nums)))
+        await msg.reply_text(
+            f"\u25b6\ufe0f Resumed ({label}). Workers reconnect within "
+            "seconds \u2014 /listworker to confirm.")
 
     async def _on_text(self, update, ctx):
         msg = update.effective_message
