@@ -1,1459 +1,1076 @@
-"""MongoDB (Motor) data-access layer shared by Bot 1 and Bot 2.
-
-Multi-category architecture (v2.0)
-----------------------------------
-The bot runs ANY number of independent content pipelines (categories). Each
-category maps ONE Database Channel -> ONE Posting Channel -> (optionally) ONE
-Main Posting Channel. Categories are created/edited at runtime through Bot 1
-admin commands (zero redeploy) and stored in the `categories` collection.
-
-Collections
------------
-users         : { user_id, verified: {category_key: until}, verified_until
-                  (legacy/global) — STATS ONLY since v2.4 (strict per-post
-                  verification: these timestamps feed /stats + /categories
-                  counts but NEVER grant file access), banned, strikes,
-                  auto_delete_override, joined_at }
-categories    : { key, label, enabled, db_channel_id, post_channel_id,
-                  post_main_channel_id, post_tag, post_time (HH:MM, IST),
-                  schedule_enabled, schedule_paused, queue_cursor,
-                  force_sub_channel_id (None = use global default),
-                  protect_content, auto_delete_minutes, created_at, updated_at }
-files         : { file_id (category-prefixed, globally unique), category,
-                  db_message_id, cover_message_id, caption, videos[], srts[],
-                  posted, created_at, posted_at, post_message_id }
-tokens        : { token, user_id, file_id, kind, expires_at, used, created_at }
-settings      : { _id: 'global', ... }   single doc (global-only knobs)
-raw           : { category, message_id, kind, caption }  staging for the scan
-join_requests : { user_id, at }
-admins        : { user_id, at }
-admin_state   : { user_id, active_category }
-deletions     : { chat_id, message_ids[], delete_at }
-genres        : { category, genre, matched: [file_id], scanned, created_at,
-                  added_by }  — v4.4: per-category genre registry; `matched`
-                  is the PERSISTED caption-scan result so the DB is scanned
-                  once per genre, never again (lazy incremental matching tops
-                  it up as new items are indexed).
-
-file_id format
---------------
-New items are addressed as "{category}_f{db_message_id}" (e.g. "jav_f123").
-Items created before the upgrade keep their legacy "f{db_message_id}" form;
-get_item_by_file_id() transparently falls back so old Download buttons in
-already-published channel posts keep working forever.
 """
+db.py — MongoDB access layer (drop-in replacement for the old SQLite version).
+
+WHY THIS FILE CHANGED
+---------------------
+The bot used to store everything in a local file called `queue.db` (SQLite).
+On serverless / free hosting (Hugging Face Spaces, Render, Railway, Fly.io...)
+the container's local disk is wiped every time the app restarts or redeploys,
+so `queue.db` — and with it the queue, admins, tokens and dedupe history —
+would silently vanish.
+
+This version stores the exact same data in MongoDB (e.g. a free MongoDB Atlas
+cluster), which lives outside the container and therefore survives restarts.
+
+DESIGN NOTE — 100% API COMPATIBLE
+---------------------------------
+Every public function keeps the SAME name and the SAME arguments as before,
+including the leading `conn` parameter. That means the rest of the project
+(worker.py, relay.py, admin_bot.py, progress_tracker.py, search_picker.py,
+queue_service.py) calls this module exactly as it did with SQLite.
+
+Two small but important compatibility details:
+
+  * `db.connect()` no longer opens a real new connection. It returns a very
+    light handle over ONE shared, process-wide MongoClient. `conn.close()` is
+    therefore a deliberate no-op. This matters: the old code called
+    `db.connect()` / `conn.close()` many times per second (the progress
+    tracker polls every 2s), and opening a genuine TCP+TLS connection to
+    Atlas that often would be slow and would blow through the free tier's
+    connection limit.
+
+  * Rows are returned as plain Python `dict`s, not `sqlite3.Row`. A dict
+    supports `row["url"]`, `row.keys()`, `"x" in row.keys()` and `dict(row)`,
+    which is every access pattern the rest of the codebase uses.
+
+COLLECTIONS (the MongoDB equivalent of the old tables)
+------------------------------------------------------
+  queue             : _id(int), url, url_hash, status, created_at, updated_at,
+                      error_reason, submitted_by, chat_id, requested_tag,
+                      cover_link, via_search, username
+  processed_urls    : _id = url_hash, url, first_seen_at, completed_at
+  flood_events      : at, seconds, context
+  bot_pings         : _id = bot name, last_ok
+  control_flags     : _id = key, value
+  admins            : _id = user_id, is_super, added_by, added_at
+  users             : _id = user_id, first_seen_at, blocked
+  job_progress      : _id = job_id, title, phase, detail, updated_at
+  progress_batches  : _id = batch_id, chat_id, message_id, job_ids, created_at,
+                      completed_at
+  user_tokens       : _id = user_id, username, used_today, last_reset_date,
+                      last_search_at
+  counters          : _id = name, seq        (replaces AUTOINCREMENT)
+
+CONFIGURATION
+-------------
+Set the environment variable MONGO_URI to your Atlas connection string, e.g.
+    mongodb+srv://user:pass@cluster0.abcde.mongodb.net/?retryWrites=true&w=majority
+Optionally set MONGO_DB_NAME (defaults to "relaybot").
+"""
+from __future__ import annotations
+
+import os
 import re
+import threading
 import time
-import uuid
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional
 
-from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
-import config
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-_client = None
-_db = None
+# Kept for backwards compatibility with startup_check.py's version assertion.
+SCHEMA_VERSION = 4
 
-DEFAULT_SETTINGS = {
-    "_id": "global",
-    "shortener_enabled": False,
-    "shortener_api_base": "https://vplink.in/api",
-    "shortener_api_key": None,   # set via /shortenerapi (DB-first, env fallback)
-    "verify_hours": 6,
-    "shortener_msg": "🔓 Verification required",
-    "shortenerbot_msg": (
-        "🔒 To download this file you must complete a quick verification.\n\n"
-        "Tap the button below, finish the shortener step, and you'll come "
-        "straight back here automatically."
-    ),
-    "verify_msg": "✅ Verification complete! Tap below to get your file.",
-    "shortener_buttons": [],
-    "force_sub_channel_id": config.FORCE_SUB_CHANNEL_ID,   # global default
-    "force_sub_channel_ids": None,    # v3.4: plural list; None -> singular above
-    "force_sub_links": {},           # v3.5: {channel_id: join-request invite link}
-    "ban_message": None,             # v3.5: custom banned-user text (/banmessage)
-    "post_sticker_id": None,         # v3.8: sticker sent after every post (/addsticker)
-    "sticker_waiting": [],           # v3.8: admin ids currently expected to send a sticker
-    "post_buttons": [],              # v4.0: extra channel-post buttons (/addbutton) — {label, url, color}
-    "cover_caption_extra": None,     # v4.0: appended to every posted cover caption (/addcovercaption)
-    "file_caption_extra": None,      # v4.0: appended to every delivered file caption (/addfilecaption)
-    "cover_caption_extra_html": None,  # v4.7+: HTML variant keeps bold/quote/mono/links
-    "file_caption_extra_html": None,
-    "cover_caption_extra_html": None,  # v4.7: HTML variant keeps bold/quote/mono/links
-    "file_caption_extra_html": None,
-    "cover_caption_extra_html": None,  # v4.7: HTML variant keeps bold/quote/mono/links
-    "file_caption_extra_html": None,
-    # legacy single-pipeline knobs, kept only as migration seeds:
-    "auto_delete_minutes": 15,
-    "post_channel_id": config.POST_CHANNEL_ID,
-    "db_channel_id": config.DB_CHANNEL_ID,
-    "post_time": "18:00",
-    "token_ttl_minutes": 10,
-    "post_main_channel_id": None,
-    "post_tag": None,
-    "post_timezone": "Asia/Kolkata",
-    "schedule_enabled": True,
-    "schedule_paused": False,
-    "queue_cursor": None,
-    "protect_content": False,
-    "with_file_message": None,   # custom post-delivery notice (/withfilemessages)
-    "browse_enabled": True,      # v4.4: /onbrowse /offbrowse global switch for the genre browse menu
-}
+DEFAULT_DB_NAME = "relaybot"
 
-# Fields a category document always carries (defaults for /addcategory).
-DEFAULT_CATEGORY = {
-    "enabled": True,
-    "db_channel_id": None,
-    "post_channel_id": None,
-    "post_main_channel_id": None,
-    "post_tag": None,
-    "post_time": "18:00",                 # always interpreted as IST
-    "schedule_enabled": True,
-    "schedule_paused": False,
-    "queue_cursor": None,
-    "force_sub_channel_id": None,         # None -> use the global default
-    "force_sub_channel_ids": None,        # v3.4: plural per-category list
-    "force_sub_links": {},            # v3.5: per-category invite links
-    "protect_content": False,
-    "auto_delete_minutes": 15,
-    "with_file_message": None,   # per-pipeline override of the delivery notice
-}
 
-CATEGORY_EDITABLE = {
-    "db_channel_id", "post_channel_id", "post_main_channel_id", "post_tag",
-    "post_time", "force_sub_channel_id", "protect_content",
-    "auto_delete_minutes", "with_file_message", "label", "enabled",
-}
+def _mongo_uri() -> str:
+    """Read MONGO_URI from the environment.
 
-
-def now() -> float:
-    return time.time()
-
-
-def _norm_key(key) -> str:
-    """Category keys are case-insensitive identifiers (stored lowercase)."""
-    return str(key or "").strip().lower()
-
-
-async def connect():
-    """Open the shared connection, ensure indexes/settings, run migration."""
-    global _client, _db
-    _client = AsyncIOMotorClient(config.MONGO_URI)
-    _db = _client[config.MONGO_DB_NAME]
-    await _db.settings.update_one(
-        {"_id": "global"}, {"$setOnInsert": DEFAULT_SETTINGS}, upsert=True
-    )
-    await _db.users.create_index("user_id", unique=True)
-    await _db.shorteners.create_index("site", unique=True)
-    await _db.verification_logs.create_index(
-        [("date", 1), ("user_id", 1)], unique=True)
-    # v3.2 migration: seed the shorteners collection from the legacy
-    # single-key setup (settings field, else the SHORTENER_API_KEY env var)
-    # on first startup after deploy — the owner never re-enters a key.
-    _legacy = await _db.settings.find_one({"_id": "global"}) or {}
-    if not _legacy.get("shorteners_migrated"):
-        if await _db.shorteners.count_documents({}) == 0:
-            _lkey = (_legacy.get("shortener_api_key")
-                     or config.SHORTENER_API_KEY or "").strip()
-            if _lkey:
-                await _db.shorteners.insert_one({
-                    "site": "vplink",
-                    "api_base": (_legacy.get("shortener_api_base")
-                                 or "https://vplink.in/api").strip(),
-                    "api_key": _lkey, "status": "active",
-                    "added_at": now(), "updated_at": now()})
-        await _db.settings.update_one(
-            {"_id": "global"},
-            {"$set": {"shorteners_migrated": True}}, upsert=True)
-    await _db.files.create_index([("category", 1), ("db_message_id", 1)], unique=True)
-    await _db.files.create_index("file_id", unique=True, sparse=True)
-    await _db.files.create_index([("category", 1), ("posted", 1)])
-    await _db.tokens.create_index("token", unique=True)
-    # Drop the legacy single-field unique index on raw.message_id — it collides
-    # across categories (every pipeline's DB channel restarts message_id at 1),
-    # which crashed the scan with DuplicateKeyError. The compound (category,
-    # message_id) index below is the correct unique key.
-    try:
-        await _db.raw.drop_index("message_id_1")
-    except Exception:
-        pass  # index already absent
-    # Drop ALL legacy single-field unique indexes that predate multi-category —
-    # they collide across pipelines because every channel restarts message_id /
-    # db_message_id at 1 (this exact bug crashed the scan twice: first on
-    # raw.message_id, then on files.db_message_id). Self-healing on startup.
-    for coll, idx in (("raw", "message_id_1"),
-                      ("files", "db_message_id_1"),
-                      ("files", "posted_1")):
-        try:
-            await _db[coll].drop_index(idx)
-        except Exception:
-            pass  # index already absent
-    await _db.raw.create_index([("category", 1), ("message_id", 1)], unique=True)
-    await _db.categories.create_index("key", unique=True)
-    await _db.categories.create_index("db_channel_id")
-    # v3.5: join requests are scoped PER CHANNEL (fixes Gate-1 bypass where any
-    # old join request passed every force-sub check). Drop the legacy index.
-    try:
-        await _db.join_requests.drop_index("user_id_1")
-    except Exception:
-        pass
-    await _db.join_requests.create_index([("user_id", 1), ("chat_id", 1)], unique=True)
-    await _db.admins.create_index("user_id", unique=True)
-    await _db.deletions.create_index("delete_at")
-    await _db.admin_state.create_index("user_id", unique=True)
-    # v4.4: one doc per (category, genre) — upserts can never duplicate a genre
-    await _db.genres.create_index([("category", 1), ("genre", 1)], unique=True)
-    await migrate_to_categories()
-    return _db
-
-
-async def close():
-    if _client:
-        _client.close()
-
-
-async def ping():
-    await _client.admin.command("ping")
-
-
-# ── migration: single pipeline -> categories ──────────────────
-async def migrate_to_categories():
-    """One-time upgrade: if no categories exist but legacy single-pipeline
-    settings do, create the first category from them and tag legacy data.
-
-    Existing files/raw docs keep their legacy `f{N}` file_id form (the whole
-    lookup chain understands it); they are only tagged with the category key.
-    Safe to run on every startup — it is a no-op once categories exist."""
-    if await _db.categories.count_documents({}):
-        return False
-    s = await _db.settings.find_one({"_id": "global"}) or {}
-    if not (s.get("db_channel_id") or config.DB_CHANNEL_ID):
-        return False  # nothing configured yet -> fresh install, wizard flow
-    key = _norm_key(config.MIGRATION_CATEGORY_KEY) or "manga"
-    doc = dict(DEFAULT_CATEGORY)
-    doc.update({
-        "key": key,
-        "label": key.capitalize(),
-        "db_channel_id": s.get("db_channel_id") or config.DB_CHANNEL_ID,
-        "post_channel_id": s.get("post_channel_id") or config.POST_CHANNEL_ID,
-        "post_main_channel_id": s.get("post_main_channel_id"),
-        "post_tag": s.get("post_tag"),
-        "post_time": s.get("post_time") or "18:00",
-        "schedule_enabled": bool(s.get("schedule_enabled", True)),
-        "schedule_paused": bool(s.get("schedule_paused", False)),
-        "queue_cursor": s.get("queue_cursor"),
-        "protect_content": bool(s.get("protect_content", False)),
-        "auto_delete_minutes": int(s.get("auto_delete_minutes") or 15),
-        "created_at": now(),
-        "updated_at": now(),
-    })
-    await _db.categories.insert_one(doc)
-    # Tag untagged legacy data (missing OR null category) with this category.
-    untagged = {"$or": [{"category": {"$exists": False}}, {"category": None}]}
-    await _db.files.update_many(untagged, {"$set": {"category": key}})
-    await _db.raw.update_many(untagged, {"$set": {"category": key}})
-    return True
-
-
-# ── settings (global knobs) ───────────────────────────────────
-async def get_settings():
-    """Global settings, always merged over DEFAULT_SETTINGS so every key is
-    present even if the stored doc predates a setting."""
-    doc = await _db.settings.find_one({"_id": "global"})
-    merged = dict(DEFAULT_SETTINGS)
-    if doc:
-        merged.update(doc)
-    return merged
-
-
-async def update_settings(fields: dict):
-    fields.pop("_id", None)
-    await _db.settings.update_one({"_id": "global"}, {"$set": fields}, upsert=True)
-
-
-# ── categories (the dynamic registry) ─────────────────────────
-async def create_category(key, label=None, **fields):
-    """Insert a new pipeline. Returns the doc, or None if key already exists."""
-    key = _norm_key(key)
-    if not key or not key.replace("_", "").isalnum():
-        raise ValueError("invalid category key")
-    if await _db.categories.find_one({"key": key}):
-        return None
-    doc = dict(DEFAULT_CATEGORY)
-    doc.update({k: v for k, v in fields.items() if k in DEFAULT_CATEGORY})
-    doc["key"] = key
-    doc["label"] = (label or key).strip() or key
-    doc["created_at"] = now()
-    doc["updated_at"] = now()
-    await _db.categories.insert_one(doc)
-    return doc
-
-
-async def update_category(key, fields: dict):
-    fields = {k: v for k, v in fields.items()
-              if k in CATEGORY_EDITABLE
-              or k in ("schedule_enabled", "schedule_paused", "queue_cursor")}
-    fields.pop("key", None)
-    fields["updated_at"] = now()
-    await _db.categories.update_one({"key": _norm_key(key)}, {"$set": fields})
-
-
-async def get_category(key):
-    return await _db.categories.find_one({"key": _norm_key(key)})
-
-
-async def list_categories(enabled_only=False):
-    q = {"enabled": True} if enabled_only else {}
-    cur = _db.categories.find(q).sort("created_at", 1)
-    return [d async for d in cur]
-
-
-async def delete_category(key, purge_data=False):
-    """Remove a pipeline. With purge_data=True also drops its files/raw."""
-    key = _norm_key(key)
-    res = await _db.categories.delete_one({"key": key})
-    if purge_data:
-        await _db.files.delete_many({"category": key})
-        await _db.raw.delete_many({"category": key})
-        await _db.genres.delete_many({"category": key})   # v4.4: no orphan genres
-    return res.deleted_count
-
-
-async def category_for_db_channel(channel_id):
-    """Resolve which pipeline owns a given Database Channel id."""
-    try:
-        channel_id = int(channel_id)
-    except (TypeError, ValueError):
-        return None
-    return await _db.categories.find_one({"db_channel_id": channel_id})
-
-
-async def count_categories():
-    return await _db.categories.count_documents({})
-
-
-# ── admin UI state (active category per admin, survives restarts) ──
-async def set_active_category(user_id, key):
-    await _db.admin_state.update_one(
-        {"user_id": user_id},
-        {"$set": {"active_category": _norm_key(key)}}, upsert=True)
-
-
-async def get_active_category(user_id):
-    doc = await _db.admin_state.find_one({"user_id": user_id})
-    key = (doc or {}).get("active_category")
-    if key and await _db.categories.find_one({"key": key}):
-        return key
-    return None
-
-
-# ── users ─────────────────────────────────────────────────────
-async def touch_user(user_id, bot=None):
-    """Upsert the user record. v4.7: optional `bot` tag ('bot1'/'bot2') is
-    added to the user's `bots` set so each bot can broadcast to exactly the
-    users who started IT (legacy users have no tag and count as Bot 1's)."""
-    ops = {"$setOnInsert": {"joined_at": now(), "banned": False,
-                            "auto_delete_override": None, "verified": {}}}
-    if bot:
-        ops["$addToSet"] = {"bots": bot}
-    await _db.users.update_one({"user_id": user_id}, ops, upsert=True)
-
-
-async def get_user(user_id):
-    return await _db.users.find_one({"user_id": user_id})
-
-
-async def mark_verified(user_id, category, hours=None):
-    """Mark a user verified for ONE category (per-category verification).
-
-    Backward-compatible signature: may be called the NEW way
-    ``mark_verified(user_id, category, hours)`` or the LEGACY way
-    ``mark_verified(user_id, hours)``. The legacy form writes the global
-    ``verified_until`` flag (pre-upgrade behaviour); the new form writes the
-    per-category flag and mirrors it to the legacy flag for compatibility."""
-    if hours is None:                     # legacy call: (user_id, hours)
-        hours = category
-        category = None
-    until = now() + hours * 3600
-    if category:
-        await _db.users.update_one(
-            {"user_id": user_id},
-            {"$set": {f"verified.{_norm_key(category)}": until},
-             "$max": {"verified_any_until": until},
-             "$setOnInsert": {"joined_at": now(), "banned": False,
-                              "auto_delete_override": None}},
-            upsert=True,
-        )
-    else:
-        await _db.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"verified_until": until},
-             "$max": {"verified_any_until": until},
-             "$setOnInsert": {"joined_at": now(), "banned": False,
-                              "auto_delete_override": None}},
-            upsert=True,
-        )
-    return until
-
-
-async def is_verified(user_id, category) -> bool:
-    """True when the user holds an unexpired verification for this category.
-
-    STATS/DIAGNOSTICS ONLY (v2.4+): strict per-post verification means this
-    must NEVER be used to skip the shortener gate — doing so was the
-    'verified globally' bug. Kept for admin stats and future features.
-
-    Legacy users verified before the upgrade carry a bare ``verified_until``;
-    that is honoured for any category so nobody is forced to re-verify."""
-    doc = await get_user(user_id)
-    if not doc:
-        return False
-    t = now()
-    until = (doc.get("verified") or {}).get(_norm_key(category))
-    if until and until > t:
-        return True
-    legacy = doc.get("verified_until")
-    return bool(legacy and legacy > t)
-
-
-async def add_strike(user_id) -> int:
-    """Increment and return the bypass-strike counter for a user (global)."""
-    doc = await _db.users.find_one_and_update(
-        {"user_id": user_id},
-        {"$inc": {"strikes": 1},
-         "$setOnInsert": {"joined_at": now()}},
-        upsert=True, return_document=True)
-    return int((doc or {}).get("strikes") or 1)
-
-
-async def reset_strikes(user_id):
-    await _db.users.update_one({"user_id": user_id},
-                               {"$set": {"strikes": 0}})
-
-
-async def set_banned(user_id, banned: bool):
-    await _db.users.update_one(
-        {"user_id": user_id},
-        {"$set": {"banned": banned, **({"strikes": 0} if not banned else {})},
-         "$setOnInsert": {"joined_at": now()}},
-        upsert=True,
-    )
-
-
-async def set_user_autodelete(user_id, minutes):
-    await _db.users.update_one(
-        {"user_id": user_id},
-        {"$set": {"auto_delete_override": minutes},
-         "$setOnInsert": {"joined_at": now(), "banned": False}},
-        upsert=True,
-    )
-
-
-async def count_users():
-    return await _db.users.count_documents({})
-
-
-async def count_verified(category=None):
-    """Verified-user count, globally (any category) or for one category."""
-    t = now()
-    if category:
-        return await _db.users.count_documents(
-            {f"verified.{_norm_key(category)}": {"$gt": t}})
-    return await _db.users.count_documents(
-        {"$or": [{"verified_any_until": {"$gt": t}},
-                 {"verified_until": {"$gt": t}}]})
-
-
-async def count_banned():
-    return await _db.users.count_documents({"banned": True})
-
-
-async def all_user_ids():
-    cur = _db.users.find({}, {"user_id": 1})
-    return [d["user_id"] async for d in cur]
-
-
-async def all_user_ids_for(bot=None):
-    """Audience of ONE bot. bot2 -> only users who started Bot 2 (explicitly
-    tagged). Any other value -> every user (legacy behaviour)."""
-    if bot == "bot2":
-        cur = _db.users.find({"bots": "bot2"}, {"user_id": 1})
-        return [d["user_id"] async for d in cur]
-    return await all_user_ids()
-
-
-async def all_user_ids_for(bot=None):
-    """Audience of ONE bot. bot2 -> only users who started Bot 2
-    (explicitly tagged). Any other value -> every user (legacy)."""
-    if bot == "bot2":
-        cur = _db.users.find({"bots": "bot2"}, {"user_id": 1})
-        return [d["user_id"] async for d in cur]
-    return await all_user_ids()
-
-
-async def all_user_ids_for(bot=None):
-    """Audience of ONE bot. bot='bot2' -> only users who started Bot 2
-    (explicitly tagged). Any other value -> every user (legacy behaviour).
-    Tagged bots land in the `bots` set via touch_user(user_id, bot=...)."""
-    if bot == "bot2":
-        cur = _db.users.find({"bots": "bot2"}, {"user_id": 1})
-        return [d["user_id"] async for d in cur]
-    return await all_user_ids()
-
-
-# ── files / posting queue (category-scoped) ───────────────────
-def make_file_id(category, db_message_id) -> str:
-    return f"{_norm_key(category)}_f{int(db_message_id)}"
-
-
-async def upsert_item(item: dict):
-    """Insert/refresh an item while PRESERVING its posted status."""
-    set_fields = {k: v for k, v in item.items() if k not in ("posted", "created_at")}
-    await _db.files.update_one(
-        {"category": item.get("category"),
-         "db_message_id": item["db_message_id"]},
-        {"$set": set_fields,
-         "$setOnInsert": {"posted": False, "created_at": now()}},
-        upsert=True,
-    )
-
-
-async def _cursor_of(category):
-    if not category:
-        return None
-    cat = await get_category(category)
-    return (cat or {}).get("queue_cursor")
-
-
-async def next_unposted(category=None):
-    """Lowest db_message_id that has not been posted yet (oldest first)."""
-    q = {"posted": False}
-    if category:
-        q["category"] = _norm_key(category)
-        cur = await _cursor_of(category)
-        if cur:
-            q["db_message_id"] = {"$gte": cur}
-    return await _db.files.find_one(q, sort=[("db_message_id", 1)])
-
-
-async def next_n_queued(category=None, n=10):
-    q = {"posted": False}
-    if category:
-        q["category"] = _norm_key(category)
-        cur = await _cursor_of(category)
-        if cur:
-            q["db_message_id"] = {"$gte": cur}
-    return await _db.files.find(q).sort("db_message_id", 1).limit(int(n)).to_list(int(n))
-
-
-async def mark_posted(db_message_id, post_message_id=None, category=None):
-    q = {"db_message_id": db_message_id}
-    if category:
-        q["category"] = _norm_key(category)
-    await _db.files.update_one(
-        q,
-        {"$set": {"posted": True, "posted_at": now(), "post_message_id": post_message_id}},
-    )
-
-
-async def get_item_by_file_id(file_id):
-    """Look up by file_id, tolerating BOTH id styles in either direction.
-
-    Items are stored with category-prefixed ids ("jav_f123"). Buttons posted
-    before the upgrade carry legacy bare ids ("f123"). Resolve by trying, in
-    order: as-is -> add each known category prefix -> strip a category prefix.
-    Every old and new button keeps working against migrated data."""
-    s = str(file_id or "").strip()
-    if not s:
-        return None
-    # 1. exact match (new-style ids, or legacy ids on legacy docs)
-    item = await _db.files.find_one({"file_id": s})
-    if item:
-        return item
-    # 2. legacy bare id -> try each category prefix (f123 -> jav_f123)
-    if s.startswith("f") and "_f" not in s and s[1:].isdigit():
-        suffix = s[1:]
-        async for cat in _db.categories.find({}, {"key": 1}):
-            item = await _db.files.find_one(
-                {"file_id": f"{cat['key']}_f{suffix}"})
-            if item:
-                return item
-    # 3. prefixed id -> strip to legacy (jav_f123 -> f123)
-    if not s.startswith("f") and "_f" in s:
-        legacy = "f" + s.rsplit("_f", 1)[-1]
-        return await _db.files.find_one({"file_id": legacy})
-    return None
-
-
-async def resolve_category(file_id):
-    """Best-effort category key for a file_id (doc, then id prefix)."""
-    item = await get_item_by_file_id(file_id)
-    if item and item.get("category"):
-        return item["category"]
-    s = str(file_id or "")
-    if "_f" in s and not s.startswith("f"):
-        return s.rsplit("_f", 1)[0]
-    return None
-
-
-async def count_files(category=None):
-    q = {"category": _norm_key(category)} if category else {}
-    return await _db.files.count_documents(q)
-
-
-async def count_posted(category=None):
-    q = {"posted": True}
-    if category:
-        q["category"] = _norm_key(category)
-    return await _db.files.count_documents(q)
-
-
-async def count_pending(category=None):
-    q = {"posted": False}
-    if category:
-        q["category"] = _norm_key(category)
-    return await _db.files.count_documents(q)
-
-
-# ── raw staging + grouping (category-scoped) ──────────────────
-async def ingest_raw(entry: dict, category=None):
-    cat = _norm_key(category or entry.get("category"))
-    await _db.raw.update_one(
-        {"category": cat, "message_id": entry["message_id"]},
-        {"$set": {**entry, "category": cat}}, upsert=True
-    )
-
-
-async def all_raw(category=None):
-    q = {"category": _norm_key(category)} if category else {}
-    cur = _db.raw.find(q).sort("message_id", 1)
-    return [d async for d in cur]
-
-
-def group_items(raw: list, category=None):
-    """Group raw messages into items.
-
-    DB-channel layout: cover post (photo) -> 1-2 videos -> optional .srt.
-    Every 'cover' starts a new item; videos/srts attach to the current item.
-    Items are ordered by message id, which is naturally sequential.
+    We read it lazily (inside the function, not at import time) so that
+    importing this module never crashes — the error surfaces with a clear
+    message only when the database is actually needed.
     """
-    cat = _norm_key(category)
-    items, current = [], None
-    for m in raw:
-        kind = m.get("kind")
-        if kind == "cover":
-            current = {"db_message_id": m["message_id"],
-                       "cover_message_id": m["message_id"],
-                       "cover_file_id": m.get("file_id"),
-                       "caption": m.get("caption") or "",
-                       "videos": [], "srts": []}
-            items.append(current)
-        elif kind == "video":
-            if current is None:
-                current = {"db_message_id": m["message_id"],
-                           "cover_message_id": None,
-                           "cover_file_id": None,
-                           "caption": m.get("caption") or "",
-                           "videos": [], "srts": []}
-                items.append(current)
-            current["videos"].append(
-                {"db_message_id": m["message_id"], "caption": m.get("caption") or ""}
+    uri = (os.getenv("MONGO_URI") or "").strip()
+    if not uri:
+        raise RuntimeError(
+            "MONGO_URI is not set. Add it as an environment variable / secret "
+            "(e.g. mongodb+srv://USER:PASS@cluster0.xxxxx.mongodb.net/"
+            "?retryWrites=true&w=majority)."
+        )
+    return uri
+
+
+def _db_name() -> str:
+    return (os.getenv("MONGO_DB_NAME") or "").strip() or DEFAULT_DB_NAME
+
+
+# ---------------------------------------------------------------------------
+# Shared client (one per process, thread-safe, lazily created)
+# ---------------------------------------------------------------------------
+
+_client: Optional[MongoClient] = None
+_client_pid: Optional[int] = None
+_client_lock = threading.Lock()
+_indexes_ready = False
+
+
+def _get_client() -> MongoClient:
+    """Return the process-wide MongoClient, creating it on first use.
+
+    Re-created automatically if the process was forked (a MongoClient must
+    never be shared across a fork), which is why we track the PID.
+    """
+    global _client, _client_pid
+    pid = os.getpid()
+    if _client is not None and _client_pid == pid:
+        return _client
+    with _client_lock:
+        if _client is not None and _client_pid == pid:
+            return _client
+        _client = MongoClient(
+            _mongo_uri(),
+            serverSelectionTimeoutMS=15000,
+            connectTimeoutMS=15000,
+            socketTimeoutMS=30000,
+            retryWrites=True,
+            maxPoolSize=20,
+            tz_aware=False,
+            appname="mtproto-relay",
+        )
+        _client_pid = pid
+        return _client
+
+
+class MongoHandle:
+    """Tiny stand-in for the old `sqlite3.Connection` object.
+
+    The rest of the codebase does:
+        conn = db.connect()
+        try:
+            ... db.something(conn, ...)
+        finally:
+            conn.close()
+
+    So the handle only needs to exist, expose the database, and tolerate
+    `.close()`. `.close()` is intentionally a NO-OP because the underlying
+    MongoClient is shared for the whole process and must stay open.
+    """
+
+    __slots__ = ("db",)
+
+    def __init__(self, database) -> None:
+        self.db = database
+
+    # --- convenience collection accessors -------------------------------
+    @property
+    def queue(self):
+        return self.db["queue"]
+
+    @property
+    def processed_urls(self):
+        return self.db["processed_urls"]
+
+    @property
+    def flood_events(self):
+        return self.db["flood_events"]
+
+    @property
+    def bot_pings(self):
+        return self.db["bot_pings"]
+
+    @property
+    def control_flags(self):
+        return self.db["control_flags"]
+
+    @property
+    def admins(self):
+        return self.db["admins"]
+
+    @property
+    def users(self):
+        return self.db["users"]
+
+    @property
+    def job_progress(self):
+        return self.db["job_progress"]
+
+    @property
+    def progress_batches(self):
+        return self.db["progress_batches"]
+
+    @property
+    def user_tokens(self):
+        return self.db["user_tokens"]
+
+    @property
+    def counters(self):
+        return self.db["counters"]
+
+    @property
+    def galleries(self):
+        """V2 dedup + delivery collection (see docs/ARCHITECTURE_V2.md).
+
+        _id = gallery_id (string). Never touched by V1 code paths.
+        """
+        return self.db["galleries"]
+
+    @property
+    def backup_state(self):
+        """v1.22: BackupDB state doc (_id='state': use_backup toggle,
+        backup_channel_id). See backup_db.py."""
+        return self.db["backup_state"]
+
+    @property
+    def nhentai_cache(self):
+        """v12.2: long-TTL cache of upstream nhentai responses.
+
+        _id  = cache key (e.g. 'gallery:274788', 'search:incest|popular|1')
+        payload = the JSON blob to return verbatim
+        expires_at = epoch seconds; TTL index below purges the doc.
+
+        Serving from here means ZERO upstream fetches — which is the
+        single biggest lever against '1 user 429s everyone'.
+        """
+        return self.db["nhentai_cache"]
+
+    @property
+    def nhentai_ratelimit(self):
+        """v12.2: shared per-endpoint token bucket for nhentai upstream.
+
+        _id = endpoint tag ('search', 'galleries', 'popular', ...)
+        tokens        = float, refills at rate_per_sec toward capacity
+        capacity      = int (max tokens = docs' anon limit for that endpoint)
+        rate_per_sec  = float (capacity / 60)
+        updated_at    = last time tokens were refilled (epoch seconds)
+
+        Sized to the OPENAPI 3.1 anon limits at nhentai.net/api/v2/openapi.json.
+        Consumed BEFORE every upstream call so we never blow past quota.
+        """
+        return self.db["nhentai_ratelimit"]
+
+    def close(self) -> None:
+        """No-op: the shared MongoClient stays alive for the process."""
+        return None
+
+    # Some older/debug code may try `conn.command(...)`; forward it.
+    def command(self, *a, **kw):
+        return self.db.command(*a, **kw)
+
+
+def connect() -> MongoHandle:
+    """Return a handle to the MongoDB database (see MongoHandle docstring)."""
+    handle = MongoHandle(_get_client()[_db_name()])
+    _ensure_indexes(handle)
+    return handle
+
+
+@contextmanager
+def transaction(conn: MongoHandle) -> Iterator[MongoHandle]:
+    """Compatibility shim.
+
+    The old SQLite layer wrapped writes in BEGIN IMMEDIATE / COMMIT. MongoDB
+    single-document updates are already atomic, and multi-document
+    transactions require a replica set plus extra latency for no benefit here,
+    so this simply yields the handle. Kept so any external code that imported
+    `db.transaction` still works.
+    """
+    yield conn
+
+
+def _ensure_indexes(conn: MongoHandle) -> None:
+    """Create the indexes once per process. Safe and cheap to call repeatedly."""
+    global _indexes_ready
+    if _indexes_ready:
+        return
+    try:
+        conn.queue.create_index([("status", ASCENDING)], name="idx_queue_status")
+        conn.queue.create_index([("url_hash", ASCENDING)], name="idx_queue_hash")
+        conn.queue.create_index([("updated_at", DESCENDING)], name="idx_queue_updated")
+        conn.queue.create_index(
+            [("status", ASCENDING), ("_id", ASCENDING)], name="idx_queue_status_id"
+        )
+        conn.processed_urls.create_index(
+            [("completed_at", ASCENDING)], name="idx_processed_completed"
+        )
+        conn.progress_batches.create_index(
+            [("completed_at", ASCENDING)], name="idx_batches_open"
+        )
+        conn.user_tokens.create_index([("username", ASCENDING)], name="idx_tokens_username")
+        # V2 galleries indexes -------------------------------------------------
+        # _id is already unique (implicit). We index status for admin sweeps,
+        # and started_at (partial: PROCESSING only) for lazy stale-recovery.
+        conn.galleries.create_index(
+            [("status", ASCENDING)], name="idx_galleries_status"
+        )
+        try:
+            conn.galleries.create_index(
+                [("started_at", ASCENDING)],
+                name="idx_galleries_started_processing",
+                partialFilterExpression={"status": "PROCESSING"},
             )
-        elif kind == "srt" and current is not None:
-            current["srts"].append(
-                {"db_message_id": m["message_id"], "caption": m.get("caption") or ""}
+        except PyMongoError:
+            # Partial index syntax is Mongo 3.2+; if the cluster refuses it,
+            # fall back to a plain index so the collection still works.
+            conn.galleries.create_index(
+                [("started_at", ASCENDING)], name="idx_galleries_started"
             )
-    if cat:
-        for it in items:
-            it["category"] = cat
-    return items
+        conn.galleries.create_index(
+            [("url_hash", ASCENDING)], name="idx_galleries_url_hash"
+        )
+        # v12.2 nhentai_cache: TTL index on expires_at auto-purges stale docs.
+        # expireAfterSeconds=0 means "expire exactly at the datetime in this field".
+        try:
+            conn.nhentai_cache.create_index(
+                [("expires_at", ASCENDING)],
+                name="idx_nhcache_ttl",
+                expireAfterSeconds=0,
+            )
+        except PyMongoError:
+            # Older Mongo without TTL support — lazy expiry in read path still works.
+            pass
+        _indexes_ready = True
+    except PyMongoError:
+        # Index creation is an optimisation, never a hard requirement.
+        _indexes_ready = True
 
 
-async def rematch_genres(category):
-    """v4.4: rebuild every genre's match list for a category from the CURRENT
-    captions. Called after /rescandb (rebuild_items may have changed captions
-    or dropped items) so genre results never go stale. One pass over files
-    per category — genres without a stored list just get their backfill."""
-    key = _norm_key(category)
-    genres = await list_genres(key)
-    if not genres:
-        return 0
-    # v4.9.4: only pull docs that CAN match a genre (non-empty string
-    # caption). Was: stream every file doc in the category from Atlas on
-    # every rescan; videos/srts without captions can never match anyway.
-    docs = await _db.files.find(
-        {"category": key, "caption": {"$type": "string", "$ne": ""}},
-        {"file_id": 1, "caption": 1}).to_list(None)
-    for gdoc in genres:
-        hits = [d["file_id"] for d in docs
-                if d.get("file_id")
-                and _genre_in_caption(gdoc["genre"], d.get("caption"))]
-        await _db.genres.update_one(
-            {"_id": gdoc["_id"]},
-            {"$set": {"matched": hits, "scanned": True}})
-    return len(genres)
+def init_db() -> None:
+    """Verify connectivity and create indexes. Called at startup."""
+    conn = connect()
+    # `ping` raises a clear error if MONGO_URI / network / credentials are wrong.
+    conn.db.command("ping")
+    _ensure_indexes(conn)
+    _set_flag_raw(conn, "schema_version", str(SCHEMA_VERSION))
 
 
-async def rebuild_items(category=None):
-    """Re-derive the files collection from raw staging (keeps posted flags).
+def confirm_wal(conn: MongoHandle) -> str:
+    """Compatibility stub.
 
-    Scoped per category so rescanning one pipeline never disturbs another.
-    Self-healing: items whose source messages are no longer in the DB channel
-    are REMOVED, so the queue renumbers itself on the next /rescandb."""
-    cat = _norm_key(category)
-    items = group_items(await all_raw(cat), cat)
-    valid_ids = {it["db_message_id"] for it in items}
-    base = {"category": cat} if cat else {}
-    if valid_ids:
-        await _db.files.delete_many({**base, "db_message_id": {"$nin": list(valid_ids)}})
-    else:
-        await _db.files.delete_many(base)
-    for it in items:
-        await upsert_item({
-            "file_id": make_file_id(cat, it["db_message_id"]) if cat
-                       else f"f{it['db_message_id']}",
-            "category": cat or it.get("category"),
-            "db_message_id": it["db_message_id"],
-            "cover_message_id": it["cover_message_id"],
-            "cover_file_id": it.get("cover_file_id"),
-            "caption": it["caption"],
-            "videos": it["videos"],
-            "srts": it["srts"],
-        })
-    return len(items)
+    SQLite's WAL journal mode has no MongoDB equivalent. startup_check.py used
+    to assert this returned 'wal'; it now checks connectivity instead. The
+    literal string is returned so any old caller still passes.
+    """
+    return "wal"
 
 
-# ── tokens ────────────────────────────────────────────────────
-async def create_token(user_id, file_id, ttl_minutes, kind="deliver"):
-    token = uuid.uuid4().hex
-    await _db.tokens.insert_one({
-        "token": token, "user_id": user_id, "file_id": file_id, "kind": kind,
-        "expires_at": now() + ttl_minutes * 60, "used": False, "created_at": now(),
-    })
-    return token
+def ping(conn: Optional[MongoHandle] = None) -> bool:
+    """True if the MongoDB server answers. Used by the startup self-test."""
+    try:
+        c = conn or connect()
+        c.db.command("ping")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
-async def get_token(token):
-    return await _db.tokens.find_one({"token": token})
+def now_ts() -> int:
+    return int(time.time())
 
 
-async def mark_token_used(token):
-    await _db.tokens.update_one(
-        {"token": token}, {"$set": {"used": True, "used_at": now()}}
+def _next_seq(conn: MongoHandle, name: str = "queue") -> int:
+    """Atomic auto-increment — replaces SQLite's INTEGER PRIMARY KEY AUTOINCREMENT."""
+    doc = conn.counters.find_one_and_update(
+        {"_id": name},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int(doc["seq"])
+
+
+def _row(doc: Optional[dict], id_field: str = "id") -> Optional[Dict[str, Any]]:
+    """Convert a Mongo document to the dict shape the old code expects.
+
+    MongoDB stores the primary key as `_id`; the old SQLite rows exposed it
+    under a friendlier name (`id`, `user_id`, `batch_id`, ...). This renames it
+    while keeping `_id` available too.
+    """
+    if doc is None:
+        return None
+    out = dict(doc)
+    if "_id" in out:
+        out[id_field] = out["_id"]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# queue operations
+# ---------------------------------------------------------------------------
+
+_QUEUE_DEFAULTS = {
+    "error_reason": None,
+    "submitted_by": None,
+    "chat_id": None,
+    "requested_tag": 0,
+    "cover_link": None,
+    "via_search": 0,
+    "username": None,
+}
+
+
+def _queue_row(doc: Optional[dict]) -> Optional[Dict[str, Any]]:
+    """Normalise a queue document so every expected key always exists.
+
+    The old table had columns added over time via ALTER TABLE, so callers use
+    guards like `"via_search" in row.keys()`. Filling defaults here means those
+    guards behave predictably for documents written by any version.
+    """
+    row = _row(doc, "id")
+    if row is None:
+        return None
+    for k, v in _QUEUE_DEFAULTS.items():
+        row.setdefault(k, v)
+    return row
+
+
+def reset_stuck_processing(conn: MongoHandle) -> int:
+    """On restart, any 'processing' job → back to 'pending'."""
+    res = conn.queue.update_many(
+        {"status": "processing"},
+        {"$set": {"status": "pending", "updated_at": now_ts(), "error_reason": None}},
+    )
+    return int(res.modified_count or 0)
+
+
+def has_completed(conn: MongoHandle, url_hash: str) -> bool:
+    doc = conn.processed_urls.find_one(
+        {"_id": url_hash, "completed_at": {"$ne": None}}, {"_id": 1}
+    )
+    return doc is not None
+
+
+def get_cached_gallery_ids(conn: MongoHandle, gallery_ids) -> set:
+    """v12.34 (Task 1): batch "is this gallery already in the DB channel?" check.
+
+    Given up to ~50 gallery ids (whatever a list route just fetched), return
+    the SUBSET whose Mongo `galleries` doc is in status COMPLETED. Used by
+    every list endpoint to attach an `is_cached` flag per card so the Mini
+    App can render the ⚡⚡ / 📥 badge without an extra roundtrip per item.
+
+    Costs ONE Mongo query per list request (find + covered index on _id).
+    Returns an empty set on any error — badges are cosmetic, never fail the
+    request. Ids are coerced to str because `galleries._id` is the string
+    gallery id (see gallery_state.STATUS_COMPLETED writes).
+    """
+    try:
+        ids = [str(g) for g in (gallery_ids or []) if g is not None]
+        if not ids:
+            return set()
+        cursor = conn.galleries.find(
+            {"_id": {"$in": ids}, "status": "COMPLETED"},
+            {"_id": 1},
+        )
+        return {str(d["_id"]) for d in cursor}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def has_pending_or_processing(conn: MongoHandle, url_hash: str) -> bool:
+    doc = conn.queue.find_one(
+        {"url_hash": url_hash, "status": {"$in": ["pending", "processing"]}}, {"_id": 1}
+    )
+    return doc is not None
+
+
+def enqueue(
+    conn: MongoHandle,
+    url: str,
+    url_hash: str,
+    gallery_id: Optional[str] = None,   # v12.88: Bot 2's queue reader prefers
+                                        # this field over the URL regex
+    submitted_by: Optional[int] = None,
+    chat_id: Optional[int] = None,
+    requested_tag: bool = False,
+    via_search: bool = False,
+    username: Optional[str] = None,
+) -> int:
+    ts = now_ts()
+    job_id = _next_seq(conn, "queue")
+    conn.queue.insert_one(
+        {
+            "_id": job_id,
+            "url": url,
+            "url_hash": url_hash,
+            "gallery_id": gallery_id or None,   # v12.88
+            "status": "pending",
+            "created_at": ts,
+            "updated_at": ts,
+            "error_reason": None,
+            "submitted_by": int(submitted_by) if submitted_by else None,
+            "chat_id": int(chat_id) if chat_id else None,
+            "requested_tag": 1 if requested_tag else 0,
+            "cover_link": None,
+            "via_search": 1 if via_search else 0,
+            "username": username,
+        }
+    )
+    return int(job_id)
+
+
+def next_pending(conn: MongoHandle) -> Optional[Dict[str, Any]]:
+    doc = conn.queue.find_one({"status": "pending"}, sort=[("_id", ASCENDING)])
+    return _queue_row(doc)
+
+
+def claim_next_pending(conn: MongoHandle) -> Optional[Dict[str, Any]]:
+    """Atomically take the oldest pending job and mark it 'processing'.
+
+    NEW (not in the SQLite version). Safe to ignore, but recommended if you
+    ever run more than one worker: it makes double-processing impossible
+    because the find and the update happen in a single atomic operation.
+    """
+    doc = conn.queue.find_one_and_update(
+        {"status": "pending"},
+        {"$set": {"status": "processing", "updated_at": now_ts()}},
+        sort=[("_id", ASCENDING)],
+        return_document=ReturnDocument.AFTER,
+    )
+    return _queue_row(doc)
+
+
+def mark_processing(conn: MongoHandle, job_id: int) -> None:
+    conn.queue.update_one(
+        {"_id": int(job_id)},
+        {"$set": {"status": "processing", "updated_at": now_ts()}},
     )
 
 
-# ── join requests ─────────────────────────────────────────────
-async def record_join_request(user_id, chat_id=None):
-    await _db.join_requests.update_one(
-        {"user_id": user_id, "chat_id": chat_id},
-        {"$set": {"at": now()}}, upsert=True)
-
-
-async def has_join_request(user_id, chat_id=None):
-    q = {"user_id": user_id}
-    if chat_id is not None:
-        q["chat_id"] = chat_id
-    return await _db.join_requests.find_one(q) is not None
-
-
-# ── admins ────────────────────────────────────────────────────
-async def add_db_admin(user_id):
-    await _db.admins.update_one(
-        {"user_id": user_id}, {"$set": {"user_id": user_id, "at": now()}}, upsert=True
+def mark_status(
+    conn: MongoHandle,
+    job_id: int,
+    status: str,
+    error_reason: Optional[str] = None,
+) -> None:
+    conn.queue.update_one(
+        {"_id": int(job_id)},
+        {"$set": {"status": status, "updated_at": now_ts(), "error_reason": error_reason}},
     )
 
 
-async def is_db_admin(user_id):
-    return await _db.admins.find_one({"user_id": user_id}) is not None
+def set_cover_link(conn: MongoHandle, job_id: int, cover_link: str) -> None:
+    """Persist the Database Channel cover-post link (t.me/c/.../msgid) for a job,
+    used by the /mpost cross-post step."""
+    conn.queue.update_one({"_id": int(job_id)}, {"$set": {"cover_link": cover_link}})
 
 
-async def list_admin_ids():
-    """ENV admins plus every admin promoted via /addadmin."""
-    ids = list(config.ADMIN_IDS)
-    async for doc in _db.admins.find({}):
-        if doc["user_id"] not in ids:
-            ids.append(doc["user_id"])
-    return ids
+def get_job(conn: MongoHandle, job_id: int) -> Optional[Dict[str, Any]]:
+    return _queue_row(conn.queue.find_one({"_id": int(job_id)}))
 
 
-# ── auto-delete queue (restart-safe) ──────────────────────────
-async def add_deletion(chat_id, message_ids, delete_at, bot=None):
-    """Queue messages for deletion. v4.0: optional `bot` tag ('bot1' for
-    broadcasts; legacy/Bot-2 deliveries stay untagged) so each bot's sweeper
-    only touches messages IT sent — Telegram only lets the sending bot delete
-    a message it sent."""
-    doc = {"chat_id": chat_id, "message_ids": list(message_ids),
-           "delete_at": delete_at}
-    if bot:
-        doc["bot"] = bot
-    await _db.deletions.insert_one(doc)
+def record_processed(conn: MongoHandle, url: str, url_hash: str) -> None:
+    """Insert the point-of-no-return row the moment PDF is forwarded."""
+    ts = now_ts()
+    conn.processed_urls.update_one(
+        {"_id": url_hash},
+        {
+            "$set": {"url": url, "completed_at": ts},
+            "$setOnInsert": {"first_seen_at": ts},
+        },
+        upsert=True,
+    )
 
 
-async def due_deletions(bot=None):
-    """Due deletion entries. v4.0: `bot` scopes by the `bot` field so Bot 1's
-    broadcast sweeper only picks up Bot 1 messages (bot='bot1') and Bot 2's
-    delivery sweeper only Bot 2's. bot=None returns everything (legacy)."""
-    q = {"delete_at": {"$lte": now()}}
-    if bot == "bot1":
-        q["bot"] = "bot1"
-    elif bot == "bot2":
-        q["bot"] = {"$ne": "bot1"}   # includes legacy docs with no bot field
-    cur = _db.deletions.find(q)
-    return [d async for d in cur]
+def log_flood(conn: MongoHandle, seconds: int, context: str = "") -> None:
+    try:
+        conn.flood_events.insert_one(
+            {"at": now_ts(), "seconds": int(seconds), "context": (context or "")[:200]}
+        )
+    except PyMongoError:
+        pass  # telemetry only — never break a job over it
 
 
-async def remove_deletion(doc_id):
-    await _db.deletions.delete_one({"_id": doc_id})
+def touch_bot_ping(conn: MongoHandle, bot: str) -> None:
+    conn.bot_pings.update_one(
+        {"_id": bot}, {"$set": {"last_ok": now_ts()}}, upsert=True
+    )
 
 
-async def pending_delivery_message_ids(chat_id):
-    """v4.7: every not-yet-deleted message id delivered to this chat."""
-    cur = _db.deletions.find({"chat_id": chat_id}, {"message_ids": 1})
-    out = set()
-    async for d in cur:
-        out.update(d.get("message_ids") or [])
-    return sorted(x for x in out if x)
+def get_bot_ping(conn: MongoHandle, bot: str) -> Optional[int]:
+    doc = conn.bot_pings.find_one({"_id": bot})
+    return int(doc["last_ok"]) if doc and doc.get("last_ok") is not None else None
 
 
-# --- pending deliveries (v4.7.1: Bot 2 force-sub resume) ---
-# Stored on the USER doc — NOT in the deep link or callback_data, because
-# Telegram caps /start payloads at 64 chars and callback_data at 64 bytes.
-async def set_pending_delivery(user_id, file_id):
-    await _db.users.update_one(
-        {"user_id": user_id},
-        {"$set": {"pending_delivery": {"file_id": file_id, "at": now()}}},
-        upsert=True)
+# ---------------------------------------------------------------------------
+# control flags
+# ---------------------------------------------------------------------------
+
+def _set_flag_raw(conn: MongoHandle, key: str, value: str) -> None:
+    conn.control_flags.update_one(
+        {"_id": key}, {"$set": {"value": str(value)}}, upsert=True
+    )
 
 
-async def get_pending_delivery(user_id):
-    d = await _db.users.find_one({"user_id": user_id}, {"pending_delivery": 1})
-    return (d or {}).get("pending_delivery")
+def set_flag(conn: MongoHandle, key: str, value: str) -> None:
+    _set_flag_raw(conn, key, value)
 
 
-async def clear_pending_delivery(user_id):
-    await _db.users.update_one(
-        {"user_id": user_id}, {"$unset": {"pending_delivery": ""}})
+def get_flag(conn: MongoHandle, key: str, default: str = "") -> str:
+    doc = conn.control_flags.find_one({"_id": key})
+    if not doc or doc.get("value") is None:
+        return default
+    return str(doc["value"])
 
 
-async def pending_delivery_message_ids(chat_id):
-    """v4.7: every not-yet-deleted message id delivered to this chat."""
-    cur = _db.deletions.find({"chat_id": chat_id}, {"message_ids": 1})
-    out = set()
-    async for d in cur:
-        out.update(d.get("message_ids") or [])
-    return sorted(x for x in out if x)
+# ---------------------------------------------------------------------------
+# stats / reporting
+# ---------------------------------------------------------------------------
+
+def counts_by_status(conn: MongoHandle) -> dict:
+    d = {"pending": 0, "processing": 0, "done": 0, "partial": 0, "failed": 0}
+    try:
+        for row in conn.queue.aggregate(
+            [{"$group": {"_id": "$status", "c": {"$sum": 1}}}]
+        ):
+            status = row.get("_id")
+            if status:
+                d[str(status)] = int(row.get("c") or 0)
+    except PyMongoError:
+        pass
+    return d
 
 
-# --- pending deliveries (v4.7.1: Bot 2 force-sub resume) ---
-# Stored on the USER doc — NOT in the deep link or callback_data, because
-# Telegram caps /start payloads at 64 chars and callback_data at 64 bytes.
-async def set_pending_delivery(user_id, file_id):
-    await _db.users.update_one(
-        {"user_id": user_id},
-        {"$set": {"pending_delivery": {"file_id": file_id, "at": now()}}},
-        upsert=True)
+def failed_last_24h(conn: MongoHandle) -> int:
+    cutoff = now_ts() - 24 * 3600
+    return int(
+        conn.queue.count_documents({"status": "failed", "updated_at": {"$gte": cutoff}})
+    )
 
 
-async def get_pending_delivery(user_id):
-    d = await _db.users.find_one({"user_id": user_id}, {"pending_delivery": 1})
-    return (d or {}).get("pending_delivery")
+def last_jobs(conn: MongoHandle, n: int = 5) -> list:
+    docs = conn.queue.find(
+        {},
+        {"url": 1, "status": 1, "updated_at": 1, "error_reason": 1},
+    ).sort("updated_at", DESCENDING).limit(int(n))
+    return [_queue_row(d) for d in docs]
 
 
-async def clear_pending_delivery(user_id):
-    await _db.users.update_one(
-        {"user_id": user_id}, {"$unset": {"pending_delivery": ""}})
+def most_recent_failed(conn: MongoHandle) -> Optional[Dict[str, Any]]:
+    doc = conn.queue.find_one({"status": "failed"}, sort=[("updated_at", DESCENDING)])
+    return _queue_row(doc)
 
 
-async def pending_delivery_message_ids(chat_id):
-    """v4.7: every not-yet-auto-deleted message id delivered to this chat —
-    i.e. the files the user currently holds, used by Bot 2's sub_ resume to
-    re-deliver everything at once after the force-sub gate passes."""
-    cur = _db.deletions.find({"chat_id": chat_id}, {"message_ids": 1})
-    out = set()
-    async for d in cur:
-        out.update(d.get("message_ids") or [])
-    return sorted(m for m in out if m)
+# ---------------------------------------------------------------------------
+# admin management (two-tier)
+# ---------------------------------------------------------------------------
+
+def add_admin(
+    conn: MongoHandle,
+    user_id: int,
+    is_super: bool = False,
+    added_by: Optional[int] = None,
+) -> None:
+    conn.admins.update_one(
+        {"_id": int(user_id)},
+        {
+            "$set": {"is_super": 1 if is_super else 0, "added_by": added_by},
+            "$setOnInsert": {"added_at": now_ts()},
+        },
+        upsert=True,
+    )
 
 
-# ── persisted per-category queue state ────────────────────────
-async def queue_summary(category=None, n=10):
-    cat = _norm_key(category)
-    cur = await _cursor_of(cat) if cat else None
-    less = 0
-    base = {"category": cat} if cat else {}
-    if cur:
-        less = await _db.files.count_documents(
-            {**base, "posted": False, "db_message_id": {"$lt": cur}})
-    items = await next_n_queued(cat, n)
-    remaining = await _db.files.count_documents(
-        {**base, "posted": False, **({"db_message_id": {"$gte": cur}} if cur else {})})
+def remove_admin(conn: MongoHandle, user_id: int) -> int:
+    res = conn.admins.delete_one({"_id": int(user_id)})
+    return int(res.deleted_count or 0)
+
+
+def get_admin(conn: MongoHandle, user_id: int) -> Optional[Dict[str, Any]]:
+    doc = conn.admins.find_one({"_id": int(user_id)})
+    row = _row(doc, "user_id")
+    if row is not None:
+        row.setdefault("is_super", 0)
+        row.setdefault("added_by", None)
+        row.setdefault("added_at", 0)
+    return row
+
+
+def is_admin_user(user_id: int) -> bool:
+    """v12.38: True if `user_id` is the root super-admin OR a row in the
+    `admins` collection. Used by the Mini App to widen the Admin tab from
+    ""root only" to ""any listed admin" without changing DB schema.
+
+    Shared Mongo client; one indexed lookup; silent-fail on errors.
+    """
+    if not user_id:
+        return False
+    try:
+        conn = connect()
+        return bool(conn.admins.find_one({"_id": int(user_id)}, projection={"_id": 1}))
+    except Exception:
+        return False
+
+def list_admins(conn: MongoHandle) -> list:
+    docs = conn.admins.find({}).sort([("is_super", DESCENDING), ("_id", ASCENDING)])
+    out = []
+    for d in docs:
+        row = _row(d, "user_id")
+        row.setdefault("is_super", 0)
+        row.setdefault("added_by", None)
+        row.setdefault("added_at", 0)
+        out.append(row)
+    return out
+
+
+def set_super(conn: MongoHandle, user_id: int, is_super: bool) -> int:
+    res = conn.admins.update_one(
+        {"_id": int(user_id)}, {"$set": {"is_super": 1 if is_super else 0}}
+    )
+    return int(res.matched_count or 0)
+
+
+# ---------------------------------------------------------------------------
+# normal users + lock/unlock
+# ---------------------------------------------------------------------------
+
+def upsert_user(conn: MongoHandle, user_id: int) -> None:
+    conn.users.update_one(
+        {"_id": int(user_id)},
+        {"$setOnInsert": {"first_seen_at": now_ts(), "blocked": 0}},
+        upsert=True,
+    )
+
+
+def is_locked(conn: MongoHandle) -> bool:
+    return get_flag(conn, "locked", "0") == "1"
+
+
+def set_locked(conn: MongoHandle, locked: bool, by_user_id: Optional[int] = None) -> None:
+    set_flag(conn, "locked", "1" if locked else "0")
+    set_flag(conn, "locked_by", str(by_user_id) if by_user_id is not None else "")
+    set_flag(conn, "locked_at", str(now_ts()) if locked else "")
+
+
+def lock_info(conn: MongoHandle) -> dict:
     return {
-        "cursor": cur,
-        "position": (less + 1) if cur else 1,
-        "remaining": remaining,
-        "items": items,
+        "locked": is_locked(conn),
+        "by": get_flag(conn, "locked_by", ""),
+        "at": get_flag(conn, "locked_at", ""),
     }
 
 
-async def queue_reset_to_position(n, category=None):
-    """Move cursor to the Nth item (1-indexed over ALL items, db_message_id ASC).
-    Flips every earlier still-unposted item to posted. Returns target or None.
-    Scoped per category so each pipeline's queue is independent."""
-    n = int(n)
-    if n < 1:
-        return None
-    base = {"category": _norm_key(category)} if category else {}
-    # v4.9.4: server-side skip+limit with a projection. Was: pull EVERY doc
-    # in the category just to read the Nth db_message_id — megabytes of
-    # Atlas->Render egress per call (Render counts it as service-initiated
-    # bandwidth, and it grows with every post you queue). Now ~100 bytes.
-    order = await _db.files.find(
-        base, {"db_message_id": 1}
-    ).sort("db_message_id", 1).skip(n - 1).limit(1).to_list(1)
-    if not order:          # n beyond the end of the queue -> invalid position
-        return None
-    target = order[0]
-    tid = target["db_message_id"]
-    await _db.files.update_many(
-        {**base, "db_message_id": {"$lt": tid}, "posted": False},
-        {"$set": {"posted": True, "posted_at": now()}})
-    # Rewind: everything from position N onward becomes unposted again.
-    await _db.files.update_many(
-        {**base, "db_message_id": {"$gte": tid}},
-        {"$set": {"posted": False},
-         "$unset": {"posted_at": "", "post_message_id": ""}})
-    if category:
-        await _db.categories.update_one(
-            {"key": _norm_key(category)},
-            {"$set": {"queue_cursor": tid, "updated_at": now()}})
-    else:
-        await _db.settings.update_one(
-            {"_id": "global"}, {"$set": {"queue_cursor": tid}}, upsert=True)
-    return target
+# ---------------------------------------------------------------------------
+# job progress tracking (v8)
+# ---------------------------------------------------------------------------
+
+PHASE_PENDING = "pending"
+PHASE_SENT_BOTS = "sent_bots"
+PHASE_WAIT_PDF = "wait_pdf"
+PHASE_FORWARDING = "forwarding"
+PHASE_MPOSTING = "mposting"
+PHASE_DONE = "done"
+PHASE_FAILED = "failed"
+PHASE_PARTIAL = "partial"
+
+_TERMINAL_PHASES = (PHASE_DONE, PHASE_FAILED, PHASE_PARTIAL)
 
 
-async def clear_queue_cursor(category=None):
-    if category:
-        await _db.categories.update_one(
-            {"key": _norm_key(category)},
-            {"$set": {"queue_cursor": None, "updated_at": now()}})
-    else:
-        await _db.settings.update_one(
-            {"_id": "global"}, {"$unset": {"queue_cursor": ""}})
+def upsert_job_progress(
+    conn: MongoHandle,
+    job_id: int,
+    phase: str,
+    title: Optional[str] = None,
+    detail: Optional[str] = None,
+) -> None:
+    """Write/refresh one job's live phase.
 
-
-# ── shorteners (multi-shortener round-robin, v3.2) ────────────
-async def list_shorteners():
-    """Every configured shortener, sorted by site name (stable order)."""
-    return await _db.shorteners.find({}).sort("site", 1).to_list(None)
-
-
-async def get_shortener(site):
-    return await _db.shorteners.find_one({"site": _norm_key(site)})
-
-
-async def add_shortener(site, api_base, api_key):
-    """Insert a shortener. Returns the doc, or None if site already exists."""
-    site = _norm_key(site)
-    if not site or not site.replace("_", "").isalnum():
-        raise ValueError("invalid site name")
-    if await _db.shorteners.find_one({"site": site}):
-        return None
-    doc = {"site": site, "api_base": api_base.strip(),
-           "api_key": api_key.strip(), "status": "active",
-           "added_at": now(), "updated_at": now()}
-    await _db.shorteners.insert_one(doc)
-    return doc
-
-
-async def set_shortener_status(site, status):
-    """'active' or 'paused'. Returns True when the site exists."""
-    res = await _db.shorteners.update_one(
-        {"site": _norm_key(site)},
-        {"$set": {"status": status, "updated_at": now()}})
-    return res.matched_count > 0
-
-
-async def remove_shortener(site):
-    res = await _db.shorteners.delete_one({"site": _norm_key(site)})
-    return res.deleted_count > 0
-
-
-async def count_shorteners():
-    return await _db.shorteners.count_documents({})
-
-
-async def next_shortener(user_id):
-    """Per-user round-robin over ACTIVE shorteners only (v3.2).
-
-    Paused shorteners are filtered out BEFORE the modulo pick, so they can
-    never be selected. The user's own cursor advances atomically on every
-    call; the chosen site is remembered on the user doc (rr_last_site).
-    Returns the shortener doc, or None when every shortener is paused
-    (caller fails open and delivers the file directly)."""
-    active = await _db.shorteners.find(
-        {"status": "active"}).sort("site", 1).to_list(None)
-    if not active:
-        return None
-    udoc = await _db.users.find_one_and_update(
-        {"user_id": user_id},
-        {"$inc": {"rr_cursor": 1}},
+    Mirrors the old SQL `title = COALESCE(excluded.title, job_progress.title)`:
+    a None title never erases a title that was already stored.
+    """
+    set_doc: Dict[str, Any] = {
+        "phase": phase,
+        "detail": detail,
+        "updated_at": now_ts(),
+    }
+    if title is not None:
+        set_doc["title"] = title
+    conn.job_progress.update_one(
+        {"_id": int(job_id)},
+        {"$set": set_doc, "$setOnInsert": {"title": title} if title is None else {}},
         upsert=True,
-        return_document=True,
     )
-    cursor = int(udoc.get("rr_cursor") or 1)
-    chosen = active[(cursor - 1) % len(active)]
-    await _db.users.update_one({"user_id": user_id},
-                               {"$set": {"rr_last_site": chosen["site"]}})
-    return chosen
 
 
-# ── daily verified-users log (v4.3, /verified_users) ─────────
-def ist_today(offset_days=0):
-    """Today's date key in IST (Asia/Kolkata), e.g. '2026-09-25'."""
-    import datetime as _dt
-    from zoneinfo import ZoneInfo
-    d = _dt.datetime.now(ZoneInfo("Asia/Kolkata")).date() \
-        - _dt.timedelta(days=offset_days)
-    return d.isoformat()
-
-
-async def record_verification(user_id, name=None, username=None,
-                              elapsed=None, category=None, link_type=None,
-                              date=None):
-    """One successful verification -> ONE row per user per IST day.
-    Repeat verifications the same day UPDATE the row: count bumps, latest
-    elapsed wins, and new categories / link types are appended (never
-    duplicated)."""
-    date = date or ist_today()
-    key = {"date": date, "user_id": user_id}
-    doc = await _db.verification_logs.find_one(key)
-    if doc:
-        upd = {"$inc": {"count": 1}}
-        setf = {}
-        if name:
-            setf["name"] = name
-        if username:
-            setf["username"] = str(username).lstrip("@")
-        if elapsed is not None:
-            setf["elapsed"] = float(elapsed)
-        if setf:
-            upd["$set"] = setf
-        addto = {}
-        if category and category not in (doc.get("categories") or []):
-            addto.setdefault("categories", category)
-        if link_type and link_type not in (doc.get("link_types") or []):
-            addto.setdefault("link_types", link_type)
-        if addto:
-            upd["$addToSet"] = {k: v for k, v in addto.items()}
-        await _db.verification_logs.update_one(key, upd)
-    else:
-        await _db.verification_logs.insert_one({
-            "date": date, "user_id": user_id,
-            "name": name, "username": (str(username).lstrip("@")
-                                       if username else None),
-            "elapsed": float(elapsed) if elapsed is not None else None,
-            "categories": [category] if category else [],
-            "link_types": [link_type] if link_type else [],
-            "count": 1, "at": now()})
-
-
-async def list_verified_today(offset_days=0):
-    cur = _db.verification_logs.find(
-        {"date": ist_today(offset_days)}).sort("count", -1)
-    return [d async for d in cur]
-
-
-async def add_verification_event(user_id, file_id=None, category=None,
-                                 elapsed=None, link_type=None, date=None):
-    """v4.8: one sub-document per successful fetch — powers the per-user
-    detail view (/verified_users <id>): exact IST time, which file, how long
-    the shortener took, which provider."""
-    await _db.verification_logs.update_one(
-        {"date": date or ist_today(), "user_id": user_id},
-        {"$push": {"events": {"file_id": file_id, "category": category,
-                              "elapsed": (float(elapsed)
-                                          if elapsed is not None else None),
-                              "link_type": link_type, "at": now()}}},
-        upsert=True)
-
-
-async def get_verified_user(user_id, offset_days=0):
-    """v4.8: one user's verification row (with per-event detail) for a day."""
-    return await _db.verification_logs.find_one(
-        {"date": ist_today(offset_days), "user_id": user_id})
-
-
-async def purge_old_verifications():
-    """Midnight hygiene: keep only today + yesterday (per owner's keep-1-day)."""
-    await _db.verification_logs.delete_many(
-        {"date": {"$nin": [ist_today(0), ist_today(1)]}})
-
-
-async def set_token_shortener(token, site, state=None):
-    """Record which shortener served a verify token — and (v4.1) WHETHER one
-    did (state 'active'/'down'). process_verify only bans too-fast returns
-    on 'active' tokens; outage tokens can never get a user banned."""
-    fields = {"shortener_site": site}
-    if state:
-        fields["shortener_state"] = state
-    await _db.tokens.update_one({"token": token}, {"$set": fields})
-
-
-async def active_shorteners():
-    """All ACTIVE shorteners in stable order (v4.1 failover list)."""
-    return await _db.shorteners.find({"status": "active"}).sort("site", 1).to_list(None)
-
-
-async def bump_rr_cursor(user_id):
-    """Advance the per-user round-robin cursor; return the OLD value (v4.1)."""
-    from pymongo import ReturnDocument
-    doc = await _db.users.find_one_and_update(
-        {"user_id": user_id}, {"$inc": {"rr_cursor": 1}},
-        upsert=True, return_document=ReturnDocument.AFTER)
-    return int((doc or {}).get("rr_cursor", 1)) - 1
-
-async def force_sub_channels(category=None):
-    """Resolved list of force-sub channel ids for a category (never None)."""
-    if category:
-        cat = await _db.categories.find_one({"key": category})
-        if cat:
-            if cat.get("force_sub_channel_ids"):
-                return [int(x) for x in cat["force_sub_channel_ids"] if x]
-            if cat.get("force_sub_channel_id"):
-                return [int(cat["force_sub_channel_id"])]
-    s = await get_settings()
-    if s.get("force_sub_channel_ids"):
-        return [int(x) for x in s["force_sub_channel_ids"] if x]
-    if s.get("force_sub_channel_id"):
-        return [int(s["force_sub_channel_id"])]
-    return []
-
-
-# ── force-sub links + removal + ban data (v3.5) ───────────────
-async def set_force_sub_link(channel_id, link, category=None):
-    cid = str(int(channel_id))
-    if category:
-        await _db.categories.update_one({"key": _norm_key(category)},
-            {"$set": {f"force_sub_links.{cid}": link}})
-    else:
-        await _db.settings.update_one({"_id": "global"},
-            {"$set": {f"force_sub_links.{cid}": link}}, upsert=True)
-
-
-async def force_sub_link(channel_id, category=None):
-    cid = str(int(channel_id))
-    if category:
-        cat = await _db.categories.find_one({"key": _norm_key(category)})
-        if cat and (cat.get("force_sub_links") or {}).get(cid):
-            return cat["force_sub_links"][cid]
-    s = await get_settings()
-    return (s.get("force_sub_links") or {}).get(cid)
-
-
-async def remove_force_sub_channel(channel_id, category=None):
-    """Remove one channel from a force-sub list. True when it was present."""
-    cid = int(channel_id)
-    if category:
-        cat = await _db.categories.find_one({"key": _norm_key(category)})
-        ids = list((cat or {}).get("force_sub_channel_ids") or [])
-        if cid not in ids:
-            return False
-        ids.remove(cid)
-        await _db.categories.update_one({"key": _norm_key(category)},
-            {"$set": {"force_sub_channel_ids": ids},
-             "$unset": {f"force_sub_links.{cid}": ""}})
-        return True
-    s = await get_settings()
-    ids = [int(x) for x in (s.get("force_sub_channel_ids") or [])]
-    if cid not in ids:
-        return False
-    ids.remove(cid)
-    fields = {"force_sub_channel_ids": ids}
-    if s.get("force_sub_channel_id") == cid:
-        fields["force_sub_channel_id"] = None
-    await _db.settings.update_one({"_id": "global"},
-        {"$set": fields, "$unset": {f"force_sub_links.{cid}": ""}}, upsert=True)
-    return True
-
-
-async def clear_force_sub(category=None):
-    fields = {"force_sub_channel_ids": [], "force_sub_links": {},
-              "force_sub_channel_id": None}
-    if category:
-        await _db.categories.update_one({"key": _norm_key(category)}, {"$set": fields})
-    else:
-        await _db.settings.update_one({"_id": "global"}, {"$set": fields}, upsert=True)
-
-
-async def list_banned():
-    return await _db.users.find({"banned": True}).sort("user_id", 1).to_list(None)
-
-
-async def mark_ban_info(user_id, username=None, elapsed=None):
-    fields = {}
-    if username:
-        fields["username"] = str(username).lstrip("@")
-    if elapsed is not None:
-        fields["last_bypass_elapsed"] = float(elapsed)
-    if fields:
-        await _db.users.update_one({"user_id": user_id}, {"$set": fields}, upsert=True)
-
-
-# ── post sticker (v3.8) ───────────────────────────────────────
-async def set_sticker_waiting(user_id, waiting: bool):
-    op = "$addToSet" if waiting else "$pull"
-    await _db.settings.update_one({"_id": "global"},
-        {op: {"sticker_waiting": user_id}}, upsert=True)
-
-
-async def is_sticker_waiting(user_id):
-    s = await get_settings()
-    return user_id in (s.get("sticker_waiting") or [])
-
-
-async def set_post_sticker(file_id):
-    await update_settings({"post_sticker_id": file_id,
-                           "sticker_waiting": []})
-
-
-# ── extra channel-post buttons (v4.0, /addbutton) ─────────────
-async def add_post_button(label, url, color=None):
-    """Append one extra button under every channel post. color is a Bot API
-    9.4 InlineKeyboardButton 'style' value (success/primary/danger) or None
-    (Telegram default / transparent)."""
-    s = await get_settings()
-    buttons = list(s.get("post_buttons") or [])
-    buttons.append({"label": label, "url": url, "color": color})
-    await update_settings({"post_buttons": buttons})
-    return len(buttons)
-
-
-async def remove_post_button(index):
-    """Remove the Nth extra button (1-based). True when it existed."""
-    s = await get_settings()
-    buttons = list(s.get("post_buttons") or [])
-    if not (1 <= index <= len(buttons)):
-        return False
-    buttons.pop(index - 1)
-    await update_settings({"post_buttons": buttons})
-    return True
-
-
-# ══════════════════════════════════════════════════════════════
-#  GENRES + BROWSE MENU (v4.4)
-# ══════════════════════════════════════════════════════════════
-# Genre slugs ride inside Telegram callback_data (hard limit: 64 BYTES).
-# Worst case 'menu:p:<cat>:<genre>:<page>' = 8 + 1 + 24 + 1 + 24 + 1 + 4 = 63.
-GENRE_MAX_LEN = 24
-
-
-def normalize_genre(text):
-    """Canonical genre slug: lowercase alnum+space, '#' and every other
-    symbol stripped, whitespace collapsed. 'Romance!', '#ROMANCE 💕' and
-    'sci  fi' all normalize cleanly; empty/over-long -> None (rejected)."""
-    slug = " ".join(re.sub(r"[^a-z0-9 ]", "", str(text or "").lower()).split())
-    if not slug or len(slug) > GENRE_MAX_LEN:
-        return None
-    return slug
-
-
-def _genre_in_caption(genre, caption) -> bool:
-    """Whole-phrase caption match, format-proof by construction.
-
-    Captions are stored as PLAIN text (Telegram bold/italic/mono entities
-    are already discarded at scan time), so any font styling can never
-    break the match. Case, '#', markdown chars, quotes and emoji are all
-    normalized away on both sides; 'romance' matches '#Romance! 💕' but
-    never 'romancer'. Pure function — unit-tested in test_all.py."""
-    g = normalize_genre(genre)
-    if not g:
-        return False
-    norm = " ".join(re.sub(r"[^a-z0-9 ]", " ", str(caption or "").lower()).split())
-    return re.search(r"(?<![a-z0-9])" + re.escape(g) + r"(?![a-z0-9])", norm) is not None
-
-
-async def add_genre(category, genre, admin_id=None):
-    """Register a genre under a category. Returns (doc, created: bool);
-    (None, False) when the genre slug is invalid. Idempotent: re-adding an
-    existing genre NEVER rescans — it just returns the stored doc."""
-    slug = normalize_genre(genre)
-    if not slug:
-        return None, False
-    key = _norm_key(category)
-    existing = await _db.genres.find_one({"category": key, "genre": slug})
-    if existing:
-        return existing, False
-    doc = {"category": key, "genre": slug, "matched": [], "scanned": False,
-           "created_at": now(), "added_by": admin_id}
-    await _db.genres.update_one(
-        {"category": key, "genre": slug}, {"$setOnInsert": doc}, upsert=True)
-    return await _db.genres.find_one({"category": key, "genre": slug}), True
-
-
-async def remove_genre(category, genre) -> bool:
-    """Delete a genre (and its stored match list). True when it existed."""
-    res = await _db.genres.delete_one(
-        {"category": _norm_key(category), "genre": normalize_genre(genre) or "\x00"})
-    return res.deleted_count > 0
-
-
-async def list_genres(category):
-    """All genres of one category with their stored match lists, A->Z."""
-    cur = _db.genres.find({"category": _norm_key(category)}).sort("genre", 1)
-    return [d async for d in cur]
-
-
-async def get_genre(category, genre):
-    slug = normalize_genre(genre)
-    if not slug:
-        return None
-    return await _db.genres.find_one(
-        {"category": _norm_key(category), "genre": slug})
-
-
-async def genre_add_matches(category, genre, file_ids):
-    """Append file ids to a genre's stored match list. $addToSet/$each is
-    idempotent — a rescan or double delivery can never create duplicates."""
-    ids = list(dict.fromkeys(file_ids or []))   # dedupe, keep order
-    if not ids:
-        return
-    await _db.genres.update_one(
-        {"category": _norm_key(category), "genre": normalize_genre(genre) or "\x00"},
-        {"$addToSet": {"matched": {"$each": ids}}})
-
-
-async def genre_mark_scanned(category, genre):
-    await _db.genres.update_one(
-        {"category": _norm_key(category), "genre": normalize_genre(genre) or "\x00"},
-        {"$set": {"scanned": True}})
-
-
-async def backfill_genre(category, genre):
-    """ONE-TIME full caption scan for a genre (runs when it is first added).
-    Stores the result in the genre doc and returns the match count."""
-    key = _norm_key(category)
-    hits = []
-    async for doc in _db.files.find({"category": key},
-                                    {"file_id": 1, "caption": 1}):
-        if _genre_in_caption(genre, doc.get("caption")):
-            hits.append(doc.get("file_id"))
-    hits = [h for h in hits if h]
-    await genre_add_matches(key, genre, hits)
-    await genre_mark_scanned(key, genre)
-    return len(hits)
-
-
-async def match_caption_against_genres(category, caption):
-    """Incremental path: check ONE new/updated caption against a category's
-    genres (an in-memory regex per genre — no scanning, no extra queries).
-    Matching genres get the item's file_id appended. Returns matched slugs.
-    file_id=None only dry-checks (used where the id is not known yet)."""
-    return await match_item_genres(category, None, caption)
-
-
-async def match_item_genres(category, file_id, caption):
-    """Same as match_caption_against_genres but records under `file_id`.
-    Skips genres whose one-time backfill has not finished yet (scanned=False)
-    — the running backfill already covers this item, so writing now would be
-    redundant work (and $addToSet makes it harmless anyway)."""
-    key = _norm_key(category)
-    matched = []
-    async for gdoc in _db.genres.find({"category": key}):
-        if not gdoc.get("scanned"):
-            continue
-        if _genre_in_caption(gdoc["genre"], caption):
-            matched.append(gdoc["genre"])
-    if matched and file_id:
-        for slug in matched:
-            await genre_add_matches(key, slug, [file_id])
-    return matched
-
-
-async def items_by_genre(category, genre, posted_only=True):
-    """Resolve a genre's stored matches into file docs (delivery query).
-    posted_only=True (the user-facing menu) filters to posted items and
-    SORTS by db_message_id — $in alone returns natural order, so results
-    would appear random without the sort."""
-    gdoc = await get_genre(category, genre)
-    ids = (gdoc or {}).get("matched") or []
-    if not ids:
+def get_progress_for_jobs(conn: MongoHandle, job_ids) -> list:
+    if not job_ids:
         return []
-    q = {"category": _norm_key(category), "file_id": {"$in": ids}}
-    if posted_only:
-        q["posted"] = True
-    cur = _db.files.find(q).sort("db_message_id", 1)
-    return [d async for d in cur]
+    ids = [int(j) for j in job_ids]
+    docs = conn.job_progress.find({"_id": {"$in": ids}})
+    out = []
+    for d in docs:
+        row = _row(d, "job_id")
+        row.setdefault("title", None)
+        row.setdefault("phase", PHASE_PENDING)
+        row.setdefault("detail", None)
+        row.setdefault("updated_at", 0)
+        out.append(row)
+    return out
 
 
-# ─────────────────────────────────────────────────────────────────────
-# v4.6: VIP / PREMIUM USERS — bypass the shortener gate entirely.
-# A premium record is {user_id, added_at, expiry, duration_seconds, added_by}.
-# There is no background job: a record is "active" iff expiry > now, so
-# expiry is automatic and self-healing (premium_purge_expired() reaps the
-# dead rows opportunistically from /listpremiumuser).
-# ─────────────────────────────────────────────────────────────────────
-PREMIUM_COLLECTION = "premium_users"
+def cleanup_progress(conn: MongoHandle, job_ids) -> None:
+    if not job_ids:
+        return
+    conn.job_progress.delete_many({"_id": {"$in": [int(j) for j in job_ids]}})
 
 
-async def premium_add(user_id: int, seconds: int, added_by=None) -> dict:
-    """Grant/extend premium. Adds the duration onto any remaining time so
-    topping up an active user never shortens their access."""
-    user_id = int(user_id)
-    t = now()
-    prev = await premium_get(user_id)
-    base = float(prev.get("expiry") or 0) if prev else 0
-    base = max(base, t)
-    doc = {"user_id": user_id, "added_at": t, "expiry": base + int(seconds),
-           "duration_seconds": int(seconds), "added_by": added_by}
-    await _db[PREMIUM_COLLECTION].update_one(
-        {"user_id": user_id}, {"$set": doc}, upsert=True)
-    return doc
+def create_progress_batch(
+    conn: MongoHandle, batch_id: str, chat_id: int, job_ids
+) -> None:
+    # job_ids stays a comma-separated string for exact compatibility with
+    # progress_tracker.py, which does: b["job_ids"].split(",")
+    ids_str = ",".join(str(int(j)) for j in job_ids)
+    conn.progress_batches.update_one(
+        {"_id": batch_id},
+        {
+            "$set": {
+                "chat_id": int(chat_id),
+                "message_id": None,
+                "job_ids": ids_str,
+                "created_at": now_ts(),
+                "completed_at": None,
+            }
+        },
+        upsert=True,
+    )
 
 
-async def premium_remove(user_id: int) -> bool:
-    r = await _db[PREMIUM_COLLECTION].delete_one({"user_id": int(user_id)})
-    return bool(r.deleted_count)
+def set_progress_batch_message(conn: MongoHandle, batch_id: str, message_id: int) -> None:
+    conn.progress_batches.update_one(
+        {"_id": batch_id}, {"$set": {"message_id": int(message_id)}}
+    )
 
 
-async def premium_reduce(user_id: int, seconds: int) -> dict | None:
-    """v4.9.6: subtract seconds from a user's premium expiry. If the expiry
-    lands at/below now, the premium row is deleted (fully expired). Returns
-    the updated doc, or None if the user had no premium row."""
-    user_id = int(user_id)
-    prev = await premium_get(user_id)
-    if not prev:
-        return None
-    new_expiry = float(prev.get("expiry") or 0) - int(seconds)
-    if new_expiry <= now():
-        await premium_remove(user_id)
-        return {**prev, "expiry": new_expiry, "expired": True}
-    prev["expiry"] = new_expiry
-    await _db[PREMIUM_COLLECTION].update_one(
-        {"user_id": user_id}, {"$set": {"expiry": new_expiry}})
-    return prev
+def get_active_progress_batches(conn: MongoHandle) -> list:
+    docs = conn.progress_batches.find({"completed_at": None})
+    out = []
+    for d in docs:
+        row = _row(d, "batch_id")
+        row.setdefault("message_id", None)
+        row.setdefault("job_ids", "")
+        row.setdefault("created_at", 0)
+        row.setdefault("completed_at", None)
+        out.append(row)
+    return out
 
 
-async def premium_get(user_id: int):
-    return await _db[PREMIUM_COLLECTION].find_one({"user_id": int(user_id)})
+def complete_progress_batch(conn: MongoHandle, batch_id: str) -> None:
+    conn.progress_batches.update_one(
+        {"_id": batch_id}, {"$set": {"completed_at": now_ts()}}
+    )
 
 
-async def premium_active(user_id) -> bool:
-    """True while the user's premium window is open (auto-expires)."""
+def delete_progress_batch(conn: MongoHandle, batch_id: str) -> None:
+    conn.progress_batches.delete_one({"_id": batch_id})
+
+
+# ---------------------------------------------------------------------------
+# v11 tokens (freepost / /token / /alltoken)
+# ---------------------------------------------------------------------------
+
+DEFAULT_FREEPOST = 20
+
+
+def _today_str() -> str:
+    """UTC date string YYYY-MM-DD. Reset boundary is 00:00 UTC."""
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def get_freepost(conn: MongoHandle) -> int:
+    """Current daily token allowance for regular (non-admin) users."""
+    v = get_flag(conn, "freepost", str(DEFAULT_FREEPOST))
     try:
-        user_id = int(user_id)
+        return max(0, int(v))
     except (TypeError, ValueError):
+        return DEFAULT_FREEPOST
+
+
+def set_freepost(conn: MongoHandle, n: int) -> None:
+    set_flag(conn, "freepost", str(max(0, int(n))))
+
+
+def _touch_user_token_row(
+    conn: MongoHandle, user_id: int, username: Optional[str] = None
+) -> Dict[str, Any]:
+    """Return the user_tokens row for user_id, creating one on first sight.
+
+    Also lazily resets `used_today` to 0 when a new UTC day has begun, and
+    refreshes the stored username (users can rename themselves).
+    """
+    uid = int(user_id)
+    today = _today_str()
+
+    # 1) Create on first sight.
+    try:
+        conn.user_tokens.update_one(
+            {"_id": uid},
+            {
+                "$setOnInsert": {
+                    "username": username,
+                    "used_today": 0,
+                    "last_reset_date": today,
+                    "last_search_at": 0,
+                }
+            },
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        pass
+
+    # 2) Reset the counter if the stored date is stale (new UTC day).
+    conn.user_tokens.update_one(
+        {"_id": uid, "last_reset_date": {"$ne": today}},
+        {"$set": {"used_today": 0, "last_reset_date": today}},
+    )
+
+    # 3) Keep the username current.
+    if username is not None:
+        conn.user_tokens.update_one({"_id": uid}, {"$set": {"username": username}})
+
+    doc = conn.user_tokens.find_one({"_id": uid}) or {}
+    row = _row(doc, "user_id") or {"user_id": uid}
+    row.setdefault("username", None)
+    row.setdefault("used_today", 0)
+    row.setdefault("last_reset_date", today)
+    row.setdefault("last_search_at", 0)
+    return row
+
+
+def get_user_tokens(
+    conn: MongoHandle, user_id: int, username: Optional[str] = None
+) -> dict:
+    """Returns {'used': X, 'remaining': Y, 'daily_cap': Z} for the user."""
+    row = _touch_user_token_row(conn, user_id, username)
+    cap = get_freepost(conn)
+    used = int(row["used_today"])
+    return {"used": used, "remaining": max(0, cap - used), "daily_cap": cap}
+
+
+def consume_tokens(
+    conn: MongoHandle, user_id: int, n: int, username: Optional[str] = None
+) -> bool:
+    """Try to consume `n` tokens atomically. Returns True on success, False if
+    the user does not have enough remaining today. Does nothing on False.
+
+    The condition `used_today <= cap - n` lives inside the update filter, so
+    the check-and-spend is a single atomic operation. Two simultaneous
+    /search confirms therefore cannot both spend the same last token.
+    """
+    if n <= 0:
+        return True
+    _touch_user_token_row(conn, user_id, username)
+    cap = get_freepost(conn)
+    n = int(n)
+    if n > cap:
         return False
-    doc = await premium_get(user_id)
-    return bool(doc and float(doc.get("expiry") or 0) > now())
+    doc = conn.user_tokens.find_one_and_update(
+        {"_id": int(user_id), "used_today": {"$lte": cap - n}},
+        {"$inc": {"used_today": n}, "$set": {"last_search_at": now_ts()}},
+        return_document=ReturnDocument.AFTER,
+    )
+    return doc is not None
 
 
-async def premium_list(include_expired: bool = True) -> list:
-    q = {} if include_expired else {"expiry": {"$gt": now()}}
-    cur = _db[PREMIUM_COLLECTION].find(q).sort("expiry", -1)
-    return [d async for d in cur]
+def refund_token(conn: MongoHandle, user_id: int, n: int = 1) -> None:
+    """Refund `n` tokens (used when a /search-originated job ends 'failed').
+    Never lets used_today drop below zero."""
+    if n <= 0 or not user_id:
+        return
+    doc = conn.user_tokens.find_one({"_id": int(user_id)})
+    if doc is None:
+        return
+    used = int(doc.get("used_today") or 0)
+    new_used = max(0, used - int(n))
+    conn.user_tokens.update_one(
+        {"_id": int(user_id)}, {"$set": {"used_today": new_used}}
+    )
 
 
-async def premium_purge_expired() -> int:
-    r = await _db[PREMIUM_COLLECTION].delete_many({"expiry": {"$lte": now()}})
-    return int(r.deleted_count)
+def set_user_tokens(
+    conn: MongoHandle, user_id: int, remaining: int, username: Optional[str] = None
+) -> dict:
+    """Manually set a user's REMAINING tokens for today (for /settoken).
+    Recomputes used_today = daily_cap - remaining, clamped to [0, cap]."""
+    _touch_user_token_row(conn, user_id, username)
+    cap = get_freepost(conn)
+    remaining = max(0, min(int(remaining), cap))
+    new_used = cap - remaining
+    conn.user_tokens.update_one(
+        {"_id": int(user_id)}, {"$set": {"used_today": new_used}}
+    )
+    return {"used": new_used, "remaining": remaining, "daily_cap": cap}
+
+
+def reset_all_tokens(conn: MongoHandle) -> int:
+    """Force-reset EVERY user's used_today to 0. Returns documents affected."""
+    today = _today_str()
+    res = conn.user_tokens.update_many(
+        {}, {"$set": {"used_today": 0, "last_reset_date": today}}
+    )
+    return int(res.modified_count or 0)
+
+
+def list_all_user_tokens(conn: MongoHandle) -> list:
+    """All user_tokens rows, refreshed by lazy-reset. Sorted by used_today DESC."""
+    today = _today_str()
+    conn.user_tokens.update_many(
+        {"last_reset_date": {"$ne": today}},
+        {"$set": {"used_today": 0, "last_reset_date": today}},
+    )
+    cap = get_freepost(conn)
+    docs = conn.user_tokens.find({}).sort(
+        [("used_today", DESCENDING), ("_id", ASCENDING)]
+    )
+    out: List[dict] = []
+    for d in docs:
+        used = int(d.get("used_today") or 0)
+        out.append(
+            {
+                "user_id": int(d["_id"]),
+                "username": d.get("username") or "",
+                "used": used,
+                "remaining": max(0, cap - used),
+                "daily_cap": cap,
+            }
+        )
+    return out
+
+
+def resolve_user_id_by_username(conn: MongoHandle, username: str) -> Optional[int]:
+    """Look up a user_id from user_tokens by @username (case-insensitive).
+    Returns None if that username has never used /search before."""
+    if not username:
+        return None
+    uname = username.lstrip("@").strip()
+    if not uname:
+        return None
+    doc = conn.user_tokens.find_one(
+        {"username": {"$regex": f"^{re.escape(uname)}$", "$options": "i"}}
+    )
+    return int(doc["_id"]) if doc else None
+
+
+# ---------------------------------------------------------------------------
+# Optional async accessor (motor)
+# ---------------------------------------------------------------------------
+# Every existing call site in this project is synchronous, and PyMongo is
+# already fast enough for that. `motor` is installed and exposed here so any
+# NEW async code you write can use a non-blocking client without a rewrite:
+#
+#     adb = await db.get_async_db()
+#     doc = await adb["queue"].find_one({"status": "pending"})
+
+_async_client = None
+_async_pid: Optional[int] = None
+
+
+def get_async_db():
+    """Return a motor (async) database handle for the same MONGO_URI."""
+    global _async_client, _async_pid
+    from motor.motor_asyncio import AsyncIOMotorClient
+
+    pid = os.getpid()
+    if _async_client is None or _async_pid != pid:
+        _async_client = AsyncIOMotorClient(
+            _mongo_uri(),
+            serverSelectionTimeoutMS=15000,
+            appname="mtproto-relay-async",
+        )
+        _async_pid = pid
+    return _async_client[_db_name()]
