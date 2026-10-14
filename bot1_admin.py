@@ -1,0 +1,2735 @@
+"""Bot 1 admin panel — every command is guarded by @admin_only.
+
+ADMIN_IDS (env) plus any user promoted with /addadmin can run these.
+
+Multi-category (v2.0)
+---------------------
+Pipeline/category settings live in the `categories` collection and are managed
+entirely through the bot:
+  /addcategory <key> <label>   — guided wizard: DB channel -> posting channel
+                                 -> main channel -> tag -> daily time (IST)
+  /categories                  — one-screen dashboard of every pipeline
+  /editcategory <key>          — wizard to change any field later
+  /delcategory <key>           — remove a pipeline (with confirmation)
+  /use <key>                   — set the ACTIVE pipeline for scoped commands
+
+Scoped commands (act on the active category, or take a trailing key):
+  /dripnow /rescandb /scandb /queueinfo /queue_reset /pauseposting
+  /resumeposting /schedule /setposttime /setschedule /protect
+  /setautodelete /setdbchannel /setpostchannel /setpostmainchannel /setposttag
+
+Global (unaffected by /use):
+  /shortener* /verifymsg /setverifytime /settokenttl /broadcast /stats
+  /ban /unban /addadmin /setforcesub (supports a trailing category key for
+  per-category overrides)
+  /addbutton /buttons /removebutton /clearbuttons /addcovercaption
+  /addfilecaption (v4.0 — channel-post buttons & captions, all global)
+
+NOTE: do_post / schedule_daily are imported lazily inside the commands that
+need them — importing them here at module level creates a circular import
+(bot1 -> bot1_admin -> bot1) that crashes the process on startup.
+"""
+import asyncio
+import logging
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ContextTypes
+
+import config
+import db
+import scanner
+from utils import admin_only, format_ram_report, human_duration, parse_duration
+from telegram.helpers import escape_markdown
+import utils  # v4.9.6: human_duration in premium replies
+
+log = logging.getLogger("bot1.admin")
+
+
+# ── small shared helpers ──────────────────────────────────────
+def _h(text) -> str:
+    """Escape a string for HTML parse_mode."""
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _parse_hhmm(text):
+    try:
+        hh, mm = text.split(":")[:2]
+        hh, mm = int(hh), int(mm)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+    except Exception:
+        pass
+    return None
+
+
+def _parse_channel_id(text):
+    t = (text or "").strip()
+    return int(t) if t.lstrip("-").isdigit() else None
+
+
+async def _channel_info(bot, channel_id) -> str:
+    """Channel title with its invite link embedded (HTML), or 'not set'."""
+    if not channel_id:
+        return "not set"
+    title, link = None, None
+    try:
+        chat = await bot.get_chat(channel_id)
+        title = getattr(chat, "title", None)
+        username = getattr(chat, "username", None)
+        if username:
+            link = f"https://t.me/{username}"
+    except Exception:
+        pass
+    if not link:
+        try:
+            link = await bot.export_chat_invite_link(channel_id)
+        except Exception:
+            pass
+    label = _h(title) if title else str(channel_id)
+    if link:
+        label = f'<a href="{link}">{label}</a>'
+    return label
+
+
+async def _resolve_active(update, args, start=0):
+    """Resolve the target category for a scoped command.
+
+    Priority: trailing argument (a category key) -> the admin's active
+    category (set via /use). Returns (key, remaining_args)."""
+    args = list(args or [])
+    if len(args) > start:
+        maybe = args[-1].lower()
+        if await db.get_category(maybe):
+            return maybe, args[:-1]
+    uid = update.effective_user.id if update.effective_user else None
+    active = await db.get_active_category(uid) if uid else None
+    return active, args
+
+
+async def _auto_key(update, key):
+    """Single-category auto-select: with exactly one pipeline configured,
+    scoped commands work with no /use needed. Returns a key or None."""
+    if key:
+        return key
+    cats = await db.list_categories()
+    if len(cats) == 1:
+        return cats[0]["key"]
+    return None
+
+
+async def _require_active(update, key):
+    """Reply with guidance when no category could be resolved. Returns bool."""
+    if key:
+        return True
+    cats = await db.list_categories()
+    if not cats:
+        await update.message.reply_text(
+            "No pipelines exist yet. Create one with /addcategory <key> <label>.")
+    else:
+        await update.message.reply_text(
+            "Multiple pipelines exist. Pick one with /use <key> first "
+            "(or append the key to this command). See /categories.")
+    return False
+
+
+# ══════════════════════════════════════════════════════════════
+#  CATEGORY MANAGEMENT + WIZARD
+# ══════════════════════════════════════════════════════════════
+# In-memory wizard sessions: {admin_user_id: {"mode", "step", "key", "data"}}.
+# Ephemeral by design (a redeploy just restarts the wizard) — only a 2-minute
+# setup conversation. Durable state lives in Mongo.
+_WIZARD = {}
+
+
+def _p_db_channel(t, mode="add"):
+    if mode == "edit" and t.strip().lower() in ("skip", "-", "none"):
+        return (None, None)   # keep the existing Database Channel
+    cid = _parse_channel_id(t)
+    return (("db_channel_id", cid) if cid is not None
+            else (None, "Send a numeric channel id (e.g. -1001234567890)"
+                  + (", or 'skip' to keep the current one." if mode == "edit" else ".")))
+
+
+def _p_post_channel(t, mode="add"):
+    if mode == "edit" and t.strip().lower() in ("skip", "-", "none"):
+        return (None, None)   # keep the existing Posting Channel
+    cid = _parse_channel_id(t)
+    return (("post_channel_id", cid) if cid is not None
+            else (None, "Send a numeric channel id (e.g. -1001234567890)"
+                  + (", or 'skip' to keep the current one." if mode == "edit" else ".")))
+
+
+def _p_main_channel(t, mode="add"):
+    if t.strip().lower() in ("skip", "-", "none", "off"):
+        # edit -> keep the current Main Channel; add -> no Main Channel
+        return (None, None) if mode == "edit" else ("post_main_channel_id", None)
+    cid = _parse_channel_id(t)
+    return (("post_main_channel_id", cid) if cid is not None
+            else (None, "Send a numeric channel id, or 'skip' to keep the current one."))
+
+
+def _p_tag(t, mode="add"):
+    if t.strip().lower() in ("skip", "-", "none", "off"):
+        return (None, None) if mode == "edit" else ("post_tag", None)
+    return ("post_tag", t.strip())
+
+
+def _p_time(t, mode="add"):
+    if t.strip().lower() in ("skip", "-", "none"):
+        return (None, None) if mode == "edit" else ("post_time", "18:00")
+    v = _parse_hhmm(t)
+    return (("post_time", v) if v
+            else (None, "Send the time as HH:MM (24h, IST), e.g. 21:30 — or 'skip'."))
+
+
+
+# Ordered ADD-wizard steps: (step_name, prompt, parser)
+_WIZARD_STEPS = [
+    ("db_channel",   "1/5 · Send the <b>Database Channel</b> id (where raw files are uploaded). In edit mode: <code>skip</code> keeps the current one.", _p_db_channel),
+    ("post_channel", "2/5 · Send the <b>Posting Channel</b> id (where covers are drip-posted). In edit mode: <code>skip</code> keeps the current one.", _p_post_channel),
+    ("main_channel", "3/5 · Send the <b>Main Posting Channel</b> id. In edit mode: <code>skip</code> keeps the current one (add mode: skip = none).", _p_main_channel),
+    ("tag",          "4/5 · Send the <b>tag line</b> — a caption shown above each forward in the Main Channel (e.g. a hashtag or @handle). Optional: <code>skip</code> keeps the current one.", _p_tag),
+    ("time",         "5/5 · Send the <b>daily post time</b> as HH:MM (IST). In edit mode: <code>skip</code> keeps the current one (add mode: skip = 18:00).", _p_time),
+]
+
+
+def _wizard_cancel_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="cat:wizcancel")]])
+
+
+@admin_only
+async def cmd_addcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addcategory <key> <label…> — start the guided pipeline setup wizard."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: /addcategory <key> <label>\nExample: /addcategory hanime HAnime")
+        return
+    key = args[0].lower()
+    label = " ".join(args[1:]).strip() or key
+    if not key.replace("_", "").isalnum():
+        await update.message.reply_text(
+            "❌ Key must be letters/numbers/underscore only (no spaces).")
+        return
+    if await db.get_category(key):
+        await update.message.reply_text(
+            f"❌ A pipeline named '{key}' already exists. Use /editcategory {key}.")
+        return
+    uid = update.effective_user.id
+    _WIZARD[uid] = {"mode": "add", "step": 0, "key": key,
+                    "data": {"key": key, "label": label}}
+    await update.message.reply_text(
+        f"🧙 Setting up pipeline <b>{_h(label)}</b> (<code>{key}</code>)\n\n"
+        + _WIZARD_STEPS[0][1],
+        parse_mode="HTML", reply_markup=_wizard_cancel_kb())
+
+
+@admin_only
+async def cmd_editcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/editcategory <key> — re-run the wizard to change a pipeline's settings."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /editcategory <key>")
+        return
+    key = args[0].lower()
+    cat = await db.get_category(key)
+    if not cat:
+        await update.message.reply_text(f"❌ No pipeline named '{key}'. See /categories.")
+        return
+    uid = update.effective_user.id
+    _WIZARD[uid] = {"mode": "edit", "step": 0, "key": key, "data": {}}
+    await update.message.reply_text(
+        f"✏️ Editing pipeline <b>{_h(cat.get('label') or key)}</b> (<code>{key}</code>)\n"
+        "Every step accepts <code>skip</code> — the current value "
+        "is kept untouched.\n\n"
+        + _WIZARD_STEPS[0][1],
+        parse_mode="HTML", reply_markup=_wizard_cancel_kb())
+
+
+async def _wizard_finish(update: Update, context, session):
+    key, data = session["key"], session["data"]
+    try:
+        if session["mode"] == "add":
+            # pop BOTH reserved keys so **data can never collide with the
+            # positional `key` arg (the crash that silently killed the wizard).
+            label = data.pop("label", key)
+            data.pop("key", None)
+            await db.create_category(key, label, **data)
+            msg = f"✅ Pipeline <b>{_h(key)}</b> created and LIVE."
+        else:
+            await db.update_category(key, data)
+            msg = f"✅ Pipeline <b>{_h(key)}</b> updated."
+    except Exception as exc:
+        # NEVER die silently: report the failure so the admin sees what happened
+        # instead of the bot just "stopping responding".
+        log.exception("wizard finish failed for %s", key)
+        await update.message.reply_text(
+            f"❌ Setup failed: {exc!r}\nNothing was saved — please retry.")
+        return
+    # (re)build schedules so the new/edited category gets its daily IST job now
+    try:
+        from bot1 import schedule_daily
+        await schedule_daily(context.application.job_queue)
+    except Exception as exc:
+        log.warning("reschedule after category save failed: %s", exc)
+    await update.message.reply_text(msg, parse_mode="HTML")
+    await _send_category_card(update, context, key)
+    cat = await db.get_category(key)
+    if cat and cat.get("db_channel_id"):
+        await update.message.reply_text(
+            "Index its Database Channel now?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔍 Scan now", callback_data=f"cat:scan:{key}"),
+                InlineKeyboardButton("Later", callback_data="cat:noop"),
+            ]]))
+
+
+async def wizard_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Free-text handler for in-progress /addcategory + /editcategory wizards.
+    Registered at group=1 so it never shadows commands. Ignores non-admins and
+    users with no active wizard session."""
+    user = update.effective_user
+    if not user:
+        return
+    session = _WIZARD.get(user.id)
+    if not session:
+        return
+    from utils import is_admin
+    if not await is_admin(user.id):
+        return
+    text = (update.message.text or "").strip()
+    if text.lower() in ("/cancel", "cancel"):
+        _WIZARD.pop(user.id, None)
+        await update.message.reply_text("✖️ Wizard cancelled.")
+        return
+    step_idx = session["step"]
+    _, prompt, parser = _WIZARD_STEPS[step_idx]
+    field, value = parser(text, session.get("mode", "add"))
+    # (None, "msg") = parse error -> re-ask; (None, None) = skip -> keep
+    # current value and advance; (field, value) = store it.
+    if field is None and value is not None:
+        await update.message.reply_text(f"⚠️ {value}\n\n{prompt}", parse_mode="HTML")
+        return
+    if field is not None:
+        session["data"][field] = value
+    session["step"] += 1
+    try:
+        if session["step"] < len(_WIZARD_STEPS):
+            await update.message.reply_text(_WIZARD_STEPS[session["step"]][1],
+                                            parse_mode="HTML",
+                                            reply_markup=_wizard_cancel_kb())
+        else:
+            _WIZARD.pop(user.id, None)
+            await _wizard_finish(update, context, session)
+    except Exception as exc:
+        log.exception("wizard step %s crashed", session["step"])
+        _WIZARD.pop(user.id, None)
+        await update.message.reply_text(
+            f"❌ Something went wrong: {exc!r}\nWizard reset — start over with /addcategory.")
+
+
+@admin_only
+async def cmd_delcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delcategory <key> — remove a pipeline (asks for confirmation)."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /delcategory <key>")
+        return
+    key = args[0].lower()
+    cat = await db.get_category(key)
+    if not cat:
+        await update.message.reply_text(f"❌ No pipeline named '{key}'.")
+        return
+    await update.message.reply_text(
+        f"⚠️ Delete pipeline <b>{_h(cat.get('label') or key)}</b>?\n\n"
+        "Choose whether to also purge its queued/indexed data:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Delete + purge data", callback_data=f"cat:delpurge:{key}")],
+            [InlineKeyboardButton("🗑 Delete (keep data)", callback_data=f"cat:delkeep:{key}")],
+            [InlineKeyboardButton("✖️ Cancel", callback_data="cat:noop")],
+        ]))
+
+
+@admin_only
+async def cmd_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/use <key> — set the active pipeline for the scoped admin commands."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /use <key>  (see /categories)")
+        return
+    key = args[0].lower()
+    cat = await db.get_category(key)
+    if not cat:
+        await update.message.reply_text(f"❌ No pipeline named '{key}'. See /categories.")
+        return
+    await db.set_active_category(update.effective_user.id, key)
+    await update.message.reply_text(
+        f"✅ Active pipeline set to <b>{_h(cat.get('label') or key)}</b>.\n"
+        "Scoped commands (/dripnow, /queueinfo, /rescandb, …) now target it.",
+        parse_mode="HTML")
+
+
+async def _send_category_card(update, context, key):
+    """The per-category dashboard card with inline action buttons."""
+    bot = context.bot
+    cat = await db.get_category(key)
+    if not cat:
+        await update.message.reply_text(f"❌ Pipeline '{key}' no longer exists.")
+        return
+    total = await db.count_files(key)
+    posted = await db.count_posted(key)
+    remaining = await db.count_pending(key)
+    verified = await db.count_verified(key)
+    sm = await db.queue_summary(key, 1)
+    nxt = sm["items"][0] if sm["items"] else None
+
+    db_ch = await _channel_info(bot, cat.get("db_channel_id"))
+    post_ch = await _channel_info(bot, cat.get("post_channel_id"))
+    main_ch = await _channel_info(bot, cat.get("post_main_channel_id"))
+    fsub = cat.get("force_sub_channel_id")
+    fsub_txt = (await _channel_info(bot, fsub)) if fsub else "global default"
+
+    status = "⏸ paused" if cat.get("schedule_paused") else (
+        "✅ active" if cat.get("enabled", True) and cat.get("schedule_enabled", True)
+        else "⛔ disabled")
+    ad = int(cat.get("auto_delete_minutes") or 0)
+    lines = [
+        f"📂 <b>{_h(cat.get('label') or key)}</b> (<code>{key}</code>) — {status}",
+        f"   🗄 DB Channel: {db_ch}",
+        f"   📣 Posting: {post_ch}",
+        f"   🏠 Main: {main_ch}"
+        + (f" · tag: {_h(cat['post_tag'])}" if cat.get("post_tag") else ""),
+        f"   🕒 Schedule: {_h(cat.get('post_time') or '18:00')} IST daily",
+        f"   📦 Queue: {total} total · {posted} posted · {remaining} remaining",
+        f"   ▶️ Next: #{posted + 1}"
+        + (f" — {_h((nxt.get('caption') or nxt.get('file_id') or '')[:40])}" if nxt else " (queue empty)"),
+        f"   🔗 Force-sub: {fsub_txt}",
+        f"   🛡 Protect: {'ON' if cat.get('protect_content') else 'OFF'}"
+        f"  ·  ⏳ Auto-delete: {human_duration(ad * 60)}",
+        f"   ✅ Verified users: {verified}",
+    ]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Post now", callback_data=f"cat:post:{key}"),
+         InlineKeyboardButton("⏸ Pause" if not cat.get("schedule_paused") else "▶️ Resume",
+                              callback_data=f"cat:togglepause:{key}")],
+        [InlineKeyboardButton("✏️ Edit", callback_data=f"cat:edit:{key}"),
+         InlineKeyboardButton("🗑 Delete", callback_data=f"cat:del:{key}")],
+    ])
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                    reply_markup=kb, disable_web_page_preview=True)
+
+
+@admin_only
+async def cmd_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/categories — full dashboard: every pipeline with all its details."""
+    cats = await db.list_categories()
+    if not cats:
+        await update.message.reply_text(
+            "No pipelines configured yet.\nCreate one with /addcategory <key> <label>.")
+        return
+    active = await db.get_active_category(update.effective_user.id)
+    await update.message.reply_text(
+        f"🗂 <b>{len(cats)} pipeline(s)</b>"
+        + (f" — active: <code>{_h(active)}</code>" if active else ""),
+        parse_mode="HTML")
+    for cat in cats:
+        await _send_category_card(update, context, cat["key"])
+
+
+@admin_only
+async def on_category_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inline buttons on the category dashboard cards (cat:<action>:<key>)."""
+    query = update.callback_query
+    data = query.data or ""
+    await query.answer()
+    if data == "cat:noop":
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    if data == "cat:wizcancel":
+        _WIZARD.pop(query.from_user.id, None)
+        try:
+            await query.edit_message_text("✖️ Wizard cancelled.")
+        except Exception:
+            pass
+        return
+    try:
+        _, action, key = data.split(":", 2)
+    except ValueError:
+        return
+    key = key.lower()
+    cat = await db.get_category(key)
+    if not cat:
+        try:
+            await query.edit_message_text(f"❌ Pipeline '{key}' no longer exists.")
+        except Exception:
+            pass
+        return
+
+    if action == "post":
+        from bot1 import do_post
+        item = await do_post(context.bot, category=key)
+        await context.bot.send_message(
+            query.from_user.id,
+            f"✅ [{key}] Posted {item['file_id']}." if item
+            else f"ℹ️ [{key}] Nothing posted (queue empty or channels not set).")
+    elif action == "togglepause":
+        new_state = not cat.get("schedule_paused")
+        await db.update_category(key, {"schedule_paused": new_state})
+        await context.bot.send_message(
+            query.from_user.id,
+            f"{'⏸️ Paused' if new_state else '▶️ Resumed'} [{key}].")
+    elif action == "edit":
+        _WIZARD[query.from_user.id] = {"mode": "edit", "step": 0, "key": key, "data": {}}
+        await context.bot.send_message(
+            query.from_user.id,
+            f"✏️ Editing <b>{_h(cat.get('label') or key)}</b>\n\n" + _WIZARD_STEPS[0][1],
+            parse_mode="HTML", reply_markup=_wizard_cancel_kb())
+    elif action == "del":
+        await context.bot.send_message(
+            query.from_user.id, f"⚠️ Delete pipeline <b>{_h(key)}</b>?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Delete + purge data", callback_data=f"cat:delpurge:{key}")],
+                [InlineKeyboardButton("🗑 Delete (keep data)", callback_data=f"cat:delkeep:{key}")],
+                [InlineKeyboardButton("✖️ Cancel", callback_data="cat:noop")],
+            ]))
+    elif action in ("delpurge", "delkeep"):
+        await db.delete_category(key, purge_data=(action == "delpurge"))
+        try:
+            from bot1 import schedule_daily
+            await schedule_daily(context.application.job_queue)
+        except Exception as exc:
+            log.warning("reschedule after delete failed: %s", exc)
+        await context.bot.send_message(
+            query.from_user.id,
+            f"🗑 Pipeline '{key}' deleted"
+            + (" and its data purged." if action == "delpurge" else " (data kept)."))
+    elif action == "scan":
+        await context.bot.send_message(query.from_user.id,
+                                       f"🔍 Scanning DB channel for [{key}]…")
+        await _run_scan(update, context, cat.get("db_channel_id"), key)
+
+
+# ══════════════════════════════════════════════════════════════
+#  SHORTENER GATE (global)
+# ══════════════════════════════════════════════════════════════
+@admin_only
+async def cmd_shortener(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    settings = await db.get_settings()
+    if not args or args[0].lower() not in ("on", "off", "status"):
+        await update.message.reply_text("Usage: /shortener on | off | status")
+        return
+    if args[0].lower() == "status":
+        await update.message.reply_text(
+            f"Shortener gate: {'ON' if settings.get('shortener_enabled') else 'OFF'}\n"
+            f"API base: {settings.get('shortener_api_base')}\n"
+            f"API key: {_mask_key(settings.get('shortener_api_key'))} (database)\n"
+            f"Shorteners in rotation: {len(await db.list_shorteners())} "
+            f"(manage with /shortenerapi)\n"
+            f"Verify validity: {settings.get('verify_hours')} h\n"
+            f"Token TTL: {settings.get('token_ttl_minutes')} min\n"
+            f"Extra buttons: {len(settings.get('shortener_buttons') or [])}"
+        )
+        return
+    enabled = args[0].lower() == "on"
+    await db.update_settings({"shortener_enabled": enabled})
+    await update.message.reply_text(
+        f"✅ Shortener gate {'enabled' if enabled else 'disabled'}.")
+
+
+def _mask_key(key):
+    """Mask an API key for display: first4...last4 (handles short keys)."""
+    key = (key or "").strip()
+    if len(key) <= 8:
+        return "•••" if key else "(not set)"
+    return f"{key[:4]}...{key[-4:]}"
+
+
+async def _sync_ref_hosts():
+    """v4.9.1: best-effort push of the ACTIVE shortener domains to LinkGuard's
+    /finish2 Referer allowlist after every /shortenerapi change."""
+    try:
+        import linkguard as _lg
+        if await _lg.enabled():
+            await _lg.push_ref_hosts()
+    except Exception:
+        pass
+
+
+@admin_only
+async def cmd_shortenerapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/shortenerapi — multi-shortener round-robin dashboard (v3.2).
+
+      /shortenerapi                              -> list all shorteners
+      /shortenerapi add <site> <api_base> <key>  -> add to the rotation
+      /shortenerapi pause <site>                 -> skip it in rotation
+      /shortenerapi resume <site>                -> back into rotation
+      /shortenerapi remove <site>                -> delete it completely
+    Paused shorteners stay listed but are NEVER used for user links.
+    The old single-key syntax (bare key / url / clearkey) was removed."""
+    import shortener as _sh
+    args = [x for x in (context.args or []) if x]
+    sub = args[0].lower() if args else ""
+
+    if sub == "add":
+        if len(args) < 4 or not args[2].startswith(("http://", "https://")):
+            await update.message.reply_text(
+                "Usage: /shortenerapi add <site> <api_base> <api_key>\n"
+                "Example: /shortenerapi add gplink https://gplinks.in/api abc123key")
+            return
+        try:
+            doc = await db.add_shortener(args[1], args[2], args[3])
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Invalid site name — letters, numbers and _ only.")
+            return
+        if not doc:
+            ex = await db.get_shortener(args[1])
+            await update.message.reply_text(
+                f"⚠️ '{args[1].lower()}' already exists with base "
+                f"{(ex or {}).get('api_base')}.\n"
+                f"To change it: /shortenerapi remove {args[1].lower()} "
+                f"then add it again.")
+            return
+        short = await _sh.test_key(doc["api_base"], doc["api_key"])
+        live = "✅ key verified live (shortener accepted it)." if short else (
+            "⚠️ saved, but the live self-test did not return a link — check the key.")
+        await update.message.reply_text(
+            f"✅ Shortener '{doc['site']}' added to the rotation.\n"
+            f"Base: {doc['api_base']}\nKey: {_mask_key(doc['api_key'])}\n"
+            f"Live self-test: {live}")
+        await _sync_ref_hosts()
+        return
+
+    if sub in ("pause", "resume"):
+        if len(args) < 2:
+            await update.message.reply_text(f"Usage: /shortenerapi {sub} <site>")
+            return
+        target = "paused" if sub == "pause" else "active"
+        if not await db.set_shortener_status(args[1], target):
+            await update.message.reply_text(
+                f"❌ No shortener named '{args[1].lower()}'.")
+            return
+        icon = "⏸" if sub == "pause" else "🟢"
+        extra = (" It stays in the list but is skipped in the rotation."
+                 if sub == "pause" else " It is back in the rotation.")
+        await update.message.reply_text(
+            f"{icon} '{args[1].lower()}' is now {target}.{extra}")
+        await _sync_ref_hosts()
+        return
+
+    if sub in ("remove", "delete"):
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /shortenerapi remove <site>")
+            return
+        if not await db.remove_shortener(args[1]):
+            await update.message.reply_text(
+                f"❌ No shortener named '{args[1].lower()}'.")
+            return
+        await update.message.reply_text(
+            f"🗑 '{args[1].lower()}' removed from the database and rotation.")
+        await _sync_ref_hosts()
+        return
+
+    if sub and sub not in ("status", "list"):
+        await update.message.reply_text(
+            "Unknown action. Use:\n"
+            "/shortenerapi — dashboard\n"
+            "/shortenerapi add <site> <api_base> <api_key>\n"
+            "/shortenerapi pause <site> · resume <site> · remove <site>")
+        return
+
+    rows = await db.list_shorteners()
+    if not rows:
+        await update.message.reply_text(
+            "🔗 No shorteners configured yet.\n"
+            "Add one: /shortenerapi add <site> <api_base> <api_key>\n"
+            "Example: /shortenerapi add vplink https://vplink.in/api YOURKEY")
+        return
+    lines = ["🔗 Shortener rotation dashboard\n"]
+    for i, r in enumerate(rows, 1):
+        icon = "🟢" if r.get("status") == "active" else "⏸"
+        state = "Active" if r.get("status") == "active" else "Paused"
+        lines.append(f"{i}. {icon} {r['site']} — {state}")
+        lines.append(f"   Base: {r['api_base']}")
+        lines.append(f"   Key: {_mask_key(r.get('api_key'))}")
+    act = sum(1 for r in rows if r.get("status") == "active")
+    lines.append(f"\n{len(rows)} total · {act} active · {len(rows) - act} paused")
+    lines.append("Users rotate per-person through the ACTIVE ones only.")
+    lines.append("Manage: add · pause · resume · remove")
+    await update.message.reply_text("\n".join(lines))
+
+
+@admin_only
+async def cmd_linkguard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/linkguard — self-hosted three-door link protector (v4.9).
+
+      /linkguard                          -> status (wrap on?, worker reachable?)
+      /linkguard on | off                 -> wrap paid short links with LinkGuard
+      /linkguard setup <base> <key>       -> worker URL + admin API key
+      /linkguard refhosts                 -> push shortener Referer allowlist
+      /linkguard honeypot <url>           -> mint a trap slug (alerts on any hit)
+      /linkguard decoys <url,url,...>     -> seed rotating decoy destinations
+    """
+    import linkguard as _lg
+    args = [x for x in (context.args or []) if x]
+    sub = args[0].lower() if args else ""
+
+    if sub == "setup":
+        if len(args) < 3 or not args[1].startswith("https://"):
+            await update.message.reply_text(
+                "Usage: /linkguard setup https://linkguard.<you>.workers.dev <ADMIN_API_KEY>")
+            return
+        await db.update_settings({
+            "linkguard_base": args[1].strip().rstrip("/"),
+            "linkguard_key": args[2].strip()})
+        await update.message.reply_text(
+            f"✅ LinkGuard configured.\nBase: {args[1].strip()}\n"
+            f"Key: {_mask_key(args[2])}\nEnable the wrap with /linkguard on")
+        return
+
+    if sub in ("on", "off"):
+        await db.update_settings({"linkguard_enabled": sub == "on"})
+        await update.message.reply_text(
+            "✅ LinkGuard wrap enabled — every paid short link now sits "
+            "behind your three-door gate." if sub == "on" else
+            "✅ LinkGuard wrap disabled — users get the plain paid short link.")
+        return
+
+    if sub == "refhosts":
+        hosts = await _lg.shortener_hosts()
+        ok = await _lg.push_ref_hosts()
+        if ok:
+            listing = "\n".join(f"• {h}" for h in hosts) or "(none active)"
+            await update.message.reply_text(
+                f"✅ Referer allowlist pushed to LinkGuard ({len(hosts)} hosts):\n"
+                + listing)
+        else:
+            await update.message.reply_text(
+                "❌ Push failed - check /linkguard status.")
+        return
+
+    if sub == "honeypot":
+        if len(args) < 2 or not args[1].startswith("http"):
+            await update.message.reply_text("Usage: /linkguard honeypot <url>")
+            return
+        url = await _lg.mint(args[1], honeypot=True)
+        await update.message.reply_text(
+            f"🍯 Honeypot armed: {url}\nPost it where scrapers lurk — any hit "
+            "alerts you and looks like a dead 404 to the probe." if url else
+            "❌ Honeypot mint failed — check /linkguard status.")
+        return
+
+    if sub == "decoys":
+        urls = [u for chunk in args[1:] for u in chunk.split(",")
+                if u.startswith("http")]
+        if not urls:
+            await update.message.reply_text(
+                "Usage: /linkguard decoys https://a.example,https://b.example,...")
+            return
+        ok = await _lg.add_decoys(urls)
+        await update.message.reply_text(
+            f"✅ {len(urls)} decoy destinations added to the rotation." if ok
+            else "❌ Failed — check /linkguard status.")
+        return
+
+    if sub and sub != "status":
+        await update.message.reply_text(
+            "Unknown action. Use: /linkguard · on · off · setup · refhosts · honeypot · decoys")
+        return
+
+    s = await db.get_settings()
+    base = (s.get("linkguard_base") or "").strip()
+    key = (s.get("linkguard_key") or "").strip()
+    live = await _lg.health() if (base and key) else False
+    await update.message.reply_text("\n".join([
+        "🛡 LinkGuard status", "",
+        f"Wrap: {'🟢 ON' if s.get('linkguard_enabled') else '⚪ OFF'}",
+        f"Worker: {base or '(not set)'}",
+        f"Admin key: {_mask_key(key)}",
+        f"Health: {'✅ reachable' if live else '❌ unreachable / not configured'}",
+        "",
+        "Setup: /linkguard setup <worker_url> <admin_key> · then /linkguard on",
+        "Extras: /linkguard refhosts · honeypot <url> · decoys <urls>",
+    ]))
+
+
+@admin_only
+async def cmd_setverifytime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: /setverifytime <hours>")
+        return
+    await db.update_settings({"verify_hours": int(args[0])})
+    await update.message.reply_text(f"✅ Verification validity set to {args[0]} hours.")
+
+
+@admin_only
+async def cmd_settokenttl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: /settokenttl <minutes>")
+        return
+    await db.update_settings({"token_ttl_minutes": int(args[0])})
+    await update.message.reply_text(f"✅ Handoff token TTL set to {args[0]} minutes.")
+
+
+@admin_only
+async def cmd_shortenermsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/shortenermsg <text> — set the gate heading. Rich input supported:
+    Markdown and ```code blocks``` in the argument are kept verbatim
+    (message entities are converted to HTML and stored), or REPLY to any
+    message with /shortenermsg to copy that message's rich text. Quotes
+    and formatting survive exactly."""
+    from telegram.helpers import mention_html  # noqa: F401  (ptb present)
+    import html as _html
+
+    src = update.message
+    rep = getattr(update.message, "reply_to_message", None)
+    if rep and getattr(rep, "text", None):
+        src = rep
+        raw_text, entities = src.text, list(getattr(src, "entities", None) or [])
+    else:
+        arg_text = update.message.text.partition(" ")[2]
+        if not arg_text.strip():
+            await update.message.reply_text(
+                "Usage: /shortenermsg <heading text>\n"
+                "or reply to a formatted message with /shortenermsg")
+            return
+        # entities of the command message shifted by the command itself
+        off = len(update.message.text) - len(arg_text)
+        raw_text = arg_text
+        entities = []
+        for e in (getattr(update.message, "entities", None) or []):
+            end = e.offset + e.length
+            if e.offset >= off:
+                entities.append(type(e)(type=e.type, offset=e.offset - off,
+                                        length=e.length, url=getattr(e, "url", None),
+                                        user=getattr(e, "user", None),
+                                        language=getattr(e, "language", None)))
+    html_body = _entities_to_html(raw_text, entities)
+    await db.update_settings({"shortener_msg": raw_text,
+                              "shortener_msg_html": html_body})
+    await update.message.reply_text(
+        "✅ Heading updated (rich formatting saved).\n\nPreview:\n"
+        + html_body, parse_mode="HTML")
+
+
+def _entities_to_html(text, entities):
+    """Minimal Telegram-entity -> HTML converter (bold/italic/code/pre/
+    underline/strikethrough/spoiler/link/blockquote). Unknown entities are
+    ignored; overlapping entities are applied in offset order."""
+    if not entities:
+        import html as _h
+        return _h.escape(text)
+    import html as _h
+    tag = {"bold": ("<b>", "</b>"), "italic": ("<i>", "</i>"),
+           "underline": ("<u>", "</u>"), "strikethrough": ("<s>", "</s>"),
+           "spoiler": ("<tg-spoiler>", "</tg-spoiler>"), "code": ("<code>", "</code>"),
+           "blockquote": ("<blockquote>", "</blockquote>")}
+    points = {}
+    for e in entities:
+        if e.type == "pre":
+            o, c = "<pre>", "</pre>"
+        elif e.type == "text_link" and getattr(e, "url", None):
+            o, c = f'<a href="{_h.escape(e.url)}">', "</a>"
+        elif e.type in tag:
+            o, c = tag[e.type]
+        else:
+            continue
+        points.setdefault(e.offset, []).append(o)
+        points.setdefault(e.offset + e.length, []).insert(0, c)
+    out, last = [], 0
+    for pos in sorted(points):
+        out.append(_h.escape(text[last:pos]))
+        out.extend(points[pos])
+        last = pos
+    out.append(_h.escape(text[last:]))
+    return "".join(out)
+
+
+@admin_only
+async def cmd_shortenerbotmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text("Usage: /shortenerbotmsg <text>")
+        return
+    await db.update_settings({"shortenerbot_msg": text})
+    await update.message.reply_text("✅ Gate message updated.")
+
+
+@admin_only
+async def cmd_verifymsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text("Usage: /verifymsg <text>")
+        return
+    await db.update_settings({"verify_msg": text})
+    await update.message.reply_text("✅ Success message updated.")
+
+
+@admin_only
+async def cmd_shortenerbtn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.partition(" ")[2]
+    if "|" not in raw:
+        await update.message.reply_text("Usage: /shortenerbtn <label> | <url>")
+        return
+    label, _, url = raw.partition("|")
+    label, url = label.strip(), url.strip()
+    if not label or not url.startswith("http"):
+        await update.message.reply_text("Both a label and an http(s) URL are required.")
+        return
+    settings = await db.get_settings()
+    buttons = list(settings.get("shortener_buttons") or [])
+    buttons.append({"label": label, "url": url})
+    await db.update_settings({"shortener_buttons": buttons})
+    await update.message.reply_text(f"✅ Added button “{label}”.")
+
+
+@admin_only
+async def cmd_clearshortenerbtns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await db.update_settings({"shortener_buttons": []})
+    await update.message.reply_text("✅ All extra buttons removed.")
+
+
+# ══════════════════════════════════════════════════════════════
+#  CHANNEL-POST BUTTONS + CAPTIONS (v4.0, global)
+# ══════════════════════════════════════════════════════════════
+_BUTTON_COLORS = {
+    "green": "success", "success": "success",
+    "blue": "primary", "primary": "primary",
+    "red": "danger", "danger": "danger",
+}
+_BUTTON_COLOR_LABELS = {"success": "green", "primary": "blue", "danger": "red"}
+
+
+def _button_color_label(color):
+    return _BUTTON_COLOR_LABELS.get(color or "", "default")
+
+
+@admin_only
+async def cmd_addbutton(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addbutton <label> | <link> [| <color>] — extra button(s) under the
+    green Download button of EVERY new channel post (global). v4.0.1 FIX:
+    accepts MULTIPLE buttons in one command — a color word ENDS a button,
+    so the next segment starts a new one. Example:
+      /addbutton Premium | https://a.com | red BACKUP | https://b.com | blue
+    adds two half-width buttons on the same row."""
+    msg = update.effective_message or update.message
+    raw = (getattr(msg, "text", None) or "").partition(" ")[2]
+    tokens = [t.strip() for t in raw.split("|")]
+    if len(tokens) < 2 or not tokens[0] or not tokens[1]:
+        await update.message.reply_text(
+            "Usage: /addbutton <label> | <link> [| <color>]\n"
+            "Example: /addbutton Join us | https://t.me/ourgroup | blue\n"
+            "Colors: green · blue · red (omit for the default look).\n\n"
+            "Multiple in one go — a color word ends a button:\n"
+            "/addbutton Premium | https://a.com | red BACKUP | https://b.com | blue")
+        return
+    chunks, cur = [], []
+    for tok in tokens:
+        if not tok:
+            continue
+        low = tok.lower()
+        # A color word ENDS the current button; anything after it in the same
+        # segment (e.g. "red 🦋BACKUP🦋") starts the NEXT button's label.
+        if cur and low in _BUTTON_COLORS:
+            chunks.append(cur + [tok])
+            cur = []
+            continue
+        if len(cur) >= 2:
+            rem = None
+            for cw in ("green", "blue", "red"):
+                if low.startswith(cw + " "):
+                    rem = tok[len(cw):].strip(" ,")
+                    chunks.append(cur + [tok[:len(cw)]])
+                    break
+            if rem is not None:
+                cur = [rem] if rem else []
+                continue
+        cur.append(tok)
+    if cur:
+        chunks.append(cur)
+    added, errors = [], []
+    for chunk in chunks:
+        if len(chunk) < 2:
+            errors.append(f"{_h(' | '.join(chunk))} — needs a label AND a link")
+            continue
+        label, url = chunk[0], chunk[1]
+        if not url.startswith(("http://", "https://", "tg://")):
+            errors.append(f"{_h(label)} — link must start with http(s):// or tg://")
+            continue
+        color = None
+        if len(chunk) >= 3 and chunk[2]:
+            color = _BUTTON_COLORS.get(chunk[2].lower())
+            if color is None:
+                errors.append(f"{_h(label)} — unknown color (use green/blue/red)")
+                continue
+        n = await db.add_post_button(label, url, color)
+        added.append(f"#{n} “{_h(label)}” → {_h(url)} ({_button_color_label(color)})")
+    if not added:
+        await update.message.reply_text(
+            "❌ Nothing added:\n" + "\n".join(errors),
+            disable_web_page_preview=True)
+        return
+    lines = [f"✅ {len(added)} button(s) added — they show under every new "
+             "channel post:"] + added
+    lines.append("Manage: /buttons · /removebutton <n> · /clearbuttons")
+    if errors:
+        lines.append("\nSkipped:\n" + "\n".join(errors))
+    await update.message.reply_text("\n".join(lines),
+                                    disable_web_page_preview=True)
+
+
+@admin_only
+async def cmd_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/buttons — list the extra channel-post buttons in display order."""
+    buttons = (await db.get_settings()).get("post_buttons") or []
+    if not buttons:
+        await update.message.reply_text(
+            "No extra buttons set. Add one with "
+            "/addbutton <label> | <link> [| <color>]")
+        return
+    lines = ["🔘 Extra post buttons (under the green Download button)\n"]
+    for i, b in enumerate(buttons, 1):
+        lines.append(f"{i}. {b.get('label')} — {b.get('url')} "
+                     f"({_button_color_label(b.get('color'))})")
+    lines.append("\nRemove one: /removebutton <number> · all: /clearbuttons")
+    await update.message.reply_text("\n".join(lines),
+                                    disable_web_page_preview=True)
+
+
+@admin_only
+async def cmd_removebutton(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/removebutton <n> — remove the Nth extra button (see /buttons)."""
+    args = [a for a in (context.args or []) if a]
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: /removebutton <number>  (see /buttons)")
+        return
+    if await db.remove_post_button(int(args[0])):
+        await update.message.reply_text(f"🗑 Button #{args[0]} removed.")
+    else:
+        await update.message.reply_text(f"❌ No button #{args[0]}. See /buttons.")
+
+
+@admin_only
+async def cmd_clearbuttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/clearbuttons — remove ALL extra channel-post buttons."""
+    await db.update_settings({"post_buttons": []})
+    await update.message.reply_text(
+        "🗑 All extra post buttons removed — posts show only the green "
+        "Download button.")
+
+
+@admin_only
+async def cmd_addcovercaption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addcovercaption <text|off> — extra appended after the original caption
+    of every posted cover photo (global). v4.8: formatting (bold, quote, mono,
+    spoilers, links) is preserved — captured as HTML via text_html."""
+    msg = update.effective_message or update.message
+    text = ((getattr(msg, "text", None) or "").partition(" ")[2]).strip()
+    if not text:
+        await update.message.reply_text(
+            "Usage: /addcovercaption <text>\n"
+            "Formatting (bold, quote, mono, links…) is kept as typed.\n"
+            "Appended after the original caption of every posted cover.\n"
+            "/addcovercaption off removes it.")
+        return
+    if text.lower() in ("off", "none", "reset", "clear", "-"):
+        await db.update_settings({"cover_caption_extra": None,
+                                  "cover_caption_extra_html": None})
+        await update.message.reply_text(
+            "✅ Cover caption extra removed — covers post with their original "
+            "caption only.")
+        return
+    html = (getattr(msg, "text_html", "") or "").partition(" ")[2].strip()
+    await db.update_settings({"cover_caption_extra": text,
+                              "cover_caption_extra_html": html or None})
+    await update.message.reply_text(
+        "✅ Cover caption extra saved (formatting kept). Preview:\n\n"
+        + (html or text),
+        parse_mode="HTML" if html else None)
+
+@admin_only
+async def cmd_addfilecaption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addfilecaption <text|off> — extra appended UNDER the caption of every
+    file Bot 2 delivers (global). v4.8: formatting preserved (HTML); the extra
+    rides in the REAL caption of each delivered file (per-file copies) — it is
+    never a separate message."""
+    msg = update.effective_message or update.message
+    text = ((getattr(msg, "text", None) or "").partition(" ")[2]).strip()
+    if not text:
+        await update.message.reply_text(
+            "Usage: /addfilecaption <text>\n"
+            "Formatting (bold, quote, mono, links…) is kept as typed.\n"
+            "Appended under the caption of every delivered file.\n"
+            "/addfilecaption off removes it.")
+        return
+    if text.lower() in ("off", "none", "reset", "clear", "-"):
+        await db.update_settings({"file_caption_extra": None,
+                                  "file_caption_extra_html": None})
+        await update.message.reply_text(
+            "✅ File caption extra removed — delivered files keep their "
+            "original caption only.")
+        return
+    html = (getattr(msg, "text_html", "") or "").partition(" ")[2].strip()
+    await db.update_settings({"file_caption_extra": text,
+                              "file_caption_extra_html": html or None})
+    await update.message.reply_text(
+        "✅ File caption extra saved (formatting kept). Preview:\n\n"
+        + (html or text),
+        parse_mode="HTML" if html else None)
+
+# ══════════════════════════════════════════════════════════════
+#  GENERAL (global)
+# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+#  BROADCAST WITH AUTO-DELETE TIMER (v4.0)
+# ══════════════════════════════════════════════════════════════
+# Admins waiting to answer "after how long should this broadcast be deleted?"
+# {admin_user_id: {"mode": "forward"|"copy", "chat_id", "message_id"}}
+_BROADCAST_PENDING = {}
+
+
+@admin_only
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply mode: FORWARD the replied-to message to every user — a real
+    forward keeps the 'Forwarded from @channel' tag, quote blocks and media
+    exactly as they are. Inline mode (/broadcast <text>): copy the command
+    message itself so its own formatting (links, bold, quotes) is kept.
+
+    v4.0: no longer sends immediately — the bot first asks for an auto-delete
+    timer ('2h', '30m', '1h 2m', 'never'), THEN broadcasts and queues every
+    delivered copy for deletion via Bot 1's sweeper (restart-safe)."""
+    msg = update.message
+    target = msg.reply_to_message
+    if target is None and not msg.text.partition(" ")[2].strip():
+        await update.message.reply_text(
+            "Usage: reply to any message with /broadcast to forward it to "
+            "all users (channel tag & quotes kept) — or /broadcast <text>.\n"
+            "The bot then asks after how long the broadcast should be "
+            "deleted from users.")
+        return
+    if target is not None:
+        _BROADCAST_PENDING[update.effective_user.id] = {
+            "mode": "forward", "chat_id": msg.chat_id,
+            "message_id": target.message_id}
+    else:
+        _BROADCAST_PENDING[update.effective_user.id] = {
+            "mode": "copy", "chat_id": msg.chat_id,
+            "message_id": msg.message_id}
+    await update.message.reply_text(
+        "⏳ After how many hours or minutes should this broadcast message be "
+        "deleted from users?\n\n"
+        "Reply with e.g. <code>2h</code>, <code>30m</code>, <code>1h 2m</code> "
+        "— or <code>never</code> to keep it forever.\n"
+        "Send /cancel to abort.",
+        parse_mode="HTML")
+
+
+async def _run_broadcast(bot, job):
+    """v4.2: PACED + RETRY broadcast. Telegram rate-limits bots to ~1 msg/sec
+    per chat and ~30 msgs/sec globally, answering bursts with 429
+    'Too Many Requests'. The old loop slept a flat 50 ms and counted every
+    429 as a permanent 'Failed' — the 12:59 broadcast logged 1,059
+    forwardMessage calls with ZERO 200 OK, which is why 'Sent' collapsed
+    349 -> 321 -> 280 -> 270 -> 129 on back-to-back broadcasts.
+
+    Now:
+      * sends are paced (~0.35 s apart, ~3/sec — under the global limit);
+      * a 429 is NOT a failure — we wait out Telegram's own `retry_after`
+        and retry the SAME user (up to 3 attempts), so every user
+        eventually receives the message;
+      * only users who still fail after all retries (blocked the bot,
+        deactivated account) count as real failures — expected, logged at
+        debug level, never retried forever.
+    Slower, but every user gets the message; the caller announces the ETA."""
+    ids = await db.all_user_ids()
+    total = len(ids)
+    pace = 0.35                      # ~3 messages/sec — under Telegram's limit
+    sent = failed = 0
+    delivered = {}
+    for i, uid in enumerate(ids):
+        ok = False
+        for attempt in range(3):     # 1 try + 2 retries for 429s
+            try:
+                if job["mode"] == "forward":
+                    m = await bot.forward_message(
+                        chat_id=uid, from_chat_id=job["chat_id"],
+                        message_id=job["message_id"])
+                else:
+                    m = await bot.copy_message(
+                        chat_id=uid, from_chat_id=job["chat_id"],
+                        message_id=job["message_id"])
+                ok = True
+                mid = getattr(m, "message_id", None)
+                if mid:
+                    delivered.setdefault(uid, []).append(mid)
+                break
+            except Exception as exc:
+                wait = getattr(exc, "retry_after", None)
+                if wait is not None:                 # Telegram 429 — honor it
+                    log.info("broadcast 429: retry user %s after %ss", uid, wait)
+                    await asyncio.sleep(min(float(wait) + 1.0, 30.0))
+                    continue
+                # genuine per-user failure (blocked/deactivated) — not a bug
+                log.debug("broadcast to %s failed permanently: %s", uid, exc)
+                break
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+        await asyncio.sleep(pace)
+        if total > 100 and i and i % 100 == 0:
+            log.info("broadcast progress: %d/%d (sent=%d failed=%d)",
+                     i, total, sent, failed)
+    return sent, failed, delivered
+
+async def broadcast_pending_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Free-text handler (group 1, registered in bot1) capturing the admin's
+    answer to the broadcast auto-delete question. Ignores everyone else."""
+    user = update.effective_user
+    if not user:
+        return
+    job = _BROADCAST_PENDING.get(user.id)
+    if not job:
+        return
+    from utils import is_admin
+    if not await is_admin(user.id):
+        return
+    text = (update.message.text or "").strip()
+    if text.lower() in ("/cancel", "cancel"):
+        _BROADCAST_PENDING.pop(user.id, None)
+        await update.message.reply_text("✖️ Broadcast cancelled — nothing was sent.")
+        return
+    seconds = parse_duration(text)
+    if seconds is None:
+        await update.message.reply_text(
+            "⚠️ Could not understand that time. Try <code>2h</code>, "
+            "<code>30m</code>, <code>1h 2m</code> — or <code>never</code>.",
+            parse_mode="HTML")
+        return
+    _BROADCAST_PENDING.pop(user.id, None)
+    _ids_n = len(await db.all_user_ids())
+    await update.message.reply_text(
+        f"📣 Broadcasting to {_ids_n} users… (~{_ids_n * 0.35 / 60:.0f} min — "
+        "paced to respect Telegram limits so EVERY user receives it. "
+        "You can keep using the bot meanwhile; I'll report when done.)")
+    sent, failed, delivered = await _run_broadcast(context.bot, job)
+    if seconds > 0 and delivered:
+        delete_at = db.now() + seconds
+        for uid, mids in delivered.items():
+            await db.add_deletion(uid, mids, delete_at, bot="bot1")
+        tail = (f"🗑 Auto-delete scheduled — the broadcast disappears from "
+                f"every user in {human_duration(seconds)}.")
+    elif seconds > 0:
+        tail = "⚠️ Nothing was delivered, so no auto-delete was scheduled."
+    else:
+        tail = "📌 Kept forever — this broadcast will NOT be auto-deleted."
+    await update.message.reply_text(
+        f"✅ Done. Sent: {sent} · Failed: {failed}\n{tail}")
+
+
+@admin_only
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Global overview + a per-pipeline breakdown."""
+    settings = await db.get_settings()
+    users = await db.count_users()
+    verified = await db.count_verified()
+    banned = await db.count_banned()
+    fsub_ch = await _channel_info(context.bot, settings.get("force_sub_channel_id"))
+
+    lines = [
+        "📊 <b>Bot Statistics</b>\n",
+        f"👤 Users: {users}",
+        f"✅ Verified (any pipeline): {verified}",
+        f"🚫 Banned: {banned}\n",
+        "⚙️ <b>Global</b>",
+        f"Shortener gate: {'ON' if settings.get('shortener_enabled') else 'OFF'}",
+        f"Force-Sub (default): {fsub_ch}",
+        f"Verify validity: {settings.get('verify_hours')} h"
+        f" · Token TTL: {settings.get('token_ttl_minutes')} min\n",
+        "🗂 <b>Pipelines</b>",
+    ]
+    cats = await db.list_categories()
+    if not cats:
+        lines.append("  none yet — /addcategory")
+    for cat in cats:
+        k = cat["key"]
+        total = await db.count_files(k)
+        posted = await db.count_posted(k)
+        pending = await db.count_pending(k)
+        status = "⏸" if cat.get("schedule_paused") else ("✅" if cat.get("enabled", True) else "⛔")
+        lines.append(
+            f"  {status} <b>{_h(cat.get('label') or k)}</b> — "
+            f"{posted} posted / {pending} queued / {total} total"
+            f" · {cat.get('post_time') or '18:00'} IST")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                    disable_web_page_preview=True)
+
+
+@admin_only
+async def cmd_forcesublist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/forcesublist — dashboard of every force-sub channel (global + per-category)."""
+    s = await db.get_settings()
+    lines = ["📢 Force-Sub configuration\n"]
+
+    async def _ensure_link(cid, cat_key, stored):
+        """Stored join-request link, or create+save one on the fly (v3.6 —
+        so channels added before v3.5 get their link backfilled here)."""
+        if stored:
+            return stored
+        try:
+            inv = await context.bot.create_chat_invite_link(
+                int(cid), creates_join_request=True)
+            link = getattr(inv, "invite_link", None)
+            if link:
+                await db.set_force_sub_link(cid, link, cat_key)
+                return link
+        except Exception as exc:
+            return f"(could not create: {exc})"
+        return "(could not create)"
+
+    gids = await db.force_sub_channels(None)
+    if gids:
+        for cid in gids:
+            link = await _ensure_link(cid, None,
+                                      (s.get("force_sub_links") or {}).get(str(cid)))
+            lines.append(f"🌐 Global: {cid}")
+            lines.append(f"   Invite: {link}")
+    else:
+        lines.append("🌐 Global: none")
+    for cat in await db.list_categories():
+        cids = cat.get("force_sub_channel_ids") or (
+            [cat["force_sub_channel_id"]] if cat.get("force_sub_channel_id") else [])
+        for cid in cids:
+            link = await _ensure_link(cid, cat["key"],
+                                      (cat.get("force_sub_links") or {}).get(str(cid)))
+            lines.append(f"📁 [{cat['key']}]: {cid}")
+            lines.append(f"   Invite: {link}")
+    lines.append("\nRemove: /forcesubremove <channel_id> · /forcesubremove <category>")
+    await update.message.reply_text("\n".join(lines))
+
+
+@admin_only
+async def cmd_forcesubremove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/forcesubremove <channel_id|category|global> — remove force-sub enforcement."""
+    args = [a for a in (context.args or []) if a]
+    if not args:
+        await update.message.reply_text(
+            "Usage: /forcesubremove <channel_id> — remove one global channel\n"
+            "/forcesubremove <category> — clear a category's override\n"
+            "/forcesubremove global — clear ALL global channels")
+        return
+    target = args[0]
+    cat = await db.get_category(target.lower())
+    if cat:
+        await db.clear_force_sub(cat["key"])
+        await update.message.reply_text(
+            f"✅ Force-sub removed for [{cat['key']}] — it now uses the global default.")
+        return
+    if target.lower() in ("global", "all", "off"):
+        await db.clear_force_sub(None)
+        await update.message.reply_text("✅ All global force-sub channels cleared.")
+        return
+    if target.lstrip("-").isdigit():
+        if await db.remove_force_sub_channel(int(target)):
+            await update.message.reply_text(f"✅ Channel {target} removed from force-sub.")
+        else:
+            await update.message.reply_text(f"❌ Channel {target} is not in the force-sub list.")
+        return
+    await update.message.reply_text("❌ No category or channel id matches that.")
+
+
+@admin_only
+async def cmd_banmessage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/banmessage <text> — set custom ban text; reply to a message with
+    /banmessage to use its text; /banmessage reset restores the default."""
+    args = [a for a in (context.args or []) if a]
+    if args and args[0].lower() in ("reset", "clear", "off", "default"):
+        await db.update_settings({"ban_message": None})
+        await update.message.reply_text("✅ Ban message reset to default.")
+        return
+    text = " ".join(args).strip()
+    if not text and update.message.reply_to_message:
+        text = (update.message.reply_to_message.text or "").strip()
+    if not text:
+        await update.message.reply_text(
+            "Usage: /banmessage <text> · reply to a message with /banmessage · "
+            "/banmessage reset")
+        return
+    await db.update_settings({"ban_message": text})
+    await update.message.reply_text(f"✅ Ban message updated.\n\nPreview:\n{text}")
+
+
+def _banlist_table_payload(users):
+    """Build the Bot API 10.1+ rich-message table payload for /banlist.
+
+    Structure: InputRichMessage{blocks:[InputRichBlockTable{...}]}.
+    Cells are plain-text rich blocks; the unban command cell is monospace
+    (code) so one tap copies ONLY the command. 45 rows per table page keeps
+    us far under the 32k-char / 500-block rich-message limits even with
+    long usernames. Pure function -> fully unit-testable."""
+    def cell(text, code=False):
+        fmt = [{"type": "code", "offset": 0, "length": len(text)}] if code else []
+        return {"text": text, "entities": fmt}   # InputRichText (cell content)
+    header = [cell("#"), cell("User"), cell("Detail"), cell("Tap to copy")]
+    rows, pages = [], []
+    for i, u in enumerate(users, 1):
+        uname = f"@{u['username']}" if u.get("username") else f"id:{u['user_id']}"
+        el = u.get("last_bypass_elapsed")
+        part = f"Elapsed: {el:.1f}s" if el is not None else "manual ban"
+        rows.append([cell(str(i)), cell(uname), cell(part),
+                     cell(f"/unban {u['user_id']}", code=True)])
+        if len(rows) == 45:
+            pages.append(rows); rows = []
+    if rows:
+        pages.append(rows)
+    return [{"chat_id": None,   # filled by caller
+             "rich_message": {"blocks": [
+                 {"type": "table", "is_compact": True,
+                  "cells": ([header] + page)}]},
+             "disable_notification": False} for page in pages]
+
+
+@admin_only
+async def cmd_banlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/banlist — banned users as a native rich-message table (Bot API 10.1+).
+    Long lists are split into multiple tables automatically. If Telegram
+    rejects the rich payload (older rollout), falls back to paged inline-code
+    messages so the command is always one-tap-copyable."""
+    users = await db.list_banned()
+    if not users:
+        await update.message.reply_text("✅ No banned users.")
+        return
+    payloads = _banlist_table_payload(users)
+    try:
+        for p in payloads:
+            p["chat_id"] = update.effective_chat.id
+            await context.bot._post("sendRichMessage", data=p)
+        return
+    except Exception as exc:
+        log.warning("rich banlist failed (%s); falling back to paged text", exc)
+    lines = [f"🚫 Banned users ({len(users)})"]
+    for i, u in enumerate(users, 1):
+        uname = f"@{u['username']}" if u.get("username") else f"id:{u['user_id']}"
+        el = u.get("last_bypass_elapsed")
+        part = f"Elapsed: {el:.1f}s" if el is not None else "manual ban"
+        lines.append(f"{i} - {uname} {part} `/unban {u['user_id']}`")
+        if len(lines) >= 41:      # page: header + 40 rows
+            await update.message.reply_text(
+                "\n".join(lines).replace("`", "<code>", 1).replace("`", "</code>", 1)
+                if False else _md_to_html("\n".join(lines)), parse_mode="HTML")
+            lines = []
+    if lines:
+        await update.message.reply_text(_md_to_html("\n".join(lines)), parse_mode="HTML")
+
+
+# ══════════════════════════════════════════════════════════════
+#  /verified_users (v4.3) — today's verifications as a rich table
+# ══════════════════════════════════════════════════════════════
+def _verified_table_payload(users):
+    """Bot API 10.1+ InputRichBlockTable payload — SAME proven shape as
+    /banlist (compact cells of InputRichText), is_compact=True. v4.8: each
+    Name is a RichTextUrl LINK to the user's profile (tg://user?id=...)."""
+    def cell(text, code=False):
+        fmt = [{"type": "code", "offset": 0, "length": len(text)}] if code else []
+        return {"text": text, "entities": fmt}
+    def link_cell(text, user_id):
+        return {"text": text,
+                "entities": [{"type": "text_link",
+                              "offset": 0, "length": len(text),
+                              "url": f"tg://user?id={user_id}"}]}
+    header = [cell("#"), cell("Name"), cell("Elapsed"), cell("Category"),
+              cell("Link Type"), cell("Count")]
+    rows, pages = [], []
+    for i, u in enumerate(users, 1):
+        name = (u.get("name") or
+                (f"@{u['username']}" if u.get("username") else None)
+                or str(u.get("user_id")))
+        name = str(name)[:20]
+        el = u.get("elapsed")
+        elapsed = f"{el:.0f}s" if el is not None else "—"
+        cat = ", ".join(u.get("categories") or []) or "—"
+        link = ", ".join(u.get("link_types") or []) or "—"
+        rows.append([cell(str(i)), link_cell(name, u.get("user_id")),
+                     cell(elapsed), cell(cat), cell(link),
+                     cell(str(u.get("count") or 1))])
+        if len(rows) == 40:
+            pages.append(rows); rows = []
+    if rows:
+        pages.append(rows)
+    return [{"chat_id": None,
+             "rich_message": {"blocks": [
+                 {"type": "table", "is_compact": True,
+                  "cells": ([header] + page)}]},
+             "disable_notification": False} for page in pages]
+
+
+@admin_only
+async def cmd_verified_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/verified_users [today|yesterday] — everyone who verified since
+    midnight IST, one row per user (repeat verifications merge: count bumps,
+    categories/link types append). Native compact rich table; falls back to
+    paged monospace text if Telegram rejects the rich payload."""
+    raw_args = [a for a in (context.args or []) if a]
+    if raw_args and raw_args[0].isdigit():
+        await _verified_user_detail(update, context,
+                                    int(raw_args[0]), raw_args[1:])
+        return
+    args = [a.lower() for a in (context.args or []) if a]
+    offset = 1 if args and args[0] in ("yesterday", "yday", "-1") else 0
+    users = await db.list_verified_today(offset)
+    day = db.ist_today(offset)
+    # v4.9.6: premium users skip the shortener, so they never appear in
+    # verification logs — always surface them, even on a zero-verification day.
+    prem_all = await db.premium_list(include_expired=False)
+    if not users:
+        msg = (f"📭 No verifications recorded for {day} "
+               f"({'yesterday' if offset else 'today so far'}).")
+        if prem_all:
+            lines = []
+            for p in prem_all:
+                left_s = max(0.0, float(p.get("expiry") or 0) - db.now())
+                lines.append(f"👑 {int(p['user_id'])} — left "
+                             f"{utils.human_duration_seconds(left_s)}")
+            msg += ("\n\n👑 Premium users (skip shortener — not in verified list):\n"
+                    + "\n".join(lines))
+        await update.message.reply_text(msg)
+        return
+    total_verifs = sum(int(u.get("count") or 1) for u in users)
+    # v4.9.6: premium users never touch the shortener, so they never appear in
+    # verification_logs — surface them alongside instead of hiding them.
+    prem = prem_all
+    prem_ids = {int(p["user_id"]) for p in prem}
+    header_txt = (f"✅ Verified users — {day} "
+                  f"({'yesterday' if offset else 'since midnight IST'}): "
+                  f"{len(users)} users · {total_verifs} verifications"
+                  + (f" · 👑 {len(prem_ids)} premium (skip shortener)"
+                     if prem_ids else ""))
+    payloads = _verified_table_payload(users)
+    try:
+        await update.message.reply_text(header_txt)
+        for pl in payloads:
+            pl["chat_id"] = update.effective_chat.id
+            await context.bot._post("sendRichMessage", data=pl)
+        if prem:
+            lines = []
+            for p in prem:
+                left_s = float(p.get("expiry") or 0) - db.now()
+                lines.append(
+                    f"👑 {int(p['user_id'])} — left "
+                    f"{utils.human_duration_seconds(max(0, left_s))}, added "
+                    f"{db.ist_str(p.get('added_at')) if hasattr(db, 'ist_str') else p.get('added_at')}")
+            await update.message.reply_text(
+                "👑 Premium users (skip shortener — not in the verified list):\n"
+                + "\n".join(lines))
+        return
+    except Exception as exc:
+        log.warning("rich verified table failed (%s); text fallback", exc)
+    # fallback: paged monospace table
+    lines = [f"<b>{_h(header_txt)}</b>", "<pre>",
+             f"{'#':<4}{'Name':<20}{'Time':<8}{'Category':<10}{'Link':<10}{'Cnt':<4}"]
+    for i, u in enumerate(users, 1):
+        name = (u.get("name") or
+                (f"@{u['username']}" if u.get("username") else None)
+                or str(u.get("user_id")))
+        el = u.get("elapsed")
+        lines.append(f"{i:<4}{str(name)[:19]:<20}"
+                     f"{(f'{el:.0f}s' if el is not None else '—'):<8}"
+                     f"{(','.join(u.get('categories') or []) or '—')[:9]:<10}"
+                     f"{(','.join(u.get('link_types') or []) or '—')[:9]:<10}"
+                     f"{u.get('count') or 1:<4}")
+        if len(lines) >= 42:
+            lines.append("</pre>")
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            lines = ["<pre>"]
+    if len(lines) > 1:
+        if not lines[-1].endswith("</pre>"):
+            lines.append("</pre>")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+
+async def _verified_user_detail(update, context, user_id, extra_args):
+    """/verified_users <user_id> [yesterday] — per-FETCH detail for one user:
+    every file fetched that IST day, exact IST time, shortener solve time and
+    provider — compact rich table (text fallback for legacy rows)."""
+    offset = 1 if extra_args and str(extra_args[0]).lower() in (
+        "yesterday", "yday", "-1") else 0
+    doc = await db.get_verified_user(user_id, offset)
+    day = db.ist_today(offset)
+    if not doc:
+        await update.message.reply_text(
+            f"📭 No verifications for user {user_id} on {day} "
+            f"({'yesterday' if offset else 'today'}).")
+        prem_doc = await db.premium_get(user_id)
+        if prem_doc:
+            left_s = max(0.0, float(prem_doc.get("expiry") or 0) - db.now())
+            state = "ACTIVE" if left_s > 0 else "EXPIRED"
+            await update.message.reply_text(
+                f"👑 Premium: {state}" +
+                (f" — {utils.human_duration_seconds(left_s)} left."
+                 if left_s > 0 else ""))
+        return
+    name = (doc.get("name") or
+            (f"@{doc['username']}" if doc.get("username") else None)
+            or str(user_id))
+    profile = f"tg://user?id={user_id}"
+    events = doc.get("events") or []
+    if events:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        rows = []
+        for i, ev in enumerate(events, 1):
+            ist = _dt.datetime.fromtimestamp(
+                float(ev.get("at") or 0), tz=_ZI("Asia/Kolkata"))
+            file_id = str(ev.get("file_id") or "—")
+            flink = (f"https://t.me/{config.BOT1_USERNAME}"
+                     f"?start=file_{file_id}") if file_id != "—" else ""
+            label = str(ev.get("category") or file_id)[:14]
+            el = ev.get("elapsed")
+            rows.append([
+                {"text": str(i)},
+                ({"text": label,
+                  "entities": [{"type": "text_link", "offset": 0,
+                                "length": len(label), "url": flink}]}
+                 if flink else {"text": label}),
+                {"text": ist.strftime("%H:%M:%S")},
+                {"text": (f"{el:.0f}s" if el is not None else "—")},
+                {"text": str(ev.get("link_type") or "—")[:12]}])
+        header = [{"text": c} for c in ("#", "File", "IST time", "Solve", "Via")]
+        pl = {"chat_id": update.effective_chat.id,
+              "rich_message": {"blocks": [
+                  {"type": "table", "is_compact": True,
+                   "cells": [header] + rows}]},
+              "disable_notification": False}
+        try:
+            await update.message.reply_text(
+                f'👤 <a href="{profile}">{_h(name)}</a> — {day}: '
+                f'{int(doc.get("count") or 1)} fetch(es)',
+                parse_mode="HTML", disable_web_page_preview=True)
+            await context.bot._post("sendRichMessage", data=pl)
+            return
+        except Exception as exc:
+            log.warning("rich user detail failed (%s); text fallback", exc)
+    lines2 = [f'👤 <a href="{profile}">{_h(name)}</a> (id <code>{user_id}</code>)',
+              f"Day: {day} ({'yesterday' if offset else 'today'})",
+              f"Fetches: {int(doc.get('count') or 1)}",
+              f"Categories: {_h(', '.join(doc.get('categories') or []) or '—')}",
+              f"Providers: {_h(', '.join(doc.get('link_types') or []) or '—')}",
+              f"Last solve time: {(str(int(doc.get('elapsed'))) + 's') if doc.get('elapsed') is not None else '—'}"]
+    if events:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        lines2.append("")
+        for i, ev in enumerate(events, 1):
+            ist = _dt.datetime.fromtimestamp(
+                float(ev.get("at") or 0), tz=_ZI("Asia/Kolkata"))
+            fid = str(ev.get("file_id") or "—")
+            flink = (f"https://t.me/{config.BOT1_USERNAME}?start=file_{fid}"
+                     if fid != "—" else "")
+            el = ev.get("elapsed")
+            entry = (f'{i}. <a href="{flink}">{_h(fid)}</a>'
+                     if flink else f"{i}. {_h(fid)}")
+            lines2.append(
+                f"{entry} — {ist.strftime('%H:%M:%S')} IST — "
+                f"{(f'{el:.0f}s' if el is not None else '—')} — "
+                f"{_h(str(ev.get('link_type') or '—'))}")
+    else:
+        lines2.append("")
+        lines2.append("ℹ️ Per-file times start recording from v4.8; "
+                      "older verifications only have the totals above.")
+    # v4.9.6: premium users never touch the shortener — show their status too.
+    prem_doc = await db.premium_get(user_id)
+    if prem_doc and float(prem_doc.get("expiry") or 0) > db.now():
+        left_s = float(prem_doc["expiry"]) - db.now()
+        lines2.append("")
+        lines2.append(
+            f"👑 Premium: ACTIVE — {utils.human_duration_seconds(left_s)} left "
+            f"(expires in {left_s/86400:.2f} day(s)). This user skips the shortener.")
+    elif prem_doc:
+        lines2.append("")
+        lines2.append("👑 Premium: EXPIRED.")
+
+    await update.message.reply_text("\n".join(lines2), parse_mode="HTML",
+                                    disable_web_page_preview=True)
+
+
+
+
+def _md_to_html(text):
+    """Convert our one-element Markdown (`code`) lines to HTML so fallback
+    pages never break on @usernames (the v3.7 Markdown crash)."""
+    out = []
+    for line in text.split("\n"):
+        if "`" in line:
+            pre, _, rest = line.partition("`")
+            code, _, post = rest.partition("`")
+            import html as _h
+            line = (f"{_h.escape(pre)}<code>{_h.escape(code)}</code>{_h.escape(post)}")
+        else:
+            import html as _h
+            line = _h.escape(line)
+        out.append(line)
+    return "\n".join(out)
+
+
+@admin_only
+async def cmd_addsticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addsticker — next sticker you forward/send becomes the post sticker:
+    it is sent right after every channel post in every pipeline."""
+    await db.set_sticker_waiting(update.effective_user.id, True)
+    await update.message.reply_text(
+        "🎴 Send or forward the sticker now — I'll save it and post it after "
+        "every channel post (all pipelines).\n"
+        "Cancel: /removesticker keeps the current one; send any text to abort.")
+
+
+@admin_only
+async def cmd_removesticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/removesticker — stop posting the sticker after channel posts."""
+    await db.update_settings({"post_sticker_id": None, "sticker_waiting": []})
+    await update.message.reply_text("🗑 Post sticker removed — nothing will be sent after posts.")
+
+
+async def sticker_intake(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """MessageHandler (non-command): captures the sticker an admin sends after
+    /addsticker. Not in COMMANDS — registered separately in bot1."""
+    uid = update.effective_user.id
+    if not await db.is_sticker_waiting(uid):
+        return
+    _admins = set(config.ADMIN_IDS or []) | set(await db.list_admin_ids())
+    if uid not in _admins:
+        await db.set_sticker_waiting(uid, False)
+        return
+    stk = update.message.sticker
+    if not stk:
+        await db.set_sticker_waiting(uid, False)
+        await update.message.reply_text("❌ That wasn't a sticker — aborted.")
+        return
+    await db.set_post_sticker(stk.file_id)
+    await update.message.reply_text(
+        "✅ Sticker saved! It will be posted right after every channel post "
+        "in every pipeline.\nRemove anytime: /removesticker")
+
+
+@admin_only
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage: /ban <user_id>")
+        return
+    await db.set_banned(int(args[0]), True)
+    await update.message.reply_text(f"🚫 Banned {args[0]}.")
+
+
+@admin_only
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage: /unban <user_id>")
+        return
+    await db.set_banned(int(args[0]), False)
+    await update.message.reply_text(f"✅ Unbanned {args[0]}.")
+
+
+@admin_only
+async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage: /addadmin <user_id>")
+        return
+    await db.add_db_admin(int(args[0]))
+    await update.message.reply_text(f"✅ {args[0]} is now an admin.")
+
+
+@admin_only
+async def cmd_setforcesub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setforcesub <channel_id|off> [category]
+    Global default when no category is given; per-category override otherwise."""
+    args = list(context.args or [])
+    if not args:
+        await update.message.reply_text("Usage: /setforcesub <channel_id | off> [category]")
+        return
+    # optional trailing category key -> per-category override
+    target_key = None
+    if len(args) > 1 and await db.get_category(args[-1].lower()):
+        target_key = args.pop(-1).lower()
+    val = args[0]
+    if val.lower() == "off":
+        if target_key:
+            await db.clear_force_sub(target_key)
+            await update.message.reply_text(
+                f"✅ Force-sub override cleared for [{target_key}] (uses global default).")
+        else:
+            await db.update_settings({"force_sub_channel_ids": []})
+            await update.message.reply_text("✅ All force-subscribe channels cleared (global).")
+        return
+    channel_id = _parse_channel_id(val)
+    if channel_id is None:
+        await update.message.reply_text("Provide a numeric channel id or 'off'.")
+        return
+    if target_key:
+        cat = await db.get_category(target_key)
+        cur = [int(x) for x in (cat.get("force_sub_channel_ids")
+               or ([cat["force_sub_channel_id"]] if cat.get("force_sub_channel_id") else []))]
+        if channel_id in cur:
+            await update.message.reply_text(f"ℹ️ Channel already required for [{target_key}].")
+            return
+        cur.append(channel_id)
+        await db.update_category(target_key, {"force_sub_channel_ids": cur})
+        scope = f"[{target_key}]"
+    else:
+        s = await db.get_settings()
+        cur = [int(x) for x in (s.get("force_sub_channel_ids")
+               or ([s["force_sub_channel_id"]] if s.get("force_sub_channel_id") else []))]
+        if channel_id in cur:
+            await update.message.reply_text("ℹ️ Channel already required (global).")
+            return
+        cur.append(channel_id)
+        await db.update_settings({"force_sub_channel_ids": cur})
+        scope = "global default"
+    try:
+        me = await context.bot.get_chat_member(channel_id, context.bot.id)
+        note = f"Bot status in channel: {me.status}"
+    except Exception as exc:
+        note = f"⚠️ Could not verify bot membership there: {exc}"
+    # v3.5: auto-create a join-request invite link for the gate button
+    link = None
+    try:
+        inv = await context.bot.create_chat_invite_link(
+            channel_id, creates_join_request=True)
+        link = getattr(inv, "invite_link", None)
+        if link:
+            await db.set_force_sub_link(channel_id, link, target_key)
+    except Exception as exc:
+        note += f"\n⚠️ Join-request link not created: {exc}"
+    chans = await db.force_sub_channels(target_key)
+    await update.message.reply_text(
+        f"✅ Channel added to force-subscribe ({scope}).\n{note}\n"
+        f"Total required channels now: {len(chans)}"
+        + (f"\nJoin-request link: {link}" if link else ""))
+
+
+# ══════════════════════════════════════════════════════════════
+#  PER-CATEGORY SCOPED COMMANDS
+# ══════════════════════════════════════════════════════════════
+@admin_only
+async def cmd_protect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/protect on|off [category] — per-category content protection."""
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    if not args or args[0].lower() not in ("on", "off"):
+        cat = await db.get_category(key) if key else {}
+        await update.message.reply_text(
+            "Usage: /protect on | off [category]\n"
+            f"Protection for [{key}] is currently "
+            f"{'ON' if (cat or {}).get('protect_content') else 'OFF'}.")
+        return
+    enabled = args[0].lower() == "on"
+    await db.update_category(key, {"protect_content": enabled})
+    await update.message.reply_text(
+        f"✅ [{key}] Content protection {'enabled' if enabled else 'disabled'}.\n"
+        + ("Users can no longer forward or save delivered files."
+           if enabled else "Users can forward and save delivered files again."))
+
+
+@admin_only
+async def cmd_setautodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setautodelete <time> [category] — per-category auto-delete timer."""
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    if not args:
+        await update.message.reply_text(
+            "Usage: /setautodelete <time> [category]\n"
+            "Examples: 30min · 2hour · 1day · 7day · never")
+        return
+    seconds = parse_duration(args[0])
+    if seconds is None:
+        await update.message.reply_text("Could not parse that duration. Try 30min / 2hour / 7day.")
+        return
+    await db.update_category(key, {"auto_delete_minutes": seconds // 60})
+    await update.message.reply_text(
+        f"✅ [{key}] Auto-delete set to {human_duration(seconds)}.")
+
+
+async def _set_category_channel(update, context, key, field, cid, label):
+    await db.update_category(key, {field: cid})
+    note = ""
+    try:
+        me = await context.bot.get_chat_member(cid, context.bot.id)
+        note = f" Bot status: {me.status}."
+        if me.status not in ("administrator", "creator"):
+            note += " ⚠️ Bot is NOT admin there."
+    except Exception as exc:
+        note = f" ⚠️ Could not verify channel: {exc}"
+    await update.message.reply_text(f"✅ [{key}] {label} set to {cid}.{note}")
+
+
+@admin_only
+async def cmd_setdbchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setdbchannel <channel_id> [category]"""
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    cid = _parse_channel_id(args[0]) if args else None
+    if cid is None:
+        await update.message.reply_text("Usage: /setdbchannel <channel_id> [category]")
+        return
+    await _set_category_channel(
+        update, context, key, "db_channel_id", cid, "Database channel")
+    await update.message.reply_text(
+        f"✅ [{key}] Database channel set to {cid}. Run /rescandb {key} to index it.")
+
+
+@admin_only
+async def cmd_setpostchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setpostchannel <channel_id> [category]"""
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    cid = _parse_channel_id(args[0]) if args else None
+    if cid is None:
+        await update.message.reply_text("Usage: /setpostchannel <channel_id> [category]")
+        return
+    await _set_category_channel(update, context, key, "post_channel_id", cid,
+                                "Posting channel")
+
+
+@admin_only
+async def cmd_setpostmainchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setpostmainchannel <channel_id|off> [category]"""
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    if not args:
+        await update.message.reply_text("Usage: /setpostmainchannel <channel_id|off> [category]")
+        return
+    if args[0].lower() == "off":
+        await db.update_category(key, {"post_main_channel_id": None})
+        await update.message.reply_text(f"✅ [{key}] Main-channel forwarding disabled.")
+        return
+    cid = _parse_channel_id(args[0])
+    if cid is None:
+        await update.message.reply_text("❌ channel_id must be a number.")
+        return
+    await _set_category_channel(update, context, key, "post_main_channel_id", cid,
+                                "Main channel")
+
+
+@admin_only
+async def cmd_setposttag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setposttag <text|off> [category]"""
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    if not args:
+        await update.message.reply_text("Usage: /setposttag <text|off> [category]")
+        return
+    tag = " ".join(args)
+    if tag.lower() == "off":
+        await db.update_category(key, {"post_tag": None})
+        await update.message.reply_text(f"✅ [{key}] Post tag cleared.")
+        return
+    await db.update_category(key, {"post_tag": tag})
+    await update.message.reply_text(f"✅ [{key}] Post tag set to: {tag}")
+
+
+@admin_only
+async def cmd_setposttime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setposttime HH:MM [category] — daily post time, always IST."""
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    t = _parse_hhmm(args[0]) if args else None
+    if not t:
+        await update.message.reply_text("Usage: /setposttime HH:MM [category]  (IST)")
+        return
+    await db.update_category(key, {"post_time": t})
+    from bot1 import schedule_daily
+    await schedule_daily(context.application.job_queue)
+    await update.message.reply_text(f"✅ [{key}] Daily post time set to {t} IST.")
+
+
+@admin_only
+async def cmd_setschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setschedule HH:MM [category] — set time (IST) and enable the pipeline."""
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    t = _parse_hhmm(args[0]) if args else None
+    if not t:
+        await update.message.reply_text("Usage: /setschedule HH:MM [category]  (IST)")
+        return
+    await db.update_category(key, {
+        "post_time": t, "schedule_enabled": True, "schedule_paused": False})
+    from bot1 import schedule_daily
+    await schedule_daily(context.application.job_queue)
+    await update.message.reply_text(f"✅ [{key}] Daily post scheduled at {t} IST.")
+
+
+@admin_only
+async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/schedule on|off [category]"""
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    if not args or args[0].lower() not in ("on", "off"):
+        await update.message.reply_text("Usage: /schedule on|off [category]")
+        return
+    on = args[0].lower() == "on"
+    await db.update_category(key, {"schedule_enabled": on, "schedule_paused": False})
+    from bot1 import schedule_daily
+    await schedule_daily(context.application.job_queue)
+    await update.message.reply_text(
+        f"✅ [{key}] Daily posting enabled." if on
+        else f"⏸️ [{key}] Daily posting disabled.")
+
+
+@admin_only
+async def cmd_pauseposting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    await db.update_category(key, {"schedule_paused": True})
+    await update.message.reply_text(f"⏸️ [{key}] Posting paused.")
+
+
+@admin_only
+async def cmd_resumeposting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    await db.update_category(key, {"schedule_paused": False})
+    await update.message.reply_text(f"▶️ [{key}] Posting resumed.")
+
+
+@admin_only
+async def cmd_dripnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    await update.message.reply_text(f"⏳ [{key}] Posting the next queued item…")
+    from bot1 import do_post
+    item = await do_post(context.bot, category=key)
+    if item:
+        await update.message.reply_text(f"✅ [{key}] Posted item {item['file_id']}.")
+    else:
+        await update.message.reply_text(
+            f"Nothing posted for [{key}] (queue empty or channels not configured).")
+
+
+@admin_only
+async def cmd_queueinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    sm = await db.queue_summary(key, 10)
+    items = sm["items"]
+    if not items:
+        await update.message.reply_text(f"[{key}] Queue is empty.")
+        return
+    cat = await db.get_category(key)
+    db_ch = (cat or {}).get("db_channel_id")
+    base = f"https://t.me/c/{str(db_ch)[4:]}" if db_ch and str(db_ch).startswith("-100") else None
+    lines = [f"📋 <b>Queue info [{_h(key)}]</b>",
+             f"Position: #{sm['position']} — Remaining: {sm['remaining']}", ""]
+    posted_total = await db.count_posted(key)
+    for i, it in enumerate(items, 1):
+        caption = (it.get("caption") or "").strip().split("\n")[0][:60]
+        label = _h(caption or str(it.get("file_id") or it["db_message_id"]))
+        if base:
+            label = f'<a href="{base}/{it["db_message_id"]}">{label}</a>'
+        lines.append(f"#{posted_total + i} · {label}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                    disable_web_page_preview=True)
+
+
+@admin_only
+async def cmd_queue_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/queue_reset N [category]"""
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    try:
+        n = int(args[0])
+    except Exception:
+        await update.message.reply_text("Usage: /queue_reset N [category]")
+        return
+    res = await db.queue_reset_to_position(n, key)
+    if not res:
+        await update.message.reply_text("❌ Invalid queue position.")
+        return
+    posted = await db.count_posted(key)
+    pending = await db.count_pending(key)
+    await update.message.reply_text(
+        f"✅ [{key}] Queue reset. Cursor set to db_message_id={res['db_message_id']}\n"
+        f"Posted={posted} - Queued={pending}")
+
+
+# ── scanning (userbot) ────────────────────────────────────────
+async def _run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id, category=None):
+    """Run the userbot scan. Works from BOTH a command (update.message set) and
+    a button callback (update.message is None) — always reply somewhere."""
+    chat = getattr(update, "effective_chat", None)
+    chat_id = chat.id if chat else update.effective_user.id
+
+    async def _say(text):
+        try:
+            await context.bot.send_message(chat_id, text, parse_mode="HTML")
+        except Exception:
+            pass
+
+    async def progress(n):
+        await _say(f"…scanned {n} messages")
+    try:
+        result = await scanner.scan_channel(channel_id, category=category, progress=progress)
+    except Exception as exc:
+        log.exception("scan failed for category %s", category)
+        await _say(f"❌ Scan failed: {exc}")
+        return
+    await _say(
+        f"✅ [{category or 'legacy'}] Scan complete. Messages indexed: {result['scanned']} · "
+        f"Items in queue: {result['items']}")
+    if category and result.get("genres"):
+        await _say(
+            f"🏷 [{category}] {result['genres']} genre match list(s) refreshed "
+            "from the current captions.")
+
+
+@admin_only
+async def cmd_rescandb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    cat = await db.get_category(key) if key else None
+    channel = (cat or {}).get("db_channel_id")
+    if not channel:
+        await update.message.reply_text(
+            f"No database channel set for [{key}]. Set it via /editcategory {key} first.")
+        return
+    await update.message.reply_text(f"🔍 Re-indexing [{key}] database channel…")
+    await _run_scan(update, context, channel, key)
+
+
+@admin_only
+async def cmd_scandb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scandb <db_channel_id> [category] — point a pipeline at a DB channel + index it."""
+    args = list(context.args or [])
+    key, args = await _resolve_active(update, args)
+    key = await _auto_key(update, key)
+    if not await _require_active(update, key):
+        return
+    cid = _parse_channel_id(args[0]) if args else None
+    if cid is None:
+        await update.message.reply_text("Usage: /scandb <db_channel_id> [category]")
+        return
+    await db.update_category(key, {"db_channel_id": cid})
+    await update.message.reply_text(f"🔍 [{key}] Scanning the database channel…")
+    await _run_scan(update, context, cid, key)
+
+
+@admin_only
+async def cmd_renamecategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/renamecategory <key> <new label> — cosmetic rename only.
+
+    The category KEY (used in file ids and Download links) never changes, so
+    renaming the display label never breaks existing posts."""
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /renamecategory <key> <new label>\n"
+            "Only the display name changes — existing links keep working.")
+        return
+    key = args[0].lower()
+    label = " ".join(args[1:]).strip()
+    cat = await db.get_category(key)
+    if not cat:
+        await update.message.reply_text(f"❌ No pipeline named '{key}'.")
+        return
+    await db.update_category(key, {"label": label})
+    await update.message.reply_text(
+        f"✅ Pipeline '{key}' renamed to <b>{_h(label)}</b>.\n"
+        "Existing Download buttons keep working (the link key is unchanged).",
+        parse_mode="HTML")
+
+
+# ══════════════════════════════════════════════════════════════
+#  GENRES + BROWSE TOGGLE (v4.4)
+# ══════════════════════════════════════════════════════════════
+async def _backfill_genre_task(category, genre, bot, chat_id):
+    """Background one-time caption scan for a freshly added genre. The result
+    is PERSISTED in the genre doc (matched + scanned) — the DB is never
+    scanned twice for the same genre. Reports the count to the admin when
+    done; a crash only logs, it can never break the command that spawned it."""
+    try:
+        n = await db.backfill_genre(category, genre)
+        await bot.send_message(
+            chat_id,
+            f"✅ [{category}] Scan done — {n} item(s) match '{genre}'. "
+            "It now appears in /browse. New uploads match automatically.")
+    except Exception as exc:
+        log.exception("genre backfill failed: %s/%s", category, genre)
+        try:
+            await bot.send_message(
+                chat_id,
+                f"⚠️ [{category}] Genre '{genre}' was saved but the caption "
+                f"scan failed: {exc}. Delete + re-add it to retry.")
+        except Exception:
+            pass
+
+
+@admin_only
+async def cmd_addgenre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addgenre <pipeline> <genre> — register a genre under a pipeline.
+    Runs a ONE-TIME caption scan in the background (result stored in Mongo);
+    re-adding an existing genre never rescans. Matching is format-proof:
+    '#Romance!', bold, mono, quotes, emoji all count (captions are stored
+    as plain text). Example: /addgenre anime Adventure"""
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /addgenre <pipeline> <genre>\n"
+            "Example: /addgenre anime Adventure\n"
+            f"(letters/numbers/spaces, max {db.GENRE_MAX_LEN} chars)")
+        return
+    key = args[0].lower()
+    raw = " ".join(args[1:]).strip()
+    cat = await db.get_category(key)
+    if not cat:
+        await update.message.reply_text(
+            f"❌ No pipeline named '{key}'. See /categories.")
+        return
+    if db.normalize_genre(raw) is None:
+        await update.message.reply_text(
+            f"❌ Invalid genre. Use letters/numbers/spaces only, max "
+            f"{db.GENRE_MAX_LEN} chars (e.g. 'Adventure', 'slice of life').")
+        return
+    doc, created = await db.add_genre(key, raw, update.effective_user.id)
+    slug = doc["genre"]
+    if not created:
+        await update.message.reply_text(
+            f"ℹ️ [{key}] Genre '{slug}' already exists — "
+            f"{len(doc.get('matched') or [])} item(s) matched "
+            f"(scan {'done' if doc.get('scanned') else 'still running'}). "
+            "No rescan needed.")
+        return
+    await update.message.reply_text(
+        f"✅ [{key}] Genre '{slug}' added. Scanning existing captions once, "
+        "in the background — I'll report the match count here when done.")
+    asyncio.create_task(_backfill_genre_task(key, slug, context.bot,
+                                             update.effective_chat.id))
+
+
+@admin_only
+async def cmd_delgenre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delgenre <pipeline> <genre> — remove a genre (menu button + stored
+    match list disappear instantly; files themselves are untouched)."""
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /delgenre <pipeline> <genre>")
+        return
+    key = args[0].lower()
+    if not await db.get_category(key):
+        await update.message.reply_text(f"❌ No pipeline named '{key}'.")
+        return
+    raw = " ".join(args[1:]).strip()
+    if await db.remove_genre(key, raw):
+        await update.message.reply_text(
+            f"🗑 [{key}] Genre '{db.normalize_genre(raw)}' removed. "
+            "The /browse menu updates instantly.")
+    else:
+        await update.message.reply_text(
+            f"❌ [{key}] No such genre. See /genres {key}.")
+
+
+@admin_only
+async def cmd_genres(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/genres [pipeline] — every pipeline's genres with match counts
+    (stored matches / currently posted). No pipeline given -> all of them."""
+    args = context.args or []
+    if args:
+        key = args[0].lower()
+        cat = await db.get_category(key)
+        if not cat:
+            await update.message.reply_text(f"❌ No pipeline named '{key}'.")
+            return
+        cats = [cat]
+    else:
+        cats = await db.list_categories()
+    if not cats:
+        await update.message.reply_text("No pipelines yet — /addcategory first.")
+        return
+    lines = []
+    for cat in cats:
+        key = cat["key"]
+        genres = await db.list_genres(key)
+        lines.append(f"📂 <b>{_h(cat.get('label') or key)}</b> (<code>{key}</code>)")
+        if not genres:
+            lines.append(f"   none — add one: /addgenre {key} &lt;genre&gt;")
+        for g in genres:
+            matched = g.get("matched") or []
+            posted = len(await db.items_by_genre(key, g["genre"],
+                                                 posted_only=True))
+            state = "" if g.get("scanned") else " ⏳ scanning"
+            lines.append(
+                f"   • {_h(g['genre'])} — {len(matched)} matched, "
+                f"{posted} posted{state}")
+        lines.append("")
+    await update.message.reply_text("\n".join(lines).strip(),
+                                    parse_mode="HTML")
+
+
+async def _browse_toggle(update, enabled):
+    await db.update_settings({"browse_enabled": enabled})
+    await update.message.reply_text(
+        "✅ Browse menu is now <b>ON</b> — /browse works for everyone."
+        if enabled else
+        "⛔ Browse menu is now <b>OFF</b> — /browse and its buttons tell "
+        "users browsing is disabled. Channel-post Download buttons are "
+        "unaffected.", parse_mode="HTML")
+
+
+@admin_only
+async def cmd_onbrowse(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/onbrowse — enable the /browse genre menu globally (default: on)."""
+    await _browse_toggle(update, True)
+
+
+@admin_only
+async def cmd_offbrowse(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/offbrowse — disable the /browse genre menu globally."""
+    await _browse_toggle(update, False)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# v4.6: VIP / PREMIUM USERS
+#   /addpremiumuser <id|@username> <duration>   (7h, 1day, 3day, 1week, 30day)
+#   /removepremiumuser <id|@username>
+#   /listpremiumuser     -> InputRichBlockTable (User | Added | Days left | Expires)
+# Premium users BYPASS the shortener gate (force-sub still applies).
+# ═════════════════════════════════════════════════════════════════════
+_PREM_UNITS = {
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+    "w": 604800, "week": 604800, "weeks": 604800,
+}
+
+
+def _premium_duration(text):
+    """Parse '30day'/'1week'/'7h' etc. into seconds. v4.9.6: a leading '-'
+    returns NEGATIVE seconds (premium time reduction)."""
+    import re as _re
+    neg = False
+    t = (text or "").strip().lower().replace(" ", "")
+    if t.startswith("-"):
+        neg, t = True, t[1:]
+    secs = utils.parse_duration(t) if hasattr(utils, "parse_duration") else None
+    if secs is None:
+        m2 = _re.fullmatch(r"(\d+)(s|m|h|day|days|d|week|weeks|w)", t)
+        if not m2:
+            return None
+        n, unit = int(m2.group(1)), m2.group(2)
+        secs = n * {"s": 1, "m": 60, "h": 3600, "d": 86400, "day": 86400,
+                    "days": 86400, "w": 604800, "week": 604800,
+                    "weeks": 604800}[unit]
+    return -secs if neg else secs
+
+
+async def _resolve_premium_target(arg, context):
+    """Accepts a numeric id, a tg://user?id= link, or @username (resolved via
+    getChat). Returns the integer user id, or None."""
+    if not arg:
+        return None
+    a = str(arg).strip()
+    if a.startswith("tg://user?id="):
+        a = a.split("id=", 1)[1]
+    if a.startswith("@"):
+        try:
+            chat = await context.bot.get_chat(a)
+            return int(chat.id)
+        except Exception:
+            return None
+    if a.lstrip("-").isdigit():
+        return int(a)
+    return None
+
+
+def _premium_name_from_doc(doc, uid):
+    if not doc:
+        return f"User {uid}"
+    return (doc.get("first_name") or doc.get("name")
+            or (("@" + doc["username"]) if doc.get("username") else None)
+            or f"User {uid}")
+
+
+def _premium_table_payload(rows, page_size=20):
+    """InputRichBlockTable payload (fields verified against the Bot API docs:
+    InputRichBlockTable{type:'table', cells:[[RichBlockTableCell...]],
+    is_bordered, is_striped, is_compact, caption}; RichBlockTableCell
+    {text: RichText, is_header, colspan, rowspan, align}; the clickable
+    profile title is a RichTextUrl{type:'url', text, url} on tg://user?id=)."""
+    def hcell(t):
+        return {"text": t, "is_header": True}
+
+    def cell(t):
+        return {"text": t}
+
+    def name_cell(text, uid):
+        return {"text": {"type": "url", "text": text,
+                         "url": f"tg://user?id={int(uid)}"}}
+
+    header = [hcell("User"), hcell("Added"), hcell("Days left"), hcell("Expires")]
+    cells = [header]
+    t = db.now()
+    for r in rows[:page_size]:
+        uid = int(r["user_id"])
+        added_days = max(1, round(int(r.get("duration_seconds") or 0) / 86400) or 1)
+        left = (float(r.get("expiry") or 0) - t) / 86400
+        left_days = max(0, __import__("math").ceil(left)) if left > 0 else 0
+        try:
+            import datetime as _dt
+            exp = _dt.datetime.fromtimestamp(
+                float(r.get("expiry") or 0),
+                _dt.timezone(_dt.timedelta(hours=5, minutes=30))).strftime("%d %b %Y %H:%M")
+        except Exception:
+            exp = "-"
+        cells.append([
+            name_cell(_premium_name_from_doc(r.get("_user"), uid), uid),
+            cell(f"{added_days}d"),
+            cell("expired" if left_days <= 0 else f"{left_days}d"),
+            cell(exp),
+        ])
+    header_doc = {"type": "table", "cells": cells, "is_bordered": True,
+                  "is_striped": True, "is_compact": True}
+    return {"blocks": [
+        _rich_heading("\U0001F451 Premium users"),
+        _rich_para(f"{len(rows)} user(s) \u00b7 shortener bypass active while days left > 0"),
+        header_doc,
+        _rich_para("Tap a name to open their profile. Remove with /removepremiumuser <id>."),
+    ]}
+
+
+def _rich_heading(text):
+    return {"type": "heading", "text": str(text), "size": 3}
+
+
+def _rich_para(text):
+    return {"type": "paragraph", "text": str(text)}
+
+
+async def _send_premium_table(bot, chat_id, payload):
+    """Raw sendRichMessage (python-telegram-bot ships no rich helpers).
+    Surfaces the REAL Telegram error instead of masking it."""
+    import json as _json
+    last = None
+    for data in ({"chat_id": chat_id, "rich_message": payload},
+                 {"chat_id": chat_id, "rich_message": _json.dumps(payload)}):
+        try:
+            return await bot._post("sendRichMessage", data=data)
+        except Exception as exc:
+            last = exc
+    try:
+        await bot.send_message(
+            chat_id,
+            "\u26A0\uFE0F Premium table could not be rendered as a rich message.\n"
+            f"Error: {last}")
+    except Exception:
+        pass
+    return None
+
+
+@admin_only
+async def cmd_addpremiumuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addpremiumuser <id|@username> <duration> — e.g. /addpremiumuser 123456789 30day.
+    Premium users bypass the shortener on all gated download paths."""
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /addpremiumuser <id|@username> <duration>\n"
+            "Examples: /addpremiumuser 123456789 7h\n"
+            "          /addpremiumuser 123456789 1day · 3day · 1week · 30day\n"
+            "          /addpremiumuser 123456789 -10day  (remove time)")
+        return
+    uid = await _resolve_premium_target(args[0], context)
+    if not uid:
+        await update.message.reply_text(
+            f"\u274C Could not resolve '{args[0]}' to a user id "
+            "(use a numeric id or @username).")
+        return
+    secs = _premium_duration(" ".join(args[1:]))
+    if not secs or (0 < secs < 60):
+        await update.message.reply_text(
+            "\u274C Invalid duration. Use s/m/h/day/week — "
+            "e.g. 7h, 1day, 3day, 1week, 30day (prefix with - to remove time, "
+            "e.g. -10day).")
+        return
+    # v4.9.6: a negative duration REMOVES time (e.g. /addpremiumuser 123 -10day
+    # undoes a mistaken grant). Positive grants extend as before.
+    if secs < 0:
+        doc = await db.premium_reduce(uid, -secs)
+        if doc is None:
+            await update.message.reply_text(
+                f"\u274C {uid} has no premium to reduce.")
+            return
+        if doc.get("expired"):
+            await update.message.reply_text(
+                f"\u2705 Removed {utils.human_duration(-secs)} from {uid} —\n"
+                "that used up all remaining time: premium is now EXPIRED.")
+            return
+        left = (doc["expiry"] - db.now()) / 86400
+        await update.message.reply_text(
+            f"\u2705 Removed {utils.human_duration(-secs)} from {uid}\n"
+            f"Premium left: {utils.human_duration_seconds(doc['expiry'] - db.now())} "
+            f"({left:.2f} day(s)).")
+        return
+    doc = await db.premium_add(uid, secs, update.effective_user.id)
+    left = (doc["expiry"] - db.now()) / 86400
+    await update.message.reply_text(
+        f"\u2705 Premium granted to {uid}\n"
+        f"Duration: {utils.human_duration(secs)}\n"
+        f"Expires in: {left:.2f} day(s) — shortener bypass is now active.")
+
+
+@admin_only
+async def cmd_removepremiumuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/removepremiumuser <id|@username> — revoke premium (shortener applies again)."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /removepremiumuser <id|@username>")
+        return
+    uid = await _resolve_premium_target(args[0], context)
+    if not uid:
+        await update.message.reply_text("\u274C Could not resolve that user id.")
+        return
+    ok = await db.premium_remove(uid)
+    await update.message.reply_text(
+        f"\u2705 Premium removed from {uid}. Shortener applies again."
+        if ok else f"\u2139\uFE0F {uid} was not in the premium list.")
+
+
+@admin_only
+async def cmd_listpremiumuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/listpremiumuser — InputRichBlockTable: user (profile linked), days added,
+    days left, expiry. Expired rows are purged automatically on each call."""
+    purged = await db.premium_purge_expired()
+    rows = await db.premium_list(include_expired=False)
+    for r in rows:
+        try:
+            r["_user"] = await db.get_user(int(r["user_id"]))
+        except Exception:
+            r["_user"] = None
+    if not rows:
+        await update.message.reply_text(
+            "\U0001F451 No premium users right now."
+            + (f" ({purged} expired record(s) purged.)" if purged else ""))
+        return
+    payload = _premium_table_payload(rows)
+    await _send_premium_table(context.bot, update.effective_chat.id, payload)
+
+
+# Command name -> handler, registered by bot1.build_bot1()
+@admin_only
+async def cmd_checkram(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/checkram — RAM of the single process that hosts BOTH bots (the total
+    is what Render bills against), plus a per-bot estimate."""
+    await update.message.reply_text(format_ram_report(), parse_mode="HTML")
+
+
+@admin_only
+async def cmd_checkram(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/checkram — RAM of the single process that hosts BOTH bots."""
+    await update.message.reply_text(format_ram_report(), parse_mode="HTML")
+
+
+COMMANDS = {
+    "shortener": cmd_shortener,
+    "shortenerapi": cmd_shortenerapi,
+    "linkguard": cmd_linkguard,
+    "setverifytime": cmd_setverifytime,
+    "settokenttl": cmd_settokenttl,
+    "shortenermsg": cmd_shortenermsg,
+    "shortenerbotmsg": cmd_shortenerbotmsg,
+    "verifymsg": cmd_verifymsg,
+    "shortenerbtn": cmd_shortenerbtn,
+    "clearshortenerbtns": cmd_clearshortenerbtns,
+    "protect": cmd_protect,
+    "broadcast": cmd_broadcast,
+    "stats": cmd_stats,
+    "ban": cmd_ban,
+    "unban": cmd_unban,
+    "banlist": cmd_banlist,
+    "banmessage": cmd_banmessage,
+    "forcesublist": cmd_forcesublist,
+    "forcesubremove": cmd_forcesubremove,
+    "addsticker": cmd_addsticker,
+    "removesticker": cmd_removesticker,
+    "addbutton": cmd_addbutton,
+    "buttons": cmd_buttons,
+    "removebutton": cmd_removebutton,
+    "clearbuttons": cmd_clearbuttons,
+    "addcovercaption": cmd_addcovercaption,
+    "addfilecaption": cmd_addfilecaption,
+    "checkram": cmd_checkram,
+    "checkram": cmd_checkram,
+    "addadmin": cmd_addadmin,
+    "setforcesub": cmd_setforcesub,
+    "setautodelete": cmd_setautodelete,
+    "setpostchannel": cmd_setpostchannel,
+    "setdbchannel": cmd_setdbchannel,
+    "setposttime": cmd_setposttime,
+    "dripnow": cmd_dripnow,
+    "rescandb": cmd_rescandb,
+    "scandb": cmd_scandb,
+    "setschedule": cmd_setschedule,
+    "schedule": cmd_schedule,
+    "pauseposting": cmd_pauseposting,
+    "resumeposting": cmd_resumeposting,
+    "queueinfo": cmd_queueinfo,
+    "queue_reset": cmd_queue_reset,
+    "setpostmainchannel": cmd_setpostmainchannel,
+    "setposttag": cmd_setposttag,
+    # multi-category management
+    "addcategory": cmd_addcategory,
+    "editcategory": cmd_editcategory,
+    "delcategory": cmd_delcategory,
+    "categories": cmd_categories,
+    "use": cmd_use,
+    "renamecategory": cmd_renamecategory,
+    "verified_users": cmd_verified_users,
+    # v4.4: genre registry + browse-menu toggle
+    "addgenre": cmd_addgenre,
+    "delgenre": cmd_delgenre,
+    "genres": cmd_genres,
+    "onbrowse": cmd_onbrowse,
+    "offbrowse": cmd_offbrowse,
+    # v4.6: VIP / premium users (shortener bypass)
+    "addpremiumuser": cmd_addpremiumuser,
+    "reducepremiumuser": cmd_addpremiumuser,   # v4.9.6: explicit alias for negative durations
+    "removepremiumuser": cmd_removepremiumuser,
+    "listpremiumuser": cmd_listpremiumuser,
+}
+
+from utils import is_admin  # v4.9.5 (harmless if already imported)
+
+# ── v4.9.5: LinkGuard observe-mode admin commands ─────────────────────
+async def cmd_lgobserve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /lgobserve on [minutes] | off — learn shortener exit hosts."""
+    if not await is_admin(update.effective_user.id):
+        return
+    import linkguard
+    args = context.args or []
+    on = not args or args[0].lower() != "off"
+    minutes = 60
+    if on and len(args) > 1:
+        try:
+            minutes = max(1, min(int(args[1]), 720))
+        except ValueError:
+            pass
+    res = await linkguard.set_observe(on, minutes)
+    if res is None:
+        await update.message.reply_text("❌ Worker unreachable — check /linkguard setup.")
+    else:
+        await update.message.reply_text(
+            f"👁 Observe-mode {'ON for ' + str(minutes) + ' min' if on else 'OFF'}.\n"
+            + ("Now solve ONE arolink yourself, then run /lghosts." if on else ""))
+
+
+async def cmd_lghosts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /lghosts — list referer hosts learned during observe-mode."""
+    if not await is_admin(update.effective_user.id):
+        return
+    import linkguard
+    res = await linkguard.observed_hosts()
+    if res is None:
+        await update.message.reply_text("❌ Worker unreachable.")
+        return
+    hosts = res.get("hosts") or []
+    state = "ON" if res.get("observe_on") else "OFF"
+    if not hosts:
+        await update.message.reply_text(
+            f"👁 Observe-mode: {state}\nNo hosts learned yet.")
+        return
+    lines = [f"• {h['host']}  (hits: {h['hits']})" for h in hosts]
+    await update.message.reply_text(
+        f"👁 Observe-mode: {state}\nLearned hosts:\n" + "\n".join(lines)
+        + "\n\nApprove with: /lgallow <host>")
+
+
+async def cmd_lgallow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /lgallow <host> — approve a host into the Referer allowlist."""
+    if not await is_admin(update.effective_user.id):
+        return
+    import linkguard
+    if not context.args:
+        await update.message.reply_text("Usage: /lgallow <host>")
+        return
+    res = await linkguard.add_ref_host(context.args[0])
+    if res and res.get("ok"):
+        await update.message.reply_text(f"✅ {res.get('added')} added to the allowlist.")
+    else:
+        await update.message.reply_text(f"❌ Failed: {(res or {}).get('error', 'worker unreachable')}")
+
+
+async def cmd_lgclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /lgclear — wipe the learned-hosts list."""
+    if not await is_admin(update.effective_user.id):
+        return
+    import linkguard
+    res = await linkguard.clear_observed()
+    await update.message.reply_text("🧹 Learned-hosts list cleared."
+                                    if res is not None else "❌ Worker unreachable.")
+
+
+LINKGUARD_ADMIN_COMMANDS = {
+    "lgobserve": cmd_lgobserve,
+    "lghosts": cmd_lghosts,
+    "lgallow": cmd_lgallow,
+    "lgclear": cmd_lgclear,
+}
+
+
+
+# v4.9.5: register LinkGuard admin commands
+for _lg_name, _lg_fn in LINKGUARD_ADMIN_COMMANDS.items():
+    COMMANDS.setdefault(_lg_name, _lg_fn)

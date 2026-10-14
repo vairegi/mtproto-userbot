@@ -1,191 +1,173 @@
-"""
-main.py — FastAPI entrypoint
+"""Entry point: ONE FastAPI process hosting BOTH Telegram bots.
 
-Boots the Mini App backend. Responsibilities:
-  * Serve the frontend static files from /static
-  * Auto-mount every route file under app/routes/
-  * Serve index.html at "/" so Telegram opens the Mini App directly
-  * SPA fallback: any non-API GET returns index.html (hash routing safe)
-  * Health check at /healthz for Render / UptimeRobot
-  * No-cache headers on index.html so the shim upgrade lands immediately
-"""
-from __future__ import annotations
+Two python-telegram-bot Applications run in webhook mode inside this single
+process. Telegram delivers updates to:
 
+    POST /bot1/webhook   -> Bot 1 (gate bot)
+    POST /bot2/webhook   -> Bot 2 (delivery bot)
+    GET  /health         -> Render health check
+
+Run locally:   uvicorn main:app --host 0.0.0.0 --port 8000
+On Render:     uvicorn main:app --host 0.0.0.0 --port $PORT
+"""
+import asyncio
 import logging
-import os
-from pathlib import Path
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Request, Response
+from telegram import Update
 
-from app.routes import mount_all
+import config
+import db
+from bot1 import build_bot1, schedule_daily, schedule_broadcast_sweeper
+from bot2 import build_bot2, schedule_sweeper
 
-log = logging.getLogger("miniapp")
-logging.basicConfig(level=os.environ.get("MINIAPP_LOG_LEVEL", "INFO").upper())
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-FRONTEND_DIR = BASE_DIR / "frontend"
-INDEX_HTML = FRONTEND_DIR / "index.html"
-
-# Sanity-check at boot — if the frontend folder is missing, LOUD warning in
-# logs. Prevents the "silent blank screen" mystery: you'll see it in Render's
-# log stream immediately after deploy.
-if not FRONTEND_DIR.is_dir():
-    log.error(
-        "FRONTEND_DIR does not exist: %s — Mini App will 404 on every request.",
-        FRONTEND_DIR,
-    )
-elif not INDEX_HTML.is_file():
-    log.error(
-        "index.html not found at %s — Mini App will 404. Check your git commit.",
-        INDEX_HTML,
-    )
-else:
-    log.info("Serving frontend from %s", FRONTEND_DIR)
-
-app = FastAPI(title="Doujinshi Universe Mini App", version="0.2.0")
-
-# CORS — Telegram Mini Apps run same-origin; permissive here for local dev.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+log = logging.getLogger("main")
 
-# ---------------------------------------------------------------------------
-# Static assets
-# ---------------------------------------------------------------------------
-# Mounted at /static — matches every `/static/css/...` and `/static/js/...`
-# reference in index.html and the importmap.
-#
-# v12.34j: no-cache middleware for /static. index.html already ships
-# no-store (see _serve_index below), but the JS/CSS MODULES it imports
-# were served with default headers — Telegram's WebView heuristic-caches
-# those for days, so a deployed frontend change (v12.34i "Similar to
-# this", v12.34h toast move, ...) never reached users until they
-# hard-refreshed. This middleware stamps the same no-cache headers on
-# every /static response so any deploy is live on the next app open.
-@app.middleware("http")
-async def _no_cache_static(request: Request, call_next):
-    resp = await call_next(request)
-    if request.url.path.startswith("/static/") or request.url.path.startswith("/js/"):
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        resp.headers["Pragma"] = "no-cache"
-        resp.headers["Expires"] = "0"
-    return resp
-
-if FRONTEND_DIR.is_dir():
-    app.mount(
-        "/static",
-        StaticFiles(directory=str(FRONTEND_DIR), html=False),
-        name="static",
-    )
-
-# Mount every /api/* route file automatically.
-mount_all(app)
+bot1 = build_bot1()
+bot2 = build_bot2()
 
 
-# ---------------------------------------------------------------------------
-# Startup: kick off the auto-delete background loop (feature 1)
-# ---------------------------------------------------------------------------
-
-
-@app.on_event("startup")
-async def _ensure_turso_schema_on_startup():
-    """Run Turso schema migration at startup.
-
-    v12.51: prefers the local `turso_schema` module when present (full schema),
-    otherwise falls back to the shared HTTP client `ensure_schema()` so that the
-    cache tables always exist — never raises, never blocks boot.
-    """
-    import logging
-    lg = logging.getLogger("miniapp.main")
-    # Try the full local schema module first
+async def _set_commands():
+    """Register the menu-button command lists for both bots."""
+    from telegram import BotCommand, BotCommandScopeChat
     try:
-        from app.services import turso_schema  # type: ignore
-        await turso_schema.ensure_schema()
-        lg.info("turso schema migration OK (local turso_schema)")
-        return
-    except ImportError:
-        pass  # fall through to shared-client fallback
-    except Exception as e:  # noqa: BLE001
-        lg.warning("turso_schema.ensure_schema failed, falling back: %s", e)
-    # Fallback: shared HTTP client schema
+        # Bot 1 — everyone sees the basics
+        await bot1.bot.set_my_commands([
+            BotCommand("start", "Start the bot"),
+            BotCommand("browse", "Browse by category & genre"),
+            BotCommand("help", "Show all commands"),
+        ])
+        # Bot 1 — admins additionally get the full admin panel in the menu
+        from bot1_admin import COMMANDS
+        admin_cmds = [BotCommand("start", "Start the bot"),
+                      BotCommand("help", "Show all commands")]
+        admin_cmds += [BotCommand(name, "admin") for name in sorted(COMMANDS)]
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot1.bot.set_my_commands(
+                    admin_cmds, scope=BotCommandScopeChat(chat_id=admin_id))
+            except Exception as exc:
+                log.warning("admin menu for %s failed: %s", admin_id, exc)
+        # Bot 2 — everyone sees the basics
+        await bot2.bot.set_my_commands([
+            BotCommand("start", "Start the bot"),
+            BotCommand("help", "Show all commands"),
+        ])
+        # Bot 2 — admins additionally get broadcast / delivery controls (v4.7)
+        b2_admin = [BotCommand("start", "Start the bot"),
+                    BotCommand("help", "Show all commands"),
+                    BotCommand("broadcast", "Message every Bot 2 user"),
+                    BotCommand("setautodelete", "Auto-delete timer"),
+                    BotCommand("withfilemessages", "Deletion notice text"),
+                    BotCommand("checkram", "RAM usage")]
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot2.bot.set_my_commands(
+                    b2_admin, scope=BotCommandScopeChat(chat_id=admin_id))
+            except Exception as exc:
+                log.warning("bot2 admin menu for %s failed: %s", admin_id, exc)
+    except Exception as exc:
+        log.warning("set_my_commands failed: %s", exc)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Database + both bots
+    await db.connect()
+    await bot1.initialize()
+    await bot1.start()
+    await bot2.initialize()
+    await bot2.start()
+
+    # 2. Register webhooks (only when a public URL is configured)
+    base = config.RENDER_EXTERNAL_URL.rstrip("/")
+    if base:
+        try:
+            await bot1.bot.set_webhook(
+                f"{base}/bot1/webhook",
+                secret_token=config.BOT1_WEBHOOK_SECRET or None,
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,
+            )
+            await bot2.bot.set_webhook(
+                f"{base}/bot2/webhook",
+                secret_token=config.BOT2_WEBHOOK_SECRET or None,
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,
+            )
+            log.info("Webhooks registered at %s", base)
+        except Exception as exc:
+            log.error("Failed to set webhooks: %s", exc)
+
+    # 3. Background jobs
+    await schedule_daily(bot1.job_queue)
+    schedule_broadcast_sweeper(bot1)   # v4.0: deletes timed /broadcast copies
+    schedule_sweeper(bot2)
+    await _set_commands()
+    log.info("Both bots are up.")
+
+    yield
+
+    # Shutdown
     try:
-        from app.services import turso_client
-        ok = await turso_client.ensure_schema()
-        if ok:
-            lg.info("turso schema migration OK (turso_client fallback)")
-        else:
-            lg.warning("turso schema migration unavailable (turso_client returned False)")
-    except Exception as e:  # noqa: BLE001
-        lg.warning("turso schema migration failed (non-fatal): %s", e)
+        await bot1.stop()
+        await bot1.shutdown()
+        await bot2.stop()
+        await bot2.shutdown()
+    finally:
+        await db.close()
 
-@app.on_event("startup")
-async def _start_deletion_scheduler() -> None:
-    """Start the background loop that deletes DM'd content after N hours.
-    Idempotent — safe on every (re)boot."""
+
+app = FastAPI(title="Telegram Video Bots", lifespan=lifespan)
+
+
+def _secret_ok(request: Request, expected: str) -> bool:
+    if not expected:
+        return True
+    return request.headers.get("x-telegram-bot-api-secret-token") == expected
+
+
+@app.get("/health")
+async def health():
+    healthy = True
     try:
-        from app.services import deletion_scheduler
-        deletion_scheduler.start_background_loop()
-        log.info("deletion_scheduler background loop started")
-    except Exception as e:  # noqa: BLE001
-        log.warning("deletion_scheduler failed to start (non-fatal): %s", e)
+        await db.ping()
+    except Exception:
+        healthy = False
+    return {"status": "ok" if healthy else "degraded", "database": healthy}
 
 
-# ---------------------------------------------------------------------------
-# HTML shell — served at "/" and also as an SPA fallback for unknown paths
-# ---------------------------------------------------------------------------
-def _serve_index() -> Response:
-    """Serve index.html with no-cache headers so shim upgrades land instantly."""
-    if not INDEX_HTML.is_file():
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": "index.html missing",
-                "expected_at": str(INDEX_HTML),
-                "hint": "Ensure the miniapp/frontend/ folder was committed to Git.",
-            },
-        )
-    return FileResponse(
-        str(INDEX_HTML),
-        media_type="text/html; charset=utf-8",
-        headers={
-            # Telegram's WebView aggressively caches HTML. No-cache guarantees
-            # the user sees the latest shell after every deploy — without this
-            # they might keep the old broken importmap-only shell for days.
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        },
-    )
+@app.post("/bot1/webhook")
+async def bot1_webhook(request: Request):
+    if not _secret_ok(request, config.BOT1_WEBHOOK_SECRET):
+        return Response(status_code=403)
+    data = await request.json()
+    update = Update.de_json(data, bot1.bot)
+    # Answer Telegram INSTANTLY (200) and process in the background.
+    # Without this, a slow handler (e.g. a long /broadcast) makes Telegram
+    # retry the same update over and over - which is exactly what caused
+    # the repeated broadcasts AND blocked the event loop so no other
+    # command could get through.
+    asyncio.create_task(bot1.process_update(update))
+    return Response(status_code=200)
 
 
-@app.get("/", include_in_schema=False)
-def root_index() -> Response:
-    return _serve_index()
+@app.post("/bot2/webhook")
+async def bot2_webhook(request: Request):
+    if not _secret_ok(request, config.BOT2_WEBHOOK_SECRET):
+        return Response(status_code=403)
+    data = await request.json()
+    update = Update.de_json(data, bot2.bot)
+    asyncio.create_task(bot2.process_update(update))
+    return Response(status_code=200)
 
 
-@app.get("/healthz", include_in_schema=False)
-def healthz() -> dict:
-    """Render + UptimeRobot health check.  Cheap: no DB call."""
-    return {"ok": True, "service": "miniapp", "frontend": FRONTEND_DIR.is_dir()}
+if __name__ == "__main__":
+    import uvicorn
 
-
-# ---------------------------------------------------------------------------
-# SPA catch-all — MUST be registered LAST so /api/* and /static/* win.
-# ---------------------------------------------------------------------------
-# The frontend uses hash routing (#search, #bookmarks, ...) so this is
-# mostly future-proofing: any accidental deep-link like /profile or
-# /admin gets the app shell instead of a 404. Anything under /api/* or
-# /static/* is untouched because those routes were registered above and
-# FastAPI matches in registration order.
-@app.get("/{full_path:path}", include_in_schema=False)
-def spa_fallback(full_path: str, request: Request) -> Response:
-    # Don't shadow the API or static routes if someone hits a bad path.
-    if full_path.startswith(("api/", "static/", "healthz")):
-        return JSONResponse(status_code=404, content={"detail": "Not found"})
-    return _serve_index()
+    uvicorn.run("main:app", host="0.0.0.0", port=config.PORT, reload=False)
