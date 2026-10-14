@@ -107,6 +107,8 @@ def _renumber(db, keep: List[Dict[str, Any]]) -> None:
     col = _col(db)
     col.delete_many({"_id": {"$regex": f"^{_SLOT_PREFIX}"}})
     for i, w in enumerate(keep, 1):
+        w = dict(w)
+        w.pop("_id", None)  # Mongo _id cannot change when slots renumber.
         w["slot"] = i
         col.update_one({"_id": f"{_SLOT_PREFIX}{i}"}, {"$set": w}, upsert=True)
 

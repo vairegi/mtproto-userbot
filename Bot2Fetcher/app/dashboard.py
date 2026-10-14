@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Dict, Optional
 
@@ -75,12 +76,15 @@ class LogBot:
         self.chat_id = _coerce_chat_id(chat_id)
         self._me: Optional[Dict[str, Any]] = None
         self._last_error_desc: str = ""   # v12.83
+        self._disabled = False
 
     async def _call(self, method: str, payload: dict) -> Optional[dict]:
         # v12.41: loud-logging port of ScraperBot v1.21 _tg_api. Every non-ok
         # response logs method + error_code + full description (truncated to
         # 400 chars) so a 400 storm is diagnosable from Render logs with one
         # grep for "bot api". "message is not modified" stays whitelisted.
+        if self._disabled:
+            return None
         url = f"{_API}/bot{self.token}/{method}"
         try:
             async with httpx.AsyncClient(timeout=15.0) as h:
@@ -93,6 +97,9 @@ class LogBot:
             desc = str(data.get("description", ""))[:400]
             self._last_error_desc = desc   # v12.83: lets _tick distinguish deleted-message 400s
             code = data.get("error_code")
+            if code == 401:
+                self._disabled = True
+                log.error("Dashboard token rejected (401); dashboard API calls disabled until restart")
             # "message is not modified" is harmless — edit called with same text.
             if "message is not modified" in desc.lower():
                 return {"ok": True, "no_op": True}
@@ -327,6 +334,8 @@ class Dashboard:
         """v12.83: /checkram for the log channel. One short getUpdates
         poll per 20s tick (timeout=0 — no long-poll hold). All failures
         swallowed so a Telegram hiccup can never stall the dashboard."""
+        if self.s.log_bot_token == (os.getenv("BOT2_TOKEN") or "").strip():
+            return  # PTB owns updates for the shared token; never compete.
         try:
             r = await self.bot._call("getUpdates", {
                 "offset": self._upd_offset, "timeout": 0,

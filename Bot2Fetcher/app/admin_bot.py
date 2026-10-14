@@ -55,8 +55,9 @@ def _first(*names: str) -> str:
 class WorkerAdminBot:
     """Owns the PTB app + the wizard state. start() is non-blocking."""
 
-    def __init__(self, db, notify_reload=None):
+    def __init__(self, db, notify_reload=None, status_provider=None):
         self._db = db
+        self._status_provider = status_provider
         self._notify_reload = notify_reload  # called after any worker change
         self._token = _first("BOT2_TOKEN")
         self._admin_id = 0
@@ -108,6 +109,8 @@ class WorkerAdminBot:
             return False
 
         app = (ApplicationBuilder().token(self._token).build())
+        app.add_handler(CommandHandler("start", self._cmd_start))
+        app.add_handler(CommandHandler("checkram", self._cmd_checkram))
         app.add_handler(CommandHandler("addworker", self._cmd_addworker))
         app.add_handler(CommandHandler("listworker", self._cmd_listworker))
         app.add_handler(CommandHandler("removeworker", self._cmd_removeworker))
@@ -134,6 +137,17 @@ class WorkerAdminBot:
         return True
 
     # -- command handlers (async, PTB) -------------------------------------
+    async def _cmd_start(self, update, ctx):
+        if self._is_admin(int(update.effective_user.id)):
+            await update.effective_message.reply_text(
+                "🛠 Bot 2 worker management\n/addworker · /listworker · "
+                "/removeworker <n…|all> · /changeapiandhash · /checkram")
+
+    async def _cmd_checkram(self, update, ctx):
+        if self._is_admin(int(update.effective_user.id)):
+            from .dashboard import _ram_line
+            await update.effective_message.reply_text(_ram_line())
+
     async def _cmd_addworker(self, update, ctx):
         msg = update.effective_message
         uid = int(update.effective_user.id)
@@ -181,6 +195,7 @@ class WorkerAdminBot:
             return
         creds = _workers.get_creds(self._db)
         workers = _workers.list_workers(self._db)
+        runtime = self._status_provider() if self._status_provider else {}
         lines = ["🛠 Bot 2 workers", ""]
         if creds:
             lines.append(f"🔑 api_id  : {creds[0]}")
@@ -194,7 +209,22 @@ class WorkerAdminBot:
             for w in workers:
                 sess = str(w["session"])
                 masked = f"{sess[:8]}…{sess[-6:]}" if len(sess) > 16 else "****"
+                rt = runtime.get(w["slot"], {})
+                live = rt.get("running", False)
+                label = rt.get("state", "pending connection")
+                if not live and label != "error":
+                    label = "pending connection"
                 lines.append(f"  {w['slot']}. session {masked}")
+                lines.append(f"     {label} · task={'running' if live else 'not running'} · "
+                             f"completed={rt.get('completed', 0)}")
+                if rt.get("account_id"):
+                    lines.append(f"     account={rt['account_id']}")
+                if rt.get("error"):
+                    lines.append(f"     setup error: {rt['error']}")
+                if rt.get("last_result"):
+                    lines.append(f"     @{rt.get('last_downloader', '?')}: {rt['last_result']}")
+                if rt.get("last_reply"):
+                    lines.append(f"     reply: {rt['last_reply']}")
         lines.append("")
         lines.append("/addworker · /removeworker <n…|all> · /changeapiandhash")
         await msg.reply_text("\n".join(lines))
@@ -265,9 +295,18 @@ class WorkerAdminBot:
             return
 
         if step == _AW_SESSION:
-            if len(text) < 40:
+            try:
+                from telethon.sessions import StringSession
+                StringSession(text)
+                valid = len(text) >= 40
+            except Exception:
+                valid = False
+            if not valid:
                 await msg.reply_text("⚠️ That doesn't look like a Telethon "
                                      "string session. Try again (or /cancel).")
+                return
+            if any(row["session"] == text for row in _workers.list_workers(self._db)):
+                await msg.reply_text("⚠️ This session is already stored. Send a different user account session.")
                 return
             if "api_id" in w:  # first worker — save creds first
                 _workers.set_creds(self._db, w["api_id"], w["api_hash"])
@@ -279,8 +318,8 @@ class WorkerAdminBot:
             if slot:
                 self._reload()
                 await msg.reply_text(
-                    f"✅ Worker #{slot} added and live — no restart needed. "
-                    "Check /listworker.")
+                    f"✅ Worker #{slot} saved. Connection is pending — no restart needed. "
+                    "Check /listworker for actual live status.")
             else:
                 await msg.reply_text("❌ Could not save the worker (Mongo error). "
                                      "Check logs and retry /addworker.")

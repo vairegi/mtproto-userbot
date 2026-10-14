@@ -127,6 +127,11 @@ class Fetcher:
         # in main.py; _slot_clients/_slot_tasks track live slots by number;
         # _creds_fp forces a full reconnect when api_id/hash change.
         self.workers_db = None
+        self.downloader_username = self.s.bot2_username.strip().lstrip("@")
+        token_id = (os.getenv("BOT2_TOKEN") or "").strip().split(":", 1)[0]
+        self._admin_bot_id = int(token_id) if token_id.isdigit() else None
+        self._slot_runtime: Dict[int, Dict[str, Any]] = {}
+        self._slot_account_ids: Dict[int, int] = {}
         self._slot_clients: Dict[int, TelegramClient] = {}
         self._slot_sessions: Dict[int, str] = {}
         self._slot_tasks: Dict[int, asyncio.Task] = {}
@@ -157,6 +162,8 @@ class Fetcher:
         self._alert_lock = asyncio.Lock()             # alert rate-limiting
 
     def _d_state(self, idx, state, gid="", title="", pages=0, step=""):
+        self._slot_runtime.setdefault(idx, {}).update(
+            state=state, gallery_id=str(gid), step=step)
         if self.dash:
             try:
                 self.dash.slot_state(idx, state, gid, title, pages, step)
@@ -168,6 +175,9 @@ class Fetcher:
                     log.warning("📊 dashboard slot_state update failed: %s", e)
 
     def _d_event(self, idx, kind, gid):
+        if kind == "completed":
+            rt = self._slot_runtime.setdefault(idx, {})
+            rt["completed"] = rt.get("completed", 0) + 1
         if self.dash:
             try:
                 self.dash.slot_event(idx, kind, gid)
@@ -225,7 +235,7 @@ class Fetcher:
             try:
                 need_warm = not (
                     peer_cache.has(slot=idx, kind="db_channel", session_fingerprint=fp)
-                    and peer_cache.has(slot=idx, kind="bot2_user", session_fingerprint=fp)
+                    and peer_cache.has(slot=idx, kind=f"pdf_user:{self.downloader_username.casefold()}", session_fingerprint=fp)
                 )
             except Exception:
                 need_warm = True
@@ -249,13 +259,19 @@ class Fetcher:
                 f"Make sure this userbot is a MEMBER of the channel."
             ) from e
         try:
-            self._bot2_per_slot[idx] = await _get_entity("bot2_user", self.s.bot2_username)
+            self._bot2_per_slot[idx] = await _get_entity(f"pdf_user:{self.downloader_username.casefold()}", self.downloader_username)
+            if (self._admin_bot_id is not None and
+                    getattr(self._bot2_per_slot[idx], "user_id", None) == self._admin_bot_id):
+                self.downloader_username = "Gallery_DLBot"
+                self._bot2_per_slot[idx] = await _get_entity(
+                    "primary_pdf_user", self.downloader_username)
+                log.warning("slot %d: management bot peer rejected; using @Gallery_DLBot", idx)
             log.info("🤖 slot %d resolved downloader bot: @%s",
-                     idx, self.s.bot2_username)
+                     idx, self.downloader_username)
         except Exception as e:
             raise RuntimeError(
-                f"slot {idx}: cannot resolve BOT2_USERNAME=@{self.s.bot2_username} — {e}. "
-                f"Have this userbot DM @{self.s.bot2_username} once, then restart."
+                f"slot {idx}: cannot resolve BOT2_USERNAME=@{self.downloader_username} — {e}. "
+                f"Have this userbot DM @{self.downloader_username} once, then restart."
             ) from e
 
         # v12.49: resolve the fallback downloader bot per slot. Optional —
@@ -275,10 +291,49 @@ class Fetcher:
                           "Have this userbot DM @%s once, then restart.",
                           idx, fb, e, fb)
 
+    async def _validate_downloader(self) -> None:
+        """Never send gallery requests to this service's management bot."""
+        token = (os.getenv("BOT2_TOKEN") or "").strip()
+        if not token:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=10) as h:
+                response = await h.get(f"https://api.telegram.org/bot{token}/getMe")
+                data = response.json()
+            if not data.get("ok"):
+                log.warning("Downloader identity guard: admin getMe failed (code=%s)",
+                            data.get("error_code"))
+                return
+            me = data["result"]
+            self._admin_bot_id = int(me["id"])
+            if self.downloader_username.casefold() == me["username"].casefold():
+                log.error("DOWNLOADER CONFIG ERROR: @%s is the worker-management bot, "
+                          "not a PDF downloader. Using @Gallery_DLBot; set "
+                          "PDF_DOWNLOADER_USERNAME=Gallery_DLBot in Render.",
+                          self.downloader_username)
+                self.downloader_username = "Gallery_DLBot"
+            log.info("PDF downloader: @%s (separate from worker-management bot)",
+                     self.downloader_username)
+        except Exception as e:
+            # Do not expose a token-bearing HTTP URL in exception text.
+            log.warning("Downloader identity guard unavailable (%s); retrying at peer resolution",
+                        type(e).__name__)
+
+    def worker_status(self) -> Dict[int, Dict[str, Any]]:
+        """Thread-readable, secret-free snapshot for /listworker."""
+        out = {}
+        for idx, rt in list(self._slot_runtime.items()):
+            row = dict(rt)
+            task = self._slot_tasks.get(idx)
+            row["running"] = bool(task and not task.done())
+            out[idx] = row
+        return out
+
     async def start(self) -> None:
         # v13.10: no env sessions — populate from the Mongo worker store.
         # Zero workers = standby (never raise). A revoked session only skips
         # its own slot; it can never take the service down.
+        await self._validate_downloader()
         await self.reconcile_workers(initial=True)
 
     # ---- v13.10 worker reconcile (hot-reload, no restart needed) ----------
@@ -310,37 +365,52 @@ class Fetcher:
             return None, []
 
     async def _connect_slot(self, idx: int, session: str, api_id: str, api_hash: str) -> None:
-        c = TelegramClient(StringSession(session), int(api_id), api_hash)
-        await c.connect()
-        if not await c.is_user_authorized():
-            try:
-                await c.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-            log.error("🤖 slot %d session NOT authorized — slot skipped "
-                      "(revoked session; re-add via /addworker)", idx)
+        c = None
+        self._slot_runtime[idx] = {"state": "connecting", "completed": 0}
+        try:
+            c = TelegramClient(StringSession(session), int(api_id), api_hash)
+            await c.connect()
+            if not await c.is_user_authorized():
+                raise RuntimeError("session not authorized; re-add this worker")
+            me = await c.get_me()
+            if int(me.id) in self._slot_account_ids.values():
+                raise RuntimeError("duplicate Telegram account already active in another slot")
+            uname = getattr(me, "username", None) or "(no username)"
+            self._slot_runtime[idx].update(account_id=int(me.id), account=uname)
+            log.info("🤖 slot %d authorized as @%s (id=%s)", idx, uname, me.id)
             if self.dash:
+                self.dash.set_account(idx, uname)
+            await self._warm_and_resolve(idx, c)
+            # Publish ONLY fully-resolved clients. Failed setup must be retried.
+            self._slot_clients[idx] = c
+            self._slot_sessions[idx] = session
+            self._slot_account_ids[idx] = int(me.id)
+            self.clients = [self._slot_clients[k] for k in sorted(self._slot_clients)]
+            self._slot_tasks[idx] = asyncio.create_task(self._slot_loop(idx, c))
+            self._slot_runtime[idx].update(state="idle", error="")
+        except BaseException as e:
+            if c is not None:
                 try:
-                    self.dash.set_account(idx, "(unauthorized)")
-                except Exception:  # noqa: BLE001
+                    await c.disconnect()
+                except Exception:
                     pass
-            return
-        me = await c.get_me()
-        uname = getattr(me, "username", None) or "(no username)"
-        log.info("🤖 slot %d authorized as @%s (id=%s)", idx, uname, me.id)
-        if self.dash:
-            self.dash.set_account(idx, uname)
-        self._slot_clients[idx] = c
-        self._slot_sessions[idx] = session
-        self.clients = [self._slot_clients[k] for k in sorted(self._slot_clients)]
-        await self._warm_and_resolve(idx, c)
-        self._slot_tasks[idx] = asyncio.create_task(self._slot_loop(idx, c))
+            self._channel_per_slot.pop(idx, None)
+            self._bot2_per_slot.pop(idx, None)
+            self._fallback_per_slot.pop(idx, None)
+            self._slot_runtime[idx].update(state="error", error=str(e)[:180])
+            raise
 
     async def _drop_slot(self, idx: int) -> None:
         t = self._slot_tasks.pop(idx, None)
         if t:
             t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
         self._slot_sessions.pop(idx, None)
+        self._slot_account_ids.pop(idx, None)
+        self._slot_runtime.pop(idx, None)
+        self._channel_per_slot.pop(idx, None)
+        self._bot2_per_slot.pop(idx, None)
+        self._fallback_per_slot.pop(idx, None)
         c = self._slot_clients.pop(idx, None)
         if c:
             try:
@@ -364,6 +434,7 @@ class Fetcher:
                             "Add one via /addworker (BOT2_TOKEN admin bot).")
             for idx in list(self._slot_clients):
                 await self._drop_slot(idx)
+            self._slot_runtime.clear()
             return
         if not creds:
             log.warning("🛌 worker(s) exist but API creds missing — finish "
@@ -376,12 +447,26 @@ class Fetcher:
             self._creds_fp = fp
             for idx in list(self._slot_clients):
                 await self._drop_slot(idx)
+        for idx in list(self._slot_runtime):
+            if idx not in want and idx not in self._slot_clients:
+                self._slot_runtime.pop(idx, None)
         for idx in list(self._slot_clients):
-            if idx not in want or self._slot_sessions.get(idx) != want[idx]:
+            task = self._slot_tasks.get(idx)
+            if (idx not in want or self._slot_sessions.get(idx) != want[idx]
+                    or task is None or task.done()):
                 await self._drop_slot(idx)
         for idx in sorted(want):
             if idx not in self._slot_clients:
-                await self._connect_slot(idx, want[idx], creds[0], creds[1])
+                try:
+                    await asyncio.wait_for(
+                        self._connect_slot(idx, want[idx], creds[0], creds[1]),
+                        timeout=45.0)
+                except Exception as e:
+                    if isinstance(e, asyncio.TimeoutError):
+                        self._slot_runtime.setdefault(idx, {}).update(
+                            state="error", error="connection/setup timeout after 45s")
+                    log.warning("slot %d setup failed (%s); remaining slots continue",
+                                idx, type(e).__name__)
 
     async def _reconcile_loop(self) -> None:
         while not self._stop.is_set():
@@ -667,7 +752,7 @@ class Fetcher:
             log.info("🛟 %s — both-bots park expired; routing STRAIGHT to "
                      "@%s (skipping @%s)", gid,
                      getattr(self.s, "fallback_username", "") or "?",
-                     self.s.bot2_username)
+                     self.downloader_username)
         # v12.72: surface a live "stage" to the mini-app right after claim.
         self.galleries.set_progress(
             gid, stage="fallback_fetching" if route_fallback_direct else "fetching",
@@ -767,8 +852,8 @@ class Fetcher:
                 if pdf_msg is None:
                     # v12.49 (operator spec): timeout is NOT an explicit
                     # "An error occurred" reply — keep the legacy drop path.
-                    log.error("⏰ %s — @Gallery_DLBot timed out (%ds) — dropping",
-                              gid, int(timeout))
+                    log.error("⏰ slot %d gallery %s — @%s timed out (%ds) — dropping",
+                              idx, gid, self.downloader_username, int(timeout))
                     self.galleries.drop_claim(gid)
                     self.stats.dropped += 1
                     # v12.88: cooldown, not a permanent blackhole — the gid
@@ -810,7 +895,7 @@ class Fetcher:
                             "@%s: <code>%s</code>\n"
                             "Parked 12h; next retry goes straight to the "
                             "fallback bot.\nhttps://nhentai.net/g/%s/" % (
-                                gid, self.s.bot2_username,
+                                gid, self.downloader_username,
                                 (primary_err or "timeout")[:150],
                                 getattr(self.s, "fallback_username", "") or "?",
                                 (fb_err or "timeout")[:150], gid))
@@ -1013,9 +1098,12 @@ class Fetcher:
             return 0
 
     async def _request_pdf(self, client: TelegramClient, bot2, gid: str, timeout: float,
-                           slot: Optional[int] = None):
-        log.info("📨 DMing @%s: https://nhentai.net/g/%s/",
-                 self.s.bot2_username, gid)
+                           slot: Optional[int] = None, downloader_name=None):
+        name = downloader_name or self.downloader_username
+        rt = self._slot_runtime.setdefault(slot, {}) if slot is not None else {}
+        rt.update(last_result="waiting", last_reply="", last_downloader=name)
+        log.info("📨 slot %s DMing @%s: https://nhentai.net/g/%s/",
+                 slot if slot is not None else "?", name, gid)
         sent = await client.send_message(bot2, f"https://nhentai.net/g/{gid}/")
         sent_id = int(getattr(sent, "id", 0) or 0)
         deadline = time.monotonic() + timeout
@@ -1041,13 +1129,16 @@ class Fetcher:
                     continue
                 doc = getattr(msg, "document", None)
                 if doc is not None:
+                    rt["last_result"] = "PDF received"
                     return msg
                 if latest_incoming is None:
                     latest_incoming = msg
             if latest_incoming is not None:
                 text = (getattr(latest_incoming, "raw_text", "") or "").strip()
                 if text:
+                    rt["last_reply"] = text.replace("\n", " ")[:140]
                     if _HARD_ERROR_PATTERNS.search(text):
+                        rt["last_result"] = "downloader error"
                         return text[:300]
                     now = time.monotonic()
                     if now - last_progress_log > 30:
@@ -1072,6 +1163,11 @@ class Fetcher:
                         except Exception:
                             pass
 
+        rt["last_result"] = "timeout"
+        log.warning("PDF timeout: slot=%s bot=@%s gallery=%s last_reply=%r. "
+                    "If silent, open this bot from that user account and check /start, "
+                    "membership and permissions.", slot, name, gid, rt.get("last_reply", ""))
+
     async def _try_fallback_pdf(self, idx: int, client: TelegramClient,
                                 gid: str, primary_err: str):
         """v12.49: single-flight fallback attempt to the backup downloader.
@@ -1093,7 +1189,9 @@ class Fetcher:
             try:
                 self._d_state(idx, "waiting_pdf", gid,
                               step=f"fallback @{getattr(self.s, 'fallback_username', '')}")
-                res = await self._request_pdf(client, fb_ent, gid, timeout)
+                res = await self._request_pdf(
+                    client, fb_ent, gid, timeout, slot=idx,
+                    downloader_name=getattr(self.s, "fallback_username", "") or "fallback")
             finally:
                 if self.fallback_lease is not None:
                     try:

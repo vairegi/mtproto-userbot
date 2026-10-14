@@ -2091,3 +2091,164 @@ bootstrap fallback but Mongo creds win.
 Files: Bot2Fetcher/app/workers.py (NEW), Bot2Fetcher/app/admin_bot.py (NEW),
 Bot2Fetcher/app/config.py, Bot2Fetcher/app/fetcher.py, Bot2Fetcher/main.py,
 Bot2Fetcher/requirements.txt, GUIDE.md, GUIDE_APPEND.txt. Deploy: Bot 2 only.
+
+
+## v13.11 — Bot 2 downloader identity and worker lifecycle fixes (2026-10-14)
+
+Baseline freshly cloned: 0958d674884f5a6ce1bf6aebeba4d3ade60ce273.
+Deployment scope: Bot2Fetcher ONLY; Bot 0 and Bot 1 source untouched.
+
+EVIDENCE / ROOT CAUSE
+The full uploaded Render log (416 lines) is at
+https://www.genspark.ai/api/files/s/ahS5lDhE
+Screenshot: https://www.genspark.ai/api/files/s/78yfL5hy
+The screenshot's three /listworker replies show 4 STORED sessions, not live
+client status. The old success text "Worker #4 added and live" was misleading:
+it meant only that the Mongo save succeeded, before asynchronous connection.
+
+Actual Render lines (verbatim message bodies, timestamps retained):
+09:02:33,206 INFO bot2fetcher.fetcher: 🤖 slot 1 resolved downloader bot: @@BOT2pdffetcherbot
+09:14:08,240 INFO bot2fetcher.fetcher: ⏸ slot 4 resting 6s
+09:14:08,307 INFO bot2fetcher.fetcher: ⏸ slot 2 resting 3s
+09:14:08,376 INFO bot2fetcher.fetcher: ⏸ slot 3 resting 3s
+09:14:11,902 INFO bot2fetcher.fetcher: 🎯 slot 2 claimed 520464 — starting job
+09:14:12,900 INFO bot2fetcher.fetcher: 🎯 slot 3 claimed 531652 — starting job
+09:14:15,269 INFO bot2fetcher.fetcher: 🎯 slot 4 claimed 685683 — starting job
+These prove slots 2–4 DO run, but time out rather than receiving PDFs.
+The log also shows slot 1 receiving PDFs. It does not establish why that
+account received replies while the others did not; the excerpt has time gaps.
+
+Read-only live curl probes (getMe/getWebhookInfo/getMyCommands, NO getUpdates)
+using the latest token in the supplied log returned:
+getMe: ok=true, id=7770208889, username=BOT2pdffetcherbot
+getWebhookInfo: ok=true, url="", pending_update_count=0
+getMyCommands: ok=true, result=[]
+Thus the primary downloader in the Render log was the SAME bot as the worker
+management bot, not the requested @Gallery_DLBot. Correct the destination;
+changing shared API credentials is not justified by these timeout logs.
+
+The early 401 messages use an older token and precede the new deployment.
+The new deployment starts the admin listener and returns 200 from Telegram.
+There is no 409 polling-conflict line in this uploaded file. An external old
+poller cannot be ruled out from getWebhookInfo alone. Do not start a second
+live poller in a sandbox. Ensure only one Render service polls BOT2_TOKEN.
+
+IMPORTANT correction to earlier guidance: BOT_2_PDF_FECTHER is an intentional,
+supported DASHBOARD token name, not an unrecognized typo. BOT2_TOKEN is the
+worker-management listener token. BOT2_USERNAME means PDF downloader, NOT
+worker-management bot username. Never set it to BOT2pdffetcherbot here.
+
+CHANGES
+- PDF_DOWNLOADER_USERNAME is the preferred explicit downloader setting;
+  BOT2_USERNAME remains a legacy alias. Strip a leading @.
+- Runtime getMe / resolved-peer ID guard detects the management bot as a
+  destination and switches it to Gallery_DLBot. Token ID provides a peer-ID
+  guard even if getMe is unavailable.
+- Downloader peer cache is keyed by downloader name: a formerly cached
+  bot2_user peer cannot keep sending to the wrong bot after correction.
+- A failed/revoked/malformed/unresolvable slot cannot abort later slots.
+  Fully resolved clients alone are published; errors disconnect the client
+  and retry on reconciliation. Setup is bounded to 45 seconds per slot.
+- Finished slot tasks are detected and reconnected. Duplicate accounts are
+  rejected at runtime, preventing concurrent jobs sharing one Telegram DM.
+- /listworker now shows actual task/state/account and request outcome, plus
+  completed count since the current connection. Errors/last bot reply help
+  identify access gates or silent downloader accounts. Runtime diagnostics
+  are rebuilt on restart; sessions and shared credentials stay in Mongo.
+- /addworker validates StringSession syntax, rejects an identical stored
+  session, and replies "saved / connection pending", never claims live early.
+- Fixed removal/renumber: don't reuse a Mongo document's immutable _id when
+  rewriting slot documents. Credential changes still reconnect existing slots.
+- Added /start and /checkram to the admin listener. Shared dashboard/admin
+  token: dashboard skips getUpdates, PTB alone owns updates. A separate
+  dashboard token retains its existing /checkram poller.
+- A dashboard 401 disables further dashboard API calls until restart.
+- Suppress HTTP INFO token URLs and redact Bot API tokens in main log messages.
+- Primary posting, backup mirror and fallback routing policies remain unchanged.
+
+BACKUP FLOW (verified in actual fetcher code and mocked integration)
+1. Each worker asks the configured primary downloader for ONE PDF.
+2. Post cover then forward PDF into DB_CHANNEL_ID (primary storage channel).
+   Primary PDF forward can use the existing download/reupload fallback if needed.
+3. Mark the gallery completed and synchronize the queue ledger.
+4. The SAME worker forwards [primary_cover_id, primary_pdf_id] in one batch
+   from the primary channel to BACKUP_DB_CHANNEL_ID, with drop_author=True.
+   This is Telegram server-side forwarding, NOT another downloader request
+   and NOT a second normal PDF download/upload through Render.
+5. Store backup_cover_msg_id, backup_pdf_msg_id and backup_status in galleries.
+   Backup mirroring is best-effort; failure does not undo primary completion.
+   This live mirror path does not itself schedule an automatic mirror retry.
+BACKUP_PDF_USERNAME is a fallback DOWNLOAD bot, unrelated to the backup
+STORAGE channel. Keep the existing fallback username if it is correct.
+Actual Render proof:
+09:02:55,191 INFO bot2fetcher.fetcher: 📤 345052 — PDF posted (msg_id=70473)
+09:03:00,158 INFO bot2fetcher.fetcher: 🗄 345052 mirrored to BackupDB cover=66161 pdf=66162
+
+SANDBOX VERIFICATION (all passing; external services mocked)
+- py_compile and pyflakes: all 6 changed production Python files + new test.
+- New test_workers_v13_11.py: actual _main startup stays alive with zero workers,
+  ASGI and real sandbox HTTP socket /healthz return 200 and zero slots;
+  uvicorn binds 0.0.0.0:18765 from PORT. Token redaction also verified.
+- Actual PTB Application.initialize/process_update dispatch: /start received a
+  sendMessage reply via MOCK transport; all worker commands, invalid input,
+  nonadmin rejection, cancel and saved credentials tested. Not a live Telegram
+  user-message test. No production Mongo or Telegram state was changed.
+- Four concurrent actual _do_job pipelines: independent mocked accounts all
+  receive PDFs, post primary messages and mark their gallery COMPLETED.
+- Revoked and cold-peer failures isolated; later healthy slot connects;
+  failed peer retries; dead task reconnect; duplicates rejected.
+- Multi-removal, immutable-_id renumber, credential reconnect, remove-all.
+- Wrong cached peer / management-bot guard / env precedence / 401 retry stop.
+- Shared-token dashboard does not call getUpdates; backup forwards one pair
+  and sends no second downloader request.
+- Existing five suites pass: root sync-audit, turso-cache, read-budget, Mongo2,
+  plus Bot2Fetcher fallback chain. git diff --check clean.
+- ZIP entries byte-compared with tested source. No tokens/log/session secrets
+  included in the ZIP. Only synthetic credentials in tests.
+These tests do NOT prove external Gallery_DLBot accepts every real account.
+Live completion for all four workers must be checked after redeployment.
+
+DEPLOY / ENV — do this in order
+1. Revoke the EXPOSED Bot2 management token through BotFather /revoke; the
+   supplied log exposes both an old and a newer token. Store a new token only
+   in Render BOT2_TOKEN. If used for logging too, replace the log token too.
+2. Extract this patch ZIP at the repository root. It contains full replacement
+   files at Bot2Fetcher/... plus GUIDE.md and GUIDE_APPEND.txt. Commit/push.
+   Retain the baseline commit above for rollback; Mongo worker data is not
+   migrated, wiped or re-added by this patch.
+3. In Bot 2 Render env set PDF_DOWNLOADER_USERNAME=Gallery_DLBot. Delete the
+   misleading BOT2_USERNAME value, or set BOT2_USERNAME=Gallery_DLBot too.
+4. Keep BOT2_TOKEN, ADMIN_USER_ID, MONGO_URI, MONGO_DB_NAME, DB_CHANNEL_ID,
+   BACKUP_DB_CHANNEL_ID, TURSO_DATABASE_URL, TURSO_AUTH_TOKEN and current
+   operational flags (including BOT2_TURSO_OFF), LOG_CHANNEL_ID and optional
+   fallback settings. DO NOT delete Mongo data or re-add the four sessions.
+5. STRING_SESSION* must stay removed. API_ID/API_HASH are not required when
+   /listworker confirms Mongo creds; legacy env bootstrap is still accepted.
+6. BOT_2_PDF_FECTHER (or LOG_BOT_TOKEN etc.) is OPTIONAL for the dashboard.
+   Replace a revoked value with a valid dashboard token, or remove stale
+   aliases to leave dashboard disabled. If using BOT2_TOKEN for the dashboard,
+   set the SAME NEW token in both vars; only PTB polls it after this patch.
+   Add the dashboard bot as admin to LOG_CHANNEL_ID for send/edit rights.
+7. Redeploy Bot 2 only: Root Directory=Bot2Fetcher, build installs requirements,
+   Start Command=python main.py, Health Check=/healthz. Leave Render's PORT
+   injection alone; code binds 0.0.0.0:$PORT. Bot 0/1 need no code redeploy.
+   If auto-deploy is enabled for all services on the same repo, manage it so
+   this change does not unintentionally redeploy the others.
+8. Confirm v13.11 boot line and PDF downloader: @Gallery_DLBot. /listworker
+   should show four distinct account IDs and task=running. Each account must
+   have access and post rights in BOTH storage channels; open Gallery_DLBot
+   from each Telegram account and complete any /start/join/access requirement.
+9. Confirm each slot sends to Gallery_DLBot and finishes a PDF. There need not
+   be equal counts or round-robin rotation: a shared queue assigns jobs to free
+   workers. A busy/slower worker completes fewer jobs legitimately.
+10. Previously timed-out galleries retain the existing 30-minute retry cooldown;
+    no queue deletion is necessary. If a worker still times out, /listworker
+    now shows its last reply/setup error; inspect that account's downloader chat.
+
+POST-DEPLOY expected lines (examples, not claims of live redeployment):
+Bot2Fetcher v13.11 booting (Mongo-backed workers; standby until /addworker)
+PDF downloader: @Gallery_DLBot (separate from worker-management bot)
+🤖 slot 1 resolved downloader bot: @Gallery_DLBot
+🧵 slot 1 worker started
+Likewise for slots 2, 3 and 4, assuming valid distinct sessions and access.
+No delete-file instruction is needed. Bot 0 and Bot 1 code are unchanged.

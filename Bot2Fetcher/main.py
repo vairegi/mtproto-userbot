@@ -24,6 +24,17 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     stream=sys.stdout,
 )
+# HTTP INFO logs include token-bearing Bot API URLs. Never publish them.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+class _RedactBotToken(logging.Filter):
+    def filter(self, record):
+        import re
+        record.msg = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[REDACTED]", record.getMessage())
+        record.args = ()
+        return True
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_RedactBotToken())
 log = logging.getLogger("bot2fetcher")
 
 settings = load()
@@ -51,7 +62,8 @@ fetcher.fallback_lease = FallbackLease(_db, settings.fallback_lease_s)
 # /listworker, /removeworker, /changeapiandhash on BOT2_TOKEN).
 fetcher.workers_db = _db
 from app.admin_bot import WorkerAdminBot
-_admin_bot = WorkerAdminBot(_db, notify_reload=fetcher.request_reconcile)
+_admin_bot = WorkerAdminBot(_db, notify_reload=fetcher.request_reconcile,
+                            status_provider=fetcher.worker_status)
 
 app = FastAPI(title="Bot2Fetcher")
 
@@ -88,7 +100,7 @@ def _run_api() -> None:
 
 
 async def _main() -> None:
-    log.info("🚀 Bot2Fetcher v13.10 booting (Mongo-backed workers; "
+    log.info("🚀 Bot2Fetcher v13.11 booting (Mongo-backed workers; "
              "standby until /addworker)")
     if _os.environ.get("BOT2_TURSO_OFF", "0").strip() in ("1", "true", "yes"):
         log.warning("🚫 [TURSO OFF] Bot2Fetcher running MONGO-ONLY "

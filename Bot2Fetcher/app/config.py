@@ -95,7 +95,8 @@ def load() -> Settings:
         turso_url=_req("TURSO_DATABASE_URL"),
         turso_token=_req("TURSO_AUTH_TOKEN"),
         db_channel_id=_req("DB_CHANNEL_ID", "DATABASE_CHANNEL_ID"),
-        bot2_username=_first("BOT2_USERNAME") or "Gallery_DLBot",
+        bot2_username=(_first("PDF_DOWNLOADER_USERNAME", "BOT2_USERNAME")
+                       or "Gallery_DLBot").lstrip("@"),
         # v12.49: fallback bot. Set BACKUP_PDF_USERNAME=pdfdownloadcinbot.
         fallback_username=(_first("BACKUP_PDF_USERNAME") or "").lstrip("@"),
         fallback_timeout_s=_int("BACKUP_PDF_TIMEOUT_S", 300),   # 5 min
