@@ -331,10 +331,25 @@ async def cmd_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # days. Two-step: `/cleanrequest` previews, `/cleanrequest confirm` applies.
 # Also (user-approved) cancels rows >7 days old with no gallery progress.
 # ---------------------------------------------------------------------------
-_CLEANREQ_AGE_S = 7 * 24 * 3600          # cancel threshold for dead rows
+_CLEANREQ_AGE_S = 7 * 24 * 3600          # (legacy) pre-v13.14 threshold
 
 
 def _cleanrequest_scan(conn):
+    """v13.14: /cleanrequest now removes EVERY open request — pending and
+    processing, dead OR still active (operator decision 2026-10-14). This
+    returns ([], [], rows) where rows = every open queue row, so the
+    existing confirm path's 'cancels' bucket wipes the whole ledger.
+    The old zombie/cancel/active triage is preserved below for reference
+    under _cleanrequest_scan_legacy."""
+    rows = list(conn.queue.find(
+        {"status": {"$in": ["pending", "processing"]}},
+        {"_id": 1, "url": 1, "gallery_id": 1, "status": 1,
+         "created_at": 1, "updated_at": 1},
+    ))
+    return [], rows, []
+
+
+def _cleanrequest_scan_legacy(conn):
     """Pure read. Returns (zombies, cancels, active) row lists."""
     rows = list(conn.queue.find(
         {"status": {"$in": ["pending", "processing"]}},
@@ -398,9 +413,7 @@ async def cmd_cleanrequest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             lines = [
                 "🧹 /cleanrequest — preview (nothing changed yet)",
                 "",
-                f"  ✅ completed but stuck (will mark done):   {len(zombies)}",
-                f"  🗑 dead >7d, no progress (will cancel):     {len(cancels)}",
-                f"  ⏳ genuinely active (left untouched):      {len(active)}",
+                f"  🗑 open requests that will be REMOVED (dead + active): {len(cancels)}",
             ]
             if zombies:
                 lines.append("")
@@ -442,7 +455,7 @@ async def cmd_cleanrequest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
                 {"$set": {
                     "status": "cancelled",
                     "updated_at": now,
-                    "error_reason": "v12.92 cleanrequest: no progress in 7d",
+                    "error_reason": "v13.14 cleanrequest: removed all open requests",
                 }},
             )
             if res.modified_count:
@@ -455,8 +468,7 @@ async def cmd_cleanrequest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         "🧹 /cleanrequest — done\n"
         f"  ✅ marked done (were completed): {zdone}"
         + (f"  ({zfail} raced/already changed)" if zfail else "") + "\n"
-        f"  🗑 cancelled (dead >7d):          {cdone}\n"
-        f"  ⏳ still active:                  {len(active)}\n"
+        f"  🗑 removed (all open requests):   {cdone}\n"
         "\n"
         f"Badge now → pending: {c.get('pending', 0)} · "
         f"processing: {c.get('processing', 0)}"

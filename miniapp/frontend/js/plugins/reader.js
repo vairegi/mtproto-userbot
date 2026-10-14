@@ -1,5 +1,5 @@
 /*
-  plugins/reader.js — v12.71: in-app "Read" viewer (skip-fix).
+  plugins/reader.js — v13.14 (was v12.71): in-app "Read" viewer (skip-fix).
 
   Webtoon-style vertical continuous scroll with progressive windowing.
   v12.71 BUG FIX (skipped pages): the old trimWindow() dropped a trimmed
@@ -21,11 +21,18 @@ import { h } from "core/components.js";
 
 const IMG_SERVERS = ["https://i1.nhentai.net", "https://i2.nhentai.net",
                      "https://i3.nhentai.net", "https://i4.nhentai.net"];
-const FIRST_CHUNK = 3;      // pages mounted on open
-const STEP = 2;             // pages appended per sentinel hit
-const MAX_MOUNTED = 21;     // current ±10 window + slack
-const AHEAD = 5;            // pages to keep mounted below the viewport
-const BEHIND = 5;           // pages to keep mounted above the viewport
+// v13.14 "load as fast as possible": pages hotlink nhentai's CDN straight
+// from the user's device — our Render server carries ZERO reader bandwidth,
+// so we are maximally aggressive: mount the whole skeleton up front (correct
+// scrollbar + progress from second 0), eager-load a big first chunk, and
+// prefetch every remaining page into the HTTP cache in the background.
+// Windowing (MAX_MOUNTED) stays only to protect Telegram WebView RAM on
+// 200+ page galleries — it trims <img> elements, never loaded bytes.
+const FIRST_CHUNK = 10;     // pages with <img> attached on open
+const STEP = 8;             // pages appended per sentinel hit
+const MAX_MOUNTED = 60;     // current window + slack (RAM safety only)
+const AHEAD = 15;           // pages kept mounted below the viewport
+const BEHIND = 8;           // pages kept mounted above the viewport
 
 let _overlay = null;        // single instance — WebView RAM safety
 
@@ -190,15 +197,26 @@ export function openReader(gallery) {
     if (el) el.textContent = `${curN} / ${meta.length}`;
   }
 
+  // v13.14: skeleton for EVERY page first — instant full-height scrollbar
+  // and accurate "n / total" progress; then eager-load the first chunk and
+  // background-prefetch the rest (CDN does the work, not our server).
+  for (let i = 0; i < meta.length; i++) body.appendChild(ph(meta[i]));
   for (let i = 0; i < FIRST_CHUNK && nextIdx < meta.length; i++, nextIdx++)
     mountPage(meta[nextIdx]);
-  for (let i = nextIdx; i < Math.min(nextIdx + 2, meta.length); i++)
-    new Image().src = pageUrl(meta[i]);
+  (function prefetchAll() {
+    let i = 0;
+    const step = () => {
+      for (let k = 0; k < 6 && i < meta.length; k++, i++)
+        new Image().src = pageUrl(meta[i]);
+      if (i < meta.length && _overlay) setTimeout(step, 40);
+    };
+    setTimeout(step, 250);
+  })();
 
   const io = new IntersectionObserver((entries) => {
     if (entries.some(e => e.isIntersecting)) {
       mountNext();
-      for (let i = nextIdx; i < Math.min(nextIdx + 2, meta.length); i++)
+      for (let i = nextIdx; i < Math.min(nextIdx + 6, meta.length); i++)
         new Image().src = pageUrl(meta[i]);
     }
   }, { root: scroller, rootMargin: "600px 0px" });

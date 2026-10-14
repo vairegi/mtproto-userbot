@@ -2252,3 +2252,29 @@ PDF downloader: @Gallery_DLBot (separate from worker-management bot)
 🧵 slot 1 worker started
 Likewise for slots 2, 3 and 4, assuming valid distinct sessions and access.
 No delete-file instruction is needed. Bot 0 and Bot 1 code are unchanged.
+
+## v13.14 — Reader full-speed loading + /cleanrequest wipes all open requests (2026-10-14)
+
+Baseline: c2e140029008e7d51d835d4eae829bd0cee4586a. Scope: Bot 0 ONLY.
+
+A) miniapp/frontend/js/plugins/reader.js — Read viewer now loads as fast as
+possible. Pages hotlink nhentai's CDN straight from the user's device, so
+our Render server carries ZERO reader bandwidth. Changes: a placeholder
+skeleton for EVERY page is mounted on open (instant full-height scrollbar +
+accurate n/total progress); first chunk eager-loads 10 pages (was 3);
+sentinel appends 8 (was 2); background prefetch warms every remaining page
+into the HTTP cache; windowing constants raised (MAX_MOUNTED 60, AHEAD 15,
+BEHIND 8) purely to protect Telegram WebView RAM on 200+ page galleries —
+trimming drops <img> elements, never downloaded bytes. Tap-to-retry and the
+v12.71 skipped-page fix are preserved.
+
+B) admin_bot.py /cleanrequest — now removes EVERY open request (pending and
+processing, dead OR still active) per operator decision 2026-10-14.
+_cleanrequest_scan returns ([], all_open_rows, []) so the existing confirm
+path's cancel bucket wipes the whole ledger; preview text says "open
+requests that will be REMOVED (dead + active)". The old zombie/cancel/active
+triage is preserved as _cleanrequest_scan_legacy for reference. Two-step
+preview → /cleanrequest confirm flow unchanged.
+
+Files: miniapp/frontend/js/plugins/reader.js, admin_bot.py, GUIDE.md,
+GUIDE_APPEND.txt. Deploy: Bot 0 only.

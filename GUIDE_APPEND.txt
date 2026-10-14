@@ -179,3 +179,11 @@ PDF downloader: @Gallery_DLBot (separate from worker-management bot)
 🧵 slot 1 worker started
 Likewise for slots 2, 3 and 4, assuming valid distinct sessions and access.
 No delete-file instruction is needed. Bot 0 and Bot 1 code are unchanged.
+
+## v13.14 — Reader full-speed loading + /cleanrequest wipes all (2026-10-14)
+
+reader.js: per-page skeleton on open, eager first chunk 10, sentinel step 8,
+background prefetch of all pages (CDN-served, zero server bandwidth), larger
+RAM-safety window. admin_bot.py: /cleanrequest now removes every open
+(pending+processing) request, dead or active; legacy triage kept as
+_cleanrequest_scan_legacy. Files: reader.js, admin_bot.py. Deploy: Bot 0 only.
