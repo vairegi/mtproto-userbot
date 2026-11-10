@@ -2340,7 +2340,75 @@ async def _global_error_handler(update, context) -> None:
         exc_info=err,
     )
 
+class _PollerLease:
+    """Coordinate updated Bot 0 deployments; no Telegram calls before ownership."""
+    ttl = 90
+
+    def __init__(self, token):
+        import hashlib, secrets
+        self.key = "bot0:" + hashlib.sha256(token.encode()).hexdigest()
+        self.owner = secrets.token_hex(16)
+
+    def acquire(self):
+        from pymongo import ReturnDocument
+        from pymongo.errors import DuplicateKeyError
+        conn = db.connect()
+        try:
+            now = _time_mod.time()
+            try:
+                doc = conn.db["bot0_poller_leases"].find_one_and_update(
+                    {"_id": self.key, "$or": [{"expires_at": {"$lte": now}}, {"owner": self.owner}]},
+                    {"$set": {"owner": self.owner, "expires_at": now + self.ttl}},
+                    upsert=True, return_document=ReturnDocument.AFTER)
+                return bool(doc and doc.get("owner") == self.owner)
+            except DuplicateKeyError:
+                return False
+        finally:
+            conn.close()
+
+    def renew(self):
+        conn = db.connect()
+        try:
+            now = _time_mod.time()
+            result = conn.db["bot0_poller_leases"].update_one(
+                {"_id": self.key, "owner": self.owner, "expires_at": {"$gt": now}},
+                {"$set": {"expires_at": now + self.ttl}})
+            return result.matched_count == 1
+        finally:
+            conn.close()
+
+    def release(self):
+        conn = db.connect()
+        try:
+            conn.db["bot0_poller_leases"].delete_one({"_id": self.key, "owner": self.owner})
+        finally:
+            conn.close()
+
+
+async def _keep_poller_lease(app, lease):
+    while True:
+        await asyncio.sleep(20)
+        try:
+            owned = await asyncio.to_thread(lease.renew)
+        except Exception:
+            owned = False
+        if not owned:
+            log.error("Bot 0 polling lease lost/unavailable; stopping this poller")
+            app.stop_running()
+            return
+
+
 async def _on_startup(app: Application) -> None:
+    lease = app.bot_data.get("_poller_lease")
+    if lease:
+        try:
+            owned = await asyncio.to_thread(lease.renew)
+        except Exception:
+            owned = False
+        if not owned:
+            app.stop_running()
+            return
+        app.bot_data["_poller_lease_task"] = asyncio.create_task(_keep_poller_lease(app, lease))
     # Resume tracking any progress batches left over from before a restart.
     progress_tracker.ensure_tracker_running(app)
 
@@ -3492,55 +3560,19 @@ async def _shortener_bot_username(ctx: ContextTypes.DEFAULT_TYPE) -> str:
     return uname
 
 
+def _shortener_service():
+    from miniapp.backend.app.services import shortener
+    return shortener
+
+
 async def _shortener_mint_and_shorten(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> str:
-    """Mint a token for uid, build the deep link, shorten via provider.
-    Fail-open: returns the raw deep link if the provider fails; empty string
-    only if no deep link could be built at all."""
-    import secrets as _secrets
-    token = _secrets.token_urlsafe(16)
-    conn = db.connect()
+    svc = _shortener_service()
     try:
-        conn.db["shortener_tokens"].update_one(
-            {"_id": token},
-            {"$set": {"uid": int(uid), "created": _time_mod.time(), "used": False}},
-            upsert=True,
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    finally:
-        conn.close()
-
-    uname = await _shortener_bot_username(ctx)
-    if not uname:
+        uname = await _shortener_bot_username(ctx)
+        return await asyncio.to_thread(svc.issue_link, uid, uname)
+    except Exception as exc:
+        log.warning("shortener: link issuance failed (%s); access remains locked", type(exc).__name__)
         return ""
-    deep_link = f"https://t.me/{uname}?start=verify_{token}"
-
-    base = _shortener_flag("shortener_api_url", "").strip()
-    if not base:
-        return deep_link
-    try:
-        from urllib.parse import quote as _quote
-        if "url=" in base:
-            head = base.split("url=")[0] + "url="
-        else:
-            head = base + ("" if base.endswith(("?", "&")) else ("&" if "?" in base else "?")) + "url="
-        target = head + _quote(deep_link, safe="")
-    except Exception:  # noqa: BLE001
-        return deep_link
-
-    def _call() -> str:
-        try:
-            r = _httpx_get(target, timeout=10.0)
-            data = json.loads(r)
-            short = (data.get("shortenedUrl") or data.get("shortened_url")
-                     or data.get("short") or data.get("url") or "")
-            return short if isinstance(short, str) and short.startswith("http") else deep_link
-        except Exception:  # noqa: BLE001
-            return deep_link
-    try:
-        return await asyncio.to_thread(_call)
-    except Exception:  # noqa: BLE001
-        return deep_link
 
 
 def _httpx_get(url: str, timeout: float = 10.0) -> str:
@@ -3571,18 +3603,8 @@ async def _shortener_send_dm(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 def _shortener_unlocked(uid: int) -> bool:
-    """True if uid currently holds a valid unlock (fail-open on error)."""
-    try:
-        conn = db.connect()
-        try:
-            doc = conn.db["shortener_unlocks"].find_one({"_id": int(uid)})
-        finally:
-            conn.close()
-        if not doc:
-            return False
-        return _time_mod.time() < float(doc.get("unlocked_until", 0) or 0)
-    except Exception:  # noqa: BLE001
-        return True
+    """One decision shared with the Mini App; errors cannot grant access."""
+    return _shortener_service().is_verified(uid, settings.admin_user_id)
 
 
 # ---- /start verify_<token> -------------------------------------------------
@@ -3601,66 +3623,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     uid = int(update.effective_user.id)
-    conn = db.connect()
-    try:
-        doc = conn.db["shortener_tokens"].find_one({"_id": token})
-    finally:
-        conn.close()
-    if not doc:
-        await msg.reply_text(
-            "⚠️ This verification link is invalid or has expired. "
-            "Open the mini app to get a fresh one.")
+    verified = await asyncio.to_thread(_shortener_service().verify_token, token, uid)
+    if verified is None:
+        await msg.reply_text("⚠️ This link is invalid, expired, already used, or was not issued through the shortener. "
+                             "Open the mini app and request a fresh link.")
         return
-    try:
-        created = float(doc.get("created", 0) or 0)
-        if created and (_time_mod.time() - created) > 24 * 3600:
-            await msg.reply_text(
-                "⚠️ This verification link has expired. "
-                "Open the mini app to get a fresh one.")
-            return
-        owner = int(doc.get("uid"))
-        if owner != uid:
-            await msg.reply_text("⚠️ This verification link isn't for your account.")
-            return
-    except Exception:  # noqa: BLE001
-        await msg.reply_text("⚠️ Could not verify that link. Try again from the mini app.")
-        return
-
-    try:
-        hours = int(_shortener_flag("shortener_hours", "6"))
-        if hours <= 0:
-            hours = 6
-    except (TypeError, ValueError):
-        hours = 6
-    now = _time_mod.time()
-    until = now + hours * 3600
-    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-
-    conn = db.connect()
-    try:
-        conn.db["shortener_tokens"].update_one(
-            {"_id": token}, {"$set": {"used": True, "used_at": now}})
-        prev = conn.db["shortener_unlocks"].find_one({"_id": uid}) or {}
-        visits_today = int(prev.get("visits_today", 0) or 0)
-        day = prev.get("day", "")
-        if day != today:
-            visits_today = 0
-            day = today
-        conn.db["shortener_unlocks"].update_one(
-            {"_id": uid},
-            {"$set": {
-                "unlocked_until": until,
-                "visits_today": visits_today + 1,
-                "day": day,
-                "visits_total": int(prev.get("visits_total", 0) or 0) + 1,
-                "last_unlock": now,
-            }},
-            upsert=True,
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    finally:
-        conn.close()
+    hours = _shortener_service().ttl_hours()
 
     kb = None
     if MINIAPP_URL and MINIAPP_URL != "/":
@@ -3696,7 +3664,8 @@ async def cmd_shortener(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     api = _shortener_flag("shortener_api_url", "")
     hours = _shortener_flag("shortener_hours", "6")
     btns = _shortener_buttons()
-    api_disp = (api[:40] + "…") if len(api) > 40 else (api or "(not set)")
+    api_disp = ("configured (valid URL)" if _shortener_service().valid_api_url(api)
+                else "INVALID / missing URL — use /shortenerapi with full https:// URL")
     lines = [
         "🔗 Link shortener status",
         f"  state   : {'ON' if enabled else 'OFF'}",
@@ -3727,8 +3696,12 @@ async def cmd_shortenerapi(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         _shortener_set_flag("shortener_api_url", "")
         await msg.reply_text("🔗 Shortener API cleared.")
         return
+    if not _shortener_service().valid_api_url(url):
+        await msg.reply_text("⚠️ Invalid API URL. Include https:// and the complete provider API URL. "
+                             "Nothing was saved. Do not send the API key alone.")
+        return
     _shortener_set_flag("shortener_api_url", url)
-    await msg.reply_text("🔗 Shortener API saved.")
+    await msg.reply_text("🔗 Shortener API saved. Provider failures now keep protected actions locked.")
 
 
 async def cmd_setverifytime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3866,12 +3839,12 @@ def build_app() -> Application:
         import httpx as _httpx_boot
         _httpx_boot.post(
             f"https://api.telegram.org/bot{settings.admin_bot_token}/deleteWebhook",
-            params={"drop_pending_updates": "true"},
+            params={"drop_pending_updates": "false"},
             timeout=10,
         )
         log.info("deleteWebhook called at boot (idempotent)")
     except Exception as _e:  # noqa: BLE001
-        log.warning("deleteWebhook failed at boot (non-fatal): %s", _e)
+        log.warning("deleteWebhook failed at boot (%s)", type(_e).__name__)
 
     app = ApplicationBuilder().token(settings.admin_bot_token).post_init(_on_startup).build()
     app.add_error_handler(_global_error_handler)
@@ -3966,12 +3939,10 @@ def build_app() -> Application:
 
 
 def main() -> int:
-    app = build_app()
-    log.info("admin bot starting")
+    log.info("admin bot waiting for singleton ownership")
     # ---- Conflict-safety settings -----------------------------------------
-    # drop_pending_updates=True  → discard the update backlog on boot. A
-    #                              previous crashed instance may have left a
-    #                              stale offset that Telegram would resend.
+    # v13.16: preserve pending verification commands across deployment;
+    # the single-use token claim makes redelivery safe.
     # timeout / poll_interval    → long poll for 25s at a time (default 10s).
     #                              Long-poll lets Telegram forcibly close the
     #                              PREVIOUS conflicting connection faster.
@@ -3994,14 +3965,32 @@ def main() -> int:
         log.error("🚨 admin_bot: another instance already holds the token — "
                   "exiting to avoid getUpdates Conflict")
         raise SystemExit(3)  # non-zero so supervise() backs off & retries
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        close_loop=False,
-        drop_pending_updates=True,
-        timeout=25,
-        poll_interval=1.0,
-        bootstrap_retries=-1,
-    )
+    lease = _PollerLease(settings.admin_bot_token)
+    while True:
+        try:
+            if lease.acquire():
+                break
+        except Exception as exc:
+            log.warning("polling lease unavailable (%s); not starting getUpdates", type(exc).__name__)
+        _time_mod.sleep(15)
+    app = None
+    try:
+        # build_app deletes a webhook / starts schedulers: ownership MUST
+        # be secured before any of these side effects, not afterwards.
+        app = build_app()
+        app.bot_data["_poller_lease"] = lease
+        log.info("admin bot acquired distributed polling lease")
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES, close_loop=False,
+            drop_pending_updates=False, timeout=25, poll_interval=1.0,
+            bootstrap_retries=-1,
+        )
+    finally:
+        if app is not None:
+            task = app.bot_data.get("_poller_lease_task")
+            if task is not None: task.cancel()
+        try: lease.release()
+        except Exception: pass
     return 0
 
 

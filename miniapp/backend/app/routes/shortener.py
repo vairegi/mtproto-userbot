@@ -8,7 +8,7 @@ Auto-mounted by routes/__init__.py (no main.py edit needed).
     GET /api/shortener/verify   → browser fallback landing (deep-link is the
                                   primary path via /start verify_<token>)
 
-The gate fails open everywhere (see services/shortener.py).
+v13.16: no direct-token fallback. Protected actions remain locked on error.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import os
 import time
 
 import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 
 from ..auth import get_current_user
@@ -53,7 +53,7 @@ def _bot_username() -> str:
             _bot_username_cache = uname
             return uname
     except Exception as e:  # noqa: BLE001
-        log.warning("shortener: getMe failed (%s)", e)
+        log.warning("shortener: getMe failed (%s)", type(e).__name__)
     return env
 
 
@@ -86,13 +86,11 @@ def _maybe_send_verify_dm(uid: int) -> None:
         return
     _last_dm[uid] = now  # mark first so a slow send can't double-fire
     try:
-        vtoken = svc.mint_token(uid)
-        deep_link = f"https://t.me/{uname}?start=verify_{vtoken}"
-        short = svc.shorten(deep_link)
+        short = svc.issue_link(uid, uname)
         rows = [[{"text": svc.UNLOCK_BUTTON_LABEL, "url": short}]]
         for b in svc.extra_buttons():
             rows.append([{"text": b["label"], "url": b["url"]}])
-        httpx.post(
+        response = httpx.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={
                 "chat_id": int(uid),
@@ -101,9 +99,13 @@ def _maybe_send_verify_dm(uid: int) -> None:
             },
             timeout=10.0,
         )
+        response.raise_for_status()
+        if not response.json().get("ok"):
+            raise RuntimeError("Telegram rejected DM")
         log.info("shortener: verify DM sent to %s", uid)
-    except Exception as e:  # noqa: BLE001
-        log.warning("shortener: verify DM to %s failed: %s", uid, e)
+    except Exception as e:
+        _last_dm.pop(uid, None)  # failed sends must not suppress retries
+        log.warning("shortener: verify DM failed (%s)", type(e).__name__)
 
 
 @router.get("/status")
@@ -119,42 +121,27 @@ def shortener_status(prompt: bool = False, user: dict = Depends(get_current_user
 
 @router.get("/link")
 def shortener_link(user: dict = Depends(get_current_user)) -> dict:
-    """Mint a one-time verify token for this user and return the shortened
-    URL that ultimately deep-links back to the bot (/start verify_<token>).
-
-    Fail-open: if the provider is down the raw deep link is returned so the
-    user can still verify directly.
-    """
+    """Only the provider-issued short URL is public. Never expose deep_link."""
     uid = int(user.get("id") or 0)
-    uname = _bot_username()
-    if not uname:
-        # Cannot build a deep link at all — treat as verified (fail open).
-        return {"ok": True, "url": "", "deep_link": "", "fail_open": True}
-    token = svc.mint_token(uid)
-    deep_link = f"https://t.me/{uname}?start=verify_{token}"
-    short = svc.shorten(deep_link)
-    return {"ok": True, "url": short, "deep_link": deep_link, "fail_open": False}
+    if svc.is_verified(uid, settings.admin_user_id):
+        return {"ok": True, "url": "", "verified": True}
+    try:
+        short = svc.issue_link(uid, _bot_username())
+        return {"ok": True, "url": short}
+    except svc.ProviderUnavailable as exc:
+        raise HTTPException(503, detail={"code": "shortener_unavailable",
+                                        "message": str(exc)}) from None
+    except Exception:
+        raise HTTPException(503, detail={"code": "shortener_unavailable",
+            "message": "Verification is unavailable. Access remains locked; please retry later."}) from None
 
 
 @router.get("/verify", response_class=HTMLResponse)
 def shortener_verify(token: str = "") -> HTMLResponse:
-    """Browser fallback landing page. The primary verification path is the
-    Telegram deep link (/start verify_<token> handled in admin_bot.py); this
-    page exists so a token opened in a plain browser still completes and the
-    user gets a friendly confirmation."""
-    uid = svc.verify_token(token) if token else None
-    if uid:
-        body = (
-            "<h1>✅ Verified</h1>"
-            "<p>Access unlocked. Return to the mini app — it will open "
-            "automatically.</p>"
-        )
-    else:
-        body = (
-            "<h1>⚠️ Invalid or expired link</h1>"
-            "<p>Please request a fresh verification link from the mini app "
-            "or the bot.</p>"
-        )
+    """Legacy browser endpoint is informational only; it cannot unlock users."""
+    body = ("<h1>Verification must finish in Telegram</h1>"
+            "<p>Use a fresh verification link from Read or Download. "
+            "This page cannot grant access.</p>")
     return HTMLResponse(
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"

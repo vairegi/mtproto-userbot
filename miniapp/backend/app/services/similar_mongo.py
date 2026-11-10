@@ -1,5 +1,5 @@
 """
-similar_mongo.py — v13.15: primary-Mongo recommendations, legacy fallback.
+similar_mongo.py — v13.16: bounded signal snapshots and compact cards.
 
 The scraper writes Mongo-1 nhentai_cache. Read and cache results there first;
 only try the older Mongo-2 mirror on a primary miss/error. Retains the bounded
@@ -83,38 +83,88 @@ def _load_payload(raw: Any) -> Optional[dict]:
         return None
 
 
+# One compact, short-lived signal snapshot per process, not one per gallery.
+# Corpus reads are Mongo -> Render ingress; full gallery payloads are never
+# read for the normal primary signal scan. Legacy JSON needs a bounded fallback.
+_SIGNAL_INDEX = {}
+_SIGNAL_TTL_SEC = 600
+
+
+def _collection_key(coll):
+    try:
+        return (id(coll.database.client), coll.full_name)
+    except AttributeError:
+        return (id(coll), "legacy-test")
+
+
+def _signal_rows(coll):
+    key, now = _collection_key(coll), time.monotonic()
+    if (_SIGNAL_INDEX.get("key") == key
+            and now - _SIGNAL_INDEX.get("built", 0) < _SIGNAL_TTL_SEC):
+        return _SIGNAL_INDEX["rows"], False
+    rows, seen, pool = [], set(), {}
+    consumed = 0
+    def keep(gid, payload):
+        if not gid.isdigit() or gid in seen:
+            return
+        seen.add(gid)
+        sig = _tags_of(payload)
+        if not sig["heavy"] and not sig["tags"]:
+            return
+        # Intern names within this snapshot to avoid storing repeated tag
+        # strings for every gallery on a 512MB host.
+        h = frozenset(pool.setdefault(x, x) for x in sig["heavy"])
+        t = frozenset(pool.setdefault(x, x) for x in sig["tags"])
+        rows.append((gid, h, t))
+    # Bot 1 stores a BSON object. Project just scoring fields: never
+    # pages_meta, covers, titles, or the other full gallery metadata.
+    cursor = coll.find({"_id": {"$regex": "^gallery:"},
+                        "payload": {"$type": "object"}},
+                       {"payload.tag_groups": 1, "payload.tags": 1}).limit(_MAX_SCAN)
+    try:
+        for doc in cursor:
+            consumed += 1
+            payload = doc.get("payload")
+            if isinstance(payload, dict):
+                keep(str(doc.get("_id", "")).split(":", 1)[-1], payload)
+    finally:
+        if hasattr(cursor, "close"): cursor.close()
+    # Existing mirrors may hold JSON strings. Mongo cannot project inside
+    # them; parse once per snapshot, discard full payload immediately.
+    remaining = _MAX_SCAN - consumed
+    if remaining > 0:
+        cursor = coll.find({"_id": {"$regex": "^gallery:"},
+                            "payload": {"$type": "string"}}, {"payload": 1}).limit(remaining)
+        try:
+            for doc in cursor:
+                payload = _load_payload(doc.get("payload"))
+                if isinstance(payload, dict):
+                    keep(str(doc.get("_id", "")).split(":", 1)[-1], payload)
+        finally:
+            if hasattr(cursor, "close"): cursor.close()
+    _SIGNAL_INDEX.clear()  # one corpus at a time: bounded process RAM
+    _SIGNAL_INDEX.update(key=key, built=time.monotonic(), rows=rows)
+    return rows, True
+
+
 def _scan_and_score(coll, gid: str, heavy_set: set, tag_set: set,
                     limit: int) -> tuple:
-    """Stream the corpus, keep ONLY a top-N heap of (score, gid). Returns
-    (heap, rows_scanned). Payloads are discarded immediately — this is the
-    memory fix."""
-    heap: List = []
-    n_scanned = 0
-    cursor = coll.find(
-        {"_id": {"$regex": "^gallery:", "$ne": f"gallery:{gid}"}},
-        {"payload": 1},
-    ).limit(_MAX_SCAN)
-    for doc in cursor:
-        n_scanned += 1
-        p = _load_payload(doc.get("payload"))
-        if not isinstance(p, dict):
+    heap = []
+    rows, refreshed = _signal_rows(coll)
+    for g, heavy, tags in rows:
+        if g == gid:
             continue
-        s2 = _tags_of(p)
-        score = (_WEIGHT_HEAVY * len(heavy_set & set(s2["heavy"]))
-                 + _WEIGHT_TAG * len(tag_set & set(s2["tags"])))
+        score = (_WEIGHT_HEAVY * len(heavy_set & heavy)
+                 + _WEIGHT_TAG * len(tag_set & tags))
         if score <= 0:
-            continue
-        g = str(p.get("id") or "").strip()
-        if not g or not g.isdigit():
-            g = str(doc.get("_id", "")).split(":", 1)[-1]
-        if not g.isdigit():
             continue
         if len(heap) < limit:
             heapq.heappush(heap, (score, g))
         elif score > heap[0][0]:
             heapq.heapreplace(heap, (score, g))
-        # p (full payload) goes out of scope here — released, not kept.
-    return heap, n_scanned
+    log.info("similar signals: %s rows=%d (metadata-only primary projection)",
+             "refreshed" if refreshed else "reused", len(rows))
+    return heap, len(rows)
 
 
 def similar_galleries(gid: str, limit: int = 6) -> List[Dict[str, Any]]:
@@ -155,7 +205,7 @@ def similar_galleries(gid: str, limit: int = 6) -> List[Dict[str, Any]]:
 
 def _similar_from_collection(coll, source: str, gid: str, limit: int) -> list:
     # v12.62: result cache hit = instant response, zero scan
-    _ck = f"similar:v13.15:{gid}"
+    _ck = f"similar:v13.16:{gid}"
     try:
         _hit = coll.find_one({"_id": _ck}, {"items": 1, "cached_at": 1, "requested_limit": 1})
         if _hit and isinstance(_hit.get("items"), list) and _hit["items"]:
@@ -170,7 +220,11 @@ def _similar_from_collection(coll, source: str, gid: str, limit: int) -> list:
         pass
 
     # 1) target signals
-    target = coll.find_one({"_id": f"gallery:{gid}"}, {"payload": 1})
+    target = coll.find_one({"_id": f"gallery:{gid}", "payload": {"$type": "object"}},
+                           {"payload.tag_groups": 1, "payload.tags": 1})
+    if not target or not target.get("payload"):
+        target = coll.find_one({"_id": f"gallery:{gid}", "payload": {"$type": "string"}},
+                               {"payload": 1})
     if not target or not target.get("payload"):
         log.info("similar_mongo(%s): target not in %s; skipping", gid, source)
         return []
@@ -190,13 +244,25 @@ def _similar_from_collection(coll, source: str, gid: str, limit: int) -> list:
                     "(client keeps skeletons hidden)", gid, _SCAN_WAIT_SEC)
         return []
     try:
+        # A waiter might have been queued behind a request for this same
+        # gallery. Re-read the tiny cached result after admission.
+        hit = coll.find_one({"_id": _ck}, {"items": 1, "cached_at": 1, "requested_limit": 1})
+        if (hit and hit.get("items") and 0 <= time.time() - float(hit.get("cached_at") or 0) < _SIM_CACHE_TTL_SEC
+                and int(hit.get("requested_limit") or 0) >= limit):
+            return hit["items"][:limit]
         heap, n_scanned = _scan_and_score(coll, gid, heavy_set, tag_set, limit)
         # 3) re-fetch ONLY the winners' payloads (one $in query, ≤limit docs)
         winners = sorted(heap, key=lambda t: -t[0])
         win_keys = [f"gallery:{g}" for _s, g in winners]
         docs_by_id = {}
         if win_keys:
-            for d in coll.find({"_id": {"$in": win_keys}}, {"payload": 1}):
+            for d in coll.find({"_id": {"$in": win_keys}, "payload": {"$type": "object"}},
+                               {"payload.id": 1, "payload.title": 1, "payload.title_en_clean": 1,
+                                "payload.cover": 1, "payload.pages": 1, "payload.favorites": 1}):
+                docs_by_id[d.get("_id")] = d
+            missing = [k for k in win_keys if k not in docs_by_id]
+            for d in (coll.find({"_id": {"$in": missing}, "payload": {"$type": "string"}},
+                                {"payload": 1}) if missing else []):
                 docs_by_id[d.get("_id")] = d
         out: List[Dict[str, Any]] = []
         for score, g in winners:
@@ -209,7 +275,7 @@ def _similar_from_collection(coll, source: str, gid: str, limit: int) -> list:
                 "title": p.get("title") or p.get("title_en_clean"),
                 "cover": p.get("cover"), "pages": p.get("pages"),
                 "favorites": p.get("favorites", 0),
-                "tags": p.get("tags") or [],
+                "tags": [],  # card UI fetches full tags only when the user opens it
                 "score": score,
             }
             if card["id"] is not None:
@@ -217,7 +283,7 @@ def _similar_from_collection(coll, source: str, gid: str, limit: int) -> list:
     finally:
         _SCAN_SLOTS.release()
 
-    log.info("📖 /similar gid=%s source=%s scored=%d rows -> %d cards (lean-scan)",
+    log.info("📖 /similar gid=%s source=%s scored=%d signal rows -> %d cards (bounded snapshot)",
              gid, source, n_scanned, len(out))
     # v12.62: cache the result for repeat opens (best-effort)
     try:

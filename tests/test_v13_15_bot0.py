@@ -51,6 +51,8 @@ def env(monkeypatch):
     monkeypatch.setattr(db, 'connect', lambda: conn)
     monkeypatch.setattr(rootdb, 'load', lambda: NS(connect=lambda: conn))
     monkeypatch.setattr(gate, '_db', db)
+    monkeypatch.setattr(admin_bot, '_shortener_service', lambda: gate)
+    similar._SIGNAL_INDEX.clear()
     monkeypatch.setattr(admin_bot, 'settings', NS(admin_user_id=1))
     monkeypatch.setattr(m2, '_get_coll', lambda: legacy)
     monkeypatch.setenv('MONGO2_READS', '1')
@@ -85,7 +87,7 @@ def env(monkeypatch):
 
 
 def unlock(e, uid=2):
-    e.primary.shortener_unlocks.update_one({'_id': uid}, {'$set': {'unlocked_until': time.time()+3600}}, upsert=True)
+    e.primary.shortener_unlocks.update_one({'_id': uid}, {'$set': {'unlocked_until': time.time()+3600, 'gate_version': 2}}, upsert=True)
 
 
 def test_browse_without_verification_and_no_dm(env):
@@ -120,8 +122,8 @@ def test_status_prompt_only_on_explicit_action(env):
     assert env.dm.call_count==1
 
 
-@pytest.mark.parametrize('uid,mode',[(2,'unlock'),(1,'admin'),(2,'disabled'),(2,'unconfigured'),(2,'db-outage')])
-def test_actions_permitted_for_valid_unlock_admin_disabled_or_failopen(env,monkeypatch,uid,mode):
+@pytest.mark.parametrize('uid,mode',[(2,'unlock'),(1,'admin'),(2,'disabled')])
+def test_actions_permitted_for_valid_unlock_admin_or_explicitly_disabled(env,monkeypatch,uid,mode):
     if mode=='unlock': unlock(env)
     if mode=='disabled': env.primary.control_flags.update_one({'_id':'shortener_enabled'},{'$set':{'value':'0'}})
     if mode=='unconfigured': env.primary.control_flags.update_one({'_id':'shortener_api_url'},{'$set':{'value':''}})
@@ -141,15 +143,17 @@ def test_expired_unlock_and_user_isolation(env):
     assert env.client.get('/api/gallery/100/read',headers=env.headers).status_code==403
 
 
-def test_real_token_roundtrip_unlock_expiry_reset(env):
-    token=gate.mint_token(2)
+def test_real_token_roundtrip_unlock_expiry_reset(env,monkeypatch):
+    monkeypatch.setattr(gate,'shorten',lambda url:'https://short.invalid/code')
+    assert gate.issue_link(2,'OfflineBot')=='https://short.invalid/code'
+    token=env.primary.shortener_tokens.find_one({'uid':2})['_id']
     assert not gate.is_verified(2,1)
-    assert gate.verify_token(token)==2
+    assert gate.verify_token(token,2)==2
     assert gate.is_verified(2,1) and not gate.is_verified(3,1)
-    visits=env.primary.shortener_unlocks.find_one({'_id':2})['visits_total']
-    assert gate.verify_token(token)==2
-    assert env.primary.shortener_unlocks.find_one({'_id':2})['visits_total']==visits
-    assert gate.verify_token('not-a-token') is None
+    previous=env.primary.shortener_unlocks.find_one({'_id':2})
+    assert gate.verify_token(token,2) is None
+    assert env.primary.shortener_unlocks.find_one({'_id':2})==previous
+    assert gate.verify_token('not-a-token',2) is None
 
 
 @pytest.mark.parametrize('path',['/api/gallery/100','/api/gallery/100/read','/api/shortener/status','/api/gallery/100/suggestions'])
@@ -194,7 +198,7 @@ def test_primary_failure_still_uses_legacy(env,monkeypatch):
 
 def test_old_or_empty_cache_does_not_hide_new_results(env):
     populate(env.primary.nhentai_cache)
-    for key in ('similar:100','similar:v13.15:100'):
+    for key in ('similar:100','similar:v13.16:100'):
         env.primary.nhentai_cache.insert_one({'_id':key,'items':[],'cached_at':time.time()})
     assert len(similar.similar_galleries('100',8))==8
 
@@ -212,7 +216,7 @@ def test_disabled_invalid_missing_and_zero_overlap(env,monkeypatch):
     assert similar.similar_galleries('100')==[]
     populate(env.primary.nhentai_cache,1)
     assert similar.similar_galleries('100')==[]
-    assert not env.primary.nhentai_cache.find_one({'_id':'similar:v13.15:100'})
+    assert not env.primary.nhentai_cache.find_one({'_id':'similar:v13.16:100'})
     monkeypatch.setenv('SIMILAR_ENABLED','0')
     assert env.client.get('/api/gallery/100/suggestions',headers=env.headers).json()['items']==[]
 
@@ -228,7 +232,7 @@ def test_turso_off_never_calls_sql_even_if_source_is_turso(env,monkeypatch):
 
 def update_for(text,uid=1):
     replies=[]
-    async def reply(s): replies.append(s)
+    async def reply(s, **kwargs): replies.append(s)
     return NS(effective_user=NS(id=uid),effective_message=NS(text=text,reply_text=reply)),replies
 
 
@@ -359,12 +363,12 @@ def test_live_dm_helper_throttles_repeated_action_prompts(env,monkeypatch):
     real=importlib.reload(shortener)
     monkeypatch.setattr(real,'_bot_token',lambda:'123456:offline')
     monkeypatch.setattr(real,'_bot_username',lambda:'OfflineBot')
-    monkeypatch.setattr(real.svc,'shorten',lambda url:url)
-    send=Mock(return_value=NS(status_code=200))
+    monkeypatch.setattr(real.svc,'shorten',lambda url:'https://short.invalid/code')
+    send=Mock(return_value=NS(status_code=200,raise_for_status=lambda:None,json=lambda:{'ok':True}))
     monkeypatch.setattr(real.httpx,'post',send)
     real._last_dm.clear()
     real._maybe_send_verify_dm(2)
     real._maybe_send_verify_dm(2)
     assert send.call_count==1
     sent=send.call_args.kwargs['json']
-    assert sent['chat_id']==2 and 'verify_' in sent['reply_markup']['inline_keyboard'][0][0]['url']
+    assert sent['chat_id']==2 and sent['reply_markup']['inline_keyboard'][0][0]['url']=='https://short.invalid/code'

@@ -45,7 +45,10 @@ def ui():
                         return route.fulfill(status=503,content_type='application/json',body='{}')
                     data={'locked':state['locked'],'message':'Verification required for Read or Download',
                           'buttons':[{'label':'Tutorial','url':'https://example.invalid/tutorial'}]}
-                elif path=='/api/shortener/link': data={'url':'https://example.invalid/verify'}
+                elif path=='/api/shortener/link':
+                    if state.get('link_fail'):
+                        return route.fulfill(status=503,content_type='application/json',body=json.dumps({'detail':{'code':'shortener_unavailable','message':'Verification link unavailable. Access remains locked.'}}))
+                    data=({'deep_link':'https://t.me/OfflineBot?start=verify_SECRET'} if state.get('legacy_link') else {'url':'https://example.invalid/verify'})
                 elif path=='/api/gallery/100': data={k:v for k,v in gallery.items() if k!='pages_meta'}
                 elif path=='/api/gallery/100/status': data=gallery['v2_status']
                 elif path=='/api/gallery/100/suggestions': data={'items':[dict(gallery,id='101',title='Related fixture')],'count':1}
@@ -155,4 +158,33 @@ def test_ttl_expiry_between_click_and_post_reopens_gate(ui):
     page.wait_for_selector('.sg-overlay')
     assert calls(state,'/api/queue/deliver/100')
     assert page.get_by_text('Sent to your DM').count()==0
+    assert not errors,errors
+
+
+def test_read_back_then_download_stays_locked_exact_reported_sequence(ui):
+    page,state,errors,gallery=ui;sheet(page,gallery)
+    page.get_by_role('button',name='Read',exact=False).first.click()
+    page.wait_for_selector('.sg-overlay')
+    page.get_by_role('button',name='Close verification and continue browsing').click()
+    page.get_by_role('button',name='Download Now',exact=False).first.click()
+    page.wait_for_selector('.sg-overlay')
+    assert not calls(state,'/api/gallery/100/read')
+    assert not calls(state,'/api/queue/deliver/100')
+    assert not errors,errors
+
+
+@pytest.mark.parametrize('failure',['link_fail','legacy_link','status_fail'])
+def test_provider_or_status_failure_does_not_open_raw_verify_link(ui,failure):
+    page,state,errors,gallery=ui;state[failure]=True;sheet(page,gallery)
+    page.get_by_role('button',name='Read',exact=False).first.click()
+    page.wait_for_selector('.sg-overlay')
+    if failure!='status_fail':
+        page.get_by_role('button',name='Verify & Unlock',exact=False).click()
+        page.wait_for_function("document.querySelector('[role=alert]').textContent.length > 0")
+        assert page.evaluate('window.__opened || null') is None
+    assert not calls(state,'/api/gallery/100/read')
+    assert not calls(state,'/api/queue/deliver/100')
+    assert page.locator('.sg-overlay').count()==1
+    page.get_by_role('button',name='Close verification and continue browsing').click()
+    assert page.locator('body.sg-locked').count()==0
     assert not errors,errors

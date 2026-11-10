@@ -2424,3 +2424,199 @@ Install Chromium OS dependencies if required by the local Linux environment.
    badges update on their next poll and stored files remain available.
 7. Rollback: restore the previous versions of these replacement files or deploy
    the previous commit. No schema migration or data purge must be reversed.
+
+
+## v13.16 — secure verification and bandwidth follow-up (2026-11-10)
+
+Base: GitHub HEAD `d0548445457eea934b93f2ceb0b6af860f4526d3`.
+This section supersedes v13.15's fail-open verification descriptions and earlier
+Mongo-2-only recommendation descriptions. Only Bot 0 production code changes.
+The Bot2Fetcher test file is also corrected; its production service is unchanged.
+
+### Confirmed incident cause
+The uploaded Render log reports missing http:// or https:// in the shortener
+provider request at 14:49:45 and again at 14:49:56. Previous code returned the
+raw Telegram verification destination after this error, both in the API and
+in the bot DM. The public link API also returned a separate deep_link field.
+The bot could then redeem that raw token without a shortener visit. Telegram
+may display a deep-link command as /start while passing its hidden argument.
+Merely dismissing the popup does not itself write an unlock; this provider
+fallback is the confirmed bypass path. Bounded read-only inspection of the
+saved API configuration confirms it lacks a valid HTTP(S) scheme. Its secret
+value is deliberately not reproduced in this guide or the release archive.
+
+The bot /start handler also previously extended expiry and incremented visit
+counts when the same token was replayed, and could report success despite
+failed writes. The unauthenticated browser verify endpoint could redeem tokens
+without binding a Telegram identity. These paths are now removed/hardened.
+
+### New verification contract (intentional security behavior change)
+- Browsing/search/details/similar stay available without verification.
+- Read/Download keep the action-only dialog and Continue browsing button.
+- Protected actions no longer fail open on missing/invalid provider setup,
+  provider rejection, HTTP failure, or a database/configuration read failure.
+  Explicit /shortener off and the configured root-admin bypass still work.
+- /shortenerapi rejects malformed/missing-scheme URLs without saving them.
+  /shortener status shows validity, not the API key or full provider URL.
+- Provider calls must return a usable short URL. No raw destination is returned
+  by the API, placed in a fallback DM, or used by the frontend as a fallback.
+  Obvious direct Telegram/encoded-token echoes are rejected. Errors show a
+  visible retry message; the user can still dismiss the dialog and browse.
+- New tokens start unissued and become redeemable only after a successful
+  provider response. They are user-bound and atomically single-use, with a
+  24-hour token validity window. Replays do not extend TTL or visit counters.
+- Bot and Mini App use the same redemption implementation. A failure writing
+  the unlock does not produce a Verified success message. A consumed token
+  whose write failed requires a fresh link rather than unsafe rollback.
+- /api/shortener/verify is informational only; it cannot unlock a user.
+- New tokens and grants use gate_version=2. Older tokens and pre-fix unlocks
+  are intentionally not trusted. Non-admin users must verify once again after
+  this security update. This invalidation is enforced in code; no mass delete,
+  production credential changes or live database migration was performed.
+
+A generic redirect-only shortener does not supply cryptographic proof that a
+person completed every ad/captcha. Returning its private destination token is
+still the completion signal. This release closes the demonstrated accidental
+fallback/exposure/replay paths; it does not claim provider-side signed callback
+validation that the configured provider has not supplied.
+
+### Provider configuration action required
+The currently saved provider API URL is malformed. After deploying, the owner
+must privately send Bot 0 the COMPLETE correct provider API URL, including
+https:// and API key, via /shortenerapi. For a VPLINK-compatible endpoint the
+shape is: /shortenerapi https://vplink.in/api?api=YOUR_KEY&url=
+Use the actual endpoint from the owner's provider dashboard, not an API key
+alone. Never paste the key into this guide, GitHub, screenshots, or public chat.
+Check /shortener status afterwards. The release deliberately does not guess or
+silently rewrite a secret provider configuration. Until fixed, protected actions
+remain locked with an error rather than handing out free verification links.
+
+### Recommendations and Render bandwidth
+The log shows one cold request scoring 15,359 rows for 8 cards and a later
+MONGO1-CACHE hit after 66 seconds. Recommendations already work, but previous
+cold requests read complete gallery payloads, and cards carried unnecessary
+tag lists. Covers are direct img URLs in the existing card component, not
+proxied image bodies through Bot 0. Reader CDN behavior is unchanged.
+
+Render bills outbound traffic sent outside Render; incoming traffic is free.
+Mongo -> Render result data is inbound to Render, although Mongo may meter its
+own outbound data and the scan still costs CPU/RAM and database operations.
+Render -> Mongo queries/cache writes and Render -> browser JSON/JS/CSS count
+as outgoing traffic, as do other public-internet sends. The Hobby 5GB monthly
+allowance is workspace-wide, shared by services in that workspace, not 5GB
+for each of these three bots. See official documentation:
+https://render.com/docs/faq
+https://render.com/docs/outbound-bandwidth
+https://render.com/blog/better-pricing-for-fast-growing-teams
+https://render.com/docs/service-metrics#outbound-bandwidth
+
+Actual bounded, read-only measurements (not a monthly usage forecast):
+- 100 primary BSON gallery rows: full-payload projection 326,600 bytes;
+  scoring-field projection 138,586 bytes, a 57.57% reduction for this sample.
+- One existing 8-card response for gallery 694291: 11,982 JSON bytes before;
+  1,853 bytes with unused tags removed; 785 bytes with gzip level 5.
+  These are serialized body sizes, excluding HTTP/TLS/protocol overhead and
+  all other requests. Different galleries have different sizes. They are not
+  measurements of Render's billable monthly totals or a guaranteed percentage
+  reduction for the entire application. Logs do not provide byte counters.
+
+Implemented optimizations:
+1. BSON-object gallery scans project only tag_groups/tags, not pages_meta,
+   titles, cover data, or entire payloads. Legacy JSON-string rows retain a
+   bounded parse fallback because Mongo cannot project inside a JSON string.
+2. One per-process compact signal snapshot is reused across different galleries
+   for 10 minutes, with interned tag strings and a shared 25,000-document cap
+   across BSON and JSON modes. This avoids a corpus download per distinct cold
+   gallery. The snapshot can delay discovery of new candidates by up to its
+   refresh window; existing 30-minute per-gallery result cache behavior remains.
+3. Preserve the scan semaphore, top-N heap, primary-first/lazy-legacy behavior,
+   Turso-off guard, and limit-aware result cache. Recheck cached results after
+   admission so waiting identical requests do not unnecessarily repeat work.
+4. Winner reads project compact card fields for BSON data. Card responses carry
+   no unused full tag lists; opening a related card fetches its full details.
+5. Enable gzip level 5 for sufficiently large API/HTML/JS/CSS responses. Keep
+   no-store frontend headers so deployed fixes still reach Telegram WebViews.
+   Compression is negotiated; clients without gzip still receive correct JSON.
+
+Recommendations are NOT zero-bandwidth. These changes reduce their portion of
+usage but cannot guarantee staying below 5GB: traffic volume, app reloads, polling,
+PDF-related uploads and other services in the workspace also matter. Compare
+Render Metrics -> Outbound Bandwidth categories and Workspace Billing after
+deploying; the metrics are hourly and may lag about an hour. No analytics keys,
+external tracker, full-table mirror or new scraper process is added.
+
+### Other confirmed issues fixed
+- The log contains HEAD / returning 405 for uptime checks. Bot 0 now answers
+  HEAD / and HEAD /healthz with a cheap 200 and no body/database work.
+- Remove the stale missing turso_schema startup import: skip schema setup when
+  Turso is off; otherwise call the existing turso_client.ensure_schema in a
+  worker thread. No deleted Turso module is recreated.
+- The log's getUpdates conflicts coincide with overlapping old/new deployments.
+  A local file lock cannot coordinate separate Render containers. Bot 0 now
+  acquires a Mongo lease BEFORE build_app's webhook/scheduler side effects,
+  renews it while active, rechecks before polling, and stops polling if ownership
+  or Mongo renewal is lost. Pending verification commands are not dropped on
+  deployment. The lease lives in bot0_poller_leases with a token fingerprint,
+  owner nonce and 90-second expiry. Waiting instances keep Bot 0's separate
+  HTTP service healthy while waiting for a lease. Typical takeover is next
+  15-second retry after release; a hard-killed owner can require ~90 seconds
+  plus retry time. No bot token is stored in the lease collection.
+  Only updated cooperating Bot 0 instances honor this lease. It cannot stop
+  an unrelated old laptop/service or an older unpatched deployment using the
+  same token. Stop all obsolete pollers and keep one active Bot 0 deployment.
+- Verification-DM logging checks Telegram HTTP/API success. Failed sends no
+  longer suppress retries for 30 minutes or falsely log successful delivery.
+- The old Bot 2 worker test fixture omitted LogBot.token and expected the old
+  health response shape. Its fixture now matches the actual effective-token
+  guard and health service field. Both shared-token no-poll and separate-token
+  polling are asserted. No Bot2Fetcher production code was changed.
+
+### Sandbox verification and installation
+84 focused tests pass: 34 existing Bot 0 tests updated for the intentional
+security contract, 39 new security/bandwidth/lease tests, and 11 real Chromium
+mobile-viewport tests. Includes the reported Read -> Continue browsing ->
+Download sequence, provider/config/status errors, no raw-link fallback, real
+/start redemption, owner isolation, legacy rejection, replay, concurrent token
+redemption, write failure, signal snapshot reuse/projections/caps, lease expiry,
+gzip/no-gzip responses, HEAD health, startup routing and original cleanup tests.
+Existing cross-service regression scripts all pass after correcting the two
+previously stale Bot 2 test expectations (11 scripts; detailed output inspected).
+All tracked Python/JavaScript source parses and start.sh passes bash -n.
+The archive is also overlaid onto a pristine base and focused tests rerun there.
+
+All external provider/Telegram/CDN operations in functional tests are mocked;
+Mongo is synthetic. Real provider ads/captchas, live Telegram DMs, physical
+Android WebViews and Render's final metered monthly totals are NOT sandbox-
+validated. Live inspection performed for this task was bounded READ ONLY;
+no production state was mutated and no live Telegram poller was started.
+
+1. Extract the update ZIP into the repository root, overwriting matching files.
+   It contains complete replacement files with repo-relative paths, not a diff.
+2. Commit/push and redeploy Bot 0 only with the existing bash start.sh command.
+   No new required environment variables or production packages are needed.
+   Mongo automatically stores new token/grant/lease fields during normal use.
+3. Stop obsolete Bot 0 deployments/laptop processes sharing the same token.
+   The old/new rolling-deploy overlap may briefly conflict until the old
+   unpatched process shuts down; check that conflicts do not continue.
+4. Privately correct /shortenerapi with the full provider URL and check status.
+5. Reopen the app using an unverified non-admin account. Browsing must remain
+   free. Read -> Continue browsing -> Download must still prompt. Provider
+   failure must show an error, never a direct Telegram unlock link. Complete
+   the real short link, return to the bot, then retap Read/Download. Replaying
+   the same completed token must not renew access.
+6. Check related cards and actual reader/DM delivery, including force-join.
+   Check HEAD /healthz (200), recommendation snapshot/cache logs, and Render
+   bandwidth metrics after enough traffic and metrics propagation time.
+7. /cleanrequest's v13.15 fix remains unchanged. Preview is safe; confirm
+   intentionally cancels all open requests, including active ones.
+
+Test-only dependencies: pytest, mongomock, playwright; install Chromium plus
+its local OS libraries. Run focused tests together with:
+python -m pytest -q tests/test_v13_15_bot0.py tests/test_v13_16_security_bandwidth.py tests/test_v13_15_browser.py
+Run the legacy regression scripts separately because some alter sys.modules.
+
+Rollback restores the previous files/commit; no cache purge is required.
+WARNING: rolling back verification code restores the insecure fallback and
+trusts old grants. Fix provider configuration rather than treating rollback as
+a security repair. No credentials/private handover/uploads/logs/bytecode are
+included in the update ZIP.

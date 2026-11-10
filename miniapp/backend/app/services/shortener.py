@@ -24,8 +24,10 @@ epoch seconds — floats, per the shared §5.5 contract):
     shortener_unlocks  {_id: uid, unlocked_until: float, visits_today: int,
                         day: "YYYY-MM-DD", visits_total: int}
 
-The gate FAILS OPEN everywhere: any DB / API / config error means the user
-is let in. The shortener is an earning layer, never a lockout.
+v13.16: protected actions fail closed on provider/config/database failure.
+Browsing is always allowed. Explicit OFF and the configured admin still bypass.
+Only successfully issued version-2 provider tokens can unlock; legacy grants
+and tokens are intentionally not trusted after this security fix.
 """
 from __future__ import annotations
 
@@ -33,6 +35,7 @@ import json
 import logging
 
 import secrets
+from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -78,8 +81,6 @@ def _flag(key: str, default: str = "") -> str:
     conn = _db.connect()
     try:
         return _db.get_flag(conn, key, default)
-    except Exception:  # noqa: BLE001
-        return default
     finally:
         try:
             conn.close()
@@ -152,186 +153,164 @@ def _is_admin(uid: int, admin_user_id: int) -> bool:
 # Gate decision
 # ---------------------------------------------------------------------------
 def is_verified(uid: int, admin_user_id: int) -> bool:
-    """True → user may Read / Download. Browsing never needs verification.
-
-    Fail-open on any error. Admins always pass. Disabled / misconfigured
-    shortener always passes.
-    """
+    """No error/config path grants an unlock. Browsing does not call this gate."""
+    if _is_admin(uid, admin_user_id):
+        return True
     try:
         if not is_enabled():
-            return True
-        if _is_admin(uid, admin_user_id):
-            return True
-        if not api_url():
-            # No provider configured → nothing to earn with → let users in.
             return True
         conn, col = _unlocks()
         try:
             doc = col.find_one({"_id": int(uid)})
         finally:
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-        if not doc:
-            return False
-        until = float(doc.get("unlocked_until", 0) or 0)
-        return _now() < until
-    except Exception:  # noqa: BLE001
-        return True  # fail open
+            conn.close()
+        return bool(doc and doc.get("gate_version") == 2
+                    and _now() < float(doc.get("unlocked_until", 0) or 0))
+    except Exception:
+        return False
 
 
 def status_for(uid: int, admin_user_id: int) -> Dict[str, Any]:
     """Payload for GET /api/shortener/status."""
     verified = is_verified(uid, admin_user_id)
+    try:
+        enabled = is_enabled()
+        msg, buttons, hours = app_message(), extra_buttons(), ttl_hours()
+        configured = not enabled or valid_api_url(api_url())
+    except Exception:
+        enabled, configured = True, False
+        msg, buttons, hours = DEFAULT_APP_MSG, [], DEFAULT_HOURS
     return {
-        "enabled": is_enabled(),
-        "verified": verified,
-        "locked": is_enabled() and not verified,
-        "message": app_message(),
-        "buttons": extra_buttons(),
-        "unlock_button": UNLOCK_BUTTON_LABEL,
-        "hours": ttl_hours(),
+        "enabled": enabled, "verified": verified,
+        "locked": enabled and not verified,
+        "message": msg, "buttons": buttons,
+        "unlock_button": UNLOCK_BUTTON_LABEL, "hours": hours,
+        "configuration_error": enabled and not configured,
     }
 
 
 # ---------------------------------------------------------------------------
 # Token mint / verify
 # ---------------------------------------------------------------------------
+class ProviderUnavailable(RuntimeError):
+    """Safe public error; never contains the API key or destination token."""
+
+
+def valid_api_url(base: str) -> bool:
+    try:
+        u = urlsplit(base)
+        return bool(u.scheme in ("http", "https") and u.hostname
+                    and not u.username and not u.password
+                    and not any(c.isspace() for c in base))
+    except (ValueError, TypeError):
+        return False
+
+
 def mint_token(uid: int) -> str:
-    token = secrets.token_urlsafe(16)
+    token = secrets.token_urlsafe(24)
     conn, col = _tokens()
     try:
-        col.update_one(
-            {"_id": token},
-            {"$set": {"uid": int(uid), "created": _now(), "used": False}},
-            upsert=True,
-        )
-    except Exception:  # noqa: BLE001
-        pass
+        # Unissued tokens are never redeemable. No best-effort success.
+        col.insert_one({"_id": token, "uid": int(uid), "created": _now(),
+                        "used": False, "issued": False, "gate_version": 2})
     finally:
-        try:
-            conn.close()
-        except Exception:  # noqa: BLE001
-            pass
+        conn.close()
     return token
 
 
-def verify_token(token: str) -> Optional[int]:
-    """Consume a token → unlock its owner. Returns uid or None.
-
-    Idempotent per token: a token may be used once. Unlock TTL and the
-    per-day visit cap are applied here.
-    """
-    if not token:
-        return None
-    conn, col = _tokens()
-    try:
-        doc = col.find_one({"_id": token})
-    finally:
-        try:
-            conn.close()
-        except Exception:  # noqa: BLE001
-            pass
-    if not doc:
-        return None
-    try:
-        created = float(doc.get("created", 0) or 0)
-        if created and _now() - created > TOKEN_TTL:
-            return None
-        if doc.get("used"):
-            # already consumed → still return uid so the bot can re-confirm,
-            # but do NOT double-count the visit.
-            return int(doc.get("uid"))
-        uid = int(doc.get("uid"))
-    except Exception:  # noqa: BLE001
-        return None
-
-    now = _now()
-    until = now + ttl_hours() * 3600
-    today = _today()
-
-    # mark token used (best effort)
-    conn, col = _tokens()
-    try:
-        col.update_one({"_id": token}, {"$set": {"used": True, "used_at": now}})
-    except Exception:  # noqa: BLE001
-        pass
-    finally:
-        try:
-            conn.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-    # record unlock + visit (respect per-day cap for counting, but always
-    # unlock — the user did complete the link)
-    conn, ucol = _unlocks()
-    try:
-        doc = ucol.find_one({"_id": uid}) or {}
-        visits_today = int(doc.get("visits_today", 0) or 0)
-        day = doc.get("day", "")
-        if day != today:
-            visits_today = 0
-            day = today
-        visits_today += 1
-        ucol.update_one(
-            {"_id": uid},
-            {"$set": {
-                "unlocked_until": until,
-                "visits_today": visits_today,
-                "day": day,
-                "visits_total": int(doc.get("visits_total", 0) or 0) + 1,
-                "last_unlock": now,
-            }},
-            upsert=True,
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    finally:
-        try:
-            conn.close()
-        except Exception:  # noqa: BLE001
-            pass
-    return uid
-
-
-# ---------------------------------------------------------------------------
-# VPLINK short-url generation (fail-open: on error return the raw deep link)
-# ---------------------------------------------------------------------------
 def shorten(deep_link: str) -> str:
-    """Return a shortened URL for deep_link via the configured provider.
-
-    VPLINK format:  GET https://vplink.in/api?api=TOKEN&url=LONGURL
-    Response JSON:  {"status":"success","shortenedUrl":"https://vplink.in/xxxx"}
-
-    On ANY failure (no api url, http error, bad json) we return the raw
-    deep_link so the user can still verify directly — fail open.
-    """
-    base = api_url()
-    if not base:
-        return deep_link
+    """Return ONLY a real short URL; never fall back to the redeem token."""
     try:
-        # Build the request URL: ensure the long link lands as the `url=` value.
-        # The admin may paste the api base with or without a trailing `url=`.
-        if "url=" in base:
-            head = base.split("url=")[0] + "url="
-        else:
-            head = base + ("" if base.endswith(("?", "&")) else ("&" if "?" in base else "?")) + "url="
-        target = head + _urlencode(deep_link)
+        base = api_url()
+        if not valid_api_url(base):
+            raise ProviderUnavailable("Shortener configuration is invalid. Contact the admin.")
+        u = urlsplit(base)
+        query = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+                 if k.lower() != "url"]
+        query.append(("url", deep_link))
+        target = urlunsplit((u.scheme, u.netloc, u.path, urlencode(query), ""))
         r = httpx.get(target, timeout=10.0, follow_redirects=True)
+        r.raise_for_status()
         data = r.json()
-        short = (
-            data.get("shortenedUrl")
-            or data.get("shortened_url")
-            or data.get("short")
-            or data.get("url")
-            or ""
-        )
-        if isinstance(short, str) and short.startswith("http"):
-            return short
-    except Exception as e:  # noqa: BLE001
-        log.warning("shortener: provider call failed (%s) — failing open", e)
-    return deep_link
+        if not isinstance(data, dict):
+            raise ValueError("response type")
+        if str(data.get("status", "success")).lower() not in ("success", "ok", "1", "true"):
+            raise ValueError("provider rejection")
+        short = (data.get("shortenedUrl") or data.get("shortened_url")
+                 or data.get("short") or data.get("url") or "")
+        if not isinstance(short, str) or not valid_api_url(short):
+            raise ValueError("missing short url")
+        parsed = urlsplit(short)
+        # Reject direct Telegram destinations or a response exposing our
+        # bearer token anywhere (including encoded query parameters).
+        from urllib.parse import unquote
+        decoded = unquote(unquote(short))
+        raw_token = deep_link.rsplit("verify_", 1)[-1]
+        if (parsed.hostname.lower() in ("t.me", "telegram.me", "telegram.dog")
+                or short == deep_link or (raw_token and raw_token in decoded)):
+            raise ValueError("unsafe destination")
+        return short
+    except ProviderUnavailable:
+        raise
+    except Exception as exc:
+        log.warning("shortener: provider unavailable (%s); access remains locked",
+                    type(exc).__name__)
+        raise ProviderUnavailable("Verification link unavailable. Please retry later; access remains locked.") from None
+
+
+def issue_link(uid: int, bot_username: str) -> str:
+    """Private redeem token goes only to provider; caller sees only short URL."""
+    if not bot_username:
+        raise ProviderUnavailable("Verification bot is unavailable. Please retry later.")
+    token = mint_token(uid)
+    short = shorten(f"https://t.me/{bot_username}?start=verify_{token}")
+    conn, col = _tokens()
+    try:
+        result = col.update_one({"_id": token, "uid": int(uid), "used": False,
+                                 "gate_version": 2}, {"$set": {"issued": True}})
+        if result.modified_count != 1:
+            raise ProviderUnavailable("Could not prepare verification. Please retry.")
+    finally:
+        conn.close()
+    return short
+
+
+def verify_token(token: str, uid: Optional[int] = None) -> Optional[int]:
+    """Atomic, user-bound redemption; never trusts legacy/unissued/replayed links.
+
+    A valid provider-issued return token is the completion signal. A generic
+    shortener does not provide cryptographic proof of ad/captcha completion.
+    """
+    if not token or uid is None:
+        return None
+    from pymongo import ReturnDocument
+    conn, col = _tokens()
+    now = _now()
+    try:
+        doc = col.find_one_and_update(
+            {"_id": token, "uid": int(uid), "gate_version": 2, "issued": True,
+             "used": False, "created": {"$gte": now - TOKEN_TTL, "$lte": now}},
+            {"$set": {"used": True, "used_at": now}},
+            return_document=ReturnDocument.AFTER)
+        if not doc:
+            return None
+        hours = ttl_hours()
+        # Atomic update pipeline keeps counts race-safe across different
+        # fresh links for one user. All grants use this one implementation.
+        conn.db["shortener_unlocks"].update_one({"_id": int(uid)}, [{"$set": {
+            "gate_version": 2, "unlocked_until": now + hours * 3600,
+            "last_unlock": now, "day": _today(),
+            "visits_total": {"$add": [{"$ifNull": ["$visits_total", 0]}, 1]},
+            "visits_today": {"$add": [{"$cond": [
+                {"$eq": ["$day", _today()]}, {"$ifNull": ["$visits_today", 0]}, 0]}, 1]},
+        }}], upsert=True)
+        return int(uid)
+    except Exception as exc:
+        # A failed redemption may need a fresh link, but never says Verified.
+        log.warning("shortener: redemption failed (%s); no success response", type(exc).__name__)
+        return None
+    finally:
+        conn.close()
 
 
 def _urlencode(s: str) -> str:
@@ -342,8 +321,7 @@ def _urlencode(s: str) -> str:
 def require_access(uid: int, admin_user_id: int) -> None:
     """Enforce action access without blocking metadata browsing.
 
-    is_verified preserves disabled/provider-unconfigured/admin/error fail-open.
-    Kept on the server as frontend overlays are not authorization.
+    Explicit OFF/admin bypass only. Other failures never unlock actions.
     """
     if not is_verified(uid, admin_user_id):
         from fastapi import HTTPException

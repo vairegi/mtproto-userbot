@@ -17,6 +17,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -46,6 +47,7 @@ else:
     log.info("Serving frontend from %s", FRONTEND_DIR)
 
 app = FastAPI(title="Doujinshi Universe Mini App", version="0.2.0")
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 
 # CORS — Telegram Mini Apps run same-origin; permissive here for local dev.
 app.add_middleware(
@@ -111,12 +113,14 @@ mount_all(app)
 
 @app.on_event("startup")
 async def _ensure_turso_schema_on_startup():
+    if os.environ.get("BOT0_TURSO_OFF", "0").strip().lower() in ("1", "true", "yes"):
+        return
     try:
-        from app.services import turso_schema
-        await turso_schema.ensure_schema()
-    except Exception as e:
-        import logging
-        logging.getLogger("miniapp.main").warning("turso schema migration failed (non-fatal): %s", e)
+        import asyncio
+        from app.services import turso_client
+        await asyncio.to_thread(turso_client.ensure_schema)
+    except Exception as exc:
+        log.warning("turso schema check failed (%s)", type(exc).__name__)
 
 @app.on_event("startup")
 async def _start_deletion_scheduler() -> None:
@@ -171,6 +175,12 @@ def _serve_index() -> Response:
             "Expires": "0",
         },
     )
+
+
+@app.head("/", include_in_schema=False)
+@app.head("/healthz", include_in_schema=False)
+def head_health() -> Response:
+    return Response(status_code=200)
 
 
 @app.get("/", include_in_schema=False)

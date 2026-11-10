@@ -264,10 +264,17 @@ async def commands():
 async def auxiliary():
     # Shared token dashboard must never consume PTB worker updates.
     d = dashboard.Dashboard(NS(log_bot_token='999999:TEST',log_channel_id='-1001'), NS(),ft.Stats())
-    d.bot=NS(_call=AsyncMock())
-    await d._poll_commands()
-    d.bot._call.assert_not_called()
-    print('PASS shared-token dashboard: no competing getUpdates consumer')
+    # The real LogBot exposes its effective token. Keep the fixture aligned
+    # with the v13.12 shared-token guard rather than crashing before assertions.
+    d.bot=NS(token='999999:TEST', _call=AsyncMock(return_value=None))
+    with patch.dict(os.environ, {'BOT2_TOKEN': '999999:TEST'}):
+        await d._poll_commands()
+        d.bot._call.assert_not_called()
+        d.bot.token='888888:TEST'  # a separate sender may poll its own token
+        await d._poll_commands()
+        d.bot._call.assert_awaited_once_with('getUpdates', {
+            'offset': d._upd_offset, 'timeout': 0, 'allowed_updates': ['message']})
+    print('PASS dashboard: shared token does not poll; separate token does')
     class UnauthorizedApi(Api):
         calls = 0
         async def post(self, url, json):
@@ -326,7 +333,8 @@ async def entrypoint():
         await asyncio.wait_for(task,2)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),base_url='http://sandbox') as c:
         response=await c.get('/healthz')
-        assert response.status_code==200 and response.json()=={'ok':True,'slots':0}
+        assert response.status_code==200 and response.json()=={
+            'ok':True, 'service':'bot2fetcher', 'slots':0}
     server = main.uvicorn.Server(main.uvicorn.Config(main.app,host='0.0.0.0',port=main.settings.port,log_level='error'))
     server_task = asyncio.create_task(server.serve())
     try:

@@ -12,30 +12,22 @@ function _removeOverlay() {
   document.body.classList.remove("sg-locked");
 }
 
-async function _fetchLink() {
-  // Mint a fresh token + shortened URL each time the user taps, so every
-  // visit is a new payable hop.
-  try {
-    const r = await api.get("/api/shortener/link");
-    if (r && r.url) return r.url;
-    if (r && r.deep_link) return r.deep_link;
-  } catch (_) { /* fall through */ }
-  return "";
-}
-
-async function _openVerify(btn) {
+async function _openVerify(btn, errorEl) {
   btn.disabled = true;
   btn.textContent = "⏳ Generating link…";
-  const url = await _fetchLink();
-  btn.disabled = false;
-  btn.textContent = "🔓 Verify & Unlock";
-  if (!url) return; // fail-open: backend said skip; overlay poll will clear
-  const tg = window.Telegram && window.Telegram.WebApp;
+  errorEl.textContent = "";
   try {
-    if (tg && tg.openLink) tg.openLink(url);
-    else window.open(url, "_blank");
-  } catch (_) {
-    try { window.open(url, "_blank"); } catch (_) {}
+    const r = await api.get("/api/shortener/link");
+    if (r?.verified === true) { _removeOverlay(); return; }
+    if (!r?.url) throw new Error("Verification link unavailable. Please retry later.");
+    const tg = window.Telegram && window.Telegram.WebApp;
+    if (tg?.openLink) tg.openLink(r.url);
+    else window.open(r.url, "_blank");
+  } catch (e) {
+    errorEl.textContent = e?.message || "Link unavailable. Access remains locked; retry later.";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "🔓 Verify & Unlock";
   }
 }
 
@@ -60,8 +52,10 @@ function _buildOverlay(cfg) {
   const unlockBtn = h("button", {
     class: "sg-btn sg-btn-primary", type: "button",
   }, cfg.unlock_button || "🔓 Verify & Unlock");
-  unlockBtn.addEventListener("click", () => { _openVerify(unlockBtn); });
+  const errorEl = h("div", { class: "sg-hint", role: "alert" });
+  unlockBtn.addEventListener("click", () => { _openVerify(unlockBtn, errorEl); });
   card.appendChild(unlockBtn);
+  card.appendChild(errorEl);
 
   // Optional admin-configured secondary buttons (label | url).
   if (Array.isArray(cfg.buttons) && cfg.buttons.length) {
@@ -97,7 +91,8 @@ async function _checkAccess() {
   try {
     cfg = await api.get("/api/shortener/status?prompt=true");
   } catch (_) {
-    return true; // existing fail-open policy; action APIs still enforce access
+    // Never interpret a failed check as permission to Read / Download.
+    cfg = { locked: true, message: "Verification status unavailable. Please retry later or continue browsing." };
   }
   if (!cfg || cfg.locked !== true) return true;
   _overlay = _buildOverlay(cfg);
