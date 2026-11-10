@@ -26,6 +26,7 @@
 */
 
 import { api } from "core/api.js";
+import { ensureShortenerAccess } from "plugins/shortener-gate.js";
 import { make } from "core/components.js";
 import { openLink } from "core/telegram.js";
 import { store } from "core/state.js";
@@ -226,6 +227,7 @@ export const cardActions = [
     },
     disabled: ({ gallery }) => isProcessing(gallery),
     async run({ gallery, close }) {
+      if (!(await ensureShortenerAccess())) return;
       // v12.13 (#B): no more full-screen hourglass on the fast DB→DM path.
       // For an already-COMPLETED gallery the admin bot copies cover+PDF from
       // the DATABASE CHANNEL to the user's DM — that's typically <1s, so a
@@ -250,11 +252,19 @@ export const cardActions = [
       // to forward the cover + PDF straight into the user's DM.
       if (isCompleted(gallery)) {
         try {
-          await api.post(`/api/queue/deliver/${gallery.id}`, {});
+          const delivery = await api.post(`/api/queue/deliver/${gallery.id}`, {});
+          if (!delivery || !delivery.delivered) {
+            toast(delivery?.message || "Delivery did not complete — try again", "error");
+            return;
+          }
           toast("📨 Sent to your DM", "success");
           close && close();
           return;
         } catch (e) {
+          if (e?.code === "shortener_required") {
+            await ensureShortenerAccess();
+            return;
+          }
           // Fall through to the normal enqueue path only when the gallery
           // isn't in the library yet. Everything else is a real delivery
           // failure — surface the reason instead of silently re-queuing.
@@ -359,7 +369,9 @@ export const cardActions = [
         toast("✅ Queued #" + gallery.id + " — progress below", "success");
         _pollProgress(gallery.id, gallery);
       } catch (e) {
-        if (e && e.status === 429) {
+        if (e?.code === "shortener_required") {
+          await ensureShortenerAccess();
+        } else if (e && e.status === 429) {
           toast("⏳ Rate limit — try again later", "error");
         } else if (e && e.status === 403) {
           toast("App is private — admins only right now", "error");
@@ -479,18 +491,20 @@ export const cardActions = [
     icon: "📖",
     kind: "secondary",
     async run({ gallery }) {
+      if (!(await ensureShortenerAccess())) return;
       try {
         const m = await import("plugins/reader.js?v=12.66");
-        let g = gallery;
-        if (!(g && Array.isArray(g.pages_meta) && g.pages_meta.length)) {
-          g = await api.get(`/api/gallery/${encodeURIComponent((g && g.id) || "")}`);
-        }
+        // Always reauthorize: a sheet can outlive the verification TTL.
+        const g = await api.get(`/api/gallery/${encodeURIComponent(gallery.id)}/read`);
         if (g && Array.isArray(g.pages_meta) && g.pages_meta.length) {
           m.openReader(g);
         } else {
           toast("Reader unavailable for this gallery yet", "error");
         }
-      } catch (e) { console.warn("[read] open failed:", e); }
+      } catch (e) {
+        if (e?.code === "shortener_required") await ensureShortenerAccess();
+        else toast(e?.message || "Reader unavailable — please try again", "error");
+      }
     },
   },
 ];

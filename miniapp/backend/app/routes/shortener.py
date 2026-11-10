@@ -3,7 +3,7 @@ shortener.py — v13.0 link-shortener verification gate routes (Bot 0).
 
 Auto-mounted by routes/__init__.py (no main.py edit needed).
 
-    GET /api/shortener/status   → gate state for THIS user (polled on boot)
+    GET /api/shortener/status   → passive state; prompt=true only on actions
     GET /api/shortener/link     → mint a token + return the shortened URL
     GET /api/shortener/verify   → browser fallback landing (deep-link is the
                                   primary path via /start verify_<token>)
@@ -73,7 +73,7 @@ def _bot_token() -> str:
 def _maybe_send_verify_dm(uid: int) -> None:
     """DM the user the verification message + buttons (bot DM text).
 
-    Fired when a LOCKED user polls status. Throttled per user. Best-effort:
+    Fired only by an explicit action prompt, never passive polling. Throttled. Best-effort:
     any failure is logged and swallowed — the overlay already tells the user
     to expect the DM, and the overlay's own button is a working fallback.
     """
@@ -107,12 +107,12 @@ def _maybe_send_verify_dm(uid: int) -> None:
 
 
 @router.get("/status")
-def shortener_status(user: dict = Depends(get_current_user)) -> dict:
-    """Gate state for the calling user. The frontend polls this on boot and
-    re-polls while the overlay is up so it auto-clears after verification."""
+def shortener_status(prompt: bool = False, user: dict = Depends(get_current_user)) -> dict:
+    """Passive status by default; prompt=true sends a throttled DM only
+    after an explicit Read / Download action. Polling never sends DMs."""
     uid = int(user.get("id") or 0)
     payload = svc.status_for(uid, settings.admin_user_id)
-    if payload.get("locked"):
+    if prompt and payload.get("locked"):
         _maybe_send_verify_dm(uid)
     return payload
 

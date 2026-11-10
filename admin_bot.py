@@ -337,7 +337,7 @@ _CLEANREQ_AGE_S = 7 * 24 * 3600          # (legacy) pre-v13.14 threshold
 def _cleanrequest_scan(conn):
     """v13.14: /cleanrequest now removes EVERY open request — pending and
     processing, dead OR still active (operator decision 2026-10-14). This
-    returns ([], [], rows) where rows = every open queue row, so the
+    returns ([], rows, []) where rows = every open queue row, so the
     existing confirm path's 'cancels' bucket wipes the whole ledger.
     The old zombie/cancel/active triage is preserved below for reference
     under _cleanrequest_scan_legacy."""
@@ -405,7 +405,7 @@ def _cleanrequest_scan_legacy(conn):
 @only_admin
 async def cmd_cleanrequest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    confirm = bool(msg and msg.text and "confirm" in msg.text.lower())
+    confirm = bool(msg and msg.text and [part.lower() for part in msg.text.split()[1:]] == ["confirm"])
     conn = db.connect()
     try:
         zombies, cancels, active = _cleanrequest_scan(conn)
@@ -448,7 +448,7 @@ async def cmd_cleanrequest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             else:
                 zfail += 1
         cdone = 0
-        for r, gid, gst in cancels:
+        for r in cancels:
             res = conn.queue.update_one(
                 {"_id": r["_id"],
                  "status": {"$in": ["pending", "processing"]}},

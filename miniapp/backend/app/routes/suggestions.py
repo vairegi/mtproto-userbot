@@ -54,9 +54,9 @@ def gallery_suggestions(
           "count": N
         }
     """
-    # v12.60: re-enabled by default, now scored on Mongo-2 (no per-read
-    # billing). SIMILAR_ENABLED=0 disables; SIMILAR_SOURCE=turso forces the
-    # old Turso engine (rollback).
+    # v13.15: primary Mongo first; Mongo-2 only as a legacy fallback.
+    # Respect the Turso-off switch even if a stale SIMILAR_SOURCE=turso
+    # remains in Render. No SQL fallback while Turso is disabled.
     import os as _os_sim
     if _os_sim.environ.get("SIMILAR_ENABLED", "1").strip().lower() in ("0", "false", "off", "no"):
         return {"ok": False, "error": "similar-disabled", "items": [], "results": []}
@@ -64,11 +64,15 @@ def gallery_suggestions(
         if _os_sim.environ.get("SIMILAR_SOURCE", "mongo").strip().lower() == "mongo":
             from ..services import similar_mongo as _sm  # noqa: WPS433
             items = _sm.similar_galleries(str(gallery_id), int(limit))
-            if not items:
-                log.info(("📖 [MONGO READ] similar(%s) — Mongo-only (BOT0_TURSO_OFF)" if os.environ.get("BOT0_TURSO_OFF", "0").strip() in ("1","true","yes") else "similar(%s): Mongo-2 returned 0 — Turso engine fallback"), gallery_id)
+            if not items and os.environ.get("BOT0_TURSO_OFF", "0").strip().lower() not in ("1", "true", "yes"):
+                log.info("similar(%s): Mongo returned 0 — Turso fallback", gallery_id)
                 items = scraper_bridge.gallery_suggestions(str(gallery_id), int(limit))
         else:
-            items = scraper_bridge.gallery_suggestions(str(gallery_id), int(limit))
+            if os.environ.get("BOT0_TURSO_OFF", "0").strip().lower() in ("1", "true", "yes"):
+                from ..services import similar_mongo as _sm
+                items = _sm.similar_galleries(str(gallery_id), int(limit))
+            else:
+                items = scraper_bridge.gallery_suggestions(str(gallery_id), int(limit))
     except Exception as e:  # noqa: BLE001
         # Fail-open: log and return empty so the sheet just hides the row.
         log.warning("gallery_suggestions(%s) failed: %s", gallery_id, e)

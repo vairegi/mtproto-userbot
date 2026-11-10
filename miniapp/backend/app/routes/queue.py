@@ -40,19 +40,7 @@ def enqueue(body: EnqueueBody, user: dict = Depends(get_current_user)) -> dict:
     if not db.get_public_mode() and uid != int(settings.admin_user_id):
         raise HTTPException(403, "App is currently private (admin only).")
 
-    # v13.0: shortener verification gate — locked users cannot queue
-    # downloads. Fails open (any error → let them through). Admins bypass.
-    try:
-        if not _shortener.is_verified(uid, int(settings.admin_user_id)):
-            raise HTTPException(
-                403,
-                "🔐 Verification required — complete the link sent to your "
-                "Telegram DM, then try again.",
-            )
-    except HTTPException:
-        raise
-    except Exception:  # noqa: BLE001
-        pass  # fail open
+    _shortener.require_access(uid, int(settings.admin_user_id))
 
     # ---- V2 dedup gate -----------------------------------------------------
     # Runs BEFORE the rate-limit consume on purpose: tapping "Queue" on a
@@ -179,6 +167,8 @@ def deliver(gallery_id: str, user: dict = Depends(get_current_user)) -> dict:
     # If app is private, still block non-admins (same rule as enqueue).
     if not db.get_public_mode() and uid != int(settings.admin_user_id):
         raise HTTPException(403, "App is currently private (admin only).")
+
+    _shortener.require_access(uid, int(settings.admin_user_id))
 
     res = dm_delivery.deliver_to_dm(gallery_id, uid)
     if res.get("blocked_by_force_join"):

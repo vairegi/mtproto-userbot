@@ -152,7 +152,7 @@ def _is_admin(uid: int, admin_user_id: int) -> bool:
 # Gate decision
 # ---------------------------------------------------------------------------
 def is_verified(uid: int, admin_user_id: int) -> bool:
-    """True → user may use the app / download. False → show the gate.
+    """True → user may Read / Download. Browsing never needs verification.
 
     Fail-open on any error. Admins always pass. Disabled / misconfigured
     shortener always passes.
@@ -337,3 +337,17 @@ def shorten(deep_link: str) -> str:
 def _urlencode(s: str) -> str:
     from urllib.parse import quote
     return quote(s, safe="")
+
+
+def require_access(uid: int, admin_user_id: int) -> None:
+    """Enforce action access without blocking metadata browsing.
+
+    is_verified preserves disabled/provider-unconfigured/admin/error fail-open.
+    Kept on the server as frontend overlays are not authorization.
+    """
+    if not is_verified(uid, admin_user_id):
+        from fastapi import HTTPException
+        raise HTTPException(403, detail={
+            "code": "shortener_required",
+            "message": "Verification required — tap Read or Download to unlock.",
+        })

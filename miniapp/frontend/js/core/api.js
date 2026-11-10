@@ -40,7 +40,10 @@ async function request(method, path, { params, body, headers } = {}) {
   const ct = res.headers.get("content-type") || "";
   const payload = ct.includes("application/json") ? await res.json() : await res.text();
   if (!res.ok) {
-    const err = new Error((payload && payload.detail) || `HTTP ${res.status}`);
+    const detail = payload && payload.detail;
+    const err = new Error((detail && typeof detail === "object"
+      ? detail.message : detail) || `HTTP ${res.status}`);
+    err.code = detail && typeof detail === "object" ? detail.code : null;
     err.status = res.status;
     err.payload = payload;
     // v12.1: expose Retry-After so callers (prefetch circuit breaker in

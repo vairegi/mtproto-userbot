@@ -1,22 +1,4 @@
-/*
-  shortener-gate.js — v13.0 link-shortener verification overlay.
-
-  Runs FIRST on boot (before the popup, before any page render). When the
-  backend says the user is locked, it paints a non-bypassable full-screen
-  overlay and hides the whole app behind it:
-
-      [ message ]                         (/shortenermsg — mini-app text)
-      [ 🔓 Verify & Unlock ]   ← hardcoded primary, opens the short link
-      [ secondary buttons… ]   ← admin-added via /shortenerbtn
-
-  The overlay POLLS /api/shortener/status every few seconds; the moment the
-  user completes verification in Telegram the backend flips verified=true
-  and the overlay removes itself automatically (auto-clear).
-
-  Fail-open: if the status fetch fails, the overlay is never shown and the
-  app boots normally (the shortener is an earning layer, never a lockout).
-*/
-
+/* v13.15: action-only verification. No import-time request or overlay. */
 import { api } from "core/api.js";
 import { h } from "core/components.js";
 
@@ -64,6 +46,12 @@ function _buildOverlay(cfg) {
   });
   const card = h("div", { class: "sg-card" });
 
+  const cancel = h("button", {
+    class: "sg-btn sg-btn-secondary", type: "button",
+    "aria-label": "Close verification and continue browsing",
+  }, "← Continue browsing");
+  cancel.addEventListener("click", _removeOverlay);
+  card.appendChild(cancel);
   card.appendChild(h("div", { class: "sg-icon" }, "🔐"));
   card.appendChild(h("div", { class: "sg-message" },
     (cfg.message && cfg.message.trim()) || "Verification required."));
@@ -95,42 +83,39 @@ function _buildOverlay(cfg) {
   }
 
   card.appendChild(h("div", { class: "sg-hint" },
-    "Complete the link in your Telegram DM — this window unlocks automatically."));
+    "Complete the link in your Telegram DM — this window closes automatically. Then tap Read or Download again."));
 
   overlay.appendChild(card);
   return overlay;
 }
 
-async function _check() {
+let _checking = null;
+
+async function _checkAccess() {
+  if (_overlay) return false;
   let cfg;
   try {
-    cfg = await api.get("/api/shortener/status");
+    cfg = await api.get("/api/shortener/status?prompt=true");
   } catch (_) {
-    return; // fail open — never block boot on a gate fetch failure
+    return true; // existing fail-open policy; action APIs still enforce access
   }
-  if (!cfg || cfg.locked !== true) { _removeOverlay(); return; }
-
-  if (!_overlay) {
-    _overlay = _buildOverlay(cfg);
-    document.body.classList.add("sg-locked");
-    document.body.appendChild(_overlay);
-  }
-
-  if (!_pollTimer) {
-    _pollTimer = setInterval(async () => {
-      try {
-        const c = await api.get("/api/shortener/status");
-        if (c && c.locked === false) _removeOverlay(); // auto-clear after verify
-      } catch (_) { /* keep overlay; retry next tick */ }
-    }, POLL_MS);
-  }
+  if (!cfg || cfg.locked !== true) return true;
+  _overlay = _buildOverlay(cfg);
+  document.body.classList.add("sg-locked");
+  document.body.appendChild(_overlay);
+  const current = _overlay;
+  _pollTimer = setInterval(async () => {
+    try {
+      const c = await api.get("/api/shortener/status");
+      if (_overlay === current && c && c.locked === false) _removeOverlay();
+    } catch (_) { /* retry while dialog is open */ }
+  }, POLL_MS);
+  return false; // after verification tap the desired action again
 }
 
-/* Boot the gate immediately on module import (app.js imports this plugin
-   before rendering any page). Fire-and-forget — never throws. */
-export function initShortenerGate() {
-  try { _check(); } catch (_) { /* ignore */ }
+export async function ensureShortenerAccess() {
+  if (!_checking) {
+    _checking = _checkAccess().finally(() => { _checking = null; });
+  }
+  return _checking;
 }
-
-// Auto-start on import so it always runs first.
-initShortenerGate();

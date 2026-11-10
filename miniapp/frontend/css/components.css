@@ -792,10 +792,9 @@ form.search-bar { margin: 0; width: 100%; }
 .popup-close:hover { background: rgba(0, 0, 0, 0.75); }
 .popup-close:active { transform: scale(0.92); }
 
-/* v13.0 — link-shortener verification gate (blocking overlay) ----------
-   Full-screen, non-bypassable while locked. Mirrors the popup look but has
-   no close button: the only way out is completing verification. `body.sg-locked`
-   hides the whole app shell behind it. */
+/* v13.15 — action-only verification dialog ----------------------------
+   Shown only after Read / Download. Continue browsing closes the dialog
+   without granting access; the action APIs enforce verification. */
 body.sg-locked #app,
 body.sg-locked #toast-root,
 body.sg-locked #sheet-root {

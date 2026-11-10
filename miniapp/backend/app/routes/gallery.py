@@ -20,7 +20,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import get_current_user
-from ..services import scraper_bridge, queue_bridge
+from ..services import scraper_bridge, queue_bridge, shortener
+from ..config import settings
 
 router = APIRouter(prefix="/api/gallery", tags=["gallery"])
 
@@ -53,7 +54,10 @@ def get_gallery(gallery_id: str, _user: dict = Depends(get_current_user)) -> dic
         status = queue_bridge.gallery_status(str(gallery_id))
     except Exception:
         status = {"known": False}
+    detail = dict(detail)  # never redact the shared cached object in-place
     detail["v2_status"] = status
+    if not shortener.is_verified(int(_user["id"]), settings.admin_user_id):
+        detail.pop("pages_meta", None)
     return detail
 
 
@@ -90,3 +94,10 @@ def gallery_status(gallery_id: str, _user: dict = Depends(get_current_user)) -> 
     if not isinstance(info, dict):
         raise HTTPException(500, "gallery_status returned unexpected shape")
     return info
+
+
+@router.get("/{gallery_id}/read")
+def read_gallery(gallery_id: str, user: dict = Depends(get_current_user)) -> dict:
+    """Reader metadata is gated; normal gallery browsing stays available."""
+    shortener.require_access(int(user["id"]), settings.admin_user_id)
+    return get_gallery(gallery_id, user)

@@ -1,5 +1,9 @@
 """
-similar_mongo.py — v12.63: "Similar to this" engine on Mongo-2 (OOM-fixed).
+similar_mongo.py — v13.15: primary-Mongo recommendations, legacy fallback.
+
+The scraper writes Mongo-1 nhentai_cache. Read and cache results there first;
+only try the older Mongo-2 mirror on a primary miss/error. Retains the bounded
+heap, scan cap and admission semaphore introduced by the OOM fixes below.
 
 History:
   v12.60 — Mongo-native scoring (no per-read billing vs Turso).
@@ -114,7 +118,7 @@ def _scan_and_score(coll, gid: str, heavy_set: set, tag_set: set,
 
 
 def similar_galleries(gid: str, limit: int = 6) -> List[Dict[str, Any]]:
-    """Score the Mongo-2 corpus against gallery `gid`. Fail-open -> []."""
+    """Score the live primary corpus, then legacy Mongo-2. Fail-open -> []."""
     if not _enabled():
         log.warning("similar_mongo: disabled via SIMILAR_ENABLED=0")
         return []
@@ -123,21 +127,44 @@ def similar_galleries(gid: str, limit: int = 6) -> List[Dict[str, Any]]:
         return []
     limit = max(1, min(int(limit or 6), 12))
 
-    from common import mongo2_client as m2
-    coll = m2._get_coll()
-    if coll is None:
-        log.warning("similar_mongo: Mongo-2 unavailable")
-        return []
-
-    # v12.62: result cache hit = instant response, zero scan
-    _ck = f"similar:{gid}"
+    # Primary is Bot 1's current live writer. Never use app.db's separate
+    # MINIAPP/MONGO_DB namespace here; rootdb honors MONGO_DB_NAME.
     try:
-        _hit = coll.find_one({"_id": _ck}, {"items": 1, "cached_at": 1})
-        if _hit and isinstance(_hit.get("items"), list):
+        from .. import rootdb
+        root = rootdb.load()
+        if root is not None:
+            out = _similar_from_collection(root.connect().nhentai_cache,
+                                          "MONGO1", gid, limit)
+            if out:
+                return out
+    except Exception as exc:
+        log.warning("similar_mongo: primary unavailable (%s)", type(exc).__name__)
+    # Lazy fallback: a primary hit must not wait for a cold/unreachable
+    # legacy connection or build its indexes on the user-facing hot path.
+    try:
+        from common import mongo2_client as m2
+        if m2.reads_enabled():
+            legacy = m2._get_coll()
+            if legacy is not None:
+                return _similar_from_collection(legacy, "MONGO2", gid, limit)
+    except Exception as exc:
+        log.warning("similar_mongo(%s): legacy unavailable (%s)",
+                    gid, type(exc).__name__)
+    return []
+
+
+def _similar_from_collection(coll, source: str, gid: str, limit: int) -> list:
+    # v12.62: result cache hit = instant response, zero scan
+    _ck = f"similar:v13.15:{gid}"
+    try:
+        _hit = coll.find_one({"_id": _ck}, {"items": 1, "cached_at": 1, "requested_limit": 1})
+        if _hit and isinstance(_hit.get("items"), list) and _hit["items"]:
             _age = time.time() - float(_hit.get("cached_at") or 0)
-            if _age < _SIM_CACHE_TTL_SEC:
-                log.info("📖 /similar gid=%s source=MONGO2-CACHE age=%ds -> %d cards",
-                         gid, int(_age), len(_hit["items"]))
+            if (0 <= _age < _SIM_CACHE_TTL_SEC
+                    and (len(_hit["items"]) >= limit
+                         or int(_hit.get("requested_limit") or 0) >= limit)):
+                log.info("📖 /similar gid=%s source=%s-CACHE age=%ds -> %d cards",
+                         gid, source, int(_age), len(_hit["items"]))
                 return _hit["items"][:limit]
     except Exception:  # noqa: BLE001
         pass
@@ -145,7 +172,7 @@ def similar_galleries(gid: str, limit: int = 6) -> List[Dict[str, Any]]:
     # 1) target signals
     target = coll.find_one({"_id": f"gallery:{gid}"}, {"payload": 1})
     if not target or not target.get("payload"):
-        log.info("similar_mongo(%s): target not in Mongo-2; skipping", gid)
+        log.info("similar_mongo(%s): target not in %s; skipping", gid, source)
         return []
     tp = _load_payload(target["payload"])
     if not isinstance(tp, dict):
@@ -178,7 +205,7 @@ def similar_galleries(gid: str, limit: int = 6) -> List[Dict[str, Any]]:
             if not isinstance(p, dict):
                 continue
             card = {
-                "id": p.get("id"),
+                "id": p.get("id") or g,
                 "title": p.get("title") or p.get("title_en_clean"),
                 "cover": p.get("cover"), "pages": p.get("pages"),
                 "favorites": p.get("favorites", 0),
@@ -190,12 +217,15 @@ def similar_galleries(gid: str, limit: int = 6) -> List[Dict[str, Any]]:
     finally:
         _SCAN_SLOTS.release()
 
-    log.info("📖 /similar gid=%s source=MONGO2 scored=%d rows -> %d cards (lean-scan)",
-             gid, n_scanned, len(out))
+    log.info("📖 /similar gid=%s source=%s scored=%d rows -> %d cards (lean-scan)",
+             gid, source, n_scanned, len(out))
     # v12.62: cache the result for repeat opens (best-effort)
     try:
+        if not out:
+            return []  # never poison new discoveries with a cached empty result
         coll.replace_one({"_id": _ck},
-                         {"_id": _ck, "items": out, "cached_at": time.time()},
+                         {"_id": _ck, "items": out, "cached_at": time.time(),
+                          "requested_limit": limit},
                          upsert=True)
     except Exception:  # noqa: BLE001
         pass

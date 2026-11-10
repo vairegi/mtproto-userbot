@@ -2278,3 +2278,149 @@ preview → /cleanrequest confirm flow unchanged.
 
 Files: miniapp/frontend/js/plugins/reader.js, admin_bot.py, GUIDE.md,
 GUIDE_APPEND.txt. Deploy: Bot 0 only.
+
+
+## v13.15 — Bot 0 action-only verification, primary-cache recommendations, cleanup fix (2026-11-10)
+
+### Scope and base
+Tested update against GitHub HEAD `85484703b6261d2eb32b32b893da30f67c620d5e`.
+This section supersedes older guide descriptions of the all-app verification lock
+and Mongo-2-only similarity engine. Only Bot 0 is changed; ScraperBot and
+Bot2Fetcher production code is unchanged. Bot 1 warms metadata in primary Mongo,
+Bot 2 fetches/stores PDFs, and Bot 0 serves metadata and delivers stored files.
+No new production dependency, environment variable, deployment root, or process.
+Keep the existing Mongo-2/Turso settings; do not delete them for this update.
+
+### Read / Download verification
+Opening the app, browsing lists, searching, opening gallery details and viewing
+similar cards do not start shortener verification or send verification DMs.
+Read and Download explicitly check access. A locked user sees the existing
+admin-configured text and unlock/tutorial buttons, plus **Continue browsing**.
+That closes the dialog without unlocking protected actions. Verification polling
+closes the dialog after a successful unlock; then tap Read or Download again.
+There is deliberately no surprise automatic download after verification.
+
+`GET /api/shortener/status` is passive. Only explicit action checks use
+`prompt=true` to request the existing throttled verification DM. The provider,
+Telegram deep-link flow, unlock TTL, configured messages and root-admin bypass
+are retained. Existing disabled/unconfigured/database-error fail-open decisions
+are retained. Polling has no DM side effect. Provider HTTP failure continues to
+fall back to the direct verification link as before.
+
+Server-side protection is applied before both queue and cached-delivery actions,
+including the delivery route's unseen-gallery enqueue fallback. Reader metadata
+has a signed-user `GET /api/gallery/{id}/read` action endpoint. The ordinary
+browse response omits `pages_meta` while verification is required, without
+mutating its shared cache object. Reader always rechecks access, even if the
+sheet already holds metadata from an earlier verified session. Structured
+`shortener_required` errors reopen verification if TTL expires during an action.
+This is app-level access control, not DRM over public upstream CDN URLs or
+revocation of pages a user already loaded. Direct CDN image delivery is unchanged.
+
+Download UI now reports success only when delivery actually reports delivered;
+force-join or other soft blocks must not display a false "Sent to your DM" toast.
+
+### Recommendations: confirmed cause and fix
+The supplied Render log says `target not in Mongo-2; skipping`, followed by
+`stage=A+C returned=0`. Bounded, read-only queries additionally confirmed that
+all three affected IDs (694158, 694327, 694159) exist with usable grouped-tag
+payloads in primary `relaybot.nhentai_cache` and are absent from the legacy
+`turso_backup.turso_nhentai_cache` mirror. No production writes were made.
+Some old generic cache-hit messages label all Mongo-only reads "Mongo-2";
+those labels are not proof of the actual underlying source.
+
+Similarity now reads primary Mongo through the existing root DB loader, matching
+Bot 1's `MONGO_DB_NAME`, not Mini App-local `MONGO_DB`. A primary hit does not
+connect to the legacy cluster. The old Mongo-2 engine is only a lazy miss/error
+fallback and honors `MONGO2_READS`. `BOT0_TURSO_OFF=1` prevents SQL fallback even
+if a stale `SIMILAR_SOURCE=turso` setting remains. Normal Turso rollback remains
+available when Turso is not disabled.
+
+Existing weighted ranking, top-N heap, maximum scan size and scan semaphore are
+retained. The new `similar:v13.15:<gid>` result cache avoids older empty results;
+empty results are not cached. Cache entries record the requested limit so a
+small request cannot truncate a later larger request, while a fully searched
+short result can still be reused. Invalid/missing targets or a corpus with no
+related records may legitimately return no cards. No background scraper, PDF
+fetcher, full-table mirror or cache purge was added to Bot 0.
+
+### /cleanrequest
+The new scanner returns dictionaries, but the previous confirm handler unpacked
+them as triples, raising ValueError. Confirm now handles the actual dictionaries.
+Preview is read-only. Only the exact `confirm` argument (case-insensitive) applies
+cleanup; words such as `unconfirmed` do not. All pending/processing ledger rows,
+including active requests, are cancelled as requested. Updates compare the
+current row status, so a concurrent completion is not overwritten. Existing
+completed/failed rows, gallery truth, stored PDF IDs, workers and cache stay intact.
+Repeated cleanup is idempotent and reports current pending/processing counts.
+This does not forcibly interrupt a Bot 2 Telegram job already in flight; Bot 2
+may finish and preserve that gallery, without resurrecting the cancelled ledger.
+
+### Sandbox verification
+Focused tests: **43 passed** (36 backend/command tests, 7 real Chromium mobile-
+viewport tests). Tests use synthetic Mongo and mocked external Telegram/provider/
+CDN traffic. Backend tests exercise real Telegram HMAC authentication, real
+FastAPI routes, actual startup callbacks with external loops substituted, and
+the complete decorated cleanup handler (preview and confirm), not just its scanner.
+Coverage includes locked/unlocked/admin/disabled/unconfigured/DB-fail-open paths,
+TTL expiry, token round-trip and user isolation, direct-action bypass attempts,
+primary recommendation source, lazy legacy fallback, result-cache limits,
+scoring, malformed payloads, scan-slot release, private download mode, DM throttle,
+empty/repeated cleanup, unauthorized commands and completion races. Browser tests
+load the actual app/import map/modules and click the real Read/Download/dialog
+buttons; they verify no boot prompt, related-card rendering, browsing cancellation,
+verification link opening, poll-to-unlock, reader opening, delivery feedback and
+expiry between status check and delivery.
+
+Existing suites rerun separately (some legacy suites alter sys.modules):
+- PASS: tests/test_sync_audit_v12_48.py
+- PASS: tests/test_turso_cache.py
+- PASS: tests/test_v12_55_read_budget.py
+- PASS: tests/test_v12_60_mongo2.py
+- PASS: ScraperBot/tests/test_english_only.py
+- PASS: ScraperBot/tests/test_v1_25_digest.py
+- PASS: ScraperBot/tests/test_v1_27_discovery.py
+- PASS: Bot2Fetcher/tests/test_fallback_chain.py
+- PASS: Bot2Fetcher/tests/test_log_channel_v13_12.py
+- PASS: Bot2Fetcher/tests/test_v13_13_ping_pause.py
+- KNOWN EXISTING FAILURE, unchanged: Bot2Fetcher/tests/test_workers_v13_11.py
+  stops at dashboard._poll_commands because its SimpleNamespace fake bot lacks
+  `.token`. This matches the supplied handover; do not describe the entire
+  repository suite as passing. Bot 2 source/test fixture is outside this update.
+
+All repository Python source is AST-checked and frontend JavaScript is checked
+with Node. Root launcher passes `bash -n`. The ZIP is overlaid onto a fresh
+base checkout and focused tests rerun there before delivery. This is not proof
+of real Telegram delivery or actual Android WebView/network behavior; those
+require the following deployed checks. No live bot poller or production cleanup
+was started from the sandbox. No production database writes were performed.
+
+To rerun focused tests locally (test-only packages; not production requirements):
+`python -m pip install pytest mongomock playwright`, `playwright install chromium`,
+then `python -m pytest -q tests/test_v13_15_bot0.py tests/test_v13_15_browser.py`.
+Install Chromium OS dependencies if required by the local Linux environment.
+
+### Installation and post-deploy checks
+1. Back up your current repository. Extract the update ZIP into the repository
+   root and overwrite its matching paths. It contains complete replacement files
+   plus focused tests, not a diff, and has no enclosing service directory.
+2. Commit/push the files. Redeploy **Bot 0 only**, using the existing root and
+   `bash start.sh`. There are no required environment changes or deletions.
+3. Close/reopen the Telegram Mini App (or Reload). Check `/healthz` and confirm
+   the intended commit deployed. Use an **unverified non-admin** account:
+   browsing/search/details/similar must work without a verification popup/DM.
+4. Tap Read and Download while locked: each should prompt. Continue browsing
+   should return to the sheet without granting access. Complete verification,
+   return and wait for the dialog to close, then tap the desired action again.
+   Verify actual reader images and real cached/uncached DM delivery, including
+   existing force-join behavior. An admin account bypasses verification and is
+   therefore not an adequate locked-user test.
+5. Open the affected gallery IDs and check similar cards and `source=MONGO1`
+   (or MONGO1-CACHE) recommendation logs. Empty results for unrelated/missing
+   metadata can still be legitimate.
+6. Run `/cleanrequest` to inspect the preview. Run `/cleanrequest confirm` ONLY
+   when you actually want to cancel every currently open request, including
+   active ones; this is not a routine harmless health check. Confirm queue
+   badges update on their next poll and stored files remain available.
+7. Rollback: restore the previous versions of these replacement files or deploy
+   the previous commit. No schema migration or data purge must be reversed.
